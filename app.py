@@ -7,7 +7,7 @@ import threading
 import datetime as dt
 from collections import defaultdict
 
-from flask import Flask, request, jsonify, make_response
+from flask import Flask, request, jsonify, make_response, Response, redirect
 from dotenv import load_dotenv
 
 # Services & strategies
@@ -19,7 +19,7 @@ import strategies.c2 as strat_c2
 # =============================================================================
 # App metadata / versioning
 # =============================================================================
-__app_version__ = "1.1.0"   # Inline scheduler + ops endpoints
+__app_version__ = "1.2.0"   # HTML dashboard + orders/positions + inline scheduler & ops
 
 # =============================================================================
 # Boot
@@ -55,7 +55,7 @@ def _now_utc_ts() -> int:
     return int(time.time())
 
 def _today_bounds_utc():
-    # Compute UTC day bounds so it's deterministic across server regions
+    # UTC day bounds for consistent rollups
     now = dt.datetime.utcnow()
     start = dt.datetime(year=now.year, month=now.month, day=now.day, tzinfo=dt.timezone.utc)
     end = start + dt.timedelta(days=1)
@@ -78,6 +78,18 @@ def mk_services():
     market = MarketCrypto()
     broker = ExchangeExec()
     return market, broker
+
+# Simple Alpaca request helper using the broker session/base (avoids modifying services file)
+def _alpaca_req(method: str, path: str, **kw):
+    _, broker = mk_services()
+    url = f"{broker.base}{path}"
+    r = broker.session.request(method.upper(), url, timeout=(5, 20), **kw)
+    r.raise_for_status()
+    # Some Alpaca endpoints can return empty bodies on 204; handle gracefully
+    try:
+        return r.json()
+    except Exception:
+        return {"status": r.status_code}
 
 # =============================================================================
 # Optional: token gate for /scan/* (set CRON_TOKEN to enable)
@@ -188,7 +200,7 @@ def health():
 @app.get("/health/versions")
 def health_versions():
     data = {
-        "app_version": __app_version__,
+        "app": __app_version__,
         "exchange": os.getenv("CRYPTO_EXCHANGE", "alpaca"),
         "systems": {
             "c1": {"version": strat_c1.__version__},
@@ -236,6 +248,25 @@ def diag_inline():
         "c2_offset_sec": int(os.getenv("C2_OFFSET_SEC", 60)),
         "last_ticks": _last_ticks,
         "dry": os.getenv("CRON_DRY", "0") == "1",
+    })
+
+# 24/7 market gate/clock for parity with equities UI
+@app.get("/diag/gate")
+def diag_gate():
+    return jsonify({
+        "gate_on": True,
+        "decision": "open",  # crypto 24/7
+        "note": "Crypto trades 24/7; gate forced open.",
+    })
+
+@app.get("/diag/clock")
+def diag_clock():
+    now = dt.datetime.utcnow().replace(tzinfo=dt.timezone.utc).isoformat()
+    return jsonify({
+        "is_open": True,
+        "now_utc": now,
+        "next_open": None,
+        "next_close": None
     })
 
 # =============================================================================
@@ -289,8 +320,7 @@ def pnl_daily():
     Returns:
       - today's journal activity summary (counts/notional)
       - live account snapshot
-      - current open positions (from Alpaca) including unrealized provided by broker
-    Note: Realized P&L should be computed from fills; this endpoint summarizes activity + live state.
+      - current open positions (from Alpaca)
     """
     summary = _summarize_today_activity()
     acct = None
@@ -333,7 +363,6 @@ def health_limits():
         ok = False
         err = str(e)
 
-    # We don't compute realized P&L here (fills required). Provide activity + equity.
     payload = {
         "ok": ok,
         "error": err,
@@ -344,6 +373,37 @@ def health_limits():
         "note": "This endpoint compares journal activity to rails; realized P&L requires fills."
     }
     return jsonify(payload)
+
+# =============================================================================
+# Orders / Positions (for dashboard)
+# =============================================================================
+@app.get("/positions")
+def positions():
+    try:
+        _, broker = mk_services()
+        data = broker.get_positions()
+        # Return array (some SDKs return dict); enforce list for UI
+        if isinstance(data, dict):
+            data = data.get("positions") or []
+        return jsonify(data)
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 502
+
+@app.get("/orders/recent")
+def orders_recent():
+    status = request.args.get("status", "all")
+    limit = int(request.args.get("limit", "200"))
+    params = {"limit": str(limit)}
+    if status and status != "all":
+        params["status"] = status
+    try:
+        data = _alpaca_req("GET", "/orders", params=params)
+        # Ensure list
+        if isinstance(data, dict) and "orders" in data:
+            data = data["orders"]
+        return jsonify(data)
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 502
 
 # =============================================================================
 # Scan routes (token-gated if CRON_TOKEN set)
@@ -361,6 +421,221 @@ def scan_c2():
     if guard:
         return guard
     return _run_strategy_http(strat_c2, "c2")
+
+# =============================================================================
+# Dashboard (inline HTML) — Crypto
+# =============================================================================
+DASHBOARD_HTML = """
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Crypto Dashboard</title>
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<style>
+  :root {
+    --bg: #0b0f14;
+    --panel: #121821;
+    --text: #e6edf3;
+    --muted: #8aa0b4;
+    --ok: #2ecc71;
+    --warn: #f1c40f;
+    --err: #e74c3c;
+    --accent: #4aa3ff;
+    --chip: #1b2430;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, "Noto Sans", "Apple Color Emoji", "Segoe UI Emoji"; background: var(--bg); color: var(--text); }
+  header { padding: 16px 20px; background: linear-gradient(180deg, #0e131a 0%, #0b0f14 100%); border-bottom: 1px solid #1a2330; display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap; }
+  h1 { margin: 0; font-size: 18px; letter-spacing: .4px; font-weight: 600; }
+  .muted { color: var(--muted); }
+  .grid { display: grid; gap: 16px; padding: 16px; grid-template-columns: repeat(auto-fill, minmax(320px, 1fr)); }
+  .card { background: var(--panel); border: 1px solid #1a2330; border-radius: 12px; padding: 16px; }
+  .card h2 { margin: 0 0 12px; font-size: 16px; letter-spacing: .3px; }
+  .row { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; }
+  .chips { display: flex; gap: 8px; flex-wrap: wrap; }
+  .chip { background: var(--chip); border: 1px solid #1f2a38; color: var(--text); border-radius: 999px; padding: 6px 10px; font-size: 12px; }
+  .ok { color: var(--ok); }
+  .warn { color: var(--warn); }
+  .err { color: var(--err); }
+  button, .btn { cursor: pointer; background: #162335; color: var(--text); border: 1px solid #233248; padding: 8px 12px; border-radius: 8px; font-size: 13px; }
+  button:hover, .btn:hover { background: #1b2a40; }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  th, td { padding: 8px; border-bottom: 1px solid #1a2330; text-align: left; }
+  th { color: var(--muted); font-weight: 500; }
+  .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace; }
+  .right { text-align: right; }
+  .small { font-size: 12px; color: var(--muted); }
+  .notice { background: #0f1520; border: 1px solid #203049; padding: 10px 12px; border-radius: 10px; font-size: 13px; }
+</style>
+</head>
+<body>
+<header>
+  <div>
+    <h1>Crypto Dashboard <span class="small muted mono" id="appVersion"></span></h1>
+    <div class="small muted">Live execution is <strong id="gateState">checking…</strong></div>
+  </div>
+  <div class="row">
+    <button onclick="refreshAll()">Refresh</button>
+    <a class="btn" href="/health/versions">Versions</a>
+    <a class="btn" href="/diag/crypto">Account</a>
+    <a class="btn" href="/pnl/daily">P&L</a>
+  </div>
+</header>
+
+<div class="grid">
+  <div class="card">
+    <h2>Market Gate</h2>
+    <div id="gateCard" class="notice">Loading…</div>
+    <div class="chips" style="margin-top:10px;">
+      <span class="chip">/diag/gate</span>
+      <span class="chip">/diag/inline</span>
+    </div>
+  </div>
+
+  <div class="card">
+    <h2>Quick Actions</h2>
+    <div class="row">
+      <button onclick="triggerScan('C1')">Scan C1</button>
+      <button onclick="triggerScan('C2')">Scan C2</button>
+    </div>
+    <div class="small muted" id="scanResult" style="margin-top:10px;"></div>
+  </div>
+
+  <div class="card" style="grid-column: 1 / -1;">
+    <h2>Recent Orders</h2>
+    <div class="row" style="margin-bottom:8px;">
+      <button onclick="loadOrders('all')">All</button>
+      <button onclick="loadOrders('open')">Open</button>
+      <button onclick="loadOrders('closed')">Closed</button>
+    </div>
+    <div id="ordersTable">Loading…</div>
+  </div>
+
+  <div class="card" style="grid-column: 1 / -1;">
+    <h2>Positions</h2>
+    <div id="positionsTable">Loading…</div>
+  </div>
+</div>
+
+<script>
+async function jfetch(url, opts={}) {
+  const r = await fetch(url, opts);
+  if (!r.ok) throw new Error("HTTP "+r.status);
+  const ct = r.headers.get("content-type") || "";
+  if (ct.includes("application/json")) return r.json();
+  return r.text();
+}
+
+function esc(s){ return (s==null?"":String(s)).replace(/[&<>"']/g, m => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m])); }
+
+async function refreshGate() {
+  try {
+    const gate = await jfetch('/diag/gate');
+    const v = await jfetch('/health/versions');
+    document.getElementById('appVersion').textContent = "v" + esc(v.app);
+    const open = (gate.decision || '').toLowerCase() === 'open';
+    document.getElementById('gateState').textContent = open ? 'OPEN' : (gate.decision || 'closed');
+    document.getElementById('gateState').className = open ? 'ok' : 'warn';
+
+    const inline = await jfetch('/diag/inline');
+    const lines = [
+      `<div><strong>Gate:</strong> ${esc(gate.gate_on ? 'on' : 'off')} — <strong>Decision:</strong> ${esc(gate.decision)}</div>`,
+      `<div><strong>Inline:</strong> ${inline.enabled ? 'enabled' : 'disabled'} · dry=${inline.dry ? '1' : '0'}</div>`,
+      `<div class="small muted mono">C1 every ${esc(inline.c1_every_sec)}s (last: ${esc(inline.last_ticks.c1)}), C2 every ${esc(inline.c2_every_sec)}s (last: ${esc(inline.last_ticks.c2)})</div>`
+    ];
+    document.getElementById('gateCard').innerHTML = lines.join('');
+  } catch (e) {
+    document.getElementById('gateCard').innerHTML = `<span class="err">Failed to load gate</span>`;
+  }
+}
+
+async function loadOrders(status='all') {
+  try {
+    const rows = await jfetch(`/orders/recent?status=${encodeURIComponent(status)}&limit=200`);
+    const arr = Array.isArray(rows) ? rows : [];
+    if (arr.length === 0) {
+      document.getElementById('ordersTable').innerHTML = '<div class="muted">No orders</div>';
+      return;
+    }
+    let html = '<table><thead><tr><th>Time</th><th>Symbol</th><th>Side</th><th>Qty</th><th>Type</th><th>Status</th><th class="right">Filled</th></tr></thead><tbody>';
+    for (const o of arr.slice(0,200)) {
+      html += `<tr>
+        <td class="mono small">${esc(o.submitted_at || o.created_at || '')}</td>
+        <td class="mono">${esc(o.symbol || '')}</td>
+        <td>${esc(o.side || '')}</td>
+        <td>${esc(o.qty || o.notional || '')}</td>
+        <td>${esc(o.type || '')}</td>
+        <td>${esc(o.status || '')}</td>
+        <td class="right">${esc(o.filled_qty || '0')}</td>
+      </tr>`;
+    }
+    html += '</tbody></table>';
+    document.getElementById('ordersTable').innerHTML = html;
+  } catch (e) {
+    document.getElementById('ordersTable').innerHTML = `<div class="err">Failed to load orders</div>`;
+  }
+}
+
+async function loadPositions() {
+  try {
+    const rows = await jfetch('/positions');
+    const arr = Array.isArray(rows) ? rows : [];
+    if (arr.length === 0) {
+      document.getElementById('positionsTable').innerHTML = '<div class="muted">No positions</div>';
+      return;
+    }
+    let html = '<table><thead><tr><th>Symbol</th><th>Side</th><th>Qty</th><th class="right">Market Value</th><th class="right">Unrealized P/L</th></tr></thead><tbody>';
+    for (const p of arr) {
+      html += `<tr>
+        <td class="mono">${esc(p.symbol || '')}</td>
+        <td>${esc(p.side || '')}</td>
+        <td>${esc(p.qty || p.quantity || '')}</td>
+        <td class="right mono">$${esc(p.market_value || '0')}</td>
+        <td class="right mono">$${esc(p.unrealized_pl || p.unrealized_plpc || '0')}</td>
+      </tr>`;
+    }
+    html += '</tbody></table>';
+    document.getElementById('positionsTable').innerHTML = html;
+  } catch (e) {
+    document.getElementById('positionsTable').innerHTML = `<div class="err">Failed to load positions</div>`;
+  }
+}
+
+async function triggerScan(which) {
+  try {
+    const url = which === 'C1' ? '/scan/c1?dry=0' : '/scan/c2?dry=0';
+    const res = await jfetch(url, { method: 'POST' });
+    document.getElementById('scanResult').textContent = JSON.stringify(res);
+    loadOrders('all');
+  } catch (e) {
+    document.getElementById('scanResult').textContent = 'Scan failed';
+  }
+}
+
+function refreshAll() {
+  refreshGate();
+  loadOrders('all');
+  loadPositions();
+}
+
+window.addEventListener('load', () => {
+  refreshAll();
+  setInterval(refreshGate, 30000);
+});
+</script>
+</body>
+</html>
+"""
+
+@app.get("/dashboard")
+def dashboard():
+    return Response(DASHBOARD_HTML, mimetype="text/html")
+
+@app.get("/")
+def index_root():
+    # Redirect root to dashboard for convenience
+    return redirect("/dashboard", code=302)
 
 # =============================================================================
 # Entrypoint
