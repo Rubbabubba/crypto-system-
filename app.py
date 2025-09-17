@@ -280,12 +280,20 @@ def _read_ledger_rows():
     with open(path, "r", newline="") as f:
         r = csv.DictReader(f)
         for row in r:
+            if not row or "ts" not in row or not row["ts"]:
+                continue
             try:
                 row["ts"] = int(row["ts"])
-                row["notional_usd"] = float(row["notional_usd"])
-                row["dry_run"] = bool(int(row["dry_run"]))
             except Exception:
-                pass
+                continue
+            try:
+                row["notional_usd"] = float(row.get("notional_usd", 0) or 0)
+            except Exception:
+                row["notional_usd"] = 0.0
+            try:
+                row["dry_run"] = bool(int(row.get("dry_run", 0) or 0))
+            except Exception:
+                row["dry_run"] = False
             rows.append(row)
     return rows
 
