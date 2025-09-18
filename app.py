@@ -15,39 +15,46 @@ from services.market_crypto import MarketCrypto
 from services.exchange_exec import ExchangeExec
 import strategies.c1 as strat_c1
 import strategies.c2 as strat_c2
-import strategies.c3 as strat_c3   # <-- NEW
+import strategies.c3 as strat_c3
+import strategies.c4 as strat_c4   # <-- NEW
 
-__app_version__ = "1.4.0"   # add C3 + signals section
+__app_version__ = "1.5.0"   # add C4 (Volume Bubbles Breakout)
 
 load_dotenv()
 app = Flask(__name__)
 os.makedirs("logs", exist_ok=True)
 os.makedirs("storage", exist_ok=True)
 
-_last_ticks = {"c1": None, "c2": None, "c3": None}
+_last_ticks = {"c1": None, "c2": None, "c3": None, "c4": None}
 
 # ----------------- ENV helpers -----------------
 def env_map():
     keys = [
         "CRYPTO_EXCHANGE", "CRYPTO_TRADING_BASE_URL", "CRYPTO_DATA_BASE_URL",
         "CRYPTO_SYMBOLS", "DAILY_TARGET", "DAILY_STOP", "ORDER_NOTIONAL",
-        # C1/C2 (existing)
+        # C1
         "C1_TIMEFRAME","C1_RSI_LEN","C1_EMA_LEN","C1_RSI_BUY","C1_RSI_SELL",
         "C1_HTF_TIMEFRAME","C1_CLOSE_ABOVE_EMA_EQ","C1_REGIME","C1_ATR_LEN",
         "C1_ATR_STOP_MULT","C1_ATR_TP_MULT","C1_COOLDOWN_SEC","C1_MAX_SPREAD_PCT",
         "C1_MIN_ATR_USD","C1_MAX_POSITIONS",
+        # C2
         "C2_TIMEFRAME","C2_LOOKBACK","C2_ATR_LEN","C2_BREAK_K","C2_MIN_RANGE_PCT",
         "C2_HTF_TIMEFRAME","C2_EMA_TREND_LEN","C2_ATR_STOP_MULT","C2_ATR_TP_MULT",
         "C2_COOLDOWN_SEC","C2_MAX_POSITIONS",
-        # C3 (new)
+        # C3
         "C3_TIMEFRAME","C3_MA1_TYPE","C3_MA2_TYPE","C3_MA1_LEN","C3_MA2_LEN",
         "C3_ATR_LEN","C3_RISK_M","C3_SWING_LOOKBACK","C3_USE_LIMIT","C3_RR_MULT",
         "C3_TRAIL_ON","C3_TRAIL_ATR_MULT","C3_TRAIL_SOURCE","C3_RR_EXIT_FRAC",
         "C3_ALLOW_SHORTS","C3_COOLDOWN_SEC","C3_MAX_POSITIONS","C3_USE_SESSION",
         "C3_SESSION_IGN_GMT6",
-        # cron
+        # C4 (new)
+        "C4_TIMEFRAME","C4_BUBBLE_TF","C4_LOOKBACK_BUBBLES","C4_MIN_TOTAL_VOL",
+        "C4_MIN_DELTA_FRAC","C4_BREAK_K_ATR","C4_ATR_LEN","C4_ATR_STOP_MULT",
+        "C4_USE_LIMIT","C4_RR_MULT","C4_TRAIL_ON","C4_TRAIL_ATR_MULT",
+        "C4_RR_EXIT_FRAC","C4_ALLOW_SHORTS","C4_COOLDOWN_SEC","C4_MAX_POSITIONS",
+        # inline cron
         "CRON_INLINE","C1_EVERY_SEC","C1_OFFSET_SEC","C2_EVERY_SEC","C2_OFFSET_SEC",
-        "C3_EVERY_SEC","C3_OFFSET_SEC","CRON_DRY",
+        "C3_EVERY_SEC","C3_OFFSET_SEC","C4_EVERY_SEC","C4_OFFSET_SEC","CRON_DRY",
     ]
     return {k: os.getenv(k) for k in keys}
 
@@ -82,6 +89,7 @@ def _load_json(path, default):
     except Exception: pass
     return default
 
+# --- tiny indicators for signals snapshots ---
 def _ema(v,l):
     if l<=1 or not v: return v[:]
     k=2.0/(l+1.0); out=[]; e=v[0]
@@ -163,6 +171,7 @@ def _start_inline_scheduler():
     c1_every=int(os.getenv("C1_EVERY_SEC",300)); c1_offset=int(os.getenv("C1_OFFSET_SEC",0))
     c2_every=int(os.getenv("C2_EVERY_SEC",900)); c2_offset=int(os.getenv("C2_OFFSET_SEC",60))
     c3_every=int(os.getenv("C3_EVERY_SEC",600)); c3_offset=int(os.getenv("C3_OFFSET_SEC",30))
+    c4_every=int(os.getenv("C4_EVERY_SEC",600)); c4_offset=int(os.getenv("C4_OFFSET_SEC",45))
     dry=os.getenv("CRON_DRY","0")=="1"
 
     def runner(every, offset, fn, label):
@@ -177,11 +186,13 @@ def _start_inline_scheduler():
         th=threading.Thread(target=loop,name=f"inline-{label}",daemon=True); th.start()
 
     app.logger.info({"msg":"Starting inline scheduler",
-                     "C1_EVERY_SEC":c1_every,"C2_EVERY_SEC":c2_every,"C3_EVERY_SEC":c3_every,
+                     "C1_EVERY_SEC":c1_every,"C2_EVERY_SEC":c2_every,
+                     "C3_EVERY_SEC":c3_every,"C4_EVERY_SEC":c4_every,
                      "CRON_DRY":int(dry)})
     runner(c1_every,c1_offset,lambda:_run_strategy_direct(strat_c1,"c1",dry),"c1")
     runner(c2_every,c2_offset,lambda:_run_strategy_direct(strat_c2,"c2",dry),"c2")
     runner(c3_every,c3_offset,lambda:_run_strategy_direct(strat_c3,"c3",dry),"c3")
+    runner(c4_every,c4_offset,lambda:_run_strategy_direct(strat_c4,"c4",dry),"c4")
 
 _start_inline_scheduler()
 
@@ -195,12 +206,14 @@ def health_versions():
           "exchange":os.getenv("CRYPTO_EXCHANGE","alpaca"),
           "systems":{"c1":{"version":strat_c1.__version__},
                      "c2":{"version":strat_c2.__version__},
-                     "c3":{"version":strat_c3.__version__}}}
+                     "c3":{"version":strat_c3.__version__},
+                     "c4":{"version":strat_c4.__version__}}}
     resp=jsonify(data)
     resp.headers["x-app-version"]=__app_version__
     resp.headers["x-c1-version"]=strat_c1.__version__
     resp.headers["x-c2-version"]=strat_c2.__version__
     resp.headers["x-c3-version"]=strat_c3.__version__
+    resp.headers["x-c4-version"]=strat_c4.__version__
     return resp
 
 @app.get("/diag/crypto")
@@ -225,6 +238,7 @@ def diag_inline():
                     "c1_every_sec":int(os.getenv("C1_EVERY_SEC",300)),
                     "c2_every_sec":int(os.getenv("C2_EVERY_SEC",900)),
                     "c3_every_sec":int(os.getenv("C3_EVERY_SEC",600)),
+                    "c4_every_sec":int(os.getenv("C4_EVERY_SEC",600)),
                     "last_ticks":_last_ticks,
                     "dry":os.getenv("CRON_DRY","0")=="1"})
 
@@ -327,13 +341,13 @@ def orders_recent():
     except Exception as e:
         return jsonify({"ok":False,"error":str(e)}),502
 
-# --------------- Signals (C1/C2 existing + C3 new) ---------------
+# --------------- Signals (C1/C2/C3 existing + C4 new) ---------------
 @app.get("/signals")
 def signals():
     symbols=get_symbols(); mkt,_=mk_services()
-    out_c1=[]; out_c2=[]; out_c3=[]
+    out_c1=[]; out_c2=[]; out_c3=[]; out_c4=[]
 
-    # C1 snapshot (unchanged)
+    # ---- C1 snapshot (unchanged) ----
     C1_TIMEFRAME=os.getenv("C1_TIMEFRAME","5Min")
     C1_HTF=os.getenv("C1_HTF_TIMEFRAME","1Hour")
     C1_EMA_LEN=int(os.getenv("C1_EMA_LEN","50"))
@@ -344,7 +358,7 @@ def signals():
     C1_ATR_LEN=int(os.getenv("C1_ATR_LEN","14"))
     C1_MIN_ATR_USD=float(os.getenv("C1_MIN_ATR_USD","0.25"))
 
-    # C2 snapshot (unchanged)
+    # ---- C2 snapshot (unchanged) ----
     C2_TIMEFRAME=os.getenv("C2_TIMEFRAME","5Min")
     C2_LOOKBACK=int(os.getenv("C2_LOOKBACK","20"))
     C2_ATR_LEN=int(os.getenv("C2_ATR_LEN","14"))
@@ -353,7 +367,7 @@ def signals():
     C2_BREAK_K=float(os.getenv("C2_BREAK_K","1.0"))
     C2_MIN_RANGE_PCT=float(os.getenv("C2_MIN_RANGE_PCT","0.5"))
 
-    # C3 snapshot (new)
+    # ---- C3 snapshot (unchanged) ----
     C3_TF=os.getenv("C3_TIMEFRAME","5Min")
     C3_MA1_TYPE=os.getenv("C3_MA1_TYPE","EMA")
     C3_MA2_TYPE=os.getenv("C3_MA2_TYPE","EMA")
@@ -365,51 +379,16 @@ def signals():
     C3_USE_LIMIT=os.getenv("C3_USE_LIMIT","1")=="1"
     C3_RR=float(os.getenv("C3_RR_MULT","1.0"))
 
-    # minimal MA helper for C3 snapshot
-    def _ma(vals, typ, ln):
-        t=typ.upper()
-        if t=="SMA": return _sma(vals, ln)
-        if t=="WMA": return _wma(vals, ln)
-        if t=="HMA": return _hma(vals, ln)
-        if t=="DEMA": return [2*x - y for x,y in zip(_ema(vals,ln), _ema(_ema(vals,ln),ln))]
-        # default EMA
-        return _ema(vals, ln)
+    # ---- C4 snapshot (new) ----
+    C4_TF=os.getenv("C4_TIMEFRAME","5Min")
+    C4_BTF=os.getenv("C4_BUBBLE_TF","1Hour")
+    C4_LB=int(os.getenv("C4_LOOKBACK_BUBBLES","24"))
+    C4_MIN_T=float(os.getenv("C4_MIN_TOTAL_VOL","0"))
+    C4_MIN_DF=float(os.getenv("C4_MIN_DELTA_FRAC","0.30"))
+    C4_ATR_LEN=int(os.getenv("C4_ATR_LEN","14"))
+    C4_BREAK_K=float(os.getenv("C4_BREAK_K_ATR","0.0"))
 
-    # quick SMA/WMA/HMA for snapshot
-    def _sma(vals,l):
-        if l<=1 or not vals: return vals[:]
-        out=[]; s=sum(vals[:l]); out.extend([vals[0]]*(l-1))
-        for i in range(l-1,len(vals)):
-            if i==l-1: out.append(s/l)
-            else:
-                s+=vals[i]-vals[i-l]; out.append(s/l)
-        return out
-    def _wma(vals,l):
-        if l<=1 or not vals: return vals[:]
-        ws=list(range(1,l+1)); den=sum(ws); out=[]
-        for i in range(len(vals)):
-            if i+1<l: out.append(vals[i])
-            else:
-                s=0.0
-                for w,j in zip(ws, range(i-l+1,i+1)): s+=vals[j]*w
-                out.append(s/den)
-        return out
-    def _hma(vals,l):
-        if l<=1 or not vals: return vals[:]
-        def __wma(v, ln):
-            if ln<=1: return v[:]
-            ws=list(range(1,ln+1)); den=sum(ws); o=[]
-            for i in range(len(v)):
-                if i+1<ln: o.append(v[i])
-                else:
-                    s=0.0
-                    for w,j in zip(ws, range(i-ln+1,i+1)): s+=v[j]*w
-                    o.append(s/den)
-            return o
-        w1=__wma(vals, l//2); w2=__wma(vals, l)
-        diff=[2*w1[i]-w2[i] if i<len(w1) and i<len(w2) else vals[i] for i in range(len(vals))]
-        return __wma(diff, int(l**0.5) or 1)
-
+    # helpers
     for sym in symbols:
         # C1
         try:
@@ -476,22 +455,60 @@ def signals():
                 h=[float(x["high"]) for x in b]
                 l=[float(x["low"])  for x in b]
                 last=c[-1]
-                m1=_ma(c,C3_MA1_TYPE,C3_MA1_LEN); m2=_ma(c,C3_MA2_TYPE,C3_MA2_LEN)
+                # quick EMA only here (signals view)
+                m1=_ema(c,C3_MA1_LEN)[-1]; m2=_ema(c,C3_MA2_LEN)[-1]
                 at=_atr(h,l,c,C3_ATR_LEN)[-1]
                 ll=min(l[-C3_SWING_LB:])
                 stop=ll - at*float(C3_RISK_M)
                 risk=max(1e-9, last - stop)
                 target = last + float(C3_RR)*risk if C3_USE_LIMIT else None
-                cross_up = (m1[-2] <= m2[-2]) and (m1[-1] > m2[-1])
+                cross_up = ( _ema(c,C3_MA1_LEN)[-2] <= _ema(c,C3_MA2_LEN)[-2]) and (m1 > m2)
                 ready=cross_up; reason="" if ready else "no_cross"
-                out_c3.append({"symbol":sym,"close":last,"ma1":m1[-1],"ma2":m2[-1],"atr":at,"stop":stop,"target":target,
+                out_c3.append({"symbol":sym,"close":last,"ma1":m1,"ma2":m2,"atr":at,"stop":stop,"target":target,
                                "ready":ready,"reason":reason})
             else:
                 out_c3.append({"symbol":sym,"status":"no_data"})
         except Exception as ex:
             out_c3.append({"symbol":sym,"error":str(ex)})
 
-    return jsonify({"symbols":symbols,"c1":out_c1,"c2":out_c2,"c3":out_c3})
+        # C4
+        try:
+            base=mkt.get_bars(sym, C4_TF, limit=300) or []
+            bub =mkt.get_bars(sym, C4_BTF, limit=max(30,C4_LB)) or []
+            if len(base)>=max(50,C4_ATR_LEN+5) and len(bub)>=3:
+                c=[float(x["close"]) for x in base]
+                h=[float(x["high"]) for x in base]
+                l=[float(x["low"])  for x in base]
+                last=c[-1]; at=_atr(h,l,c,C4_ATR_LEN)[-1]
+
+                # compute last completed bubble totals (simple: use penultimate bubble)
+                bb=bub[-2]
+                o=float(bb["open"]); hi=float(bb["high"]); lo=float(bb["low"]); cl=float(bb["close"]); vol=float(bb.get("volume",0))
+                # split vol (same heuristic)
+                barTop = hi - max(o, cl)
+                barBot = min(o, cl) - lo
+                barRng = hi - lo
+                bull   = (cl - o) > 0
+                buyRng = barRng if bull else (barTop + barBot)
+                sellRng= (barTop + barBot) if bull else barRng
+                totalR = barRng + barTop + barBot
+                if totalR>0 and vol>0:
+                    buy = (buyRng/totalR)*vol; sell=(sellRng/totalR)*vol
+                else:
+                    buy = sell = 0.0
+                total = buy + sell; delta = buy - sell
+                frac = abs(delta)/total if total>0 else 0.0
+                thresh = hi + C4_BREAK_K*at
+                ready = (total>=C4_MIN_T) and (frac>=C4_MIN_DF) and (last>thresh)
+                out_c4.append({"symbol":sym,"close":last,"bubble_hi":hi,"bubble_lo":lo,"total":total,"delta_frac":round(frac,3),
+                               "atr":at,"thresh":thresh,"ready":ready,
+                               "reason":"" if ready else "thresholds/break not met"})
+            else:
+                out_c4.append({"symbol":sym,"status":"no_data"})
+        except Exception as ex:
+            out_c4.append({"symbol":sym,"error":str(ex)})
+
+    return jsonify({"symbols":symbols,"c1":out_c1,"c2":out_c2,"c3":out_c3,"c4":out_c4})
 
 # --------------- scan routes ---------------
 @app.post("/scan/c1")
@@ -512,7 +529,13 @@ def scan_c3():
     if guard: return guard
     return _run_strategy_http(strat_c3,"c3")
 
-# --------------- dashboard (C3 added) ---------------
+@app.post("/scan/c4")
+def scan_c4():
+    guard=_require_cron_token_if_set()
+    if guard: return guard
+    return _run_strategy_http(strat_c4,"c4")
+
+# --------------- dashboard (C4 added) ---------------
 DASHBOARD_HTML = """
 <!doctype html>
 <html lang="en"><head>
@@ -572,6 +595,7 @@ DASHBOARD_HTML = """
       <button onclick="triggerScan('C1')">Scan C1</button>
       <button onclick="triggerScan('C2')">Scan C2</button>
       <button onclick="triggerScan('C3')">Scan C3</button>
+      <button onclick="triggerScan('C4')">Scan C4</button>
     </div>
     <div class="small muted" id="scanResult" style="margin-top:10px;"></div>
   </div>
@@ -611,7 +635,7 @@ async function refreshGate(){
     const lines=[
       `<div><strong>Gate:</strong> ${esc(gate.decision)}</div>`,
       `<div><strong>Inline:</strong> ${inline.enabled?'enabled':'disabled'} · dry=${inline.dry?'1':'0'}</div>`,
-      `<div class="small mono">C1:${esc(inline.c1_every_sec)}s · C2:${esc(inline.c2_every_sec)}s · C3:${esc(inline.c3_every_sec)}s</div>`
+      `<div class="small mono">C1:${esc(inline.c1_every_sec)}s · C2:${esc(inline.c2_every_sec)}s · C3:${esc(inline.c3_every_sec)}s · C4:${esc(inline.c4_every_sec)}s</div>`
     ];
     document.getElementById('gateCard').innerHTML=lines.join('');
   }catch(e){document.getElementById('gateCard').innerHTML='<span class="err">Failed</span>';}
@@ -623,19 +647,20 @@ async function loadSignals(){
     function tableC1(a){let h='<h3 style="margin:8px 0">C1 — Mean-Revert</h3><table><thead><tr><th>Symbol</th><th class="right">Close</th><th class="right">EMA</th><th class="right">RSI</th><th class="right">ATR</th><th>Regime</th><th>Ready</th><th>Reason</th></tr></thead><tbody>';
       for(const r of a){ if(r.status){h+=`<tr><td colspan="8" class="muted">${esc(r.symbol)} — ${esc(r.status)}</td></tr>`;continue;}
         h+=`<tr><td class="mono">${esc(r.symbol)}</td><td class="right mono">${esc(r.close)}</td><td class="right mono">${esc(r.ema)}</td><td class="right mono">${esc(r.rsi)}</td><td class="right mono">${esc(r.atr)}</td><td>${esc(r.regime||'')}</td><td>${r.ready?'<span class="ok">yes</span>':'no'}</td><td class="small muted">${esc(r.reason||'')}</td></tr>`;}
-      return h+'</tbody></table>';
-    }
+      return h+'</tbody></table>'; }
     function tableC2(a){let h='<h3 style="margin:16px 0 8px;">C2 — Breakout</h3><table><thead><tr><th>Symbol</th><th class="right">Close</th><th class="right">HH</th><th class="right">ATR</th><th class="right">Thresh</th><th>Trend</th><th>Ready</th><th>Reason</th></tr></thead><tbody>';
       for(const r of a){ if(r.status){h+=`<tr><td colspan="8" class="muted">${esc(r.symbol)} — ${esc(r.status)}</td></tr>`;continue;}
         h+=`<tr><td class="mono">${esc(r.symbol)}</td><td class="right mono">${esc(r.close)}</td><td class="right mono">${esc(r.hh)}</td><td class="right mono">${esc(r.atr)}</td><td class="right mono">${esc(r.thresh)}</td><td>${r.trend_up?'up':'down'}</td><td>${r.ready?'<span class="ok">yes</span>':'no'}</td><td class="small muted">${esc(r.reason||'')}</td></tr>`;}
-      return h+'</tbody></table>';
-    }
+      return h+'</tbody></table>'; }
     function tableC3(a){let h='<h3 style="margin:16px 0 8px;">C3 — MA Cross + ATR</h3><table><thead><tr><th>Symbol</th><th class="right">Close</th><th class="right">MA1</th><th class="right">MA2</th><th class="right">ATR</th><th class="right">Stop</th><th class="right">Target</th><th>Ready</th><th>Reason</th></tr></thead><tbody>';
       for(const r of a){ if(r.status){h+=`<tr><td colspan="9" class="muted">${esc(r.symbol)} — ${esc(r.status)}</td></tr>`;continue;}
         h+=`<tr><td class="mono">${esc(r.symbol)}</td><td class="right mono">${esc(r.close)}</td><td class="right mono">${esc(r.ma1)}</td><td class="right mono">${esc(r.ma2)}</td><td class="right mono">${esc(r.atr)}</td><td class="right mono">${esc(r.stop)}</td><td class="right mono">${r.target!=null?esc(r.target):'-'}</td><td>${r.ready?'<span class="ok">yes</span>':'no'}</td><td class="small muted">${esc(r.reason||'')}</td></tr>`;}
-      return h+'</tbody></table>';
-    }
-    let html=tableC1(s.c1||[])+tableC2(s.c2||[])+tableC3(s.c3||[]);
+      return h+'</tbody></table>'; }
+    function tableC4(a){let h='<h3 style="margin:16px 0 8px;">C4 — Volume Bubble Breakout</h3><table><thead><tr><th>Symbol</th><th class="right">Close</th><th class="right">Bubble High</th><th class="right">Bubble Low</th><th class="right">Total Vol</th><th class="right">Δ/Total</th><th class="right">ATR</th><th class="right">Thresh</th><th>Ready</th><th>Reason</th></tr></thead><tbody>';
+      for(const r of a){ if(r.status){h+=`<tr><td colspan="10" class="muted">${esc(r.symbol)} — ${esc(r.status)}</td></tr>`;continue;}
+        h+=`<tr><td class="mono">${esc(r.symbol)}</td><td class="right mono">${esc(r.close)}</td><td class="right mono">${esc(r.bubble_hi)}</td><td class="right mono">${esc(r.bubble_lo)}</td><td class="right mono">${esc(r.total)}</td><td class="right mono">${esc(r.delta_frac)}</td><td class="right mono">${esc(r.atr)}</td><td class="right mono">${esc(r.thresh)}</td><td>${r.ready?'<span class="ok">yes</span>':'no'}</td><td class="small muted">${esc(r.reason||'')}</td></tr>`;}
+      return h+'</tbody></table>'; }
+    let html=tableC1(s.c1||[])+tableC2(s.c2||[])+tableC3(s.c3||[])+tableC4(s.c4||[]);
     document.getElementById('signalsTable').innerHTML=html;
   }catch(e){document.getElementById('signalsTable').innerHTML='<div class="err">Failed to load signals</div>';}
 }
@@ -667,7 +692,7 @@ async function loadPositions(){
 
 async function triggerScan(which){
   try{
-    const url= which==='C1'?'/scan/c1?dry=0': which==='C2'?'/scan/c2?dry=0':'/scan/c3?dry=0';
+    const url= which==='C1'?'/scan/c1?dry=0': which==='C2'?'/scan/c2?dry=0': which==='C3'?'/scan/c3?dry=0':'/scan/c4?dry=0';
     const res=await jfetch(url,{method:'POST'}); document.getElementById('scanResult').textContent=JSON.stringify(res);
     loadOrders('all'); loadPositions();
   }catch(e){document.getElementById('scanResult').textContent='Scan failed';}
