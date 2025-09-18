@@ -1,7 +1,6 @@
 # services/market_crypto.py
 from __future__ import annotations
 import os
-import json
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Any, Iterable
 from datetime import datetime, timezone
@@ -18,12 +17,14 @@ def _env(key: str, default: Optional[str] = None) -> Optional[str]:
     v = os.environ.get(key)
     return v if (v is not None and str(v).strip() != "") else default
 
+# If you provide a FULL base like https://data.alpaca.markets/v1beta3/crypto/us
+# we will auto-detect and NOT append a scope again.
 APCA_KEY    = _env("CRYPTO_API_KEY", _env("APCA_API_KEY_ID"))
 APCA_SECRET = _env("CRYPTO_API_SECRET", _env("APCA_API_SECRET_KEY"))
-DATA_BASE   = _env("CRYPTO_DATA_BASE", _env("ALPACA_DATA_BASE", "https://data.alpaca.markets"))
-DATA_SCOPE  = _env("CRYPTO_DATA_SCOPE", "v1beta3/crypto/us")  # path piece after base
+RAW_BASE    = _env("CRYPTO_DATA_BASE", _env("ALPACA_DATA_BASE", "https://data.alpaca.markets"))
+DEFAULT_SCOPE = "v1beta3/crypto/us"
 
-DEFAULT_TIMEFRAME = _env("CRYPTO_TIMEFRAME", "5Min")  # v1beta3 uses "1Min","5Min","15Min","1Hour","1Day", etc.
+DEFAULT_TIMEFRAME = _env("CRYPTO_TIMEFRAME", "5Min")
 DEFAULT_LIMIT = int(_env("CRYPTO_BARS_LIMIT", "500") or "500")
 
 
@@ -38,13 +39,9 @@ class MarketCrypto:
     """
     Thin wrapper around Alpaca v1beta3 Crypto bars endpoint.
 
-    Endpoints:
-      GET {DATA_BASE}/{DATA_SCOPE}/bars?symbols=BTC/USD,ETH/USD&timeframe=5Min&limit=300
-
-    Methods exposed:
-      - candles(symbols: Iterable[str], timeframe="5Min", limit=300) -> Dict[str, BarsResult]
-      - last_price(symbol: str) -> Optional[float]
-      - now_utc() -> datetime
+    Final bars URL will be either:
+      <base>/bars                                (when base already includes v1beta3/crypto/<venue>)
+      <base>/<scope>/bars                        (when base is just the host)
     """
 
     def __init__(
@@ -57,8 +54,17 @@ class MarketCrypto:
         default_timeframe: str = DEFAULT_TIMEFRAME,
         default_limit: int = DEFAULT_LIMIT,
     ):
-        self.data_base = (data_base or DATA_BASE or "https://data.alpaca.markets").rstrip("/")
-        self.data_scope = (data_scope or DATA_SCOPE or "v1beta3/crypto/us").strip("/")
+        raw_base = (data_base or RAW_BASE or "https://data.alpaca.markets").rstrip("/")
+
+        # Detect if base already contains v1beta3/crypto
+        lowered = raw_base.lower()
+        if "v1beta3/crypto" in lowered:
+            self.data_base = raw_base      # full path already; no separate scope
+            self.data_scope = ""           # <- IMPORTANT
+        else:
+            self.data_base = raw_base
+            self.data_scope = (data_scope or DEFAULT_SCOPE).strip("/")
+
         self.key = api_key or APCA_KEY
         self.secret = api_secret or APCA_SECRET
         self.s = session or requests.Session()
@@ -85,7 +91,9 @@ class MarketCrypto:
         }
 
     def _bars_url(self) -> str:
-        return f"{self.data_base}/{self.data_scope}/bars"
+        if self.data_scope:
+            return f"{self.data_base}/{self.data_scope}/bars"
+        return f"{self.data_base}/bars"
 
     def candles(
         self,
@@ -122,31 +130,24 @@ class MarketCrypto:
         out: Dict[str, BarsResult] = {}
         bars_map = (data or {}).get("bars") or {}
         for sym, rows in bars_map.items():
-            # Build DataFrame (fall back to list-of-dicts if pandas missing)
             if pd is None:
-                # Minimal structure w/o pandas
                 frame = rows  # type: ignore
                 out[sym] = BarsResult(symbol=sym, frame=frame)  # type: ignore
                 continue
 
             df = pd.DataFrame(rows or [])
             if not df.empty:
-                # Normalize columns
                 if "t" in df.columns:
                     df["ts"] = pd.to_datetime(df["t"], utc=True)
                     df = df.drop(columns=["t"])
-                else:
-                    # Some feeds might return "timestamp"
-                    if "timestamp" in df.columns:
-                        df["ts"] = pd.to_datetime(df["timestamp"], utc=True)
-                        df = df.drop(columns=["timestamp"])
-                # Ensure standard column names exist; fill if missing
+                elif "timestamp" in df.columns:
+                    df["ts"] = pd.to_datetime(df["timestamp"], utc=True)
+                    df = df.drop(columns=["timestamp"])
                 for col in ("o","h","l","c","v"):
                     if col not in df.columns:
                         df[col] = None
                 df = df[["ts","o","h","l","c","v"]].sort_values("ts").set_index("ts")
             else:
-                # Create empty frame with the right columns
                 df = pd.DataFrame(columns=["o","h","l","c","v"])
             out[sym] = BarsResult(symbol=sym, frame=df)
         return out
@@ -158,7 +159,6 @@ class MarketCrypto:
             return None
         frame = br.frame
         if pd is None:
-            # list mode
             return (frame[-1].get("c") if frame else None)  # type: ignore
         if frame is None or len(frame) == 0:
             return None
