@@ -1,123 +1,176 @@
 # strategies/c2.py
 from __future__ import annotations
 import math
-from typing import Dict, Any
+from typing import Any, Dict, Iterable, List, Callable, Optional
 import pandas as pd
 
-from .utils import last, nz, ensure_df_has, len_ok, safe_float
+__version__ = "1.1.2"
+VERSION = (1, 1, 2)
 
-__version__ = "1.1.1"
-VERSION = (1, 1, 1)
+# Helpers
+def _nz(x, alt=0.0):
+    try:
+        if x is None or (isinstance(x, float) and math.isnan(x)):
+            return alt
+        return x
+    except Exception:
+        return alt
+
+def _last(s: pd.Series, default=float("nan")) -> float:
+    try:
+        if s is None or len(s) == 0:
+            return default
+        return float(s.iloc[-1])
+    except Exception:
+        return default
+
+def _len_ok(df: pd.DataFrame, n: int) -> bool:
+    try:
+        return isinstance(df, pd.DataFrame) and len(df) >= n
+    except Exception:
+        return False
+
+def _ensure_cols(df: pd.DataFrame, cols: Iterable[str]) -> bool:
+    try:
+        return all(c in df.columns for c in cols)
+    except Exception:
+        return False
+
+def _safe_float(v, default: float) -> float:
+    try:
+        return float(v)
+    except Exception:
+        return default
 
 def ema(series: pd.Series, length: int) -> pd.Series:
-    return series.ewm(span=length, adjust=False).mean()
+    return series.astype(float).ewm(span=int(length), adjust=False).mean()
 
 def atr(df: pd.DataFrame, length: int = 14) -> pd.Series:
-    high = df["high"].astype(float)
-    low = df["low"].astype(float)
-    close = df["close"].astype(float)
-    prev_close = close.shift(1)
-    tr = pd.concat([
-        (high - low),
-        (high - prev_close).abs(),
-        (low - prev_close).abs()
-    ], axis=1).max(axis=1)
-    return tr.ewm(span=length, adjust=False).mean()
+    h = df["high"].astype(float); l = df["low"].astype(float); c = df["close"].astype(float)
+    pc = c.shift(1)
+    tr = pd.concat([(h-l), (h-pc).abs(), (l-pc).abs()], axis=1).max(axis=1)
+    return tr.ewm(span=int(length), adjust=False).mean()
 
-def run(symbol: str, df: pd.DataFrame, cfg: Dict[str, Any], place_order, log, **kwargs):
+# Market/Broker adapters
+def _fetch_df(market: Any, symbol: str, cfg: Dict[str, Any]) -> Optional[pd.DataFrame]:
+    tf = cfg.get("CRYPTO_TF", "5Min")
+    limit = int(cfg.get("CRYPTO_LOOKBACK", 500))
+    for name in ("get_history","history","get_ohlcv","fetch_ohlcv","bars","get_bars"):
+        if hasattr(market, name):
+            fn = getattr(market, name)
+            for args in ((symbol, tf, limit),(symbol, tf),(symbol,)):
+                try:
+                    df = fn(*args)  # type: ignore
+                    if isinstance(df, pd.DataFrame) and _ensure_cols(df, ["open","high","low","close"]):
+                        if "volume" not in df.columns:
+                            df["volume"] = 0.0
+                        return df
+                except TypeError:
+                    continue
+                except Exception:
+                    break
+    return None
+
+def _place_order(broker: Any, symbol: str, side: str, notional: float) -> Any:
+    for name in ("place_order","submit_order","submit","order","create_order","buy" if side=="buy" else "sell"):
+        if hasattr(broker, name):
+            fn = getattr(broker, name)
+            try:
+                return fn(symbol=symbol, side=side, notional=notional)
+            except TypeError:
+                try:
+                    return fn(symbol, side, notional)
+                except Exception:
+                    pass
+            except Exception:
+                pass
+    return {"status": "no_broker_method"}
+
+def _pwrite_from(kwargs: Dict[str, Any]):
+    pw = kwargs.get("pwrite")
+    return pw if callable(pw) else (lambda _m: None)
+
+# Core single-symbol logic
+def _run_single(symbol: str, df: pd.DataFrame, cfg: Dict[str, Any],
+                broker: Optional[Any], dry: bool) -> Dict[str, Any]:
     """
-    Donchian breakout above HH + k*ATR with EMA trend filter.
-    Env knobs:
-      C2_LOOKBACK (20), C2_BREAK_K (0.5), C2_ATR_LEN (14),
-      C2_EMA_TREND_LEN (50), ORDER_NOTIONAL (25), C2_MIN_BARS
-    kwargs: dry, force, now (ignored safely)
+    Donchian breakout above HH + k*ATR with EMA trend filter (long-only).
+    Knobs: C2_LOOKBACK(20), C2_BREAK_K(0.5), C2_ATR_LEN(14),
+           C2_EMA_TREND_LEN(50), ORDER_NOTIONAL(25), C2_MIN_BARS
     """
     out = {"symbol": symbol, "action": "flat"}
-    try:
-        dry = bool(kwargs.get("dry", False))
+    if not _ensure_cols(df, ["close","high","low"]):
+        out.update({"reason":"missing_cols"})
+        return out
 
-        need_cols = ["close", "high", "low"]
-        if not ensure_df_has(df, need_cols):
-            out.update({"reason": "missing_cols", "need": need_cols})
-            return out
+    n       = int(cfg.get("C2_LOOKBACK", 20))
+    k       = _safe_float(cfg.get("C2_BREAK_K", 0.5), 0.5)
+    atr_len = int(cfg.get("C2_ATR_LEN", 14))
+    ema_len = int(cfg.get("C2_EMA_TREND_LEN", 50))
+    notional= _safe_float(cfg.get("ORDER_NOTIONAL", 25), 25.0)
+    min_bar = int(cfg.get("C2_MIN_BARS", max(100, n + ema_len + atr_len + 2)))
 
-        n = int(cfg.get("C2_LOOKBACK", 20))
-        k = safe_float(cfg.get("C2_BREAK_K", 0.5), 0.5)
-        atr_len = int(cfg.get("C2_ATR_LEN", 14))
-        ema_len = int(cfg.get("C2_EMA_TREND_LEN", 50))
-        notional = safe_float(cfg.get("ORDER_NOTIONAL", 25), 25.0)
-        min_bars = int(cfg.get("C2_MIN_BARS", max(100, n + ema_len + atr_len + 2)))
+    if not _len_ok(df, min_bar):
+        out.update({"reason":"not_enough_bars","have":len(df),"need":min_bar})
+        return out
 
-        if not len_ok(df, min_bars):
-            out.update({"reason": "not_enough_bars", "have": len(df), "need": min_bars})
-            return out
+    close_s = df["close"].astype(float)
+    high_s  = df["high"].astype(float)
+    hh_s    = high_s.rolling(n, min_periods=n).max()
+    atr_s   = atr(df, atr_len)
+    ema_s   = ema(close_s, ema_len)
 
-        close_s = df["close"].astype(float)
-        high_s = df["high"].astype(float)
+    close = _nz(_last(close_s))
+    hh    = _nz(_last(hh_s))
+    av    = _nz(_last(atr_s))
+    emv   = _nz(_last(ema_s))
 
-        hh_s = high_s.rolling(n, min_periods=n).max()
-        atr_s = atr(df, atr_len)
-        ema_s = ema(close_s, ema_len)
+    if any(math.isnan(x) for x in [close, hh, av, emv]):
+        out["reason"] = "nan_indicators"
+        return out
 
-        close = nz(last(close_s))
-        hh = nz(last(hh_s))
-        atr_v = nz(last(atr_s))
-        ema_v = nz(last(ema_s))
+    breakout_up = close > (hh + k * av)
+    trend_ok    = close > emv
+    enter_long  = bool(breakout_up and trend_ok)
 
-        if any(math.isnan(x) for x in [close, hh, atr_v, ema_v]):
-            out["reason"] = "nan_indicators"
-            return out
-
-        breakout_up = close > (hh + k * atr_v)
-        trend_ok = close > ema_v
-        enter_long = bool(breakout_up and trend_ok)
-
-        if enter_long and notional > 0:
-            if dry:
-                out.update({
-                    "action": "paper_buy",
-                    "close": round(close, 4),
-                    "hh": round(hh, 4),
-                    "atr": round(atr_v, 6),
-                    "ema": round(ema_v, 4),
-                    "reason": "dry_run_breakout_trend_ok"
-                })
-            else:
-                oid = place_order(symbol, "buy", notional=notional)
-                out.update({
-                    "action": "buy",
-                    "order_id": oid,
-                    "close": round(close, 4),
-                    "hh": round(hh, 4),
-                    "atr": round(atr_v, 6),
-                    "ema": round(ema_v, 4),
-                    "reason": "donchian_breakout_trend_ok"
-                })
+    if enter_long and notional > 0:
+        if dry or broker is None:
+            out.update({"action":"paper_buy","close":round(close,4),"hh":round(hh,4),"atr":round(av,6),"ema":round(emv,4),"reason":"dry_run_breakout_trend_ok"})
         else:
-            out.update({
-                "action": "flat",
-                "close": round(close, 4),
-                "hh": round(hh, 4),
-                "atr": round(atr_v, 6),
-                "ema": round(ema_v, 4),
-                "reason": "no_signal"
-            })
-        return out
+            oid = _place_order(broker, symbol, "buy", notional)
+            out.update({"action":"buy","order_id":oid,"close":round(close,4),"hh":round(hh,4),"atr":round(av,6),"ema":round(emv,4),"reason":"donchian_breakout_trend_ok"})
+    else:
+        out.update({"action":"flat","close":round(close,4),"hh":round(hh,4),"atr":round(av,6),"ema":round(emv,4),"reason":"no_signal"})
+    return out
 
-    except Exception as e:
-        out.update({
-            "action": "error",
-            "error": f"{type(e).__name__}: {e}",
-            "ctx": {
-                "nrows": int(len(df) if isinstance(df, pd.DataFrame) else 0),
-                "cols": list(df.columns) if isinstance(df, pd.DataFrame) else [],
-                "params": {
-                    "C2_LOOKBACK": cfg.get("C2_LOOKBACK"),
-                    "C2_BREAK_K": cfg.get("C2_BREAK_K"),
-                    "C2_ATR_LEN": cfg.get("C2_ATR_LEN"),
-                    "C2_EMA_TREND_LEN": cfg.get("C2_EMA_TREND_LEN"),
-                    "ORDER_NOTIONAL": cfg.get("ORDER_NOTIONAL"),
-                },
-            },
-        })
-        return out
+# Public API (both styles)
+def run(*args, **kwargs):
+    dry = bool(kwargs.get("dry", False))
+    cfg = kwargs.get("params") or kwargs.get("cfg") or {}
+
+    if len(args) >= 4 and not isinstance(args[0], str):
+        market, broker, symbols, params = args[0], args[1], list(args[2]), dict(args[3] or {})
+        cfg = {**params, **cfg}
+        pwrite = _pwrite_from(kwargs)
+
+        results: List[Dict[str, Any]] = []
+        for sym in symbols:
+            df = _fetch_df(market, sym, cfg)
+            if df is None:
+                results.append({"symbol": sym, "action": "error", "error": "no_data"})
+                continue
+            try:
+                results.append(_run_single(sym, df, cfg, broker=None if dry else broker, dry=dry))
+            except Exception as e:
+                pwrite(f"[c2] error {sym}: {e}")
+                results.append({"symbol": sym, "action": "error", "error": f"{type(e).__name__}: {e}"})
+        return results
+    else:
+        symbol = args[0] if len(args)>0 else kwargs.get("symbol")
+        df     = args[1] if len(args)>1 else kwargs.get("df")
+        cfg_in = args[2] if len(args)>2 else kwargs.get("cfg") or {}
+        cfg = {**cfg_in, **cfg}
+        broker = kwargs.get("broker")
+        if symbol is None or not isinstance(df, pd.DataFrame):
+            return {"action":"error","error":"invalid_arguments"}
+        return _run_single(symbol, df, cfg, broker=None if dry else broker, dry=dry)
