@@ -1,15 +1,16 @@
 # app.py
 from __future__ import annotations
-import os, json, time, importlib
+import os, json, importlib
 from typing import Any, Dict, List, Callable
 from datetime import datetime, timezone
 
 from flask import Flask, request, jsonify, Response, redirect
+import requests
 
 # ----------------------------
 # App / Env
 # ----------------------------
-APP_VERSION = os.environ.get("APP_VERSION", "1.6.0")
+APP_VERSION = os.environ.get("APP_VERSION", "1.6.1")
 SYSTEM_NAME = "crypto"
 
 CRYPTO_EXCHANGE = os.environ.get("CRYPTO_EXCHANGE", "alpaca")
@@ -24,19 +25,18 @@ API_SECRET = os.environ.get("CRYPTO_API_SECRET") or os.environ.get("APCA_API_SEC
 # ----------------------------
 # Imports: Market & Broker
 # ----------------------------
-# Market data service (your repo file)
+# Market data service (must exist in your repo)
 try:
     from services.market_crypto import MarketCrypto  # must expose MarketCrypto.from_env()
 except Exception:
     MarketCrypto = None  # type: ignore
 
-# Execution service (new file we added earlier)
+# Execution service (this is the new file above)
 try:
     from services.exchange_exec import ExchangeExec  # must expose ExchangeExec.from_env()
 except Exception:
     ExchangeExec = None  # type: ignore
 
-# Instantiate shared services
 def _make_market():
     if MarketCrypto is None:
         raise RuntimeError("services.market_crypto.MarketCrypto not found. Ensure services/market_crypto.py exists.")
@@ -61,30 +61,21 @@ app = Flask(__name__)
 def _ok(data: Dict[str, Any], headers: Dict[str, str] | None = None):
     resp = jsonify(data)
     if headers:
-        for k, v in headers.items():
-            resp.headers[k] = v
+        for k, v in headers.items(): resp.headers[k] = v
     return resp, 200
 
 def _err(msg: str, code: int = 400):
     return jsonify({"ok": False, "error": msg}), code
 
 def _bool(val: Any, default: bool=False) -> bool:
-    if val is None:
-        return default
+    if val is None: return default
     s = str(val).strip().lower()
     return s in ("1","true","yes","y","on")
-
-def _float(val: Any, default: float | None=None):
-    try:
-        return float(val)
-    except Exception:
-        return default
 
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 def _strategy_module(name: str):
-    """Import a strategy module from strategies.<name>"""
     return importlib.import_module(f"strategies.{name}")
 
 def _mod_version(mod_name: str) -> str:
@@ -95,16 +86,10 @@ def _mod_version(mod_name: str) -> str:
         return "error"
 
 def _collect_params_from_request(prefix: str = "param.") -> Dict[str, Any]:
-    """
-    Accepts query items like ?param.C1_RSI_BUY=50 and turns into {"C1_RSI_BUY": "50"}.
-    Also accepts JSON body with {"params": {...}}
-    """
     params: Dict[str, Any] = {}
-    # querystring
     for k, v in request.args.items():
         if k.startswith(prefix):
             params[k[len(prefix):]] = v
-    # body
     if request.is_json:
         body = request.get_json(silent=True) or {}
         if isinstance(body, dict) and "params" in body and isinstance(body["params"], dict):
@@ -120,19 +105,13 @@ def _inline_logger(tag: str) -> Callable[[str], None]:
 # Strategy runner
 # ----------------------------
 def _run_strategy_direct(tag: str, mod, symbols: List[str], params: Dict[str, Any], dry: bool):
-    """
-    Calls strategy.run(market, broker, symbols, params, dry=<bool>, log=<callable>, pwrite=<fn>)
-    and returns the module's results list (or an error).
-    """
     pbuf: List[str] = []
-    def pwrite(s: str):  # for strategies that want to 'print'
-        pbuf.append(str(s))
-
+    def pwrite(s: str): pbuf.append(str(s))
     try:
         results = mod.run(market, broker, symbols, params, dry=dry, log=_inline_logger(tag), pwrite=pwrite)
         return {"ok": True, "results": results, "prints": pbuf}
-    except TypeError as te:
-        # Older strategies may not accept 'log'/'pwrite'. Retry more permissive signatures.
+    except TypeError:
+        # Fallback for older signature (no log)
         try:
             results = mod.run(market, broker, symbols, params, dry=dry, pwrite=pwrite)  # type: ignore
             return {"ok": True, "results": results, "prints": pbuf}
@@ -144,38 +123,24 @@ def _run_strategy_direct(tag: str, mod, symbols: List[str], params: Dict[str, An
         return {"ok": False, "error": str(e)}
 
 # ----------------------------
-# Routes: UI
+# UI Dashboard (minimal)
 # ----------------------------
 DASHBOARD_HTML = """
 <!doctype html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<title>Crypto Dashboard</title>
-<meta name="viewport" content="width=device-width, initial-scale=1" />
+<html lang="en"><head><meta charset="utf-8">
+<title>Crypto Dashboard</title><meta name="viewport" content="width=device-width, initial-scale=1" />
 <style>
-  :root {
-    --bg:#0b0f14; --panel:#121821; --text:#e6edf3; --muted:#8aa0b4; --ok:#2ecc71; --warn:#f1c40f; --err:#e74c3c; --chip:#1b2430; --accent:#4aa3ff;
-  }
-  *{box-sizing:border-box} body{margin:0;font-family:ui-sans-serif,system-ui,-apple-system,"Segoe UI",Roboto,"Helvetica Neue",Arial;background:var(--bg);color:var(--text)}
+  :root{--bg:#0b0f14;--panel:#121821;--text:#e6edf3;--muted:#8aa0b4;--ok:#2ecc71;--warn:#f1c40f;--err:#e74c3c;--chip:#1b2430}
+  *{box-sizing:border-box}body{margin:0;font-family:ui-sans-serif,system-ui,-apple-system,"Segoe UI",Roboto,"Helvetica Neue",Arial;background:var(--bg);color:var(--text)}
   header{padding:16px 20px;background:linear-gradient(180deg,#0e131a 0%,#0b0f14 100%);border-bottom:1px solid #1a2330;display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap}
-  h1{margin:0;font-size:18px;letter-spacing:.4px;font-weight:600}
-  .muted{color:var(--muted)} .grid{display:grid;gap:16px;padding:16px;grid-template-columns:repeat(auto-fill,minmax(320px,1fr))}
-  .card{background:var(--panel);border:1px solid #1a2330;border-radius:12px;padding:16px}
-  .card h2{margin:0 0 12px;font-size:16px;letter-spacing:.3px}
-  .row{display:flex;gap:12px;align-items:center;flex-wrap:wrap}
-  .chips{display:flex;gap:8px;flex-wrap:wrap}
-  .chip{background:var(--chip);border:1px solid #1f2a38;color:var(--text);border-radius:999px;padding:6px 10px;font-size:12px}
-  .ok{color:var(--ok)} .warn{color:var(--warn)} .err{color:var(--err)}
+  h1{margin:0;font-size:18px;letter-spacing:.4px;font-weight:600}.muted{color:var(--muted)}
+  .grid{display:grid;gap:16px;padding:16px;grid-template-columns:repeat(auto-fill,minmax(320px,1fr))}
+  .card{background:var(--panel);border:1px solid #1a2330;border-radius:12px;padding:16px}.card h2{margin:0 0 12px;font-size:16px}
+  .row{display:flex;gap:12px;align-items:center;flex-wrap:wrap}.chip{background:#1b2430;border:1px solid #1f2a38;border-radius:999px;padding:6px 10px;font-size:12px}
   button,.btn{cursor:pointer;background:#162335;color:var(--text);border:1px solid #233248;padding:8px 12px;border-radius:8px;font-size:13px}
-  button:hover,.btn:hover{background:#1b2a40}
-  table{width:100%;border-collapse:collapse;font-size:13px}
-  th,td{padding:8px;border-bottom:1px solid #1a2330;text-align:left}
-  th{color:var(--muted);font-weight:500}
-  .mono{font-family:ui-monospace,Menlo,Consolas,monospace}.right{text-align:right}.small{font-size:12px;color:var(--muted)}
-  .notice{background:#0f1520;border:1px solid #203049;padding:10px 12px;border-radius:10px;font-size:13px}
-</style>
-</head>
+  button:hover,.btn:hover{background:#1b2a40}table{width:100%;border-collapse:collapse;font-size:13px}th,td{padding:8px;border-bottom:1px solid #1a2330;text-align:left}th{color:var(--muted)}
+  .mono{font-family:ui-monospace,Menlo,Consolas,monospace}.right{text-align:right}.small{font-size:12px;color:var(--muted)}.err{color:#e74c3c}
+</style></head>
 <body>
 <header>
   <div>
@@ -188,7 +153,6 @@ DASHBOARD_HTML = """
     <a class="btn" href="/diag/crypto">Account</a>
   </div>
 </header>
-
 <div class="grid">
   <div class="card">
     <h2>Quick Actions</h2>
@@ -199,98 +163,31 @@ DASHBOARD_HTML = """
       <button onclick="triggerScan('c4')">Scan C4</button>
     </div>
     <div class="small muted" id="scanResult" style="margin-top:10px;"></div>
-    <div class="chips" style="margin-top:10px;">
-      <span class="chip">/scan/c1</span><span class="chip">/scan/c2</span><span class="chip">/scan/c3</span><span class="chip">/scan/c4</span>
-    </div>
+    <div class="row" style="margin-top:10px;"><span class="chip">/scan/c1</span><span class="chip">/scan/c2</span><span class="chip">/scan/c3</span><span class="chip">/scan/c4</span></div>
   </div>
-
-  <div class="card" style="grid-column:1 / -1;">
+  <div class="card" style="grid-column:1/-1;">
     <h2>Recent Orders</h2>
     <div class="row" style="margin-bottom:8px;">
-      <button onclick="loadOrders('all')">All</button>
-      <button onclick="loadOrders('open')">Open</button>
-      <button onclick="loadOrders('closed')">Closed</button>
+      <button onclick="loadOrders('all')">All</button><button onclick="loadOrders('open')">Open</button><button onclick="loadOrders('closed')">Closed</button>
     </div>
     <div id="ordersTable">Loading…</div>
   </div>
-
-  <div class="card" style="grid-column:1 / -1;">
+  <div class="card" style="grid-column:1/-1;">
     <h2>Positions</h2>
     <div id="positionsTable">Loading…</div>
   </div>
 </div>
-
 <script>
-async function jfetch(url, opts={}) {
-  const r = await fetch(url, opts);
-  if (!r.ok) throw new Error("HTTP "+r.status);
-  const ct = r.headers.get("content-type") || "";
-  return ct.includes("application/json") ? r.json() : r.text();
-}
-function esc(s){ return (s==null?"":String(s)).replace(/[&<>"']/g, m => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]); }
-
-async function refreshMeta(){
-  try{
-    const v = await jfetch('/health/versions');
-    document.getElementById('appVersion').textContent = "v"+esc(v.app);
-    document.getElementById('symList').textContent = (await jfetch('/health')).symbols.join(', ');
-  }catch(e){}
-}
-
-async function triggerScan(which){
-  try{
-    const res = await jfetch(`/scan/${which}?dry=0`, {method:'POST'});
-    document.getElementById('scanResult').textContent = JSON.stringify(res);
-    loadOrders('all');
-  }catch(e){ document.getElementById('scanResult').textContent = 'Scan failed'; }
-}
-
-async function loadOrders(status='all'){
-  try{
-    const rows = await jfetch(`/orders/recent?status=${encodeURIComponent(status)}&limit=200`);
-    const arr = Array.isArray(rows)?rows:[];
-    if(arr.length===0){ document.getElementById('ordersTable').innerHTML = '<div class="muted">No orders</div>'; return; }
-    let html = '<table><thead><tr><th>Time</th><th>Symbol</th><th>Side</th><th>Qty</th><th>Status</th><th class="right">Filled</th></tr></thead><tbody>';
-    for(const o of arr){
-      html += `<tr>
-        <td class="mono small">${esc(o.submitted_at || o.created_at || '')}</td>
-        <td class="mono">${esc(o.symbol || '')}</td>
-        <td>${esc(o.side || '')}</td>
-        <td>${esc(o.qty || o.notional || '')}</td>
-        <td>${esc(o.status || '')}</td>
-        <td class="right">${esc(o.filled_qty || '0')}</td>
-      </tr>`;
-    }
-    html += '</tbody></table>';
-    document.getElementById('ordersTable').innerHTML = html;
-  }catch(e){ document.getElementById('ordersTable').innerHTML = '<div class="err">Failed to load orders</div>'; }
-}
-
-async function loadPositions(){
-  try{
-    const rows = await jfetch('/positions');
-    const arr = Array.isArray(rows)?rows:[];
-    if(arr.length===0){ document.getElementById('positionsTable').innerHTML='<div class="muted">No positions</div>'; return; }
-    let html = '<table><thead><tr><th>Symbol</th><th>Side</th><th>Qty</th><th class="right">Market Value</th><th class="right">Unrealized P/L</th></tr></thead><tbody>';
-    for(const p of arr){
-      html += `<tr>
-        <td class="mono">${esc(p.symbol||'')}</td>
-        <td>${esc(p.side||'')}</td>
-        <td>${esc(p.qty||'')}</td>
-        <td class="right mono">$${esc(p.market_value||'0')}</td>
-        <td class="right mono">$${esc(p.unrealized_pl||'0')}</td>
-      </tr>`;
-    }
-    html += '</tbody></table>';
-    document.getElementById('positionsTable').innerHTML = html;
-  }catch(e){ document.getElementById('positionsTable').innerHTML = '<div class="err">Failed to load positions</div>'; }
-}
-
-function refreshAll(){ refreshMeta(); loadOrders('all'); loadPositions(); }
-window.addEventListener('load', () => { refreshAll(); setInterval(refreshMeta, 30000); });
+async function jfetch(u,o={}){const r=await fetch(u,o);if(!r.ok)throw new Error("HTTP "+r.status);const ct=r.headers.get("content-type")||"";return ct.includes("application/json")?r.json():r.text();}
+function esc(s){return(s==null?"":String(s)).replace(/[&<>"']/g,m=>({"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;","'":"&#39;"}[m]));}
+async function refreshMeta(){try{const v=await jfetch('/health/versions');document.getElementById('appVersion').textContent="v"+esc(v.app);const h=await jfetch('/health');document.getElementById('symList').textContent=(h.symbols||[]).join(', ');}catch(e){}}
+async function triggerScan(which){try{const res=await jfetch(`/scan/${which}?dry=0`,{method:'POST'});document.getElementById('scanResult').textContent=JSON.stringify(res);loadOrders('all');}catch(e){document.getElementById('scanResult').textContent='Scan failed';}}
+async function loadOrders(status='all'){try{const rows=await jfetch(`/orders/recent?status=${encodeURIComponent(status)}&limit=200`);const arr=Array.isArray(rows)?rows:[];if(arr.length===0){document.getElementById('ordersTable').innerHTML='<div class="muted">No orders</div>';return;}let h='<table><thead><tr><th>Time</th><th>Symbol</th><th>Side</th><th>Qty/Notional</th><th>Status</th><th class="right">Filled</th></tr></thead><tbody>';for(const o of arr){h+=`<tr><td class="mono small">${esc(o.submitted_at||o.created_at||'')}</td><td class="mono">${esc(o.symbol||'')}</td><td>${esc(o.side||'')}</td><td>${esc(o.qty||o.notional||'')}</td><td>${esc(o.status||'')}</td><td class="right">${esc(o.filled_qty||'0')}</td></tr>`;}h+='</tbody></table>';document.getElementById('ordersTable').innerHTML=h;}catch(e){document.getElementById('ordersTable').innerHTML='<div class="err">Failed to load orders</div>';}}
+async function loadPositions(){try{const rows=await jfetch('/positions');const arr=Array.isArray(rows)?rows:[];if(arr.length===0){document.getElementById('positionsTable').innerHTML='<div class="muted">No positions</div>';return;}let h='<table><thead><tr><th>Symbol</th><th>Side</th><th>Qty</th><th class="right">Market Value</th><th class="right">Unrealized P/L</th></tr></thead><tbody>';for(const p of arr){h+=`<tr><td class="mono">${esc(p.symbol||'')}</td><td>${esc(p.side||'')}</td><td>${esc(p.qty||'')}</td><td class="right mono">$${esc(p.market_value||'0')}</td><td class="right mono">$${esc(p.unrealized_pl||'0')}</td></tr>`;}h+='</tbody></table>';document.getElementById('positionsTable').innerHTML=h;}catch(e){document.getElementById('positionsTable').innerHTML='<div class="err">Failed to load positions</div>';}}
+function refreshAll(){refreshMeta();loadOrders('all');loadPositions();}
+window.addEventListener('load',()=>{refreshAll();setInterval(refreshMeta,30000);});
 </script>
-</body>
-</html>
+</body></html>
 """
 
 @app.get("/dashboard")
@@ -328,8 +225,6 @@ def health_versions():
 # ----------------------------
 # Diag: Crypto (Alpaca)
 # ----------------------------
-import requests
-
 def _alpaca_headers():
     return {
         "APCA-API-KEY-ID": API_KEY or "",
@@ -366,15 +261,12 @@ def diag_crypto():
 def orders_recent():
     status = request.args.get("status", "all")
     limit  = int(request.args.get("limit", "50"))
-    params = {"status": status, "limit": str(limit), "direction": "desc", "nested": "true", "symbols": None}
-    # Restrict to crypto
-    params["asset_class"] = "crypto"
+    params = {"status": status, "limit": str(limit), "direction": "desc", "nested": "true", "asset_class": "crypto"}
     r = requests.get(f"{ALPACA_TRADING_BASE}/orders", headers=_alpaca_headers(), params=params, timeout=20)
     try:
         data = r.json()
     except Exception:
         data = []
-    # ensure list
     data = data if isinstance(data, list) else []
     return _ok(data)
 
@@ -385,7 +277,6 @@ def positions():
         rows = r.json()
     except Exception:
         rows = []
-    # Only crypto (a bit defensive)
     out = []
     for p in rows if isinstance(rows, list) else []:
         if str(p.get("asset_class","")).lower() == "crypto" or "/" in str(p.get("symbol","")):
@@ -406,42 +297,32 @@ def _scan(name: str):
     dry   = _bool(request.args.get("dry"), default=False)
     force = _bool(request.args.get("force"), default=False)
     params = _collect_params_from_request()
-
     try:
         mod = _strategy_module(name)
     except Exception as e:
         return _err(f"strategy import failed: {e}", 500)
-
     tag = name
     res = _run_strategy_direct(tag, mod, CRYPTO_SYMBOLS, params, dry=dry)
     if not res.get("ok"):
         return jsonify({"ok": False, "strategy": name, "dry": dry, "force": force, "error": res.get("error")}), 200
-
-    payload = {
-        "ok": True,
-        "strategy": name,
-        "dry": dry,
-        "force": force,
-        "results": res.get("results", []),
-    }
-    # Expose strategy module version in header
+    payload = {"ok": True, "strategy": name, "dry": dry, "force": force, "results": res.get("results", [])}
     ver = getattr(mod, "__version__", "unknown")
     return _ok(payload, {"x-strategy-version": ver})
 
-@app.post("/scan/c1")
+@app.post("/scan/c1")  # RSI pullback / momentum analog
 def scan_c1(): return _scan("c1")
 
-@app.post("/scan/c2")
+@app.post("/scan/c2")  # breakout / ATR premium
 def scan_c2(): return _scan("c2")
 
-@app.post("/scan/c3")
+@app.post("/scan/c3")  # MA regime w/ flips
 def scan_c3(): return _scan("c3")
 
-@app.post("/scan/c4")
+@app.post("/scan/c4")  # volume-delta / liquidity skew analog
 def scan_c4(): return _scan("c4")
 
 # ----------------------------
-# Signals panel (optional JSON)
+# Signals panel (JSON)
 # ----------------------------
 @app.get("/signals")
 def signals():
