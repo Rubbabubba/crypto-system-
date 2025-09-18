@@ -6,6 +6,7 @@ import time
 import threading
 import datetime as dt
 from collections import defaultdict
+from typing import List, Dict, Any
 
 from flask import Flask, request, jsonify, make_response, Response, redirect
 from dotenv import load_dotenv
@@ -19,7 +20,7 @@ import strategies.c2 as strat_c2
 # =============================================================================
 # App metadata / versioning
 # =============================================================================
-__app_version__ = "1.2.0"   # HTML dashboard + orders/positions + inline scheduler & ops
+__app_version__ = "1.3.0"   # exits + signals panel + safer journal
 
 # =============================================================================
 # Boot
@@ -41,7 +42,12 @@ def env_map():
         "CRYPTO_EXCHANGE", "CRYPTO_TRADING_BASE_URL", "CRYPTO_DATA_BASE_URL",
         "CRYPTO_SYMBOLS", "DAILY_TARGET", "DAILY_STOP", "ORDER_NOTIONAL",
         "C1_TIMEFRAME", "C1_RSI_LEN", "C1_EMA_LEN", "C1_RSI_BUY", "C1_RSI_SELL",
+        "C1_HTF_TIMEFRAME", "C1_CLOSE_ABOVE_EMA_EQ", "C1_REGIME",
+        "C1_ATR_LEN", "C1_ATR_STOP_MULT", "C1_ATR_TP_MULT", "C1_COOLDOWN_SEC",
+        "C1_MAX_SPREAD_PCT", "C1_MIN_ATR_USD", "C1_MAX_POSITIONS",
         "C2_TIMEFRAME", "C2_LOOKBACK", "C2_ATR_LEN", "C2_BREAK_K",
+        "C2_MIN_RANGE_PCT", "C2_HTF_TIMEFRAME", "C2_EMA_TREND_LEN",
+        "C2_ATR_STOP_MULT", "C2_ATR_TP_MULT", "C2_COOLDOWN_SEC", "C2_MAX_POSITIONS",
         "CRON_INLINE", "C1_EVERY_SEC", "C1_OFFSET_SEC", "C2_EVERY_SEC", "C2_OFFSET_SEC",
         "CRON_DRY",
     ]
@@ -79,13 +85,79 @@ def mk_services():
     broker = ExchangeExec()
     return market, broker
 
-# Simple Alpaca request helper using the broker session/base (avoids modifying services file)
+# Small JSON helpers
+def _load_json(path: str, default):
+    try:
+        if os.path.exists(path):
+            with open(path, "r") as f:
+                return json.load(f)
+    except Exception:
+        pass
+    return default
+
+def _save_json(path: str, obj) -> None:
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w") as f:
+            json.dump(obj, f)
+    except Exception:
+        pass
+
+# Minimal indicators for /signals (duplicated here to avoid importing private strategy helpers)
+def _ema(values: List[float], length: int) -> List[float]:
+    if length <= 1 or not values:
+        return values[:]
+    k = 2.0 / (length + 1.0)
+    out = []
+    e = values[0]
+    for v in values:
+        e = v * k + e * (1 - k)
+        out.append(e)
+    return out
+
+def _rsi(values: List[float], length: int) -> List[float]:
+    if length <= 1 or len(values) < length + 1:
+        return [50.0] * len(values)
+    gains, losses = [], []
+    for i in range(1, len(values)):
+        ch = values[i] - values[i-1]
+        gains.append(max(ch, 0.0))
+        losses.append(max(-ch, 0.0))
+    avg_gain = sum(gains[:length]) / length
+    avg_loss = sum(losses[:length]) / length
+    rsis = [50.0] * (length)
+    for i in range(length, len(gains)):
+        avg_gain = (avg_gain * (length - 1) + gains[i]) / length
+        avg_loss = (avg_loss * (length - 1) + losses[i]) / length
+        rs = 99.0 if avg_loss == 0 else (avg_gain / avg_loss)
+        rsis.append(100 - (100 / (1 + rs)))
+    while len(rsis) < len(values):
+        rsis.append(rsis[-1])
+    return rsis
+
+def _true_ranges(h: List[float], l: List[float], c: List[float]) -> List[float]:
+    trs = []
+    prev_close = None
+    for i in range(len(c)):
+        hi, lo, cl = h[i], l[i], c[i]
+        if prev_close is None:
+            tr = hi - lo
+        else:
+            tr = max(hi - lo, abs(hi - prev_close), abs(lo - prev_close))
+        trs.append(max(tr, 0.0))
+        prev_close = cl
+    return trs
+
+def _atr(h: List[float], l: List[float], c: List[float], length: int) -> List[float]:
+    trs = _true_ranges(h, l, c)
+    return _ema(trs, length) if length > 1 else trs
+
+# Simple Alpaca request helper using broker session/base (no SDK import here)
 def _alpaca_req(method: str, path: str, **kw):
     _, broker = mk_services()
     url = f"{broker.base}{path}"
     r = broker.session.request(method.upper(), url, timeout=(5, 20), **kw)
     r.raise_for_status()
-    # Some Alpaca endpoints can return empty bodies on 204; handle gracefully
     try:
         return r.json()
     except Exception:
@@ -299,8 +371,8 @@ def _read_ledger_rows():
 
 def _summarize_today_activity():
     start_ts, end_ts = _today_bounds_utc()
-    by_sys = defaultdict(lambda: {"count": 0, "buy_notional": 0.0, "flat_count": 0, "other_count": 0})
-    total = {"count": 0, "buy_notional": 0.0, "flat_count": 0, "other_count": 0}
+    by_sys = defaultdict(lambda: {"count": 0, "buy_notional": 0.0, "flat_count": 0, "sell_count": 0, "other_count": 0})
+    total = {"count": 0, "buy_notional": 0.0, "flat_count": 0, "sell_count": 0, "other_count": 0}
     rows = _read_ledger_rows()
     for row in rows:
         if not (start_ts <= row["ts"] < end_ts):
@@ -314,6 +386,9 @@ def _summarize_today_activity():
         if side == "BUY":
             by_sys[sysname]["buy_notional"] += row.get("notional_usd", 0.0)
             total["buy_notional"] += row.get("notional_usd", 0.0)
+        elif side in ("SELL","FLAT","EXIT"):
+            by_sys[sysname]["sell_count"] += 1
+            total["sell_count"] += 1
         elif side == "FLAT":
             by_sys[sysname]["flat_count"] += 1
             total["flat_count"] += 1
@@ -390,7 +465,6 @@ def positions():
     try:
         _, broker = mk_services()
         data = broker.get_positions()
-        # Return array (some SDKs return dict); enforce list for UI
         if isinstance(data, dict):
             data = data.get("positions") or []
         return jsonify(data)
@@ -406,12 +480,119 @@ def orders_recent():
         params["status"] = status
     try:
         data = _alpaca_req("GET", "/orders", params=params)
-        # Ensure list
         if isinstance(data, dict) and "orders" in data:
             data = data["orders"]
         return jsonify(data)
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 502
+
+# =============================================================================
+# Signals API (for dashboard panel)
+# =============================================================================
+@app.get("/signals")
+def signals():
+    """
+    Returns per-symbol indicator snapshot + pass/fail reasons for C1 and C2.
+    {
+      "symbols": [...],
+      "c1": [{"symbol":..., "close":..., "ema":..., "rsi":..., "atr":..., "regime":"up|down", "ready": true/false, "reason": "..."}],
+      "c2": [{"symbol":..., "close":..., "hh":..., "atr":..., "thresh":..., "trend_up": true/false, "ready": true/false, "reason":"..."}]
+    }
+    """
+    symbols = get_symbols()
+    mkt, _ = mk_services()
+
+    # Grab env knobs we need
+    C1_TIMEFRAME = os.getenv("C1_TIMEFRAME", "5Min")
+    C1_HTF = os.getenv("C1_HTF_TIMEFRAME", "1Hour")
+    C1_EMA_LEN = int(os.getenv("C1_EMA_LEN", "50"))
+    C1_RSI_LEN = int(os.getenv("C1_RSI_LEN", "14"))
+    C1_RSI_BUY = float(os.getenv("C1_RSI_BUY", "42"))
+    C1_ALLOW_EQ = os.getenv("C1_CLOSE_ABOVE_EMA_EQ", "0") == "1"
+    C1_REGIME = os.getenv("C1_REGIME", "up").lower()
+    C1_ATR_LEN = int(os.getenv("C1_ATR_LEN", "14"))
+    C1_MIN_ATR_USD = float(os.getenv("C1_MIN_ATR_USD", "0.25"))
+
+    C2_TIMEFRAME = os.getenv("C2_TIMEFRAME", "5Min")
+    C2_LOOKBACK = int(os.getenv("C2_LOOKBACK", "20"))
+    C2_ATR_LEN = int(os.getenv("C2_ATR_LEN", "14"))
+    C2_HTF = os.getenv("C2_HTF_TIMEFRAME", "1Hour")
+    C2_EMA_TREND_LEN = int(os.getenv("C2_EMA_TREND_LEN", "100"))
+    C2_BREAK_K = float(os.getenv("C2_BREAK_K", "1.0"))
+    C2_MIN_RANGE_PCT = float(os.getenv("C2_MIN_RANGE_PCT", "0.5"))
+
+    out_c1, out_c2 = [], []
+
+    for sym in symbols:
+        # ----- C1 -----
+        try:
+            bars = mkt.get_bars(sym, C1_TIMEFRAME, limit=300) or []
+            if len(bars) >= 60:
+                closes = [float(b["close"]) for b in bars]
+                highs  = [float(b["high"]) for b in bars]
+                lows   = [float(b["low"])  for b in bars]
+                c = closes[-1]
+                e = _ema(closes, C1_EMA_LEN)[-1]
+                r = _rsi(closes, C1_RSI_LEN)[-1]
+                a = _atr(highs, lows, closes, C1_ATR_LEN)[-1]
+                htf_bars = mkt.get_bars(sym, C1_HTF, limit=200) or []
+                if len(htf_bars) > 20:
+                    htf_closes = [float(b["close"]) for b in htf_bars]
+                    htf_ema = _ema(htf_closes, 200)[-1] if len(htf_closes) >= 200 else _ema(htf_closes, max(20, len(htf_closes)//2))[-1]
+                    regime_up = htf_closes[-1] >= htf_ema
+                else:
+                    regime_up = True
+                regime = "up" if regime_up else "down"
+
+                ready = True
+                reason = []
+                if a < C1_MIN_ATR_USD: ready=False; reason.append("ATR low")
+                above = (c >= e) if C1_ALLOW_EQ else (c > e)
+                if not above: ready=False; reason.append("close<EMA")
+                if r >= C1_RSI_BUY: ready=False; reason.append(f"RSI≥{C1_RSI_BUY}")
+                if C1_REGIME == "up" and not regime_up: ready=False; reason.append("regime down")
+                if C1_REGIME == "down" and regime_up: ready=False; reason.append("regime up")
+
+                out_c1.append({"symbol": sym, "close": c, "ema": e, "rsi": r, "atr": a, "regime": regime, "ready": ready, "reason": ", ".join(reason) if not ready else ""})
+            else:
+                out_c1.append({"symbol": sym, "status": "no_data"})
+        except Exception as ex:
+            out_c1.append({"symbol": sym, "error": str(ex)})
+
+        # ----- C2 -----
+        try:
+            bars = mkt.get_bars(sym, C2_TIMEFRAME, limit=300) or []
+            if len(bars) >= max(50, C2_LOOKBACK+5):
+                closes = [float(b["close"]) for b in bars]
+                highs  = [float(b["high"]) for b in bars]
+                lows   = [float(b["low"])  for b in bars]
+                c = closes[-1]
+                at = _atr(highs, lows, closes, C2_ATR_LEN)[-1]
+                hh = max(highs[-C2_LOOKBACK:])
+                ll = min(lows[-C2_LOOKBACK:])
+                range_pct = (hh - ll) / max(1e-9, (hh + ll)/2) * 100.0
+
+                htf_bars = mkt.get_bars(sym, C2_HTF, limit=200) or []
+                trend_up = True
+                if len(htf_bars) >= C2_EMA_TREND_LEN:
+                    htf_closes = [float(b["close"]) for b in htf_bars]
+                    ema_tr = _ema(htf_closes, C2_EMA_TREND_LEN)[-1]
+                    trend_up = htf_closes[-1] >= ema_tr
+
+                thresh = hh + C2_BREAK_K * at
+                ready = True
+                reason = []
+                if not trend_up: ready=False; reason.append("trend down")
+                if range_pct < C2_MIN_RANGE_PCT: ready=False; reason.append("range low")
+                if c <= thresh: ready=False; reason.append("no_break")
+
+                out_c2.append({"symbol": sym, "close": c, "hh": hh, "ll": ll, "atr": at, "range_pct": round(range_pct,3), "thresh": thresh, "trend_up": trend_up, "ready": ready, "reason": ", ".join(reason) if not ready else ""})
+            else:
+                out_c2.append({"symbol": sym, "status": "no_data"})
+        except Exception as ex:
+            out_c2.append({"symbol": sym, "error": str(ex)})
+
+    return jsonify({"symbols": symbols, "c1": out_c1, "c2": out_c2})
 
 # =============================================================================
 # Scan routes (token-gated if CRON_TOKEN set)
@@ -431,7 +612,7 @@ def scan_c2():
     return _run_strategy_http(strat_c2, "c2")
 
 # =============================================================================
-# Dashboard (inline HTML) — Crypto
+# Dashboard (inline HTML) — Crypto (now includes Signals panel)
 # =============================================================================
 DASHBOARD_HTML = """
 <!doctype html>
@@ -475,6 +656,8 @@ DASHBOARD_HTML = """
   .right { text-align: right; }
   .small { font-size: 12px; color: var(--muted); }
   .notice { background: #0f1520; border: 1px solid #203049; padding: 10px 12px; border-radius: 10px; font-size: 13px; }
+  .green { color: var(--ok); }
+  .red { color: var(--err); }
 </style>
 </head>
 <body>
@@ -493,11 +676,12 @@ DASHBOARD_HTML = """
 
 <div class="grid">
   <div class="card">
-    <h2>Market Gate</h2>
+    <h2>Market & Inline</h2>
     <div id="gateCard" class="notice">Loading…</div>
     <div class="chips" style="margin-top:10px;">
       <span class="chip">/diag/gate</span>
       <span class="chip">/diag/inline</span>
+      <span class="chip">/signals</span>
     </div>
   </div>
 
@@ -508,6 +692,11 @@ DASHBOARD_HTML = """
       <button onclick="triggerScan('C2')">Scan C2</button>
     </div>
     <div class="small muted" id="scanResult" style="margin-top:10px;"></div>
+  </div>
+
+  <div class="card" style="grid-column: 1 / -1;">
+    <h2>Signals</h2>
+    <div id="signalsTable">Loading…</div>
   </div>
 
   <div class="card" style="grid-column: 1 / -1;">
@@ -541,12 +730,12 @@ async function refreshGate() {
   try {
     const gate = await jfetch('/diag/gate');
     const v = await jfetch('/health/versions');
+    const inline = await jfetch('/diag/inline');
     document.getElementById('appVersion').textContent = "v" + esc(v.app);
     const open = (gate.decision || '').toLowerCase() === 'open';
     document.getElementById('gateState').textContent = open ? 'OPEN' : (gate.decision || 'closed');
     document.getElementById('gateState').className = open ? 'ok' : 'warn';
 
-    const inline = await jfetch('/diag/inline');
     const lines = [
       `<div><strong>Gate:</strong> ${esc(gate.gate_on ? 'on' : 'off')} — <strong>Decision:</strong> ${esc(gate.decision)}</div>`,
       `<div><strong>Inline:</strong> ${inline.enabled ? 'enabled' : 'disabled'} · dry=${inline.dry ? '1' : '0'}</div>`,
@@ -555,6 +744,54 @@ async function refreshGate() {
     document.getElementById('gateCard').innerHTML = lines.join('');
   } catch (e) {
     document.getElementById('gateCard').innerHTML = `<span class="err">Failed to load gate</span>`;
+  }
+}
+
+async function loadSignals() {
+  try {
+    const s = await jfetch('/signals');
+    function rowC1(r){
+      if(r.status==='no_data') return `<tr><td colspan="9" class="muted">${esc(r.symbol)} — no data</td></tr>`;
+      if(r.error) return `<tr><td colspan="9" class="err">${esc(r.symbol)} — ${esc(r.error)}</td></tr>`;
+      const ok = r.ready;
+      return `<tr>
+        <td class="mono">${esc(r.symbol)}</td>
+        <td class="right mono">${esc(r.close)}</td>
+        <td class="right mono">${esc(r.ema)}</td>
+        <td class="right mono">${esc(r.rsi?.toFixed ? r.rsi.toFixed(2) : r.rsi)}</td>
+        <td class="right mono">${esc(r.atr?.toFixed ? r.atr.toFixed(4) : r.atr)}</td>
+        <td class="mono">${esc(r.regime||'')}</td>
+        <td>${ok?'<span class="green">yes</span>':'<span class="red">no</span>'}</td>
+        <td class="small muted">${esc(r.reason||'')}</td>
+      </tr>`;
+    }
+    function rowC2(r){
+      if(r.status==='no_data') return `<tr><td colspan="9" class="muted">${esc(r.symbol)} — no data</td></tr>`;
+      if(r.error) return `<tr><td colspan="9" class="err">${esc(r.symbol)} — ${esc(r.error)}</td></tr>`;
+      const ok = r.ready;
+      return `<tr>
+        <td class="mono">${esc(r.symbol)}</td>
+        <td class="right mono">${esc(r.close)}</td>
+        <td class="right mono">${esc(r.hh)}</td>
+        <td class="right mono">${esc(r.atr?.toFixed ? r.atr.toFixed(4) : r.atr)}</td>
+        <td class="right mono">${esc(r.thresh)}</td>
+        <td>${r.trend_up?'<span class="green">up</span>':'<span class="red">down</span>'}</td>
+        <td>${ok?'<span class="green">yes</span>':'<span class="red">no</span>'}</td>
+        <td class="small muted">${esc(r.reason||'')}</td>
+      </tr>`;
+    }
+    let html = '<div class="row" style="margin-bottom:8px;"><span class="muted small">Snapshot of entry readiness · C1 (MR) & C2 (Breakout)</span></div>';
+    html += '<div style="display:grid;gap:12px;grid-template-columns:1fr;max-width:100%;overflow:auto">';
+    html += '<div><h3 style="margin:0 0 8px;">C1 — Mean-Revert</h3><table><thead><tr><th>Symbol</th><th class="right">Close</th><th class="right">EMA</th><th class="right">RSI</th><th class="right">ATR</th><th>Regime</th><th>Ready</th><th>Reason</th></tr></thead><tbody>';
+    for(const r of (s.c1||[])) html += rowC1(r);
+    html += '</tbody></table></div>';
+    html += '<div><h3 style="margin:16px 0 8px;">C2 — Breakout</h3><table><thead><tr><th>Symbol</th><th class="right">Close</th><th class="right">HH</th><th class="right">ATR</th><th class="right">Thresh</th><th>Trend</th><th>Ready</th><th>Reason</th></tr></thead><tbody>';
+    for(const r of (s.c2||[])) html += rowC2(r);
+    html += '</tbody></table></div>';
+    html += '</div>';
+    document.getElementById('signalsTable').innerHTML = html;
+  } catch (e) {
+    document.getElementById('signalsTable').innerHTML = `<div class="err">Failed to load signals</div>`;
   }
 }
 
@@ -616,6 +853,7 @@ async function triggerScan(which) {
     const res = await jfetch(url, { method: 'POST' });
     document.getElementById('scanResult').textContent = JSON.stringify(res);
     loadOrders('all');
+    loadPositions();
   } catch (e) {
     document.getElementById('scanResult').textContent = 'Scan failed';
   }
@@ -623,6 +861,7 @@ async function triggerScan(which) {
 
 function refreshAll() {
   refreshGate();
+  loadSignals();
   loadOrders('all');
   loadPositions();
 }
@@ -630,6 +869,7 @@ function refreshAll() {
 window.addEventListener('load', () => {
   refreshAll();
   setInterval(refreshGate, 30000);
+  setInterval(loadSignals, 60000);
 });
 </script>
 </body>
