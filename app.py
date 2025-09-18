@@ -10,14 +10,15 @@ import requests
 # ----------------------------
 # App / Env
 # ----------------------------
-APP_VERSION = os.environ.get("APP_VERSION", "1.6.2")
+APP_VERSION = os.environ.get("APP_VERSION", "1.6.3")
 SYSTEM_NAME = "crypto"
 
 CRYPTO_EXCHANGE = os.environ.get("CRYPTO_EXCHANGE", "alpaca")
 CRYPTO_SYMBOLS  = [s.strip() for s in os.environ.get("CRYPTO_SYMBOLS", "BTC/USD,ETH/USD,SOL/USD,DOGE/USD").split(",") if s.strip()]
 
 ALPACA_TRADING_BASE = os.environ.get("CRYPTO_TRADING_BASE") or os.environ.get("ALPACA_TRADING_BASE") or "https://paper-api.alpaca.markets/v2"
-ALPACA_DATA_BASE    = os.environ.get("CRYPTO_DATA_BASE")    or os.environ.get("ALPACA_DATA_BASE")    or "https://data.alpaca.markets/v1beta3/crypto/us"
+# Note: this may be either the host OR already include /v1beta3/crypto/<venue>
+ALPACA_DATA_BASE    = os.environ.get("CRYPTO_DATA_BASE")    or os.environ.get("ALPACA_DATA_BASE")    or "https://data.alpaca.markets"
 
 API_KEY    = os.environ.get("CRYPTO_API_KEY") or os.environ.get("APCA_API_KEY_ID")
 API_SECRET = os.environ.get("CRYPTO_API_SECRET") or os.environ.get("APCA_API_SECRET_KEY")
@@ -25,13 +26,11 @@ API_SECRET = os.environ.get("CRYPTO_API_SECRET") or os.environ.get("APCA_API_SEC
 # ----------------------------
 # Imports: Market & Broker
 # ----------------------------
-# Market data service
 try:
     from services.market_crypto import MarketCrypto  # must expose MarketCrypto.from_env()
 except Exception:
     MarketCrypto = None  # type: ignore
 
-# Execution service
 try:
     from services.exchange_exec import ExchangeExec  # must expose ExchangeExec.from_env()
 except Exception:
@@ -40,7 +39,6 @@ except Exception:
 def _make_market():
     if MarketCrypto is None:
         raise RuntimeError("services.market_crypto.MarketCrypto not found. Ensure services/market_crypto.py exists.")
-    # Graceful whether or not from_env exists
     if hasattr(MarketCrypto, "from_env") and callable(getattr(MarketCrypto, "from_env")):
         return MarketCrypto.from_env()  # type: ignore[attr-defined]
     return MarketCrypto()  # type: ignore[call-arg]
@@ -226,7 +224,7 @@ def health_versions():
     return _ok(body, headers)
 
 # ----------------------------
-# Diag: Crypto (Alpaca)
+# Diag: Crypto (Alpaca + 1-bar data probe)
 # ----------------------------
 def _alpaca_headers():
     return {
@@ -237,25 +235,55 @@ def _alpaca_headers():
 
 @app.get("/diag/crypto")
 def diag_crypto():
+    # Account probe
+    acct_ok = False
+    acct_payload: Any = None
+    acct_err: Optional[str] = None
     try:
         r = requests.get(f"{ALPACA_TRADING_BASE}/account", headers=_alpaca_headers(), timeout=20)
-        sample = r.json() if r.headers.get("content-type","").startswith("application/json") else {"status_code": r.status_code, "text": r.text}
-        return _ok({
-            "ok": r.status_code < 300,
-            "exchange": CRYPTO_EXCHANGE,
-            "api_key_present": bool(API_KEY),
-            "trading_base": ALPACA_TRADING_BASE,
-            "data_base": ALPACA_DATA_BASE,
-            "symbols": CRYPTO_SYMBOLS,
-            "account_sample": sample,
-            "error": None if r.status_code < 300 else f"HTTP {r.status_code}",
-        })
+        acct_ok = r.status_code < 300
+        acct_payload = r.json() if r.headers.get("content-type","").startswith("application/json") else {"status_code": r.status_code, "text": r.text}
+        if not acct_ok:
+            acct_err = f"HTTP {r.status_code}"
     except Exception as e:
-        return _ok({
-            "ok": False, "exchange": CRYPTO_EXCHANGE, "api_key_present": bool(API_KEY),
-            "trading_base": ALPACA_TRADING_BASE, "data_base": ALPACA_DATA_BASE,
-            "symbols": CRYPTO_SYMBOLS, "error": str(e)
-        })
+        acct_err = str(e)
+
+    # Data probe: attempt 1 bar for first symbol to reveal effective bars URL & result size
+    data_probe: Dict[str, Any] = {}
+    effective_bars_url = ""
+    try:
+        # introspect effective bars URL from market
+        if hasattr(market, "_bars_url"):
+            effective_bars_url = market._bars_url()  # type: ignore[attr-defined]
+        test_sym = CRYPTO_SYMBOLS[0] if CRYPTO_SYMBOLS else "BTC/USD"
+        bars = market.candles([test_sym], limit=1)  # type: ignore
+        cnt = 0
+        ok_syms = []
+        for k, br in (bars or {}).items():
+            # br.frame is either DataFrame or list
+            if hasattr(br, "frame"):
+                fr = getattr(br, "frame")
+                if fr is None:
+                    pass
+                elif hasattr(fr, "__len__"):
+                    cnt += len(fr)
+                ok_syms.append(k)
+        data_probe = {"queried": ok_syms, "rows": cnt}
+    except Exception as e:
+        data_probe = {"error": str(e)}
+
+    return _ok({
+        "ok": bool(acct_ok),
+        "exchange": CRYPTO_EXCHANGE,
+        "api_key_present": bool(API_KEY),
+        "trading_base": ALPACA_TRADING_BASE,
+        "data_base_env": ALPACA_DATA_BASE,
+        "effective_bars_url": effective_bars_url,
+        "symbols": CRYPTO_SYMBOLS,
+        "account_sample": acct_payload,
+        "account_error": acct_err,
+        "data_probe": data_probe,
+    })
 
 # ----------------------------
 # Orders & Positions (Alpaca)
@@ -312,16 +340,16 @@ def _scan(name: str):
     ver = getattr(mod, "__version__", "unknown")
     return _ok(payload, {"x-strategy-version": ver})
 
-@app.post("/scan/c1")  # RSI pullback / momentum analog
+@app.post("/scan/c1")
 def scan_c1(): return _scan("c1")
 
-@app.post("/scan/c2")  # breakout / ATR premium
+@app.post("/scan/c2")
 def scan_c2(): return _scan("c2")
 
-@app.post("/scan/c3")  # MA regime w/ flips
+@app.post("/scan/c3")
 def scan_c3(): return _scan("c3")
 
-@app.post("/scan/c4")  # volume-delta / liquidity skew analog
+@app.post("/scan/c4")
 def scan_c4(): return _scan("c4")
 
 # ----------------------------
