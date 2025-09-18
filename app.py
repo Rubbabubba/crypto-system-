@@ -10,14 +10,13 @@ import requests
 # ----------------------------
 # App / Env
 # ----------------------------
-APP_VERSION = os.environ.get("APP_VERSION", "1.6.3")
+APP_VERSION = os.environ.get("APP_VERSION", "1.6.4")
 SYSTEM_NAME = "crypto"
 
 CRYPTO_EXCHANGE = os.environ.get("CRYPTO_EXCHANGE", "alpaca")
 CRYPTO_SYMBOLS  = [s.strip() for s in os.environ.get("CRYPTO_SYMBOLS", "BTC/USD,ETH/USD,SOL/USD,DOGE/USD").split(",") if s.strip()]
 
 ALPACA_TRADING_BASE = os.environ.get("CRYPTO_TRADING_BASE") or os.environ.get("ALPACA_TRADING_BASE") or "https://paper-api.alpaca.markets/v2"
-# Note: this may be either the host OR already include /v1beta3/crypto/<venue>
 ALPACA_DATA_BASE    = os.environ.get("CRYPTO_DATA_BASE")    or os.environ.get("ALPACA_DATA_BASE")    or "https://data.alpaca.markets"
 
 API_KEY    = os.environ.get("CRYPTO_API_KEY") or os.environ.get("APCA_API_KEY_ID")
@@ -224,13 +223,14 @@ def health_versions():
     return _ok(body, headers)
 
 # ----------------------------
-# Diag: Crypto (Alpaca + 1-bar data probe)
+# Diag: Crypto (Alpaca + 1-bar data probe with error echo)
 # ----------------------------
 def _alpaca_headers():
     return {
         "APCA-API-KEY-ID": API_KEY or "",
         "APCA-API-SECRET-KEY": API_SECRET or "",
         "Content-Type": "application/json",
+        "Accept": "application/json",
     }
 
 @app.get("/diag/crypto")
@@ -248,11 +248,11 @@ def diag_crypto():
     except Exception as e:
         acct_err = str(e)
 
-    # Data probe: attempt 1 bar for first symbol to reveal effective bars URL & result size
+    # Data probe
     data_probe: Dict[str, Any] = {}
     effective_bars_url = ""
+    last_data_error = None
     try:
-        # introspect effective bars URL from market
         if hasattr(market, "_bars_url"):
             effective_bars_url = market._bars_url()  # type: ignore[attr-defined]
         test_sym = CRYPTO_SYMBOLS[0] if CRYPTO_SYMBOLS else "BTC/USD"
@@ -260,7 +260,6 @@ def diag_crypto():
         cnt = 0
         ok_syms = []
         for k, br in (bars or {}).items():
-            # br.frame is either DataFrame or list
             if hasattr(br, "frame"):
                 fr = getattr(br, "frame")
                 if fr is None:
@@ -268,8 +267,11 @@ def diag_crypto():
                 elif hasattr(fr, "__len__"):
                     cnt += len(fr)
                 ok_syms.append(k)
+        last_data_error = getattr(market, "last_error", None)
+        effective_bars_url = getattr(market, "last_url", effective_bars_url)
         data_probe = {"queried": ok_syms, "rows": cnt}
     except Exception as e:
+        last_data_error = str(e)
         data_probe = {"error": str(e)}
 
     return _ok({
@@ -279,6 +281,7 @@ def diag_crypto():
         "trading_base": ALPACA_TRADING_BASE,
         "data_base_env": ALPACA_DATA_BASE,
         "effective_bars_url": effective_bars_url,
+        "last_data_error": last_data_error,
         "symbols": CRYPTO_SYMBOLS,
         "account_sample": acct_payload,
         "account_error": acct_err,
