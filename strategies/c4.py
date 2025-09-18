@@ -1,294 +1,158 @@
 # strategies/c4.py
-"""
-C4 — Volume Bubbles Breakout (LuxAlgo-inspired)
-- Aggregate a "bubble" on a higher timeframe (bubble TF) using a wick/body volume split heuristic
-- Use last COMPLETED bubble: total volume, delta (buy-sell), price range (hi/lo)
-- Long entry when:
-    * total >= C4_MIN_TOTAL_VOL
-    * abs(delta)/total >= C4_MIN_DELTA_FRAC
-    * current price breaks above bubble high (+ optional ATR buffer)
-- Stop = bubble_low - ATR * C4_ATR_STOP_MULT
-- Target = entry + RR * risk  (if C4_USE_LIMIT=1)
-- Optional ATR trailing (C4_TRAIL_ON)
-- Shorts optional (default off)
-"""
+from __future__ import annotations
+import math
+from typing import Dict, Any
+import pandas as pd
+import numpy as np
 
-__version__ = "1.0.0"
+from .utils import last, nz, ensure_df_has, len_ok, safe_float
 
-import os, json, time
-from typing import List, Dict, Any
+__version__ = "1.1.0"
 
-def ema(values: List[float], length: int) -> List[float]:
-    if length <= 1 or not values: return values[:]
-    k = 2.0 / (length + 1.0)
-    out=[]; e=values[0]
-    for v in values:
-        e = v*k + e*(1-k)
-        out.append(e)
+def ema(series: pd.Series, length: int) -> pd.Series:
+    return series.ewm(span=length, adjust=False).mean()
+
+def atr(df: pd.DataFrame, length: int = 14) -> pd.Series:
+    high = df["high"].astype(float)
+    low = df["low"].astype(float)
+    close = df["close"].astype(float)
+    prev_close = close.shift(1)
+
+    tr = pd.concat([
+        (high - low),
+        (high - prev_close).abs(),
+        (low - prev_close).abs()
+    ], axis=1).max(axis=1)
+    return tr.ewm(span=length, adjust=False).mean()
+
+def _estimated_buy_sell_volume(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Proxy buy/sell volume like the TV script:
+      - bull bar: buy ~ full range, sell ~ wicks
+      - bear bar: sell ~ full range, buy ~ wicks
+    Not exact tick-volume, but consistent cross-venue.
+    """
+    o = df["open"].astype(float)
+    h = df["high"].astype(float)
+    l = df["low"].astype(float)
+    c = df["close"].astype(float)
+    v = df["volume"].fillna(0.0).astype(float)
+
+    bar_top = h - np.maximum(o, c)
+    bar_bot = np.minimum(o, c) - l
+    bar_rng = (h - l).clip(lower=1e-12)
+    bull = (c - o) > 0
+
+    buy_rng = np.where(bull, bar_rng, bar_top + bar_bot)
+    sell_rng = np.where(bull, bar_top + bar_bot, bar_rng)
+    tot_rng = (bar_rng + bar_top + bar_bot).clip(lower=1e-12)
+
+    buy_vol = np.round((buy_rng / tot_rng) * v, 6)
+    sell_vol = np.round((sell_rng / tot_rng) * v, 6)
+
+    out = pd.DataFrame(index=df.index)
+    out["buy_vol"] = buy_vol
+    out["sell_vol"] = sell_vol
+    out["delta_vol"] = buy_vol - sell_vol
+    out["tot_vol"] = buy_vol + sell_vol
     return out
 
-def true_ranges(h, l, c):
-    trs=[]; pc=None
-    for i in range(len(c)):
-        hi,lo,cl = h[i],l[i],c[i]
-        tr = hi-lo if pc is None else max(hi-lo, abs(hi-pc), abs(lo-pc))
-        trs.append(max(tr,0.0))
-        pc=cl
-    return trs
-
-def atr(h,l,c,len_):
-    return ema(true_ranges(h,l,c), len_) if len_>1 else true_ranges(h,l,c)
-
-# ---- storage helpers ----
-def _load_json(path, default):
-    try:
-        if os.path.exists(path):
-            with open(path,"r") as f: return json.load(f)
-    except Exception: pass
-    return default
-
-def _save_json(path, obj):
-    try:
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-        with open(path,"w") as f: json.dump(obj,f)
-    except Exception: pass
-
-def _cooldown_ok(path, key, cd):
-    st = _load_json(path, {})
-    last = st.get(key)
-    return (last is None) or (time.time() - float(last) >= cd)
-
-def _touch(path,key):
-    st = _load_json(path, {}); st[key]=time.time(); _save_json(path, st)
-
-def _cfg(params: Dict[str, Any]) -> Dict[str, Any]:
-    g = lambda k, d=None: params.get(k, os.getenv(k, d))
-    return {
-        # Base TF for ATR and current price checks
-        "TIMEFRAME":        g("C4_TIMEFRAME","5Min"),
-        # Bubble TF (where volume bubble is built)
-        "BUBBLE_TF":        g("C4_BUBBLE_TF","1Hour"),
-        "LOOKBACK_BUBBLES": int(g("C4_LOOKBACK_BUBBLES", "24")),  # how many bubble bars to scan
-        # Thresholds
-        "MIN_TOTAL_VOL":    float(g("C4_MIN_TOTAL_VOL","0")),      # absolute; set >0 to enforce
-        "MIN_DELTA_FRAC":   float(g("C4_MIN_DELTA_FRAC","0.30")),  # e.g., 0.30 → |delta| >= 30% of total
-        "BREAK_K_ATR":      float(g("C4_BREAK_K_ATR","0.0")),      # add k*ATR to breakout threshold
-        # Risk
-        "ATR_LEN":          int(g("C4_ATR_LEN","14")),
-        "ATR_STOP_MULT":    float(g("C4_ATR_STOP_MULT","1.0")),
-        "USE_LIMIT":        str(g("C4_USE_LIMIT","1"))=="1",
-        "RR_MULT":          float(g("C4_RR_MULT","1.2")),
-        # Trailing
-        "TRAIL_ON":         str(g("C4_TRAIL_ON","0"))=="1",
-        "TRAIL_ATR_MULT":   float(g("C4_TRAIL_ATR_MULT","1.0")),
-        "RR_EXIT_FRAC":     float(g("C4_RR_EXIT_FRAC","0.5")),
-        # Shorts
-        "ALLOW_SHORTS":     str(g("C4_ALLOW_SHORTS","0"))=="1",
-        # Limits / timing
-        "ORDER_NOTIONAL":   float(g("ORDER_NOTIONAL",25)),
-        "COOLDOWN_SEC":     int(g("C4_COOLDOWN_SEC",600)),
-        "MAX_POSITIONS":    int(g("C4_MAX_POSITIONS",5)),
-    }
-
-# Heuristic: split a bar's volume into buy/sell using wick/body like Lux script
-def _split_vol(open_, high, low, close, vol):
-    barTop  = high - max(open_, close)
-    barBot  = min(open_, close) - low
-    barRng  = high - low
-    bull    = (close - open_) > 0
-    buyRng  = barRng if bull else (barTop + barBot)
-    sellRng = (barTop + barBot) if bull else barRng
-    totalR  = barRng + barTop + barBot
-    if totalR <= 0 or vol <= 0:
-        return 0.0, 0.0
-    buy = round((buyRng/totalR)*vol, 6)
-    sell= round((sellRng/totalR)*vol, 6)
-    return buy, sell
-
-def _last_completed_bubble(bars):
+def run(symbol: str, df: pd.DataFrame, cfg: Dict[str, Any], place_order, log):
     """
-    bars: list of bubble timeframe bars [{open, high, low, close, volume, t}, ...]
-    Return metrics for the last COMPLETED bubble (the penultimate bar if the last is still forming in real-time).
+    Volume-delta window + small ATR breakout.
+    Env knobs:
+      C4_DELTA_WIN(20), C4_MIN_DELTA_FRAC(0.25),
+      C4_BREAK_K_ATR(0.25), C4_ATR_LEN(14),
+      C4_TREND_EMA_LEN(50), ORDER_NOTIONAL(25), C4_MIN_BARS
     """
-    if not bars or len(bars) < 2: return None
-    # Use the bar at index -2 as "completed"
-    b = bars[-2]
-    return b
-
-def _build_bubble_metrics(bubble_bars):
-    """Compute totals for the last completed bubble & some history stats."""
-    if not bubble_bars or len(bubble_bars) < 2:
-        return None
-    # We'll compute buy/sell split on each bubble bar in the lookback, but entries depend on the LAST completed
-    total_hist=[]
-    delta_hist=[]
-    rng_hist=[]
-    for bb in bubble_bars[:-1]:  # exclude current forming bubble
-        buy, sell = _split_vol(float(bb["open"]), float(bb["high"]), float(bb["low"]), float(bb["close"]), float(bb.get("volume", 0)))
-        total = buy + sell
-        delta = buy - sell
-        rng   = float(bb["high"]) - float(bb["low"])
-        total_hist.append(total); delta_hist.append(delta); rng_hist.append(rng)
-
-    if not total_hist: return None
-    last = bubble_bars[-2]
-    buy, sell = _split_vol(float(last["open"]), float(last["high"]), float(last["low"]), float(last["close"]), float(last.get("volume", 0)))
-    last_total = buy + sell
-    last_delta = buy - sell
-    return {
-        "last": {
-            "high": float(last["high"]),
-            "low": float(last["low"]),
-            "close": float(last["close"]),
-            "open": float(last["open"]),
-            "total": float(last_total),
-            "delta": float(last_delta),
-        },
-        "hist": {
-            "total_max": max(total_hist),
-            "total_avg": sum(total_hist)/len(total_hist),
-            "delta_max_abs": max(abs(x) for x in delta_hist),
-            "rng_avg": sum(rng_hist)/len(rng_hist),
-        }
-    }
-
-def run(market, broker, symbols: List[str], params: Dict[str, Any], dry: bool, pwrite):
-    cfg = _cfg(params)
-    results=[]
-    cooldown_path="storage/c4_cooldowns.json"
-    state_path="storage/c4_state.json"
-    state=_load_json(state_path, {})  # per-symbol tracking {entry, stop, target, trail, armed}
-
-    # positions cap
+    out = {"symbol": symbol, "action": "flat"}
     try:
-        positions = broker.get_positions()
-        n_open = len(positions) if isinstance(positions, list) else 0
-    except Exception:
-        n_open = 0
+        need_cols = ["open", "high", "low", "close", "volume"]
+        if not ensure_df_has(df, need_cols):
+            out.update({"reason": "missing_cols", "need": need_cols})
+            return out
 
-    for sym in symbols:
-        try:
-            # pull base timeframe (for ATR & current)
-            base = market.get_bars(sym, cfg["TIMEFRAME"], limit=300)
-            if not base or len(base) < max(50, cfg["ATR_LEN"]+5):
-                results.append({"symbol":sym,"status":"no_data_base"})
-                continue
-            closes=[float(x["close"]) for x in base]
-            highs =[float(x["high"]) for x in base]
-            lows  =[float(x["low"])  for x in base]
-            c=closes[-1]
-            a=atr(highs,lows,closes,cfg["ATR_LEN"])[-1]
+        delta_win = int(cfg.get("C4_DELTA_WIN", 20))
+        min_delta_frac = safe_float(cfg.get("C4_MIN_DELTA_FRAC", 0.25), 0.25)  # |delta| >= frac * total
+        k_atr = safe_float(cfg.get("C4_BREAK_K_ATR", 0.25), 0.25)
+        atr_len = int(cfg.get("C4_ATR_LEN", 14))
+        trend_ema_len = int(cfg.get("C4_TREND_EMA_LEN", 50))
+        notional = safe_float(cfg.get("ORDER_NOTIONAL", 25), 25.0)
+        min_bars = int(cfg.get("C4_MIN_BARS", max(150, delta_win + trend_ema_len + atr_len + 5)))
 
-            # bubble timeframe series
-            bubbles = market.get_bars(sym, cfg["BUBBLE_TF"], limit=max(30, cfg["LOOKBACK_BUBBLES"]))
-            if not bubbles or len(bubbles) < 3:
-                results.append({"symbol":sym,"status":"no_data_bubble"})
-                continue
+        if not len_ok(df, min_bars):
+            out.update({"reason": "not_enough_bars", "have": len(df), "need": min_bars})
+            return out
 
-            m = _build_bubble_metrics(bubbles)
-            if not m:
-                results.append({"symbol":sym,"status":"bubble_build_fail"})
-                continue
+        # indicators
+        close_s = df["close"].astype(float)
+        high_s = df["high"].astype(float)
+        vol_parts = _estimated_buy_sell_volume(df)
+        atr_s = atr(df, atr_len)
+        ema_trend = ema(close_s, trend_ema_len)
 
-            b_last = m["last"]
-            bub_hi = b_last["high"]; bub_lo=b_last["low"]
-            total  = b_last["total"]; delta=b_last["delta"]
-            frac   = (abs(delta)/total) if total>0 else 0.0
+        # window metrics
+        delta_roll = vol_parts["delta_vol"].rolling(delta_win, min_periods=delta_win).sum()
+        total_roll = vol_parts["tot_vol"].rolling(delta_win, min_periods=delta_win).sum()
 
-            # manage open trade
-            st = state.get(sym, {})
-            in_trade = bool(st.get("entry"))
-            if in_trade:
-                entry=float(st["entry"]); stop=float(st.get("stop",0) or 0)
-                target=st.get("target"); trail=st.get("trail"); armed=bool(st.get("armed", False))
+        # scalars
+        close = nz(last(close_s))
+        hh = nz(last(high_s.rolling(delta_win, min_periods=delta_win).max()))
+        atr_v = nz(last(atr_s))
+        ema_v = nz(last(ema_trend))
+        delta_sum = nz(last(delta_roll))
+        total_sum = nz(last(total_roll), 0.0)
 
-                # arm trailing when a fraction towards target is reached
-                if cfg["TRAIL_ON"] and cfg["RR_EXIT_FRAC"]>=0 and cfg["USE_LIMIT"] and target:
-                    trigger = entry + cfg["RR_EXIT_FRAC"]*(target-entry)
-                    if c >= trigger: armed=True
-                elif cfg["TRAIL_ON"] and not cfg["USE_LIMIT"]:
-                    armed=True
+        if any(math.isnan(x) for x in [close, hh, atr_v, ema_v, delta_sum]) or total_sum <= 0:
+            out["reason"] = "nan_or_zero_denominator"
+            return out
 
-                # trail = max(prior trail, last bubble low + (?) or close - ATR*mult). We’ll use price-based trail: c - ATR*mult.
-                if cfg["TRAIL_ON"] and armed:
-                    new_trail = c - cfg["TRAIL_ATR_MULT"]*a
-                    if not trail or new_trail > trail:
-                        trail = new_trail
+        delta_frac = abs(delta_sum) / max(1e-12, total_sum)
+        skew_ok = delta_frac >= min_delta_frac
+        breakout_up = close > (hh + k_atr * atr_v)
+        trend_ok = close > ema_v
 
-                active_stop = max(trail or -1e99, stop or -1e99)
-                do_exit=False; reason="hold"
-                if c <= active_stop:
-                    do_exit=True; reason="stop/trail_hit"
-                elif cfg["USE_LIMIT"] and target and c >= target:
-                    do_exit=True; reason="target_hit"
+        enter_long = bool(skew_ok and breakout_up and trend_ok)
 
-                if do_exit:
-                    if not dry:
-                        try:
-                            if hasattr(broker,"close_position"): broker.close_position(sym)
-                            else: broker.place_order_notional(symbol=sym, side="sell", notional=cfg["ORDER_NOTIONAL"], type="market")
-                        except Exception as ex:
-                            results.append({"symbol":sym,"action":"error","error":str(ex)})
-                    pwrite(sym,"c4","SELL",cfg["ORDER_NOTIONAL"],reason,dry,{"entry":entry,"stop":active_stop,"target":target,"trail":trail,"close":c})
-                    state.pop(sym, None)
-                    _touch(cooldown_path, sym)
-                    results.append({"symbol":sym,"action":"sell","reason":reason,"close":c})
-                    continue
-                else:
-                    state[sym]={"entry":entry,"stop":stop,"target":target,"trail":trail,"armed":armed}
-                    results.append({"symbol":sym,"action":"hold","close":c,"entry":entry,"stop":stop,"target":target,"trail":trail})
-                    continue
+        if enter_long and notional > 0:
+            oid = place_order(symbol, "buy", notional=notional)
+            out.update({
+                "action": "buy",
+                "order_id": oid,
+                "close": round(close, 4),
+                "hh": round(hh, 4),
+                "atr": round(atr_v, 6),
+                "ema": round(ema_v, 4),
+                "delta_frac": round(delta_frac, 4),
+                "reason": "delta_skew_breakout_trend_ok"
+            })
+        else:
+            out.update({
+                "action": "flat",
+                "close": round(close, 4),
+                "hh": round(hh, 4),
+                "atr": round(atr_v, 6),
+                "ema": round(ema_v, 4),
+                "delta_frac": round(delta_frac, 4),
+                "reason": "no_signal"
+            })
+        return out
 
-            # flat → evaluate entry
-            if not _cooldown_ok(cooldown_path, sym, cfg["COOLDOWN_SEC"]):
-                results.append({"symbol":sym,"action":"flat","reason":"cooldown"})
-                continue
-            if n_open >= cfg["MAX_POSITIONS"] and not dry:
-                results.append({"symbol":sym,"action":"flat","reason":"max_positions"})
-                continue
-
-            # breakout above bubble high (+ K*ATR)
-            thr = bub_hi + cfg["BREAK_K_ATR"]*a
-            pass_total = (total >= cfg["MIN_TOTAL_VOL"])
-            pass_delta = (frac >= cfg["MIN_DELTA_FRAC"])
-
-            want_long = pass_total and pass_delta and (c > thr)
-
-            if want_long:
-                stop = bub_lo - cfg["ATR_STOP_MULT"]*a
-                risk = max(1e-9, c - stop)
-                tgt  = c + cfg["RR_MULT"]*risk if cfg["USE_LIMIT"] else None
-
-                if not dry:
-                    broker.place_order_notional(symbol=sym, side="buy", notional=cfg["ORDER_NOTIONAL"], type="market")
-                pwrite(sym,"c4","BUY",cfg["ORDER_NOTIONAL"],"bubble_breakout",dry,{"close":c,"bubble_hi":bub_hi,"bubble_lo":bub_lo,"total":total,"delta":delta,"frac":frac,"atr":a})
-
-                state[sym]={"entry":c,"stop":stop,"target":tgt,"trail":stop,"armed":False}
-                _touch(cooldown_path, sym)
-                results.append({"symbol":sym,"action":"buy","close":c,"stop":stop,"target":tgt,"atr":a,"bubble_hi":bub_hi})
-                continue
-
-            # (Optional) short logic (disabled by default)
-            # e.g., c < (bub_lo - k*ATR) and negative delta. Not enabled unless ALLOW_SHORTS=1
-            if cfg["ALLOW_SHORTS"]:
-                thr_s = bub_lo - cfg["BREAK_K_ATR"]*a
-                want_short = pass_total and pass_delta and (delta < 0) and (c < thr_s)
-                if want_short:
-                    stop = bub_hi + cfg["ATR_STOP_MULT"]*a
-                    risk = max(1e-9, stop - c)
-                    tgt  = c - cfg["RR_MULT"]*risk if cfg["USE_LIMIT"] else None
-                    if not dry:
-                        broker.place_order_notional(symbol=sym, side="sell", notional=cfg["ORDER_NOTIONAL"], type="market")
-                    pwrite(sym,"c4","SELL",cfg["ORDER_NOTIONAL"],"bubble_breakdown",dry,{"close":c,"bubble_hi":bub_hi,"bubble_lo":bub_lo,"total":total,"delta":delta,"frac":frac,"atr":a})
-                    state[sym]={"entry":c,"stop":stop,"target":tgt,"trail":stop,"armed":False}
-                    _touch(cooldown_path, sym)
-                    results.append({"symbol":sym,"action":"sell_short","close":c,"stop":stop,"target":tgt,"atr":a,"bubble_lo":bub_lo})
-                    continue
-
-            results.append({"symbol":sym,"action":"flat","close":c,"reason":"no_break_or_threshold","bubble_hi":bub_hi,"total":total,"frac":frac})
-
-        except Exception as ex:
-            results.append({"symbol":sym,"action":"error","error":str(ex)})
-
-    _save_json(state_path, state)
-    return results
+    except Exception as e:
+        out.update({
+            "action": "error",
+            "error": f"{type(e).__name__}: {e}",
+            "ctx": {
+                "nrows": int(len(df) if isinstance(df, pd.DataFrame) else 0),
+                "cols": list(df.columns) if isinstance(df, pd.DataFrame) else [],
+                "params": {
+                    "C4_DELTA_WIN": cfg.get("C4_DELTA_WIN"),
+                    "C4_MIN_DELTA_FRAC": cfg.get("C4_MIN_DELTA_FRAC"),
+                    "C4_BREAK_K_ATR": cfg.get("C4_BREAK_K_ATR"),
+                    "C4_ATR_LEN": cfg.get("C4_ATR_LEN"),
+                    "C4_TREND_EMA_LEN": cfg.get("C4_TREND_EMA_LEN"),
+                    "ORDER_NOTIONAL": cfg.get("ORDER_NOTIONAL"),
+                },
+            },
+        })
+        return out
