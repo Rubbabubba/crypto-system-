@@ -6,7 +6,8 @@ import pandas as pd
 
 from .utils import last, nz, ensure_df_has, len_ok, safe_float
 
-__version__ = "1.1.0"
+__version__ = "1.1.1"
+VERSION = (1, 1, 1)
 
 def ema(series: pd.Series, length: int) -> pd.Series:
     return series.ewm(span=length, adjust=False).mean()
@@ -16,7 +17,6 @@ def atr(df: pd.DataFrame, length: int = 14) -> pd.Series:
     low = df["low"].astype(float)
     close = df["close"].astype(float)
     prev_close = close.shift(1)
-
     tr = pd.concat([
         (high - low),
         (high - prev_close).abs(),
@@ -24,15 +24,18 @@ def atr(df: pd.DataFrame, length: int = 14) -> pd.Series:
     ], axis=1).max(axis=1)
     return tr.ewm(span=length, adjust=False).mean()
 
-def run(symbol: str, df: pd.DataFrame, cfg: Dict[str, Any], place_order, log):
+def run(symbol: str, df: pd.DataFrame, cfg: Dict[str, Any], place_order, log, **kwargs):
     """
-    Breakout above recent high by k*ATR with EMA trend filter.
+    Donchian breakout above HH + k*ATR with EMA trend filter.
     Env knobs:
       C2_LOOKBACK (20), C2_BREAK_K (0.5), C2_ATR_LEN (14),
       C2_EMA_TREND_LEN (50), ORDER_NOTIONAL (25), C2_MIN_BARS
+    kwargs: dry, force, now (ignored safely)
     """
     out = {"symbol": symbol, "action": "flat"}
     try:
+        dry = bool(kwargs.get("dry", False))
+
         need_cols = ["close", "high", "low"]
         if not ensure_df_has(df, need_cols):
             out.update({"reason": "missing_cols", "need": need_cols})
@@ -70,16 +73,26 @@ def run(symbol: str, df: pd.DataFrame, cfg: Dict[str, Any], place_order, log):
         enter_long = bool(breakout_up and trend_ok)
 
         if enter_long and notional > 0:
-            oid = place_order(symbol, "buy", notional=notional)
-            out.update({
-                "action": "buy",
-                "order_id": oid,
-                "close": round(close, 4),
-                "hh": round(hh, 4),
-                "atr": round(atr_v, 6),
-                "ema": round(ema_v, 4),
-                "reason": "donchian_breakout_trend_ok"
-            })
+            if dry:
+                out.update({
+                    "action": "paper_buy",
+                    "close": round(close, 4),
+                    "hh": round(hh, 4),
+                    "atr": round(atr_v, 6),
+                    "ema": round(ema_v, 4),
+                    "reason": "dry_run_breakout_trend_ok"
+                })
+            else:
+                oid = place_order(symbol, "buy", notional=notional)
+                out.update({
+                    "action": "buy",
+                    "order_id": oid,
+                    "close": round(close, 4),
+                    "hh": round(hh, 4),
+                    "atr": round(atr_v, 6),
+                    "ema": round(ema_v, 4),
+                    "reason": "donchian_breakout_trend_ok"
+                })
         else:
             out.update({
                 "action": "flat",

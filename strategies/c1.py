@@ -6,7 +6,8 @@ import pandas as pd
 
 from .utils import last, nz, ensure_df_has, len_ok, safe_float
 
-__version__ = "1.1.0"
+__version__ = "1.1.1"
+VERSION = (1, 1, 1)
 
 # ---- basic indicators (no external deps) ----
 def ema(series: pd.Series, length: int) -> pd.Series:
@@ -21,21 +22,23 @@ def rsi(series: pd.Series, length: int = 14) -> pd.Series:
     rs = roll_up / (roll_down.replace(0, 1e-12))
     return 100 - (100 / (1 + rs))
 
-def run(symbol: str, df: pd.DataFrame, cfg: Dict[str, Any], place_order, log):
+def run(symbol: str, df: pd.DataFrame, cfg: Dict[str, Any], place_order, log, **kwargs):
     """
     RSI pullback above EMA. Long-only by default.
-    Env knobs (read via cfg):
+    Env knobs:
       C1_RSI_LEN (14), C1_EMA_LEN (21), C1_RSI_BUY (48),
-      C1_CLOSE_ABOVE_EMA_EQ (0/1), ORDER_NOTIONAL (25), C1_MIN_BARS (50)
+      C1_CLOSE_ABOVE_EMA_EQ (0/1), ORDER_NOTIONAL (25), C1_MIN_BARS (>=50)
+    kwargs: dry, force, now (ignored safely)
     """
     out = {"symbol": symbol, "action": "flat"}
     try:
+        dry = bool(kwargs.get("dry", False))
+
         need_cols = ["close"]
         if not ensure_df_has(df, need_cols):
             out.update({"reason": "missing_cols", "need": need_cols})
             return out
 
-        # parameters
         rsi_len = int(cfg.get("C1_RSI_LEN", 14))
         ema_len = int(cfg.get("C1_EMA_LEN", 21))
         min_bars = int(cfg.get("C1_MIN_BARS", max(50, ema_len + rsi_len + 2)))
@@ -64,27 +67,35 @@ def run(symbol: str, df: pd.DataFrame, cfg: Dict[str, Any], place_order, log):
         enter_long = bool(above_ema and pullback_ok)
 
         if enter_long and notional > 0:
-            oid = place_order(symbol, "buy", notional=notional)
-            out.update({
-                "action": "buy",
-                "order_id": oid,
-                "rsi": round(rsi_v, 2),
-                "ema": round(ema_v, 2),
-                "close": round(close, 4),
-                "reason": "enter_long_rsi_pullback"
-            })
+            if dry:
+                out.update({
+                    "action": "paper_buy",
+                    "close": round(close, 4),
+                    "rsi": round(rsi_v, 2),
+                    "ema": round(ema_v, 2),
+                    "reason": "dry_run_enter_long_rsi_pullback"
+                })
+            else:
+                oid = place_order(symbol, "buy", notional=notional)
+                out.update({
+                    "action": "buy",
+                    "order_id": oid,
+                    "close": round(close, 4),
+                    "rsi": round(rsi_v, 2),
+                    "ema": round(ema_v, 2),
+                    "reason": "enter_long_rsi_pullback"
+                })
         else:
             out.update({
                 "action": "flat",
+                "close": round(close, 4),
                 "rsi": round(rsi_v, 2),
                 "ema": round(ema_v, 2),
-                "close": round(close, 4),
                 "reason": "no_signal"
             })
         return out
 
     except Exception as e:
-        # Option 3: richer error context
         out.update({
             "action": "error",
             "error": f"{type(e).__name__}: {e}",

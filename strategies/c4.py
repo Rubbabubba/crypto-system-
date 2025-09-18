@@ -7,7 +7,8 @@ import numpy as np
 
 from .utils import last, nz, ensure_df_has, len_ok, safe_float
 
-__version__ = "1.1.0"
+__version__ = "1.1.1"
+VERSION = (1, 1, 1)
 
 def ema(series: pd.Series, length: int) -> pd.Series:
     return series.ewm(span=length, adjust=False).mean()
@@ -17,7 +18,6 @@ def atr(df: pd.DataFrame, length: int = 14) -> pd.Series:
     low = df["low"].astype(float)
     close = df["close"].astype(float)
     prev_close = close.shift(1)
-
     tr = pd.concat([
         (high - low),
         (high - prev_close).abs(),
@@ -26,12 +26,6 @@ def atr(df: pd.DataFrame, length: int = 14) -> pd.Series:
     return tr.ewm(span=length, adjust=False).mean()
 
 def _estimated_buy_sell_volume(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Proxy buy/sell volume like the TV script:
-      - bull bar: buy ~ full range, sell ~ wicks
-      - bear bar: sell ~ full range, buy ~ wicks
-    Not exact tick-volume, but consistent cross-venue.
-    """
     o = df["open"].astype(float)
     h = df["high"].astype(float)
     l = df["low"].astype(float)
@@ -57,23 +51,26 @@ def _estimated_buy_sell_volume(df: pd.DataFrame) -> pd.DataFrame:
     out["tot_vol"] = buy_vol + sell_vol
     return out
 
-def run(symbol: str, df: pd.DataFrame, cfg: Dict[str, Any], place_order, log):
+def run(symbol: str, df: pd.DataFrame, cfg: Dict[str, Any], place_order, log, **kwargs):
     """
-    Volume-delta window + small ATR breakout.
+    Volume-delta window + small ATR breakout with trend filter.
     Env knobs:
       C4_DELTA_WIN(20), C4_MIN_DELTA_FRAC(0.25),
       C4_BREAK_K_ATR(0.25), C4_ATR_LEN(14),
       C4_TREND_EMA_LEN(50), ORDER_NOTIONAL(25), C4_MIN_BARS
+    kwargs: dry, force, now (ignored safely)
     """
     out = {"symbol": symbol, "action": "flat"}
     try:
+        dry = bool(kwargs.get("dry", False))
+
         need_cols = ["open", "high", "low", "close", "volume"]
         if not ensure_df_has(df, need_cols):
             out.update({"reason": "missing_cols", "need": need_cols})
             return out
 
         delta_win = int(cfg.get("C4_DELTA_WIN", 20))
-        min_delta_frac = safe_float(cfg.get("C4_MIN_DELTA_FRAC", 0.25), 0.25)  # |delta| >= frac * total
+        min_delta_frac = safe_float(cfg.get("C4_MIN_DELTA_FRAC", 0.25), 0.25)
         k_atr = safe_float(cfg.get("C4_BREAK_K_ATR", 0.25), 0.25)
         atr_len = int(cfg.get("C4_ATR_LEN", 14))
         trend_ema_len = int(cfg.get("C4_TREND_EMA_LEN", 50))
@@ -84,18 +81,15 @@ def run(symbol: str, df: pd.DataFrame, cfg: Dict[str, Any], place_order, log):
             out.update({"reason": "not_enough_bars", "have": len(df), "need": min_bars})
             return out
 
-        # indicators
         close_s = df["close"].astype(float)
         high_s = df["high"].astype(float)
         vol_parts = _estimated_buy_sell_volume(df)
         atr_s = atr(df, atr_len)
         ema_trend = ema(close_s, trend_ema_len)
 
-        # window metrics
         delta_roll = vol_parts["delta_vol"].rolling(delta_win, min_periods=delta_win).sum()
         total_roll = vol_parts["tot_vol"].rolling(delta_win, min_periods=delta_win).sum()
 
-        # scalars
         close = nz(last(close_s))
         hh = nz(last(high_s.rolling(delta_win, min_periods=delta_win).max()))
         atr_v = nz(last(atr_s))
@@ -111,21 +105,31 @@ def run(symbol: str, df: pd.DataFrame, cfg: Dict[str, Any], place_order, log):
         skew_ok = delta_frac >= min_delta_frac
         breakout_up = close > (hh + k_atr * atr_v)
         trend_ok = close > ema_v
-
         enter_long = bool(skew_ok and breakout_up and trend_ok)
 
         if enter_long and notional > 0:
-            oid = place_order(symbol, "buy", notional=notional)
-            out.update({
-                "action": "buy",
-                "order_id": oid,
-                "close": round(close, 4),
-                "hh": round(hh, 4),
-                "atr": round(atr_v, 6),
-                "ema": round(ema_v, 4),
-                "delta_frac": round(delta_frac, 4),
-                "reason": "delta_skew_breakout_trend_ok"
-            })
+            if dry:
+                out.update({
+                    "action": "paper_buy",
+                    "close": round(close, 4),
+                    "hh": round(hh, 4),
+                    "atr": round(atr_v, 6),
+                    "ema": round(ema_v, 4),
+                    "delta_frac": round(delta_frac, 4),
+                    "reason": "dry_run_delta_skew_breakout_trend_ok"
+                })
+            else:
+                oid = place_order(symbol, "buy", notional=notional)
+                out.update({
+                    "action": "buy",
+                    "order_id": oid,
+                    "close": round(close, 4),
+                    "hh": round(hh, 4),
+                    "atr": round(atr_v, 6),
+                    "ema": round(ema_v, 4),
+                    "delta_frac": round(delta_frac, 4),
+                    "reason": "delta_skew_breakout_trend_ok"
+                })
         else:
             out.update({
                 "action": "flat",

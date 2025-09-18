@@ -6,7 +6,8 @@ import pandas as pd
 
 from .utils import last, nz, ensure_df_has, len_ok, safe_float
 
-__version__ = "1.1.0"
+__version__ = "1.1.1"
+VERSION = (1, 1, 1)
 
 def ema(series: pd.Series, length: int) -> pd.Series:
     return series.ewm(span=length, adjust=False).mean()
@@ -24,7 +25,6 @@ def atr(df: pd.DataFrame, length: int = 14) -> pd.Series:
     low = df["low"].astype(float)
     close = df["close"].astype(float)
     prev_close = close.shift(1)
-
     tr = pd.concat([
         (high - low),
         (high - prev_close).abs(),
@@ -32,17 +32,20 @@ def atr(df: pd.DataFrame, length: int = 14) -> pd.Series:
     ], axis=1).max(axis=1)
     return tr.ewm(span=length, adjust=False).mean()
 
-def run(symbol: str, df: pd.DataFrame, cfg: Dict[str, Any], place_order, log):
+def run(symbol: str, df: pd.DataFrame, cfg: Dict[str, Any], place_order, log, **kwargs):
     """
-    Fast/slow MA cross with ATR-based stops/targets (long-only by default).
+    Fast/slow MA cross with ATR-based stops/targets (long-only).
     Env knobs:
       C3_MA1_TYPE(EMA), C3_MA2_TYPE(EMA), C3_MA1_LEN(13), C3_MA2_LEN(34),
       C3_ATR_LEN(14), C3_RISK_M(0.8), C3_RR_MULT(1.0),
       C3_USE_LIMIT(1), C3_TRAIL_ON(1), C3_TRAIL_ATR_MULT(1.2), C3_RR_EXIT_FRAC(0.5),
       ORDER_NOTIONAL(25), C3_MIN_BARS
+    kwargs: dry, force, now (ignored safely)
     """
     out = {"symbol": symbol, "action": "flat"}
     try:
+        dry = bool(kwargs.get("dry", False))
+
         need_cols = ["close", "high", "low"]
         if not ensure_df_has(df, need_cols):
             out.update({"reason": "missing_cols", "need": need_cols})
@@ -74,7 +77,6 @@ def run(symbol: str, df: pd.DataFrame, cfg: Dict[str, Any], place_order, log):
         ma2_s = ma2_fn(close_s, ma2_len)
         atr_s = atr(df, atr_len)
 
-        # Cross detection uses previous & current scalars
         ma1_prev = nz(last(ma1_s.iloc[-2]))
         ma2_prev = nz(last(ma2_s.iloc[-2]))
         ma1_now = nz(last(ma1_s))
@@ -89,32 +91,44 @@ def run(symbol: str, df: pd.DataFrame, cfg: Dict[str, Any], place_order, log):
         cross_up = (ma1_prev <= ma2_prev) and (ma1_now > ma2_now)
 
         if cross_up and notional > 0:
-            # Risk model (simple): stop = close - risk_m * ATR, target = close + rr_mult * (close - stop)
-            stop = close - risk_m * atr_v
+            stop = close - max(1e-12, (safe_float(cfg.get("C3_RISK_M", 0.8), 0.8)) * atr_v)
             risk = max(1e-12, close - stop)
-            target = close + rr_mult * risk
+            target = close + safe_float(cfg.get("C3_RR_MULT", 1.0), 1.0) * risk
 
-            oid = place_order(symbol, "buy", notional=notional,
-                              risk_model={
-                                  "stop": round(stop, 6),
-                                  "target": round(target, 6),
-                                  "trail_on": trail_on,
-                                  "trail_atr_mult": trail_mult,
-                                  "rr_exit_frac": rr_exit_frac,
-                              },
-                              limit_price=(round(target, 6) if use_limit else None))
-
-            out.update({
-                "action": "buy",
-                "order_id": oid,
-                "close": round(close, 4),
-                "ma1": round(ma1_now, 4),
-                "ma2": round(ma2_now, 4),
-                "atr": round(atr_v, 6),
-                "stop": round(stop, 6),
-                "target": round(target, 6),
-                "reason": "ma_cross_up",
-            })
+            if dry:
+                out.update({
+                    "action": "paper_buy",
+                    "close": round(close, 4),
+                    "ma1": round(ma1_now, 4),
+                    "ma2": round(ma2_now, 4),
+                    "atr": round(atr_v, 6),
+                    "stop": round(stop, 6),
+                    "target": round(target, 6),
+                    "reason": "dry_run_ma_cross_up",
+                })
+            else:
+                oid = place_order(
+                    symbol, "buy", notional=notional,
+                    risk_model={
+                        "stop": round(stop, 6),
+                        "target": round(target, 6),
+                        "trail_on": trail_on,
+                        "trail_atr_mult": trail_mult,
+                        "rr_exit_frac": rr_exit_frac,
+                    },
+                    limit_price=(round(target, 6) if use_limit else None)
+                )
+                out.update({
+                    "action": "buy",
+                    "order_id": oid,
+                    "close": round(close, 4),
+                    "ma1": round(ma1_now, 4),
+                    "ma2": round(ma2_now, 4),
+                    "atr": round(atr_v, 6),
+                    "stop": round(stop, 6),
+                    "target": round(target, 6),
+                    "reason": "ma_cross_up",
+                })
         else:
             out.update({
                 "action": "flat",
