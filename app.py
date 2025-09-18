@@ -10,7 +10,7 @@ import requests
 # ----------------------------
 # App / Env
 # ----------------------------
-APP_VERSION = os.environ.get("APP_VERSION", "1.6.1")
+APP_VERSION = os.environ.get("APP_VERSION", "1.6.2")
 SYSTEM_NAME = "crypto"
 
 CRYPTO_EXCHANGE = os.environ.get("CRYPTO_EXCHANGE", "alpaca")
@@ -25,13 +25,13 @@ API_SECRET = os.environ.get("CRYPTO_API_SECRET") or os.environ.get("APCA_API_SEC
 # ----------------------------
 # Imports: Market & Broker
 # ----------------------------
-# Market data service (must exist in your repo)
+# Market data service
 try:
     from services.market_crypto import MarketCrypto  # must expose MarketCrypto.from_env()
 except Exception:
     MarketCrypto = None  # type: ignore
 
-# Execution service (this is the new file above)
+# Execution service
 try:
     from services.exchange_exec import ExchangeExec  # must expose ExchangeExec.from_env()
 except Exception:
@@ -40,12 +40,17 @@ except Exception:
 def _make_market():
     if MarketCrypto is None:
         raise RuntimeError("services.market_crypto.MarketCrypto not found. Ensure services/market_crypto.py exists.")
-    return MarketCrypto.from_env()
+    # Graceful whether or not from_env exists
+    if hasattr(MarketCrypto, "from_env") and callable(getattr(MarketCrypto, "from_env")):
+        return MarketCrypto.from_env()  # type: ignore[attr-defined]
+    return MarketCrypto()  # type: ignore[call-arg]
 
 def _make_broker():
     if ExchangeExec is None:
         raise RuntimeError("services.exchange_exec.ExchangeExec not found. Ensure services/exchange_exec.py exists.")
-    return ExchangeExec.from_env()
+    if hasattr(ExchangeExec, "from_env") and callable(getattr(ExchangeExec, "from_env")):
+        return ExchangeExec.from_env()  # type: ignore[attr-defined]
+    return ExchangeExec()  # type: ignore[call-arg]
 
 market = _make_market()
 broker = _make_broker()
@@ -111,7 +116,6 @@ def _run_strategy_direct(tag: str, mod, symbols: List[str], params: Dict[str, An
         results = mod.run(market, broker, symbols, params, dry=dry, log=_inline_logger(tag), pwrite=pwrite)
         return {"ok": True, "results": results, "prints": pbuf}
     except TypeError:
-        # Fallback for older signature (no log)
         try:
             results = mod.run(market, broker, symbols, params, dry=dry, pwrite=pwrite)  # type: ignore
             return {"ok": True, "results": results, "prints": pbuf}
@@ -123,11 +127,10 @@ def _run_strategy_direct(tag: str, mod, symbols: List[str], params: Dict[str, An
         return {"ok": False, "error": str(e)}
 
 # ----------------------------
-# UI Dashboard (minimal)
+# UI (dashboard – compact)
 # ----------------------------
 DASHBOARD_HTML = """
-<!doctype html>
-<html lang="en"><head><meta charset="utf-8">
+<!doctype html><html lang="en"><head><meta charset="utf-8">
 <title>Crypto Dashboard</title><meta name="viewport" content="width=device-width, initial-scale=1" />
 <style>
   :root{--bg:#0b0f14;--panel:#121821;--text:#e6edf3;--muted:#8aa0b4;--ok:#2ecc71;--warn:#f1c40f;--err:#e74c3c;--chip:#1b2430}
