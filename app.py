@@ -1,5 +1,5 @@
 # app.py  —  Crypto System Web API
-# Version: 1.6.11
+# Version: 1.6.12
 from __future__ import annotations
 
 import os, json, importlib
@@ -12,7 +12,7 @@ from flask import Flask, request, jsonify, Response, redirect
 # ----------------------------
 # App / Env
 # ----------------------------
-APP_VERSION = os.environ.get("APP_VERSION", "1.6.11")
+APP_VERSION = os.environ.get("APP_VERSION", "1.6.12")
 SYSTEM_NAME = "crypto"
 
 CRYPTO_EXCHANGE = os.environ.get("CRYPTO_EXCHANGE", "alpaca")
@@ -278,6 +278,7 @@ def diag_crypto():
     data_probe: Dict[str, Any] = {}
     effective_bars_url = ""
     last_data_error = None
+    last_attempts = []
     try:
         if hasattr(market, "_bars_url"):
             effective_bars_url = market._bars_url()  # type: ignore
@@ -292,6 +293,7 @@ def diag_crypto():
             ok_syms.append(k)
         last_data_error = getattr(market, "last_error", None)
         effective_bars_url = getattr(market, "last_url", effective_bars_url)
+        last_attempts = getattr(market, "last_attempts", [])
         data_probe = {"queried": ok_syms, "rows": cnt}
     except Exception as e:
         last_data_error = str(e)
@@ -305,10 +307,27 @@ def diag_crypto():
         "data_base_env": ALPACA_DATA_BASE,
         "effective_bars_url": effective_bars_url,
         "last_data_error": last_data_error,
+        "last_attempts": last_attempts,
         "symbols": CRYPTO_SYMBOLS,
         "account_sample": acct_payload,
         "account_error": acct_err,
         "data_probe": data_probe,
+    })
+
+@app.get("/diag/candles")
+def diag_candles():
+    syms = request.args.get("symbols") or ",".join(CRYPTO_SYMBOLS)
+    symbols = [s.strip() for s in syms.split(",") if s.strip()]
+    tf = request.args.get("tf") or request.args.get("timeframe") or "5Min"
+    limit = int(request.args.get("limit", "100"))
+    res = market.candles(symbols, timeframe=tf, limit=limit)  # type: ignore
+    out = {k: len(v.frame) for k, v in res.items()}
+    return _ok({
+        "symbols": symbols, "timeframe": tf, "limit": limit,
+        "rows": out,
+        "last_url": getattr(market, "last_url", ""),
+        "last_error": getattr(market, "last_error", None),
+        "last_attempts": getattr(market, "last_attempts", []),
     })
 
 @app.get("/orders/recent")
