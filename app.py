@@ -1,5 +1,5 @@
 # app.py  —  Crypto System Web API
-# Version: 1.6.8
+# Version: 1.6.9
 from __future__ import annotations
 
 import os, json, importlib
@@ -12,7 +12,7 @@ from flask import Flask, request, jsonify, Response, redirect
 # ----------------------------
 # App / Env
 # ----------------------------
-APP_VERSION = os.environ.get("APP_VERSION", "1.6.8")
+APP_VERSION = os.environ.get("APP_VERSION", "1.6.9")
 SYSTEM_NAME = "crypto"
 
 CRYPTO_EXCHANGE = os.environ.get("CRYPTO_EXCHANGE", "alpaca")
@@ -40,13 +40,11 @@ API_SECRET = os.environ.get("CRYPTO_API_SECRET") or os.environ.get("APCA_API_SEC
 # ----------------------------
 # Imports: Market & Broker
 # ----------------------------
-# MarketCrypto must exist at services/market_crypto.py and provide MarketCrypto (with .from_env() optional)
 try:
     from services.market_crypto import MarketCrypto  # type: ignore
 except Exception:
     MarketCrypto = None  # type: ignore
 
-# ExchangeExec must exist at services/exchange_exec.py and provide ExchangeExec (with .from_env() optional)
 try:
     from services.exchange_exec import ExchangeExec  # type: ignore
 except Exception:
@@ -117,11 +115,9 @@ def _mod_version(mod_name: str) -> str:
 
 def _collect_params_from_request(prefix: str = "param.") -> Dict[str, Any]:
     params: Dict[str, Any] = {}
-    # querystring
     for k, v in request.args.items():
         if k.startswith(prefix):
             params[k[len(prefix):]] = v
-    # json body
     if request.is_json:
         body = request.get_json(silent=True) or {}
         if isinstance(body, dict) and "params" in body and isinstance(body["params"], dict):
@@ -145,11 +141,9 @@ def _run_strategy_direct(tag: str, mod, symbols: List[str], params: Dict[str, An
         pbuf.append(str(s))
 
     try:
-        # First try with log kwarg
         results = mod.run(market, broker, symbols, params, dry=dry, log=_inline_logger(tag), pwrite=pwrite)
         return {"ok": True, "results": results, "prints": pbuf}
     except TypeError:
-        # Fallback for older signatures without 'log'
         try:
             results = mod.run(market, broker, symbols, params, dry=dry, pwrite=pwrite)  # type: ignore
             return {"ok": True, "results": results, "prints": pbuf}
@@ -164,8 +158,7 @@ def _run_strategy_direct(tag: str, mod, symbols: List[str], params: Dict[str, An
 # ----------------------------
 # UI (Dashboard)
 # ----------------------------
-DASHBOARD_HTML = """
-<!doctype html><html lang="en"><head><meta charset="utf-8">
+DASHBOARD_HTML = """<!doctype html><html lang="en"><head><meta charset="utf-8">
 <title>Crypto Dashboard</title><meta name="viewport" content="width=device-width, initial-scale=1" />
 <style>
   :root{--bg:#0b0f14;--panel:#121821;--text:#e6edf3;--muted:#8aa0b4;--ok:#2ecc71;--warn:#f1c40f;--err:#e74c3c;--chip:#1b2430}
@@ -229,24 +222,19 @@ window.addEventListener('load',()=>{refreshAll();setInterval(refreshMeta,30000);
 """
 
 # ----------------------------
-# Routes: Dashboard & Root (single definitions)
+# Routes
 # ----------------------------
 @app.get("/dashboard")
 def dashboard():
     return Response(DASHBOARD_HTML, mimetype="text/html")
 
-
 @app.get("/")
 def index_root():
     return redirect("/dashboard")
 
-# ----------------------------
-# Health & Versions
-# ----------------------------
 @app.get("/health")
 def health():
     return _ok({"ok": True, "system": SYSTEM_NAME, "symbols": CRYPTO_SYMBOLS})
-
 
 @app.get("/health/versions")
 def health_versions():
@@ -265,9 +253,6 @@ def health_versions():
     }
     return _ok(body, headers)
 
-# ----------------------------
-# Diag: Crypto (account + data probe)
-# ----------------------------
 def _alpaca_headers():
     return {
         "APCA-API-KEY-ID": API_KEY or "",
@@ -276,44 +261,35 @@ def _alpaca_headers():
         "Accept": "application/json",
     }
 
-
 @app.get("/diag/crypto")
 def diag_crypto():
-    # Account probe
     acct_ok = False
     acct_payload: Any = None
     acct_err: str | None = None
     try:
         r = requests.get(f"{ALPACA_TRADING_BASE}/account", headers=_alpaca_headers(), timeout=20)
         acct_ok = r.status_code < 300
-        acct_payload = (
-            r.json() if r.headers.get("content-type", "").startswith("application/json")
-            else {"status_code": r.status_code, "text": r.text}
-        )
+        acct_payload = r.json() if r.headers.get("content-type","").startswith("application/json") else {"status_code": r.status_code, "text": r.text}
         if not acct_ok:
             acct_err = f"HTTP {r.status_code}"
     except Exception as e:
         acct_err = str(e)
 
-    # Data probe (via market client)
     data_probe: Dict[str, Any] = {}
     effective_bars_url = ""
     last_data_error = None
     try:
         if hasattr(market, "_bars_url"):
-            effective_bars_url = market._bars_url()  # type: ignore[attr-defined]
+            effective_bars_url = market._bars_url()  # type: ignore
         test_sym = CRYPTO_SYMBOLS[0] if CRYPTO_SYMBOLS else "BTC/USD"
         bars = market.candles([test_sym], limit=1)  # type: ignore
         cnt = 0
         ok_syms = []
         for k, br in (bars or {}).items():
-            if hasattr(br, "frame"):
-                fr = getattr(br, "frame")
-                if fr is None:
-                    pass
-                elif hasattr(fr, "__len__"):
-                    cnt += len(fr)
-                ok_syms.append(k)
+            fr = getattr(br, "frame", None)
+            if fr is not None and hasattr(fr, "__len__"):
+                cnt += len(fr)
+            ok_syms.append(k)
         last_data_error = getattr(market, "last_error", None)
         effective_bars_url = getattr(market, "last_url", effective_bars_url)
         data_probe = {"queried": ok_syms, "rows": cnt}
@@ -335,20 +311,11 @@ def diag_crypto():
         "data_probe": data_probe,
     })
 
-# ----------------------------
-# Orders & Positions (Alpaca)
-# ----------------------------
 @app.get("/orders/recent")
 def orders_recent():
     status = request.args.get("status", "all")
     limit  = int(request.args.get("limit", "50"))
-    params = {
-        "status": status,
-        "limit": str(limit),
-        "direction": "desc",
-        "nested": "true",
-        "asset_class": "crypto",
-    }
+    params = {"status": status, "limit": str(limit), "direction": "desc", "nested": "true", "asset_class": "crypto"}
     r = requests.get(f"{ALPACA_TRADING_BASE}/orders", headers=_alpaca_headers(), params=params, timeout=20)
     try:
         data = r.json()
@@ -356,7 +323,6 @@ def orders_recent():
         data = []
     data = data if isinstance(data, list) else []
     return _ok(data)
-
 
 @app.get("/positions")
 def positions():
@@ -367,7 +333,7 @@ def positions():
         rows = []
     out = []
     for p in rows if isinstance(rows, list) else []:
-        if str(p.get("asset_class", "")).lower() == "crypto" or "/" in str(p.get("symbol", "")):
+        if str(p.get("asset_class","")).lower()=="crypto" or "/" in str(p.get("symbol","")):
             out.append({
                 "symbol": p.get("symbol"),
                 "side": "long" if float(p.get("qty", 0)) >= 0 else "short",
@@ -378,9 +344,6 @@ def positions():
             })
     return _ok(out)
 
-# ----------------------------
-# Scans: C1–C4
-# ----------------------------
 def _scan(name: str):
     dry   = _bool(request.args.get("dry"), default=False)
     force = _bool(request.args.get("force"), default=False)
@@ -397,29 +360,19 @@ def _scan(name: str):
     ver = getattr(mod, "__version__", "unknown")
     return _ok(payload, {"x-strategy-version": ver})
 
-
 @app.post("/scan/c1")
 def scan_c1(): return _scan("c1")
-
-
 @app.post("/scan/c2")
 def scan_c2(): return _scan("c2")
-
-
 @app.post("/scan/c3")
 def scan_c3(): return _scan("c3")
-
-
 @app.post("/scan/c4")
 def scan_c4(): return _scan("c4")
 
-# ----------------------------
-# Signals panel (JSON)
-# ----------------------------
 @app.get("/signals")
 def signals():
     out: Dict[str, Any] = {}
-    for name in ("c1", "c2", "c3", "c4"):
+    for name in ("c1","c2","c3","c4"):
         try:
             mod = _strategy_module(name)
             getter = getattr(mod, "signals", None)
@@ -428,22 +381,10 @@ def signals():
             out[name] = {}
     return _ok(out)
 
-# ----------------------------
-# Inline diag
-# ----------------------------
 @app.get("/diag/inline")
 def diag_inline():
-    return _ok({
-        "app": APP_VERSION,
-        "exchange": CRYPTO_EXCHANGE,
-        "symbols": CRYPTO_SYMBOLS,
-        "server_time": _now_iso(),
-    })
+    return _ok({"app": APP_VERSION, "exchange": CRYPTO_EXCHANGE, "symbols": CRYPTO_SYMBOLS, "server_time": _now_iso()})
 
-
-# ----------------------------
-# Main
-# ----------------------------
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", "10000"))
     app.run(host="0.0.0.0", port=port)
