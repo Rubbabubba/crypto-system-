@@ -27,7 +27,6 @@ DEFAULT_SCOPE = "v1beta3/crypto/us"
 
 DEFAULT_TIMEFRAME = _env("CRYPTO_TIMEFRAME", "5Min")
 DEFAULT_LIMIT = int(_env("CRYPTO_BARS_LIMIT", "500") or "500")
-DEFAULT_FEED = _env("CRYPTO_FEED", "us")  # force 'us' unless explicitly overridden
 
 
 # ---- Helpers for symbol normalization ---------------------------------------
@@ -52,11 +51,11 @@ class BarsResult:
 class MarketCrypto:
     """
     Alpaca crypto bars client
-      • Only uses v1beta3/crypto/us/bars (v2 crypto endpoint does not exist)
+      • Uses v1beta3/crypto/us/bars (no 'feed' or 'adjustment' params allowed)
       • Symbol translation BTC/USD <-> BTCUSD
-      • feed=us and a sane default start window (now-48h) to ensure data
+      • Default start = now-48h to avoid empty responses
     """
-    __version__ = "1.1.1"
+    __version__ = "1.1.2"
 
     def __init__(
         self,
@@ -67,11 +66,10 @@ class MarketCrypto:
         session: Optional[requests.Session] = None,
         default_timeframe: str = DEFAULT_TIMEFRAME,
         default_limit: int = DEFAULT_LIMIT,
-        default_feed: Optional[str] = DEFAULT_FEED,
     ):
         raw_base = (data_base or RAW_BASE or "https://data.alpaca.markets").rstrip("/")
 
-        # Always v1beta3/crypto/us
+        # Always v1beta3/crypto/us unless caller passed a full v1beta3 path
         lowered = raw_base.lower()
         if "v1beta3/crypto" in lowered:
             self.data_base = raw_base
@@ -85,7 +83,7 @@ class MarketCrypto:
         self.s = session or requests.Session()
         self.default_timeframe = default_timeframe
         self.default_limit = default_limit
-        self.default_feed = default_feed or "us"
+
         self.last_error: Optional[str] = None
         self.last_url: Optional[str] = None
 
@@ -174,8 +172,6 @@ class MarketCrypto:
         limit: Optional[int] = None,
         start: Optional[str] = None,
         end: Optional[str] = None,
-        adjustment: str = "raw",
-        feed: Optional[str] = None,
     ) -> Dict[str, BarsResult]:
         req_syms = [s.strip() for s in symbols if s and str(s).strip()]
         if not req_syms:
@@ -186,15 +182,12 @@ class MarketCrypto:
         # Default start = now-48h to ensure non-empty results
         if not start:
             start_dt = self.now_utc() - timedelta(hours=48)
-            # RFC3339 with Z
-            start = start_dt.isoformat().replace("+00:00", "Z")
+            start = start_dt.isoformat().replace("+00:00", "Z")  # RFC3339 Z
 
         params: Dict[str, Any] = {
             "symbols": ",".join(data_syms),
             "timeframe": timeframe or self.default_timeframe,
-            "limit": str(limit or self.default_limit),
-            "adjustment": adjustment,
-            "feed": feed or self.default_feed or "us",
+            "limit": int(limit or self.default_limit),
             "start": start,
         }
         if end:
