@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # app.py — Crypto System API
-# Version: 1.7.8
+# Version: 1.8.0
 
 import os
 import json
@@ -9,7 +9,7 @@ from typing import Any, Dict, List, Tuple, Optional
 
 from flask import Flask, request, jsonify, Response, redirect
 
-APP_VERSION = "1.7.8"
+APP_VERSION = "1.8.0"
 app = Flask(__name__)
 
 # ----------------------------- utils -----------------------------
@@ -23,7 +23,7 @@ def _bool(x: Any, default=False) -> bool:
 
 def _int(x: Any, default: int) -> int:
     try:
-        return int(x)
+        return int(str(x).strip())
     except Exception:
         return default
 
@@ -42,6 +42,15 @@ def _tf_norm(tf: str) -> str:
         "1Hour":"1Hour","1Day":"1Day"
     }
     return m.get(s, s)
+
+def _to_utc_ts(x) -> Optional[dt.datetime]:
+    try:
+        if isinstance(x, (int, float)):
+            return dt.datetime.fromtimestamp(float(x), tz=dt.timezone.utc)
+        # Alpaca returns RFC3339 strings
+        return dt.datetime.fromisoformat(str(x).replace("Z","+00:00")).astimezone(dt.timezone.utc)
+    except Exception:
+        return None
 
 # ----------------------------- imports -----------------------------
 try:
@@ -95,18 +104,42 @@ def _alpaca_headers() -> Dict[str, str]:
         h["APCA-API-SECRET-KEY"] = sec
     return h
 
-def _rename_bars_df(df: pd.DataFrame) -> pd.DataFrame:
+def _normalize_df(df: pd.DataFrame) -> pd.DataFrame:
+    """Return df with columns: time, ts, open, high, low, close, volume (UTC)."""
+    if df is None or df.empty:
+        return pd.DataFrame(columns=["time","ts","open","high","low","close","volume"])
+    # Accept both v1beta3 & generic names
     rename_map = {
-        "t":"ts","o":"open","h":"high","l":"low","c":"close","v":"volume",
-        "timestamp":"ts","open":"open","high":"high","low":"low","close":"close","volume":"volume"
+        "t":"time","timestamp":"time",
+        "o":"open","h":"high","l":"low","c":"close","v":"volume",
+        "Open":"open","High":"high","Low":"low","Close":"close","Volume":"volume",
     }
     df = df.rename(columns=rename_map)
-    cols = [c for c in ["ts","open","high","low","close","volume"] if c in df.columns]
-    return df[cols] if cols else df
+    # Create 'time' if missing but 'ts' exists
+    if "time" not in df.columns and "ts" in df.columns:
+        df["time"] = df["ts"]
+    # Create 'ts' from 'time' for parity
+    if "ts" not in df.columns and "time" in df.columns:
+        df["ts"] = df["time"]
+
+    # Convert time columns to UTC datetime
+    for col in ("time","ts"):
+        if col in df.columns:
+            try:
+                df[col] = pd.to_datetime(df[col], utc=True, errors="coerce")
+            except Exception:
+                df[col] = [ _to_utc_ts(v) for v in df[col] ]
+    # Ensure OHLCV exist
+    for col in ("open","high","low","close","volume"):
+        if col not in df.columns:
+            df[col] = pd.NA
+    # Order & drop dup rows by time
+    df = df[["time","ts","open","high","low","close","volume"]]
+    df = df.dropna(subset=["time"]).drop_duplicates(subset=["time"]).sort_values("time")
+    return df.reset_index(drop=True)
 
 def _http_candles_multi(symbols: List[str], timeframe: str, limit: int
 ) -> Tuple[Dict[str,pd.DataFrame], List[str], Optional[str], Optional[str]]:
-    """Batch fetch; returns map + attempts/url/error (no per-symbol retries here)."""
     attempts: List[str] = []
     last_url: Optional[str] = None
     last_error: Optional[str] = None
@@ -128,7 +161,7 @@ def _http_candles_multi(symbols: List[str], timeframe: str, limit: int
         for s in symbols:
             rows = bars_map.get(s, [])
             if rows:
-                out[s] = _rename_bars_df(pd.DataFrame(rows))
+                out[s] = _normalize_df(pd.DataFrame(rows))
         return out, attempts, last_url, None
     except Exception as e:
         last_error = f"{type(e).__name__}: {e}"
@@ -136,7 +169,6 @@ def _http_candles_multi(symbols: List[str], timeframe: str, limit: int
 
 def _http_candles_single(symbol: str, timeframe: str, limit: int
 ) -> Tuple[pd.DataFrame, str, Optional[str]]:
-    """Single-symbol fetch; returns df, url, error."""
     base = _alpaca_base()
     tf = _tf_norm(timeframe)
     url = f"{base}/v1beta3/crypto/us/bars"
@@ -150,71 +182,72 @@ def _http_candles_single(symbol: str, timeframe: str, limit: int
         bars_map = data.get("bars", {})
         rows = bars_map.get(symbol, [])
         if rows:
-            return _rename_bars_df(pd.DataFrame(rows)), final_url, None
+            return _normalize_df(pd.DataFrame(rows)), final_url, None
         return pd.DataFrame(), final_url, None
     except Exception as e:
         return pd.DataFrame(), url, f"{type(e).__name__}: {e}"
 
 # ----------------------------- safe market wrapper -----------------------------
 class MarketProxy:
-    """Facade around MarketCrypto with HTTP fallback (batch + per-symbol)."""
+    """
+    Facade around MarketCrypto with HTTP fallback and schema normalization.
+    Also offers common method aliases some strategies use.
+    """
     def __init__(self, inner):
         self.inner = inner
         self.symbols = getattr(inner, "symbols", ["BTC/USD","ETH/USD","SOL/USD","DOGE/USD"])
         self.last_bars_url: Optional[str] = None
         self.last_error: Optional[str] = None
         self.last_attempts: List[str] = []
+        self._last_map: Dict[str, pd.DataFrame] = {}
 
-    def _inner_try(self, symbols: List[str], timeframe: str, limit: int):
-        attempts: List[str] = []
-        url = None
-        err = None
+    # ---- canonical method
+    def candles(self, symbols: List[str], timeframe: str = "5Min", limit: int = 600, return_debug: bool = False):
+        tf = _tf_norm(timeframe or "5Min")
+        limit = int(limit or 600)
+
+        # Try inner market first (if present)
         out: Dict[str, pd.DataFrame] = {s: pd.DataFrame() for s in symbols}
-        if not hasattr(self.inner, "candles"):
-            return out, attempts, url, "inner: no candles()"
-        try:
-            rv = self.inner.candles(symbols=symbols, timeframe=timeframe, limit=limit, return_debug=True)
-            if isinstance(rv, tuple) and len(rv) == 4:
-                maybe_map, attempts, url, err = rv
-                if isinstance(maybe_map, dict):
+        attempts: List[str] = []
+        last_url = None
+        last_error = None
+
+        def _norm_in_place(m: Dict[str, Any]):
+            for s in symbols:
+                df = m.get(s)
+                if isinstance(df, pd.DataFrame):
+                    m[s] = _normalize_df(df)
+
+        if self.inner and hasattr(self.inner, "candles"):
+            try:
+                rv = self.inner.candles(symbols=symbols, timeframe=tf, limit=limit, return_debug=True)
+                if isinstance(rv, tuple) and len(rv) == 4:
+                    maybe_map, attempts, last_url, last_error = rv
+                    if isinstance(maybe_map, dict):
+                        _norm_in_place(maybe_map)
+                        for s in symbols:
+                            out[s] = maybe_map.get(s, pd.DataFrame())
+                elif isinstance(rv, dict):
+                    _norm_in_place(rv)
                     for s in symbols:
-                        v = maybe_map.get(s)
-                        if isinstance(v, pd.DataFrame):
-                            out[s] = v
-                elif isinstance(maybe_map, pd.DataFrame) and symbols:
-                    out[symbols[0]] = maybe_map
-            elif isinstance(rv, dict):
-                for s in symbols:
-                    v = rv.get(s)
-                    if isinstance(v, pd.DataFrame):
-                        out[s] = v
-            elif isinstance(rv, pd.DataFrame) and symbols:
-                out[symbols[0]] = rv
-        except Exception as e:
-            err = f"inner: {type(e).__name__}: {e}"
-        return out, attempts, url, err
+                        out[s] = rv.get(s, pd.DataFrame())
+                elif isinstance(rv, pd.DataFrame) and symbols:
+                    out[symbols[0]] = _normalize_df(rv)
+            except Exception as e:
+                last_error = f"inner: {type(e).__name__}: {e}"
 
-    def candles(self, symbols: List[str], timeframe: str, limit: int, return_debug: bool = False):
-        tf = _tf_norm(timeframe)
-        m1, a1, u1, e1 = self._inner_try(symbols, tf, limit)
-        has_any = any((not df.empty) for df in m1.values())
-
-        attempts = list(a1)
-        last_url = u1
-        last_error = e1
-
-        # 1) Batch fallback
-        if not has_any:
+        # Batch fallback
+        if not any((not df.empty) for df in out.values()):
             m2, a2, u2, e2 = _http_candles_multi(symbols, tf, limit)
             for s in symbols:
-                if m1.get(s) is None or m1[s].empty:
-                    m1[s] = m2.get(s, pd.DataFrame())
+                if out[s].empty and not m2.get(s, pd.DataFrame()).empty:
+                    out[s] = m2[s]
             attempts.extend(a2)
             last_url = u2 or last_url
             last_error = e2 or last_error
 
-        # 2) Per-symbol fallback for any that are still empty
-        empties = [s for s in symbols if m1.get(s) is None or m1[s].empty]
+        # Per-symbol fallback
+        empties = [s for s in symbols if out[s].empty]
         for s in empties:
             df, url_s, err_s = _http_candles_single(s, tf, limit)
             if url_s:
@@ -223,15 +256,32 @@ class MarketProxy:
             if err_s and not last_error:
                 last_error = err_s
             if not df.empty:
-                m1[s] = df
+                out[s] = df
 
         self.last_attempts = attempts
         self.last_bars_url = last_url
         self.last_error = last_error
+        self._last_map = out
 
         if return_debug:
-            return m1, attempts, last_url, last_error
-        return m1
+            return out, attempts, last_url, last_error
+        return out
+
+    # ---- aliases many strategies might call
+    def bars(self, symbols: List[str], timeframe: str = "5Min", limit: int = 600, return_debug: bool = False):
+        return self.candles(symbols, timeframe, limit, return_debug)
+
+    def history(self, symbol: str, timeframe: str = "5Min", limit: int = 600) -> pd.DataFrame:
+        m = self.candles([symbol], timeframe, limit)
+        return m.get(symbol, pd.DataFrame())
+
+    def candles_df(self, symbol: str, timeframe: str = "5Min", limit: int = 600) -> pd.DataFrame:
+        return self.history(symbol, timeframe, limit)
+
+    # Convenience to see last fetched normalized frames
+    @property
+    def last_df_map(self) -> Dict[str, pd.DataFrame]:
+        return self._last_map
 
 # Use proxy if underlying exists
 market = MarketProxy(_underlying_market) if _underlying_market else None
@@ -244,7 +294,7 @@ def _norm_scan_params(args) -> Dict[str, Any]:
         p["timeframe"] = str(tf)
     lim = args.get("limit") or args.get("param.limit")
     if lim:
-        p["limit"] = _int(lim, 300)
+        p["limit"] = _int(lim, 600)
     syms = args.get("symbols")
     if syms:
         toks = [s.strip() for s in syms.split(",") if s.strip()]
@@ -350,7 +400,7 @@ def diag_candles():
 
     return jsonify({
         "symbols": syms,
-        "timeframe": tf,
+        "timeframe": _tf_norm(tf),
         "limit": limit,
         "rows": rows_map,
         "last_attempts": attempts,
@@ -382,6 +432,11 @@ def _run_strategy_direct(name: str, dry: bool, force: bool, params: Dict[str, An
         return False, [{"action": "error", "error": f"strategy {name} unavailable"}]
     if not market or not broker:
         return False, [{"action": "error", "error": "market/broker unavailable"}]
+
+    # defaults if caller omitted
+    params = dict(params or {})
+    params.setdefault("timeframe", "5Min")
+    params.setdefault("limit", 600)
 
     try:
         symbols = params.pop("symbols", getattr(market, "symbols", ["BTC/USD","ETH/USD","SOL/USD","DOGE/USD"]))
