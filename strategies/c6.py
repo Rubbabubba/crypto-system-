@@ -1,100 +1,109 @@
-# strategies/c6.py
-# Version: 1.0.0
+"""
+Strategy C6 — Trend-follow with ATR breakout & trailing logic (scan-style)
+Version: 1.0.1
+- Uses market.candles(...) (or market.get_bars via compat shim)
+- Accepts: timeframe, limit, ma_len, atr_len, atr_mult
+"""
+
 from __future__ import annotations
-from typing import Any, Dict, List
-import numpy as np
+from typing import Dict, Any, List
 import pandas as pd
+import numpy as np
+
+DEFAULTS = dict(
+    timeframe="5Min",
+    limit=600,
+    ma_len=50,
+    atr_len=14,
+    atr_mult=2.0,
+)
 
 def _ema(s: pd.Series, n: int) -> pd.Series:
-    return s.ewm(span=n, adjust=False, min_periods=n).mean()
+    return s.ewm(span=n, adjust=False).mean()
 
-def _tr(h, l, pc):
-    return np.maximum(h - l, np.maximum(abs(h - pc), abs(l - pc)))
+def _atr(h: pd.Series, l: pd.Series, c: pd.Series, n: int) -> pd.Series:
+    high_low = (h - l).abs()
+    high_close = (h - c.shift()).abs()
+    low_close = (l - c.shift()).abs()
+    tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
+    return tr.rolling(n, min_periods=n).mean()
 
-def _atr(df: pd.DataFrame, n: int) -> pd.Series:
-    tr = _tr(df['high'], df['low'], df['close'].shift(1))
-    return pd.Series(tr).rolling(n, min_periods=n).mean()
+def _try_buy(broker, symbol: str, *, notional: float | None, qty: float | None):
+    if notional is not None:
+        if hasattr(broker, "market_buy_notional"):
+            return broker.market_buy_notional(symbol, notional=notional)
+        if hasattr(broker, "submit_order"):
+            return broker.submit_order(symbol=symbol, side="buy", type="market",
+                                       notional=notional, time_in_force="gtc")
+    if qty is not None:
+        if hasattr(broker, "market_buy"):
+            return broker.market_buy(symbol, qty=qty)
+        if hasattr(broker, "submit_order"):
+            return broker.submit_order(symbol=symbol, side="buy", type="market",
+                                       qty=qty, time_in_force="gtc")
+    return {"status": "no_broker_method"}
 
-def _rsi(s: pd.Series, n: int) -> pd.Series:
-    delta = s.diff()
-    up = delta.clip(lower=0)
-    down = -delta.clip(upper=0)
-    ma_up = up.ewm(alpha=1/n, adjust=False, min_periods=n).mean()
-    ma_dn = down.ewm(alpha=1/n, adjust=False, min_periods=n).mean()
-    rs = ma_up / ma_dn.replace(0, np.nan)
-    rsi = 100 - (100 / (1 + rs))
-    return rsi
+def run(market, broker, symbols: List[str], params: Dict[str, Any], *, dry: bool, pwrite=print, log=print):
+    cfg = {**DEFAULTS, **(params or {})}
+    tf = cfg["timeframe"]
+    limit = int(cfg["limit"])
+    ma_len = int(cfg["ma_len"])
+    atr_len = int(cfg["atr_len"])
+    atr_mult = float(cfg["atr_mult"])
+    notional = float(cfg.get("notional")) if cfg.get("notional") else None
+    qty = float(cfg.get("qty")) if cfg.get("qty") else None
 
-def _place_order(broker, symbol: str, side: str, qty=None, notional=None):
-    for name, payload in [
-        ("market_order", {"symbol": symbol, "side": side, "qty": qty, "notional": notional}),
-        ("market_buy",   {"symbol": symbol, "qty": qty, "notional": notional}),
-        ("market_sell",  {"symbol": symbol, "qty": qty, "notional": notional}),
-        ("create_order", {"symbol": symbol, "side": side, "type": "market", "time_in_force": "gtc", "qty": qty, "notional": notional}),
-    ]:
-        if hasattr(broker, name):
-            try:
-                return getattr(broker, name)(**{k:v for k,v in payload.items() if v is not None})
-            except Exception as e:
-                return {"status":"error","error":str(e)}
-    return {"status":"no_broker_method"}
+    if hasattr(market, "candles"):
+        data = market.candles(symbols=symbols, timeframe=tf, limit=limit)
+    else:
+        data = market.get_bars(symbols=symbols, timeframe=tf, limit=limit)
 
-def _analyze_symbol(df: pd.DataFrame, symbol: str, p: Dict[str, Any]) -> Dict[str, Any]:
-    if df is None or len(df) == 0:
-        return {"symbol": symbol, "action": "error", "error": "no_data"}
-    for c in ("ts","open","high","low","close","volume"):
-        if c not in df.columns:
-            return {"symbol": symbol, "action": "error", "error": f"missing_col:{c}"}
-
-    kc_len = int(p.get("kc_len", 20))
-    kc_mult = float(p.get("kc_mult", 2.0))
-    atr_len = int(p.get("atr_len", 14))
-    rsi_len = int(p.get("rsi_len", 14))
-    rsi_buy = float(p.get("rsi_buy", 35))
-    rsi_sell = float(p.get("rsi_sell", 65))
-
-    close = df["close"]
-    basis = _ema(close, kc_len)
-    atr = _atr(df, atr_len)
-    upper = basis + kc_mult * atr
-    lower = basis - kc_mult * atr
-    rsi = _rsi(close, rsi_len)
-
-    if pd.isna(basis.iloc[-1]) or pd.isna(upper.iloc[-1]) or pd.isna(lower.iloc[-1]) or pd.isna(rsi.iloc[-1]):
-        return {"symbol": symbol, "action": "error", "error": "warmup"}
-
-    c = float(close.iloc[-1])
-    b = float(basis.iloc[-1])
-    u = float(upper.iloc[-1])
-    l = float(lower.iloc[-1])
-    r = float(rsi.iloc[-1])
-    a = float(atr.iloc[-1])
-
-    # Mean-reversion gates:
-    if c <= l and r <= rsi_buy:
-        return {"symbol": symbol, "action": "buy", "reason": "keltner_rsi_long", "close": c,
-                "basis": b, "upper": u, "lower": l, "rsi": r, "atr": a}
-    if c >= u and r >= rsi_sell:
-        return {"symbol": symbol, "action": "sell", "reason": "keltner_rsi_short", "close": c,
-                "basis": b, "upper": u, "lower": l, "rsi": r, "atr": a}
-
-    return {"symbol": symbol, "action": "flat", "reason": "no_signal", "close": c,
-            "basis": b, "upper": u, "lower": l, "rsi": r, "atr": a}
-
-def run(market, broker, symbols, params, dry, log, pwrite):
-    tf   = params.get("timeframe", "5Min")
-    lim  = int(params.get("limit", 600))
-    data = market.get_bars(symbols=symbols, timeframe=tf, limit=lim)
-
-    notional = params.get("notional")
-    qty      = params.get("qty")
-
-    results = []
+    out = []
     for sym in symbols:
-        res = _analyze_symbol(data.get(sym), sym, params)
-        if not dry and res.get("action") in ("buy","sell"):
-            side = "buy" if res["action"] == "buy" else "sell"
-            res["order_id"] = _place_order(broker, sym, side, qty=qty, notional=notional)
-        results.append(res)
+        df = data.get(sym)
+        if df is None or len(df) == 0:
+            out.append({"symbol": sym, "action": "error", "error": "no_data"})
+            continue
 
-    return {"ok": True, "strategy": "c6", "results": results, "dry": bool(dry), "force": False}
+        h = df["high"].astype(float)
+        l = df["low"].astype(float)
+        c = df["close"].astype(float)
+
+        ma = _ema(c, ma_len)
+        atr = _atr(h, l, c, atr_len)
+
+        last_close = float(c.iloc[-1])
+        last_ma = float(ma.iloc[-1])
+        last_atr = float(atr.iloc[-1]) if not np.isnan(atr.iloc[-1]) else None
+
+        # Simple breakout logic: price above MA + ATR band
+        upper_band = last_ma + atr_mult * (last_atr if last_atr is not None else 0.0)
+        lower_band = last_ma - atr_mult * (last_atr if last_atr is not None else 0.0)
+
+        action = "flat"
+        reason = "no_signal"
+        order_id = None
+
+        if last_atr is not None:
+            if last_close > upper_band:
+                action = "buy"
+                reason = "trend_breakout_up"
+                if not dry:
+                    order_id = _try_buy(broker, sym, notional=notional, qty=qty)
+            elif last_close < lower_band:
+                action = "flat"  # in this simplified scan we exit via c5’s sell rule or a separate exit strategy
+                reason = "trend_breakdown"
+
+        out.append({
+            "symbol": sym,
+            "action": action,
+            "reason": reason,
+            "close": last_close,
+            "ma": round(last_ma, 4),
+            "atr": round(last_atr, 6) if last_atr is not None else None,
+            "upper": round(upper_band, 4) if last_atr is not None else None,
+            "lower": round(lower_band, 4) if last_atr is not None else None,
+            "order_id": order_id if not dry else None,
+        })
+
+    return {"ok": True, "force": False, "dry": dry, "results": out, "strategy": "c6"}
