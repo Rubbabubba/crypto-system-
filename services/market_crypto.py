@@ -1,9 +1,9 @@
 # services/market_crypto.py
-# Version: 0.4.0
+# Version: 0.4.1
 from __future__ import annotations
 
 import os
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 from dataclasses import dataclass
 
 import requests
@@ -39,8 +39,10 @@ class MarketCrypto:
     """
     Robust Alpaca crypto data client.
 
-    Primary: v1beta3 /crypto/us/bars with slash pairs (BTC/USD).
-    Fallback: v2 /crypto/bars?feed=us (some accounts intermittently return empties on multi-symbol v1beta3).
+    Order of attempts:
+      1) v1beta3 multi-symbol
+      2) v2 multi-symbol (feed=us)
+      3) per-symbol fan-out: v1beta3 then v2 for each symbol
     """
 
     def __init__(self,
@@ -55,6 +57,7 @@ class MarketCrypto:
         self.last_url: str = ""
         self.last_error: Optional[str] = None
         self._last_used_path: str = "/v1beta3/crypto/us/bars"
+        self.last_attempts: List[str] = []
 
     @classmethod
     def from_env(cls) -> "MarketCrypto":
@@ -70,38 +73,33 @@ class MarketCrypto:
     def _bars_url(self) -> str:
         return f"{self.data_base}{self._last_used_path}"
 
-    # ---------- core ----------
-    def _request_v1beta3(self, symbols: List[str], timeframe: str, limit: int, start: Optional[str]) -> Dict[str, Any]:
-        self._last_used_path = "/v1beta3/crypto/us/bars"
-        url = f"{self.data_base}{self._last_used_path}"
-        params: Dict[str, Any] = {
-            "symbols": ",".join(symbols),   # KEEP slashes
-            "timeframe": timeframe,
-            "limit": str(limit),
-        }
-        if start:
-            params["start"] = start
-        self.last_url = requests.Request("GET", url, params=params).prepare().url or url
+    # ---------- HTTP helpers ----------
+    def _prep(self, path: str, params: Dict[str, Any]) -> Tuple[str, Dict[str, Any], str]:
+        url = f"{self.data_base}{path}"
+        prepared = requests.Request("GET", url, params=params).prepare()
+        full = prepared.url or url
+        return url, params, full
+
+    def _request(self, path: str, params: Dict[str, Any]) -> Dict[str, Any]:
+        url, params, full = self._prep(path, params)
+        self._last_used_path = path
+        self.last_url = full
+        self.last_attempts.append(full)
         r = self.session.get(url, headers=self._headers(), params=params, timeout=20)
         r.raise_for_status()
         return r.json()
+
+    def _request_v1beta3(self, symbols: List[str], timeframe: str, limit: int, start: Optional[str]) -> Dict[str, Any]:
+        params: Dict[str, Any] = {"symbols": ",".join(symbols), "timeframe": timeframe, "limit": str(limit)}
+        if start: params["start"] = start
+        return self._request("/v1beta3/crypto/us/bars", params)
 
     def _request_v2(self, symbols: List[str], timeframe: str, limit: int, start: Optional[str]) -> Dict[str, Any]:
-        self._last_used_path = "/v2/crypto/bars"
-        url = f"{self.data_base}{self._last_used_path}"
-        params: Dict[str, Any] = {
-            "symbols": ",".join(symbols),   # KEEP slashes
-            "timeframe": timeframe,
-            "limit": str(limit),
-            "feed": "us",
-        }
-        if start:
-            params["start"] = start
-        self.last_url = requests.Request("GET", url, params=params).prepare().url or url
-        r = self.session.get(url, headers=self._headers(), params=params, timeout=20)
-        r.raise_for_status()
-        return r.json()
+        params: Dict[str, Any] = {"symbols": ",".join(symbols), "timeframe": timeframe, "limit": str(limit), "feed": "us"}
+        if start: params["start"] = start
+        return self._request("/v2/crypto/bars", params)
 
+    # ---------- payload → frames ----------
     def _build_out(self, symbols: List[str], payload: Dict[str, Any]) -> Dict[str, BarResult]:
         data = payload.get("bars") or {}
         out: Dict[str, BarResult] = {}
@@ -122,6 +120,10 @@ class MarketCrypto:
             out[sym] = BarResult(sym, df)
         return out
 
+    def _all_empty(self, out: Dict[str, BarResult]) -> bool:
+        return all(len(br.frame) == 0 for br in out.values())
+
+    # ---------- public ----------
     def candles(self,
                 symbols: List[str],
                 timeframe: str = "5Min",
@@ -136,7 +138,11 @@ class MarketCrypto:
           - bars / limit: number of rows
           - start: ISO8601
         """
-        # Alias handling
+        # Reset attempt log per call
+        self.last_attempts = []
+        self.last_error = None
+
+        # Aliases
         tf = kwargs.get("tf")
         if tf and not timeframe:
             timeframe = tf
@@ -151,28 +157,46 @@ class MarketCrypto:
         if kwargs.get("start") and not start:
             start = kwargs.get("start")
 
-        self.last_error = None
-
-        # First try v1beta3
+        # Try multi v1beta3
         try:
             payload = self._request_v1beta3(symbols, timeframe, limit, start)
             out = self._build_out(symbols, payload)
-            if any(len(v.frame) for v in out.values()):
+            if not self._all_empty(out):
                 return out
         except requests.HTTPError as e:
             self.last_error = f"v1beta3 HTTP {getattr(e.response, 'status_code', '?')}: {getattr(e.response, 'text', str(e))}"
         except Exception as e:
             self.last_error = f"v1beta3 error: {str(e)}"
 
-        # Fallback to v2 if v1beta3 was empty or errored
+        # Try multi v2
         try:
             payload2 = self._request_v2(symbols, timeframe, limit, start)
             out2 = self._build_out(symbols, payload2)
-            return out2
+            if not self._all_empty(out2):
+                return out2
         except requests.HTTPError as e2:
             self.last_error = f"{self.last_error or ''} | v2 HTTP {getattr(e2.response, 'status_code', '?')}: {getattr(e2.response, 'text', str(e2))}".strip()
-            # Return empty frames for consistency
-            return {sym: BarResult(sym, pd.DataFrame(columns=["ts","open","high","low","close","volume"])) for sym in symbols}
         except Exception as e2:
             self.last_error = f"{self.last_error or ''} | v2 error: {str(e2)}".strip()
-            return {sym: BarResult(sym, pd.DataFrame(columns=["ts","open","high","low","close","volume"])) for sym in symbols}
+
+        # Fan-out per symbol: v1beta3 then v2
+        merged: Dict[str, BarResult] = {}
+        for sym in symbols:
+            # v1beta3 single
+            try:
+                p1 = self._request_v1beta3([sym], timeframe, limit, start)
+                r1 = self._build_out([sym], p1)
+                if not self._all_empty(r1):
+                    merged[sym] = r1[sym]
+                    continue
+            except Exception:
+                pass
+            # v2 single
+            try:
+                p2 = self._request_v2([sym], timeframe, limit, start)
+                r2 = self._build_out([sym], p2)
+                merged[sym] = r2[sym]
+            except Exception:
+                merged[sym] = BarResult(sym, pd.DataFrame(columns=["ts","open","high","low","close","volume"]))
+
+        return merged
