@@ -1,5 +1,5 @@
 # app.py  —  Crypto System Web API
-# Version: 1.6.10
+# Version: 1.6.11
 from __future__ import annotations
 
 import os, json, importlib
@@ -12,7 +12,7 @@ from flask import Flask, request, jsonify, Response, redirect
 # ----------------------------
 # App / Env
 # ----------------------------
-APP_VERSION = os.environ.get("APP_VERSION", "1.6.10")
+APP_VERSION = os.environ.get("APP_VERSION", "1.6.11")
 SYSTEM_NAME = "crypto"
 
 CRYPTO_EXCHANGE = os.environ.get("CRYPTO_EXCHANGE", "alpaca")
