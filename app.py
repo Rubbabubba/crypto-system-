@@ -1,668 +1,585 @@
-#!/usr/bin/env python3
-# app.py — Crypto System API
-# Version: 1.8.1
+# app.py
+# Version: 1.7.1
+from __future__ import annotations
 
 import os
 import json
-import datetime as dt
-from typing import Any, Dict, List, Tuple, Optional, Iterable
+from datetime import datetime, timezone
+from typing import Any, Dict, List, Tuple
 
-from flask import Flask, request, jsonify, Response, redirect
+from flask import Flask, jsonify, request, redirect, Response
 
-APP_VERSION = "1.8.1"
-app = Flask(__name__)
-
-# ----------------------------- utils -----------------------------
-def _bool(x: Any, default=False) -> bool:
-    if x is None:
-        return default
-    if isinstance(x, bool):
-        return x
-    s = str(x).strip().lower()
-    return s in ("1","true","t","yes","y","on")
-
-def _int(x: Any, default: int) -> int:
-    try:
-        return int(str(x).strip())
-    except Exception:
-        return default
-
-def _now_iso() -> str:
-    return dt.datetime.utcnow().replace(tzinfo=dt.timezone.utc).isoformat()
-
-def _tf_norm(tf: str) -> str:
-    if not tf:
-        return "5Min"
-    s = str(tf).strip()
-    m = {
-        "1m":"1Min","3m":"3Min","5m":"5Min","15m":"15Min","30m":"30Min","60m":"60Min",
-        "1h":"1Hour","1H":"1Hour","1d":"1Day","1D":"1Day",
-        "5min":"5Min","15min":"15Min","30min":"30Min","60min":"60Min",
-        "1Min":"1Min","3Min":"3Min","5Min":"5Min","15Min":"15Min","30Min":"30Min","60Min":"60Min",
-        "1Hour":"1Hour","1Day":"1Day"
-    }
-    return m.get(s, s)
-
-def _to_utc_ts(x) -> Optional[dt.datetime]:
-    try:
-        if isinstance(x, (int, float)):
-            return dt.datetime.fromtimestamp(float(x), tz=dt.timezone.utc)
-        return dt.datetime.fromisoformat(str(x).replace("Z","+00:00")).astimezone(dt.timezone.utc)
-    except Exception:
-        return None
-
-# ----------------------------- imports -----------------------------
+# --- Strategy imports (ensure these files exist) ---
+# Your existing strategies:
+#   strategies/c1.py, strategies/c2.py, strategies/c3.py, strategies/c4.py
+# New strategies we added:
+#   strategies/c5.py, strategies/c6.py
 try:
-    from services.exchange_exec import ExchangeExec
+    import strategies.c1 as c1
 except Exception:
-    ExchangeExec = None  # type: ignore
-
+    c1 = None
 try:
-    from services.market_crypto import MarketCrypto
+    import strategies.c2 as c2
 except Exception:
-    MarketCrypto = None  # type: ignore
+    c2 = None
+try:
+    import strategies.c3 as c3
+except Exception:
+    c3 = None
+try:
+    import strategies.c4 as c4
+except Exception:
+    c4 = None
+try:
+    import strategies.c5 as c5
+except Exception:
+    c5 = None
+try:
+    import strategies.c6 as c6
+except Exception:
+    c6 = None
 
-import requests
-import pandas as pd
-
-# strategies c1..c4
-_strat_modules: Dict[str, Any] = {}
-for _name in ("c1","c2","c3","c4"):
-    try:
-        _strat_modules[_name] = __import__(f"strategies.{_name}", fromlist=["*"])
-    except Exception:
-        _strat_modules[_name] = None
-
-# ----------------------------- broker/market -----------------------------
-def _make_broker():
-    if ExchangeExec is None:
-        return None
-    return ExchangeExec.from_env()
-
+# --- Services (market + broker) ---
+# Expecting:
+#   services/market_crypto.py -> class MarketCrypto with a .make() or similar factory
+#   services/exchange_exec.py -> class ExchangeExec with .from_env()
 def _make_market():
-    if MarketCrypto is None:
-        return None
     try:
+        from services.market_crypto import MarketCrypto
+        # Prefer a modern factory if you have it; fall back to a simple constructor.
+        if hasattr(MarketCrypto, "make"):
+            return MarketCrypto.make()
+        if hasattr(MarketCrypto, "from_env"):
+            return MarketCrypto.from_env()
         return MarketCrypto()
-    except Exception:
+    except Exception as e:
+        print(f"[boot] Market init failed: {e}")
         return None
 
+def _make_broker():
+    try:
+        from services.exchange_exec import ExchangeExec
+        if hasattr(ExchangeExec, "from_env"):
+            return ExchangeExec.from_env()
+        return ExchangeExec()
+    except Exception as e:
+        print(f"[boot] Broker init failed: {e}")
+        return None
+
+app = Flask(__name__)
+market = _make_market()
 broker = _make_broker()
-_underlying_market = _make_market()
 
-# ----------------------------- Alpaca HTTP helpers -----------------------------
-def _alpaca_base() -> str:
-    return os.getenv("ALPACA_DATA_BASE","https://data.alpaca.markets").rstrip("/")
+APP_VERSION = "1.7.1"
+DEFAULT_SYMBOLS = ["BTC/USD", "ETH/USD", "SOL/USD", "DOGE/USD"]
 
-def _alpaca_headers() -> Dict[str,str]:
-    h: Dict[str,str] = {}
-    key = os.getenv("APCA_API_KEY_ID") or os.getenv("ALPACA_API_KEY_ID")
-    sec = os.getenv("APCA_API_SECRET_KEY") or os.getenv("ALPACA_API_SECRET_KEY")
-    if key and sec:
-        h["APCA-API-KEY-ID"] = key
-        h["APCA-API-SECRET-KEY"] = sec
-    return h
+# ---------- Helpers ----------
+def _ok(payload: Dict[str, Any], code: int = 200) -> Tuple[Response, int]:
+    return jsonify(payload), code
 
-# ----------------------------- normalization -----------------------------
-def _normalize_df(df: pd.DataFrame) -> pd.DataFrame:
-    """Ensure columns: time, ts, open, high, low, close, volume (UTC & sorted)."""
-    if df is None or getattr(df, "empty", False):
-        return pd.DataFrame(columns=["time","ts","open","high","low","close","volume"])
+def _parse_symbols_arg(raw: str | None) -> List[str]:
+    if not raw:
+        return list(DEFAULT_SYMBOLS)
+    # allow comma or space separated; trim items
+    parts = [p.strip() for p in raw.replace(" ", ",").split(",") if p.strip()]
+    return parts or list(DEFAULT_SYMBOLS)
 
-    rename_map = {
-        "t":"time","timestamp":"time","Timestamp":"time",
-        "o":"open","h":"high","l":"low","c":"close","v":"volume",
-        "Open":"open","High":"high","Low":"low","Close":"close","Volume":"volume",
-        "trade_count":"trade_count"
-    }
-    df = df.rename(columns=rename_map, errors="ignore")
-
-    if "time" not in df.columns and "ts" in df.columns:
-        df["time"] = df["ts"]
-    if "ts" not in df.columns and "time" in df.columns:
-        df["ts"] = df["time"]
-
-    for col in ("time","ts"):
-        if col in df.columns:
-            try:
-                df[col] = pd.to_datetime(df[col], utc=True, errors="coerce")
-            except Exception:
-                df[col] = [ _to_utc_ts(v) for v in df[col] ]
-
-    for col in ("open","high","low","close","volume"):
-        if col not in df.columns:
-            df[col] = pd.NA
-
-    cols = ["time","ts","open","high","low","close","volume"]
-    df = df[[c for c in cols if c in df.columns]].dropna(subset=["time"]).drop_duplicates(subset=["time"]).sort_values("time")
-    return df.reset_index(drop=True)
-
-def _bar_like_to_rows(obj: Any) -> List[Dict[str, Any]]:
-    """Coerce SDK Bar objects or dicts into a list of row dicts."""
-    rows: List[Dict[str,Any]] = []
-
-    # Pandas already? Return via to_dict
-    if isinstance(obj, pd.DataFrame):
+def _parse_params(args) -> Dict[str, Any]:
+    out: Dict[str, Any] = {}
+    for k, v in args.items():
+        if k.lower() in ("dry", "force", "symbols"):
+            continue
+        # attempt numeric cast
         try:
-            return obj.to_dict(orient="records")
+            if v.lower() in ("true", "false"):
+                out[k] = (v.lower() == "true")
+            elif "." in v:
+                out[k] = float(v)
+            else:
+                out[k] = int(v)
         except Exception:
-            pass
-
-    # Dict row or {symbol: rows}
-    if isinstance(obj, dict):
-        # If it's a raw row (has o/h/l/c/v keys) treat as single row
-        keys = set(k.lower() for k in obj.keys())
-        if {"o","h","l","c","v","t"}.issubset(keys) or {"open","high","low","close","volume","time"}.issubset(keys):
-            return [obj]
-        # Else assume mapping symbol -> rows
-        for v in obj.values():
-            rows.extend(_bar_like_to_rows(v))
-        return rows
-
-    # Iterable of rows/Bar objects
-    if isinstance(obj, (list, tuple, set)) or (hasattr(obj, "__iter__") and not isinstance(obj, (str, bytes))):
-        try:
-            for item in obj:
-                if isinstance(item, dict):
-                    rows.append(item)
-                else:
-                    # Try to read attributes (Alpaca SDK Bar)
-                    t = getattr(item, "t", getattr(item, "time", None))
-                    o = getattr(item, "o", getattr(item, "open", None))
-                    h = getattr(item, "h", getattr(item, "high", None))
-                    l = getattr(item, "l", getattr(item, "low", None))
-                    c = getattr(item, "c", getattr(item, "close", None))
-                    v = getattr(item, "v", getattr(item, "volume", None))
-                    if any(x is not None for x in (t,o,h,l,c,v)):
-                        rows.append({"t": t, "o": o, "h": h, "l": l, "c": c, "v": v})
-            return rows
-        except Exception:
-            pass
-
-    # SDK containers with common attributes
-    for attr in ("df", "data", "bars"):
-        if hasattr(obj, attr):
-            try:
-                return _bar_like_to_rows(getattr(obj, attr))
-            except Exception:
-                continue
-
-    # Last resort: nothing recognized
-    return rows
-
-def _coerce_to_df(obj: Any) -> pd.DataFrame:
-    """Convert any bar-ish object into our normalized DataFrame."""
-    if obj is None:
-        return _normalize_df(pd.DataFrame())
-    if isinstance(obj, pd.DataFrame):
-        return _normalize_df(obj)
-    if isinstance(obj, dict):
-        # If dict is symbol->rows, try flattening; if it's already rows, normalize directly
-        # Decide by checking values type
-        values = list(obj.values())
-        if values and (isinstance(values[0], (list, tuple, pd.DataFrame)) or hasattr(values[0], "__iter__")):
-            rows = _bar_like_to_rows(obj)
-            return _normalize_df(pd.DataFrame(rows))
-        return _normalize_df(pd.DataFrame(_bar_like_to_rows(obj)))
-    # lists / SDK objects
-    rows = _bar_like_to_rows(obj)
-    return _normalize_df(pd.DataFrame(rows))
-
-# ----------------------------- HTTP fetchers (fallback) -----------------------------
-def _http_candles_multi(symbols: List[str], timeframe: str, limit: int
-) -> Tuple[Dict[str,pd.DataFrame], List[str], Optional[str], Optional[str]]:
-    attempts: List[str] = []
-    last_url: Optional[str] = None
-    last_error: Optional[str] = None
-    out: Dict[str, pd.DataFrame] = {s: pd.DataFrame() for s in symbols}
-
-    base = _alpaca_base()
-    tf = _tf_norm(timeframe)
-    url = f"{base}/v1beta3/crypto/us/bars"
-    params = {"symbols": ",".join(symbols), "timeframe": tf, "limit": str(limit)}
-    try:
-        r = requests.get(url, params=params, headers=_alpaca_headers(), timeout=12)
-        last_url = r.url
-        attempts.append(last_url or url)
-        if r.status_code != 200:
-            last_error = f"HTTP {r.status_code}: {r.text[:300]}"
-            return out, attempts, last_url, last_error
-        data = r.json() or {}
-        bars_map = data.get("bars", {})
-        for s in symbols:
-            rows = bars_map.get(s, [])
-            if rows:
-                out[s] = _coerce_to_df(rows)
-        return out, attempts, last_url, None
-    except Exception as e:
-        last_error = f"{type(e).__name__}: {e}"
-        return out, attempts, last_url, last_error
-
-def _http_candles_single(symbol: str, timeframe: str, limit: int
-) -> Tuple[pd.DataFrame, str, Optional[str]]:
-    base = _alpaca_base()
-    tf = _tf_norm(timeframe)
-    url = f"{base}/v1beta3/crypto/us/bars"
-    params = {"symbols": symbol, "timeframe": tf, "limit": str(limit)}
-    try:
-        r = requests.get(url, params=params, headers=_alpaca_headers(), timeout=12)
-        final_url = r.url
-        if r.status_code != 200:
-            return pd.DataFrame(), final_url, f"HTTP {r.status_code}: {r.text[:300]}"
-        data = r.json() or {}
-        bars_map = data.get("bars", {})
-        rows = bars_map.get(symbol, [])
-        if rows:
-            return _coerce_to_df(rows), final_url, None
-        return pd.DataFrame(), final_url, None
-    except Exception as e:
-        return pd.DataFrame(), url, f"{type(e).__name__}: {e}"
-
-# ----------------------------- safe market proxy -----------------------------
-class MarketProxy:
-    """
-    Facade around MarketCrypto with HTTP fallback and schema normalization.
-    Accepts pandas/JSON as well as Alpaca SDK types (BarResult/BarSet/Bar).
-    """
-    def __init__(self, inner):
-        self.inner = inner
-        self.symbols = getattr(inner, "symbols", ["BTC/USD","ETH/USD","SOL/USD","DOGE/USD"])
-        self.last_bars_url: Optional[str] = None
-        self.last_error: Optional[str] = None
-        self.last_attempts: List[str] = []
-        self._last_map: Dict[str, pd.DataFrame] = {}
-
-    def _coerce_map(self, symbols: List[str], obj: Any) -> Dict[str, pd.DataFrame]:
-        """Try to turn any 'map-ish' result into {symbol: DataFrame}."""
-        out: Dict[str, pd.DataFrame] = {s: pd.DataFrame() for s in symbols}
-
-        # Direct dict mapping
-        if isinstance(obj, dict):
-            # Some SDKs return {'bars': {...}} or similar
-            if "bars" in obj and isinstance(obj["bars"], dict):
-                for s in symbols:
-                    out[s] = _coerce_to_df(obj["bars"].get(s))
-                return out
-            # Otherwise assume keys may be symbols
-            for s in symbols:
-                if s in obj:
-                    out[s] = _coerce_to_df(obj[s])
-            # If nothing matched, but dict contains rows, spread to all? No: leave as is.
-            return out
-
-        # SDK containers with .items()
-        if hasattr(obj, "items"):
-            try:
-                for k, v in obj.items():
-                    if k in out:
-                        out[k] = _coerce_to_df(v)
-            except Exception:
-                pass
-            return out
-
-        # Single-frame fallback (first symbol)
-        if symbols:
-            out[symbols[0]] = _coerce_to_df(obj)
-        return out
-
-    # ---- canonical method
-    def candles(self, symbols: List[str], timeframe: str = "5Min", limit: int = 600, return_debug: bool = False):
-        tf = _tf_norm(timeframe or "5Min")
-        limit = int(limit or 600)
-
-        out: Dict[str, pd.DataFrame] = {s: pd.DataFrame() for s in symbols}
-        attempts: List[str] = []
-        last_url: Optional[str] = None
-        last_error: Optional[str] = None
-
-        # 1) Try inner market (whatever it returns)
-        if self.inner and hasattr(self.inner, "candles"):
-            try:
-                rv = self.inner.candles(symbols=symbols, timeframe=tf, limit=limit, return_debug=True)
-                # Expected shape: (map, attempts, last_url, last_error) OR varying types
-                if isinstance(rv, tuple) and len(rv) == 4:
-                    maybe_map, a2, u2, e2 = rv
-                    attempts.extend(list(a2) if isinstance(a2, (list,tuple)) else [])
-                    last_url = u2 or last_url
-                    last_error = e2 or last_error
-                    out = self._coerce_map(symbols, maybe_map)
-                else:
-                    out = self._coerce_map(symbols, rv)
-            except Exception as e:
-                last_error = f"inner: {type(e).__name__}: {e}"
-
-        # 2) HTTP batch fallback if still empty
-        if not any((isinstance(df, pd.DataFrame) and not df.empty) for df in out.values()):
-            m2, a2, u2, e2 = _http_candles_multi(symbols, tf, limit)
-            attempts.extend(a2)
-            last_url = u2 or last_url
-            last_error = e2 or last_error
-            for s in symbols:
-                if out[s].empty and not m2.get(s, pd.DataFrame()).empty:
-                    out[s] = m2[s]
-
-        # 3) Per-symbol fallback
-        empties = [s for s in symbols if out[s].empty]
-        for s in empties:
-            df, url_s, err_s = _http_candles_single(s, tf, limit)
-            if url_s:
-                attempts.append(url_s)
-                last_url = url_s
-            if err_s and not last_error:
-                last_error = err_s
-            if not df.empty:
-                out[s] = df
-
-        self.last_attempts = attempts
-        self.last_bars_url = last_url
-        self.last_error = last_error
-        self._last_map = out
-
-        if return_debug:
-            return out, attempts, last_url, last_error
-        return out
-
-    # ---- aliases some strategies may call
-    def bars(self, symbols: List[str], timeframe: str = "5Min", limit: int = 600, return_debug: bool = False):
-        return self.candles(symbols, timeframe, limit, return_debug)
-
-    def history(self, symbol: str, timeframe: str = "5Min", limit: int = 600) -> pd.DataFrame:
-        m = self.candles([symbol], timeframe, limit)
-        return m.get(symbol, pd.DataFrame())
-
-    def candles_df(self, symbol: str, timeframe: str = "5Min", limit: int = 600) -> pd.DataFrame:
-        return self.history(symbol, timeframe, limit)
-
-    @property
-    def last_df_map(self) -> Dict[str, pd.DataFrame]:
-        return self._last_map
-
-market = MarketProxy(_underlying_market) if _underlying_market else None
-
-# ----------------------------- scan params normalizer -----------------------------
-def _norm_scan_params(args) -> Dict[str, Any]:
-    p: Dict[str, Any] = {}
-    tf = args.get("timeframe") or args.get("tf") or args.get("param.timeframe")
-    if tf:
-        p["timeframe"] = str(tf)
-    lim = args.get("limit") or args.get("param.limit")
-    if lim:
-        p["limit"] = _int(lim, 600)
-    syms = args.get("symbols")
-    if syms:
-        toks = [s.strip() for s in syms.split(",") if s.strip()]
-        if toks:
-            p["symbols"] = toks
-    for k, v in list(args.items()):
-        if k.startswith("param.") and k not in ("param.timeframe", "param.limit"):
-            p[k[6:]] = v
-    return p
-
-# ----------------------------- gate -----------------------------
-GATE_ON = _bool(os.getenv("CRYPTO_GATE_ON","true"), True)
-GATE_REASON = os.getenv("CRYPTO_GATE_REASON","")
-def _gate_state() -> Dict[str, Any]:
-    clock = {"is_open": True, "next_open": None, "next_close": None, "source": "crypto-24x7"}
-    return {"gate_on": GATE_ON, "decision": "open" if GATE_ON else "closed",
-            "reason": GATE_REASON or ("24/7 crypto" if GATE_ON else "manually disabled"),
-            "clock": clock, "ts": _now_iso()}
-
-# ----------------------------- versions -----------------------------
-def _strategy_versions() -> Dict[str, Dict[str, str]]:
-    out: Dict[str, Dict[str, str]] = {}
-    for name, mod in _strat_modules.items():
-        if mod is None:
-            out[name] = {"version": ""}
-        else:
-            out[name] = {"version": getattr(mod, "STRATEGY_VERSION","") or ""}
+            out[k] = v
     return out
 
-@app.get("/health")
-def health():
-    syms = []
-    try:
-        syms = market.symbols if market and getattr(market, "symbols", None) else ["BTC/USD","ETH/USD","SOL/USD","DOGE/USD"]
-    except Exception:
-        syms = ["BTC/USD","ETH/USD","SOL/USD","DOGE/USD"]
-    return jsonify({"ok": True, "system": "crypto", "symbols": syms})
+def _parse_bool(s: str | None, default: bool) -> bool:
+    if s is None:
+        return default
+    return str(s).lower() in ("1", "true", "yes", "y", "on")
 
+def _run_strategy_direct(mod, strat_name: str):
+    """Uniform runner to call strategy.run(...) with parsed args and safe error handling."""
+    symbols = _parse_symbols_arg(request.args.get("symbols"))
+    params = _parse_params(request.args)
+    dry = _parse_bool(request.args.get("dry"), True)
+
+    def log(*a, **kw):
+        print(*a, **kw)
+
+    if mod is None:
+        return _ok({"ok": False, "strategy": strat_name, "error": "strategy_module_missing"})
+
+    try:
+        result = mod.run(market, broker, symbols, params, dry, log, print)
+        # Flatten a bit to keep old consumers happy
+        payload = {"ok": True, "strategy": strat_name}
+        if isinstance(result, dict):
+            payload.update(result)
+        return _ok(payload)
+    except Exception as e:
+        return _ok({"ok": False, "strategy": strat_name, "error": str(e)})
+
+def _module_version(mod) -> str:
+    # Try a few sources to produce a friendly version string.
+    for attr in ("__version__", "VERSION", "version"):
+        v = getattr(mod, attr, None) if mod else None
+        if isinstance(v, str) and v.strip():
+            return v
+    # Look in top-level __doc__ for a version-like token
+    doc = getattr(mod, "__doc__", "") if mod else ""
+    if isinstance(doc, str):
+        for token in doc.split():
+            if token.lower().startswith("version"):
+                return token
+    # Fallback
+    return "1.x"
+
+# ---------- Basic routes ----------
+@app.get("/")
+def root_redirect():
+    return redirect("/dashboard", code=302)
+
+@app.get("/dashboard")
+def dashboard_view():
+    """Return a full HTML dashboard with quick controls for scans and live orders."""
+    html = f"""<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>Crypto System Dashboard · v{APP_VERSION}</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <style>
+    :root {{
+      --bg: #0e1117;
+      --card: #161b22;
+      --ink: #e6edf3;
+      --muted: #9da7b3;
+      --accent: #2f81f7;
+      --ok: #1f6feb;
+      --warn: #f2cc60;
+      --err: #ff6b6b;
+      --good: #2ea043;
+    }}
+    * {{ box-sizing: border-box; }}
+    body {{
+      margin: 0;
+      background: var(--bg);
+      color: var(--ink);
+      font: 14px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, "Noto Sans", "Apple Color Emoji", "Segoe UI Emoji";
+    }}
+    header {{
+      display:flex; align-items:center; justify-content: space-between;
+      padding: 16px 20px; border-bottom: 1px solid #202634;
+      position: sticky; top: 0; background: rgba(14,17,23,0.9); backdrop-filter: blur(6px);
+    }}
+    header h1 {{ margin: 0; font-size: 18px; }}
+    .grid {{
+      display: grid; grid-template-columns: repeat(12, 1fr); gap: 16px; padding: 16px;
+    }}
+    .card {{
+      background: var(--card); border: 1px solid #222a39; border-radius: 14px; padding: 16px;
+    }}
+    .span-4 {{ grid-column: span 4; }}
+    .span-6 {{ grid-column: span 6; }}
+    .span-8 {{ grid-column: span 8; }}
+    .span-12 {{ grid-column: span 12; }}
+    h2 {{ margin-top: 0; font-size: 16px; }}
+    label {{ color: var(--muted); font-size: 12px; display:block; margin-bottom:4px; }}
+    input, select {{
+      width: 100%; padding: 8px 10px; border-radius: 10px; border: 1px solid #2a3242;
+      background: #0c111b; color: var(--ink);
+    }}
+    .row {{ display:flex; gap: 10px; }}
+    .row > div {{ flex: 1; }}
+    button {{
+      padding: 10px 14px; border-radius: 10px; border: 1px solid #2a3242; background: #0c111b; color: var(--ink);
+      cursor: pointer; transition: all .15s ease;
+    }}
+    button.primary {{ background: var(--accent); border-color: var(--accent); color: white; }}
+    button.good {{ background: var(--good); border-color: var(--good); color: #fff; }}
+    button.warn {{ background: var(--warn); border-color: var(--warn); color: #111; }}
+    button:hover {{ filter: brightness(1.1); transform: translateY(-1px); }}
+    pre {{
+      background: #0b0f16; border: 1px solid #202634; color: #b7c1cc;
+      padding: 12px; border-radius: 12px; overflow:auto; max-height: 420px; white-space: pre-wrap;
+    }}
+    table {{ width:100%; border-collapse: collapse; }}
+    th, td {{ padding: 8px 10px; border-bottom: 1px solid #243048; text-align:left; }}
+    .pill {{ display:inline-flex; padding:2px 8px; border-radius:999px; font-size:12px; border:1px solid #2a3242; color:#c8d2de; }}
+    .muted {{ color: var(--muted);}}
+    .mono {{ font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace; }}
+    .small {{ font-size: 12px; }}
+  </style>
+</head>
+<body>
+  <header>
+    <h1>Crypto Trading System <span class="muted">· v{APP_VERSION}</span></h1>
+    <div class="row">
+      <button id="btn-refresh" title="Refresh panels">Refresh</button>
+      <a href="/health/versions" target="_blank"><button>Health · Versions</button></a>
+    </div>
+  </header>
+
+  <section class="grid">
+    <div class="card span-6">
+      <h2>Scan Runner</h2>
+      <div class="row">
+        <div>
+          <label>Strategy</label>
+          <select id="strat">
+            <option value="c1">c1</option>
+            <option value="c2">c2</option>
+            <option value="c3">c3</option>
+            <option value="c4">c4</option>
+            <option value="c5">c5</option>
+            <option value="c6">c6</option>
+          </select>
+        </div>
+        <div>
+          <label>Dry Run</label>
+          <select id="dry">
+            <option value="1" selected>Yes (no orders)</option>
+            <option value="0">No (live orders)</option>
+          </select>
+        </div>
+      </div>
+      <div class="row" style="margin-top:10px;">
+        <div><label>Symbols (comma-separated)</label><input id="symbols" value="BTC/USD,ETH/USD,SOL/USD,DOGE/USD"/></div>
+      </div>
+      <div class="row" style="margin-top:10px;">
+        <div><label>Timeframe</label><input id="timeframe" value="5Min"/></div>
+        <div><label>Limit</label><input id="limit" value="600"/></div>
+      </div>
+      <div class="row" style="margin-top:10px;">
+        <div><label>Notional ($)</label><input id="notional" placeholder="e.g. 25"/></div>
+        <div><label>Qty</label><input id="qty" placeholder="optional"/></div>
+      </div>
+      <div class="row" style="margin-top:10px;">
+        <div><label>Extra Params (key=value, one per line)</label>
+          <textarea id="extra" rows="6" style="width:100%; background:#0c111b; color:#e6edf3; border:1px solid #2a3242; border-radius:10px;" placeholder="rsi_len=9&#10;rsi_buy=60&#10;rsi_sell=40"></textarea>
+        </div>
+      </div>
+      <div class="row" style="margin-top:12px;">
+        <button class="primary" id="btn-run">Run Scan</button>
+        <button class="good" id="btn-run-c1-live">$25 Quick · c1 LIVE</button>
+        <button class="warn" id="btn-clear">Clear Output</button>
+      </div>
+      <div style="margin-top:12px;">
+        <label>Response</label>
+        <pre id="out">—</pre>
+      </div>
+    </div>
+
+    <div class="card span-6">
+      <h2>Health</h2>
+      <div id="health-container">
+        <div class="muted small">loading…</div>
+      </div>
+      <h2 style="margin-top:18px;">Recent Orders</h2>
+      <div class="row">
+        <div><label class="small">Status</label>
+          <select id="orders-status">
+            <option value="all" selected>all</option>
+            <option value="open">open</option>
+            <option value="closed">closed</option>
+            <option value="canceled">canceled</option>
+            <option value="filled">filled</option>
+          </select>
+        </div>
+        <div><label class="small">Limit</label><input id="orders-limit" value="50"/></div>
+        <div style="align-self:flex-end;"><button id="btn-orders">Refresh Orders</button></div>
+      </div>
+      <pre id="orders">—</pre>
+
+      <h2 style="margin-top:18px;">Positions</h2>
+      <div class="row">
+        <div style="align-self:flex-end;"><button id="btn-positions">Refresh Positions</button></div>
+      </div>
+      <pre id="positions">—</pre>
+    </div>
+
+    <div class="card span-12">
+      <h2>Candles Probe</h2>
+      <div class="row">
+        <div><label>Symbols</label><input id="probe-symbols" value="BTC/USD,ETH/USD,SOL/USD,DOGE/USD"/></div>
+        <div><label>TF</label><input id="probe-tf" value="5m"/></div>
+        <div><label>Limit</label><input id="probe-limit" value="3"/></div>
+        <div style="align-self:flex-end;"><button id="btn-probe">Probe</button></div>
+      </div>
+      <pre id="probe">—</pre>
+    </div>
+  </section>
+
+  <script>
+  const $ = (id) => document.getElementById(id);
+  function kvToQuery(kv) {{
+    const params = [];
+    for (const [k,v] of Object.entries(kv)) {{
+      if (v === undefined || v === null || String(v).trim() === "") continue;
+      params.push(encodeURIComponent(k) + "=" + encodeURIComponent(String(v)));
+    }}
+    return params.length ? ("?" + params.join("&")) : "";
+  }}
+
+  async function runScan(preset) {{
+    const strat = preset?.strat || $("strat").value;
+    const dry = preset?.dry ?? $("dry").value;
+    const symbols = preset?.symbols || $("symbols").value;
+    const timeframe = preset?.timeframe || $("timeframe").value;
+    const limit = preset?.limit || $("limit").value;
+    const notional = preset?.notional ?? $("notional").value;
+    const qty = preset?.qty ?? $("qty").value;
+
+    // parse extra k=v per line
+    const extra = {{}};
+    const raw = $("extra").value || "";
+    raw.split(/\\r?\\n/).forEach(line => {{
+      const s = line.trim();
+      if (!s || s.startsWith("#")) return;
+      const eq = s.indexOf("=");
+      if (eq > 0) {{
+        const k = s.slice(0,eq).trim();
+        const v = s.slice(eq+1).trim();
+        if (k) extra[k] = v;
+      }}
+    }});
+
+    const kv = Object.assign({{
+      dry, symbols, timeframe, limit, notional, qty
+    }}, extra);
+
+    const url = "/scan/" + strat + kvToQuery(kv);
+    $("out").textContent = "POST " + url + "\\n…";
+    try {{
+      const res = await fetch(url, {{ method:"POST" }});
+      const j = await res.json();
+      $("out").textContent = JSON.stringify(j, null, 2);
+    }} catch (e) {{
+      $("out").textContent = "ERROR: " + e;
+    }}
+  }}
+
+  async function refreshHealth() {{
+    try {{
+      const v = await fetch("/health/versions").then(r => r.json());
+      const html = `
+        <table>
+          <tr><th>App</th><th>Exchange</th><th>Systems</th></tr>
+          <tr>
+            <td class="mono">${{v.app}}</td>
+            <td class="mono">${{v.exchange}}</td>
+            <td><pre class="small mono" style="max-height:160px;">${{JSON.stringify(v.systems, null, 2)}}</pre></td>
+          </tr>
+        </table>`;
+      $("health-container").innerHTML = html;
+    }} catch (e) {{
+      $("health-container").innerHTML = `<div class="muted small">error: ${{e}}</div>`;
+    }}
+  }}
+
+  async function refreshOrders() {{
+    const status = $("orders-status").value || "all";
+    const limit = $("orders-limit").value || "50";
+    $("orders").textContent = "Loading…";
+    try {{
+      const j = await fetch(`/orders/recent?status=${{encodeURIComponent(status)}}&limit=${{encodeURIComponent(limit)}}`).then(r => r.json());
+      $("orders").textContent = JSON.stringify(j, null, 2);
+    }} catch (e) {{
+      $("orders").textContent = "ERROR: " + e;
+    }}
+  }}
+
+  async function refreshPositions() {{
+    $("positions").textContent = "Loading…";
+    try {{
+      const j = await fetch("/positions").then(r => r.json());
+      $("positions").textContent = JSON.stringify(j, null, 2);
+    }} catch (e) {{
+      $("positions").textContent = "ERROR: " + e;
+    }}
+  }}
+
+  async function probeCandles() {{
+    const symbols = $("probe-symbols").value;
+    const tf = $("probe-tf").value;
+    const limit = $("probe-limit").value;
+    $("probe").textContent = "Loading…";
+    try {{
+      const j = await fetch(`/diag/candles?symbols=${{encodeURIComponent(symbols)}}&tf=${{encodeURIComponent(tf)}}&limit=${{encodeURIComponent(limit)}}`).then(r => r.json());
+      $("probe").textContent = JSON.stringify(j, null, 2);
+    }} catch (e) {{
+      $("probe").textContent = "ERROR: " + e;
+    }}
+  }}
+
+  $("btn-run").addEventListener("click", () => runScan());
+  $("btn-run-c1-live").addEventListener("click", () => runScan({{
+    strat:"c1", dry:"0", timeframe:"5Min", limit:"600", notional:"25"
+  }}));
+  $("btn-clear").addEventListener("click", () => $("out").textContent = "—");
+  $("btn-refresh").addEventListener("click", () => {{ refreshHealth(); refreshOrders(); refreshPositions(); }});
+  $("btn-orders").addEventListener("click", refreshOrders);
+  $("btn-positions").addEventListener("click", refreshPositions);
+  $("btn-probe").addEventListener("click", probeCandles);
+
+  // initial
+  refreshHealth(); refreshOrders(); refreshPositions();
+  </script>
+</body>
+</html>
+"""
+    return Response(html, mimetype="text/html")
+
+# ---------- Strategy endpoints ----------
+# Keep separate functions to avoid endpoint name collisions.
+@app.post("/scan/c1")
+def scan_c1():
+    return _run_strategy_direct(c1, "c1")
+
+@app.post("/scan/c2")
+def scan_c2():
+    return _run_strategy_direct(c2, "c2")
+
+@app.post("/scan/c3")
+def scan_c3():
+    return _run_strategy_direct(c3, "c3")
+
+@app.post("/scan/c4")
+def scan_c4():
+    return _run_strategy_direct(c4, "c4")
+
+@app.post("/scan/c5")
+def scan_c5():
+    return _run_strategy_direct(c5, "c5")
+
+@app.post("/scan/c6")
+def scan_c6():
+    return _run_strategy_direct(c6, "c6")
+
+# ---------- Health ----------
 @app.get("/health/versions")
 def health_versions():
-    versions = _strategy_versions()
-    resp = {
-        "app": APP_VERSION,
-        "exchange": getattr(broker, "exchange_name", "alpaca") if broker else "unknown",
-        "systems": versions,
+    systems = {
+        "c1": _module_version(c1) if c1 else "",
+        "c2": _module_version(c2) if c2 else "",
+        "c3": _module_version(c3) if c3 else "",
+        "c4": _module_version(c4) if c4 else "",
+        "c5": _module_version(c5) if c5 else "1.0.0",
+        "c6": _module_version(c6) if c6 else "1.0.0",
     }
-    headers = {
-        "x-app-version": APP_VERSION,
-        "x-c1-version": versions.get("c1",{}).get("version",""),
-        "x-c2-version": versions.get("c2",{}).get("version",""),
-        "x-c3-version": versions.get("c3",{}).get("version",""),
-        "x-c4-version": versions.get("c4",{}).get("version",""),
-    }
-    return (jsonify(resp), 200, headers)
+    return _ok({"app": APP_VERSION, "exchange": "alpaca", "systems": systems})
 
-# ----------------------------- diagnostics -----------------------------
+# ---------- Diag: crypto / candles / gate (minimal, but useful) ----------
 @app.get("/diag/crypto")
 def diag_crypto():
-    info: Dict[str, Any] = {
+    out: Dict[str, Any] = {
         "ok": True,
-        "exchange": getattr(broker, "exchange_name", "alpaca") if broker else "unknown",
-        "trading_base": getattr(broker, "trading_base", None) if broker else None,
-        "data_base_env": os.getenv("ALPACA_DATA_BASE") or "https://data.alpaca.markets",
-        "effective_bars_url": getattr(market, "last_bars_url", None) if market else None,
-        "last_data_error": getattr(market, "last_error", None) if market else None,
-        "api_key_present": bool(os.getenv("APCA_API_KEY_ID") or os.getenv("ALPACA_API_KEY_ID")),
-        "symbols": getattr(market, "symbols", ["BTC/USD","ETH/USD","SOL/USD","DOGE/USD"]),
-        "last_attempts": getattr(market, "last_attempts", []),
+        "exchange": "alpaca",
+        "trading_base": getattr(broker, "trading_base", ""),
+        "data_base_env": os.environ.get("ALPACA_DATA_BASE", "https://data.alpaca.markets"),
+        "symbols": DEFAULT_SYMBOLS,
+        "api_key_present": bool(os.environ.get("APCA_API_KEY_ID") or os.environ.get("ALPACA_KEY_ID")),
     }
-    acct_sample = None
-    acct_err = None
-    if broker and hasattr(broker, "account_sample"):
-        try:
-            acct_sample = broker.account_sample()
-        except Exception as e:
-            acct_err = str(e)
-    info["account_sample"] = acct_sample
-    info["account_error"] = acct_err
-    return jsonify(info)
+    # Try probing account (optional)
+    try:
+        if hasattr(broker, "get_account"):
+            acct = broker.get_account()
+            # keep it short
+            out["account_sample"] = {k: acct.get(k) for k in list(acct)[:24]} if isinstance(acct, dict) else str(acct)[:1000]
+    except Exception as e:
+        out["account_error"] = str(e)
+    return _ok(out)
 
 @app.get("/diag/candles")
 def diag_candles():
-    symbols = request.args.get("symbols", "BTC/USD,ETH/USD,SOL/USD,DOGE/USD")
-    limit = _int(request.args.get("limit", 3), 3)
-    tf = request.args.get("tf") or request.args.get("timeframe") or "5m"
-    syms = [s.strip() for s in symbols.split(",") if s.strip()]
-    rows_map: Dict[str, int] = {s: 0 for s in syms}
-    attempts: List[str] = []
-    last_url = None
-    last_error = None
-
-    df_map: Dict[str, Any] = {s: pd.DataFrame() for s in syms}
-    try:
-        if market:
-            rv = market.candles(symbols=syms, timeframe=tf, limit=limit, return_debug=True)
-            if isinstance(rv, tuple) and len(rv) == 4:
-                df_map, attempts, last_url, last_error = rv
-            else:
-                df_map = rv  # already a map
-            for s in syms:
-                df = df_map.get(s)
-                rows_map[s] = int(getattr(df, "shape", [0])[0]) if df is not None else 0
-    except Exception as e:
-        last_error = f"{type(e).__name__}: {e}"
-
-    return jsonify({
-        "symbols": syms,
-        "timeframe": _tf_norm(tf),
+    symbols = _parse_symbols_arg(request.args.get("symbols"))
+    tf = request.args.get("tf", "5m")
+    limit = int(request.args.get("limit", "3"))
+    out = {
+        "symbols": symbols,
+        "timeframe": tf,
         "limit": limit,
-        "rows": rows_map,
-        "last_attempts": attempts,
-        "last_url": last_url,
-        "last_error": last_error,
-    })
+        "rows": {},
+        "last_error": "",
+    }
+    try:
+        if market is None or not hasattr(market, "get_bars"):
+            out["last_error"] = "market_missing_or_no_get_bars"
+            return _ok(out)
+        data = market.get_bars(symbols=symbols, timeframe=tf, limit=limit)  # dict
+        for s in symbols:
+            df = data.get(s)
+            try:
+                out["rows"][s] = int(len(df)) if df is not None else 0
+            except Exception:
+                out["rows"][s] = 0
+    except Exception as e:
+        out["last_error"] = str(e)
+    return _ok(out)
 
 @app.get("/diag/gate")
 def diag_gate():
-    clock = {"is_open": True, "next_open": "", "next_close": "", "source": "crypto-24x7"}
-    return jsonify({"gate_on": True, "decision": "open", "reason": "24/7 crypto", "clock": clock, "ts": _now_iso()})
+    # For crypto, markets are 24/7; keep simple
+    return _ok({
+        "gate_on": True,
+        "decision": "open",
+        "reason": "24/7 crypto",
+        "clock": {"is_open": True, "next_open": "", "next_close": "", "source": "crypto-24x7"},
+        "ts": datetime.now(timezone.utc).isoformat()
+    })
 
-# ----------------------------- scans -----------------------------
-def _pwrite(msg: str):
-    try:
-        print(msg, flush=True)
-    except Exception:
-        pass
-
-def _log(col: Dict[str, Any]):
-    try:
-        print(json.dumps(col), flush=True)
-    except Exception:
-        pass
-
-def _run_strategy_direct(name: str, dry: bool, force: bool, params: Dict[str, Any]) -> Tuple[bool, List[Dict[str, Any]]]:
-    mod = _strat_modules.get(name)
-    if not mod:
-        return False, [{"action": "error", "error": f"strategy {name} unavailable"}]
-    if not market or not broker:
-        return False, [{"action": "error", "error": "market/broker unavailable"}]
-
-    params = dict(params or {})
-    params.setdefault("timeframe", "5Min")
-    params.setdefault("limit", 600)
-
-    try:
-        symbols = params.pop("symbols", getattr(market, "symbols", ["BTC/USD","ETH/USD","SOL/USD","DOGE/USD"]))
-        res = mod.run(market, broker, symbols, params, dry=dry, pwrite=_pwrite, log=_log)  # type: ignore
-        results = res if isinstance(res, list) else (res or [])
-        return True, results
-    except TypeError:
-        try:
-            symbols = params.pop("symbols", getattr(market, "symbols", ["BTC/USD","ETH/USD","SOL/USD","DOGE/USD"]))
-            res = mod.run(market, broker, symbols, params, dry=dry, pwrite=_pwrite)  # type: ignore
-            results = res if isinstance(res, list) else (res or [])
-            return True, results
-        except Exception as e2:
-            return False, [{"action": "error", "error": str(e2)}]
-    except Exception as e:
-        return False, [{"action": "error", "error": str(e)}]
-
-def _scan_response(name: str, dry: bool, force: bool, params: Dict[str, Any]):
-    ok, results = _run_strategy_direct(name, dry, force, params)
-    headers = {
-        "x-app-version": APP_VERSION,
-        "x-strategy-version": getattr(_strat_modules.get(name), "STRATEGY_VERSION", "") if _strat_modules.get(name) else "",
-    }
-    body = {"strategy": name, "ok": ok, "dry": dry, "force": force, "results": results}
-    return (jsonify(body), 200, headers)
-
-@app.post("/scan/<name>")
-def scan(name: str):
-    n = name.lower()
-    if n not in _strat_modules:
-        return jsonify({"ok": False, "dry": _bool(request.args.get("dry"), True),
-                        "force": False, "strategy": n, "error": "unknown strategy"}), 400
-    dry = _bool(request.args.get("dry"), True)
-    force = _bool(request.args.get("force"), False)
-    p = _norm_scan_params(request.args)
-    return _scan_response(n, dry, force, p)
-
-# ----------------------------- orders/positions/signals -----------------------------
+# ---------- Orders / Positions ----------
 @app.get("/orders/recent")
 def orders_recent():
-    status = request.args.get("status","all")
-    limit = _int(request.args.get("limit", 50), 50)
-    rows: List[Dict[str, Any]] = []
+    status = request.args.get("status", "all")
+    limit = int(request.args.get("limit", "50"))
+    out: Dict[str, Any] = {"status": status, "limit": limit, "orders": []}
     try:
-        if broker and hasattr(broker, "orders_recent"):
-            rows = broker.orders_recent(status=status, limit=limit)
+        if broker and hasattr(broker, "list_orders"):
+            orders = broker.list_orders(status=status, limit=limit)
+            # Ensure JSON serializable
+            if isinstance(orders, list):
+                out["orders"] = orders
+            else:
+                out["orders"] = [orders]
+        else:
+            out["error"] = "no_broker_list_orders"
     except Exception as e:
-        return jsonify({"ok": False, "error": str(e)}), 500
-    return jsonify(rows)
+        out["error"] = str(e)
+    return _ok(out)
 
 @app.get("/positions")
-def positions():
+def positions_get():
+    out: Dict[str, Any] = {"positions": []}
     try:
-        if broker and hasattr(broker, "positions"):
-            return jsonify(broker.positions())
+        if broker and hasattr(broker, "list_positions"):
+            poss = broker.list_positions()
+            if isinstance(poss, list):
+                out["positions"] = poss
+            else:
+                out["positions"] = [poss]
+        else:
+            out["error"] = "no_broker_list_positions"
     except Exception as e:
-        return jsonify({"ok": False, "error": str(e)}), 500
-    return jsonify([])
+        out["error"] = str(e)
+    return _ok(out)
 
+# ---------- Signals (optional placeholder to prevent 404 on UI links) ----------
 @app.get("/signals")
-def signals():
-    try:
-        if hasattr(market, "recent_signals"):
-            return jsonify(getattr(market, "recent_signals"))
-    except Exception:
-        pass
-    return jsonify([])
+def signals_get():
+    # If you have a signals store, populate here.
+    return _ok({"ok": True, "signals": [], "ts": datetime.now(timezone.utc).isoformat()})
 
-# ----------------------------- dashboard -----------------------------
-DASHBOARD_HTML = """<!doctype html><html lang="en"><head>
-<meta charset="utf-8"><title>Crypto Dashboard</title>
-<meta name="viewport" content="width=device-width, initial-scale=1" />
-<style>
-  :root { --bg:#0b0f14; --panel:#121821; --text:#e6edf3; --muted:#8aa0b4; --ok:#2ecc71; --warn:#f1c40f; --err:#e74c3c; --chip:#1b2430; }
-  * { box-sizing:border-box; } body { margin:0; font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, Arial; background:var(--bg); color:var(--text);}
-  header { padding:16px 20px; background: linear-gradient(180deg,#0e131a 0%,#0b0f14 100%); border-bottom:1px solid #1a2330; display:flex; align-items:center; justify-content:space-between; gap:12px; flex-wrap:wrap; }
-  h1 { margin:0; font-size:18px; letter-spacing:.4px; font-weight:600; } .muted { color: var(--muted); }
-  .grid { display:grid; gap:16px; padding:16px; grid-template-columns: repeat(auto-fill, minmax(320px, 1fr)); }
-  .card { background: var(--panel); border:1px solid #1a2330; border-radius:12px; padding:16px; }
-  .card h2 { margin:0 0 12px; font-size:16px; letter-spacing:.3px; }
-  .row { display:flex; gap:12px; align-items:center; flex-wrap:wrap; }
-  .chips { display:flex; gap:8px; flex-wrap:wrap; } .chip { background: var(--chip); border:1px solid #1f2a38; color: var(--text); border-radius:999px; padding:6px 10px; font-size:12px; }
-  .ok { color: var(--ok); } .warn { color: var(--warn); } .err { color: var(--err); }
-  button, .btn { cursor:pointer; background:#162335; color:var(--text); border:1px solid #233248; padding:8px 12px; border-radius:8px; font-size:13px; }
-  button:hover, .btn:hover { background:#1b2a40; } table { width:100%; border-collapse: collapse; font-size: 13px; }
-  th, td { padding:8px; border-bottom:1px solid #1a2330; text-align:left; } th { color: var(--muted); font-weight:500; }
-  .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, "Courier New", monospace; } .right { text-align: right; } .small { font-size: 12px; color: var(--muted); }
-</style>
-</head><body>
-<header>
-  <div><h1>Crypto Dashboard <span class="small muted mono" id="appVersion"></span></h1>
-  <div class="small muted">Gate <strong id="gateState">checking…</strong></div></div>
-  <div class="row">
-    <button onclick="refreshAll()">Refresh</button>
-    <a class="btn" href="/health/versions">Versions</a>
-    <a class="btn" href="/diag/crypto">Crypto</a>
-    <a class="btn" href="/diag/candles?symbols=BTC/USD,ETH/USD,SOL/USD,DOGE/USD&limit=3&tf=5m">Candles</a>
-  </div>
-</header>
-<div class="grid">
-  <div class="card"><h2>Gate</h2><div id="gateCard">Loading…</div></div>
-  <div class="card"><h2>Quick Scans</h2><div class="row">
-    <button onclick="triggerScan('c1')">Scan C1</button>
-    <button onclick="triggerScan('c2')">Scan C2</button>
-    <button onclick="triggerScan('c3')">Scan C3</button>
-    <button onclick="triggerScan('c4')">Scan C4</button>
-  </div><div class="small muted" id="scanResult" style="margin-top:10px;"></div></div>
-  <div class="card" style="grid-column: 1 / -1;"><h2>Recent Orders</h2><div id="ordersTable">Loading…</div></div>
-  <div class="card" style="grid-column: 1 / -1;"><h2>Positions</h2><div id="positionsTable">Loading…</div></div>
-</div>
-<script>
-async function jfetch(u,o={}){const r=await fetch(u,o);if(!r.ok)throw new Error("HTTP "+r.status);const ct=r.headers.get("content-type")||"";return ct.includes("application/json")?r.json():r.text();}
-function esc(s){return (s==null?"":String(s)).replace(/[&<>\"']/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]));}
-async function refreshGate(){try{const g=await jfetch('/diag/gate');const v=await jfetch('/health/versions');document.getElementById('appVersion').textContent="v"+esc(v.app);const open=g.decision==='open';document.getElementById('gateState').textContent=open?'OPEN':(g.decision||'closed');document.getElementById('gateState').className=open?'ok':'warn';document.getElementById('gateCard').innerHTML=`<div><strong>Gate:</strong> ${esc(g.gate_on?'on':'off')} — <strong>Decision:</strong> ${esc(g.decision)} — ${esc(g.reason||'')}</div>`;}catch(e){document.getElementById('gateCard').innerHTML='<span class="err">Failed to load gate</span>';}}
-async function loadOrders(){try{const rows=await jfetch('/orders/recent?status=all&limit=200');const a=Array.isArray(rows)?rows:[];if(a.length===0){document.getElementById('ordersTable').innerHTML='<div class="muted">No orders</div>';return;}let h='<table><thead><tr><th>Time</th><th>Symbol</th><th>Side</th><th>Qty</th><th>Type</th><th>Status</th><th class="right">Filled</th></tr></thead><tbody>';for(const o of a.slice(0,200)){h+=`<tr><td class="mono small">${esc(o.submitted_at||o.created_at||'')}</td><td class="mono">${esc(o.symbol||'')}</td><td>${esc(o.side||'')}</td><td>${esc(o.qty||'')}</td><td>${esc(o.type||o.order_type||'')}</td><td>${esc(o.status||'')}</td><td class="right">${esc(o.filled_qty||'0')}</td></tr>`;}h+='</tbody></table>';document.getElementById('ordersTable').innerHTML=h;}catch(e){document.getElementById('ordersTable').innerHTML='<div class="err">Failed to load orders</div>';}}
-async function loadPositions(){try{const rows=await jfetch('/positions');const a=Array.isArray(rows)?rows:[];if(a.length===0){document.getElementById('positionsTable').innerHTML='<div class="muted">No positions</div>';return;}let h='<table><thead><tr><th>Symbol</th><th>Side</th><th>Qty</th><th class="right">Market Value</th><th class="right">Unrealized P/L</th></tr></thead><tbody>';for(const p of a){h+=`<tr><td class="mono">${esc(p.symbol||p.asset_id||'')}</td><td>${esc(p.side||'')}</td><td>${esc(p.qty||'')}</td><td class="right mono">$${esc(p.market_value||'0')}</td><td class="right mono">$${esc(p.unrealized_pl||'0')}</td></tr>`;}h+='</tbody></table>';document.getElementById('positionsTable').innerHTML=h;}catch(e){document.getElementById('positionsTable').innerHTML='<div class="err">Failed to load positions</div>';}}
-async function triggerScan(w){try{const res=await jfetch(`/scan/${w}?dry=1&timeframe=5Min&limit=600`,{method:'POST'});document.getElementById('scanResult').textContent=JSON.stringify(res);}catch(e){document.getElementById('scanResult').textContent='Scan failed';}}
-function refreshAll(){refreshGate();loadOrders();loadPositions();}
-window.addEventListener('load',()=>{refreshAll();setInterval(refreshGate,30000);});
-</script>
-</body></html>
-"""
-
-@app.get("/dashboard")
-def dashboard():
-    return Response(DASHBOARD_HTML, mimetype="text/html")
-
-@app.get("/")
-def index_root():
-    return redirect("/dashboard")
-
-# ----------------------------- run -----------------------------
+# ---------- Main ----------
 if __name__ == "__main__":
-    port = int(os.getenv("PORT","10000"))
+    port = int(os.environ.get("PORT", "10000"))
     app.run(host="0.0.0.0", port=port)
