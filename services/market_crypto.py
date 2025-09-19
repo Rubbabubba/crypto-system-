@@ -1,5 +1,5 @@
 # services/market_crypto.py
-# Version: 0.4.1
+# Version: 0.4.2
 from __future__ import annotations
 
 import os
@@ -42,7 +42,7 @@ class MarketCrypto:
     Order of attempts:
       1) v1beta3 multi-symbol
       2) v2 multi-symbol (feed=us)
-      3) per-symbol fan-out: v1beta3 then v2 for each symbol
+      3) per-symbol fan-out: v1beta3 then v2 for each *empty* symbol
     """
 
     def __init__(self,
@@ -120,8 +120,8 @@ class MarketCrypto:
             out[sym] = BarResult(sym, df)
         return out
 
-    def _all_empty(self, out: Dict[str, BarResult]) -> bool:
-        return all(len(br.frame) == 0 for br in out.values())
+    def _empty_symbols(self, out: Dict[str, BarResult]) -> List[str]:
+        return [s for s, br in out.items() if len(br.frame) == 0]
 
     # ---------- public ----------
     def candles(self,
@@ -157,37 +157,45 @@ class MarketCrypto:
         if kwargs.get("start") and not start:
             start = kwargs.get("start")
 
-        # Try multi v1beta3
+        # 1) Try multi v1beta3
+        out: Dict[str, BarResult] = {}
         try:
             payload = self._request_v1beta3(symbols, timeframe, limit, start)
             out = self._build_out(symbols, payload)
-            if not self._all_empty(out):
+            missing = self._empty_symbols(out)
+            if not missing:
                 return out
         except requests.HTTPError as e:
             self.last_error = f"v1beta3 HTTP {getattr(e.response, 'status_code', '?')}: {getattr(e.response, 'text', str(e))}"
+            missing = symbols[:]  # treat as all missing
+            out = {s: BarResult(s, pd.DataFrame(columns=["ts","open","high","low","close","volume"])) for s in symbols}
         except Exception as e:
             self.last_error = f"v1beta3 error: {str(e)}"
+            missing = symbols[:]
+            out = {s: BarResult(s, pd.DataFrame(columns=["ts","open","high","low","close","volume"])) for s in symbols}
 
-        # Try multi v2
-        try:
-            payload2 = self._request_v2(symbols, timeframe, limit, start)
-            out2 = self._build_out(symbols, payload2)
-            if not self._all_empty(out2):
-                return out2
-        except requests.HTTPError as e2:
-            self.last_error = f"{self.last_error or ''} | v2 HTTP {getattr(e2.response, 'status_code', '?')}: {getattr(e2.response, 'text', str(e2))}".strip()
-        except Exception as e2:
-            self.last_error = f"{self.last_error or ''} | v2 error: {str(e2)}".strip()
+        # 2) Try multi v2 for any missing
+        if missing:
+            try:
+                payload2 = self._request_v2(missing, timeframe, limit, start)
+                out2 = self._build_out(missing, payload2)
+                for s in missing:
+                    if len(out2.get(s, BarResult(s, pd.DataFrame())).frame) > 0:
+                        out[s] = out2[s]
+                missing = self._empty_symbols(out)
+            except requests.HTTPError as e2:
+                self.last_error = f"{self.last_error or ''} | v2 HTTP {getattr(e2.response, 'status_code', '?')}: {getattr(e2.response, 'text', str(e2))}".strip()
+            except Exception as e2:
+                self.last_error = f"{self.last_error or ''} | v2 error: {str(e2)}".strip()
 
-        # Fan-out per symbol: v1beta3 then v2
-        merged: Dict[str, BarResult] = {}
-        for sym in symbols:
+        # 3) Per-symbol fan-out (v1beta3 then v2) for any still-missing
+        for sym in list(missing):
             # v1beta3 single
             try:
                 p1 = self._request_v1beta3([sym], timeframe, limit, start)
                 r1 = self._build_out([sym], p1)
-                if not self._all_empty(r1):
-                    merged[sym] = r1[sym]
+                if len(r1[sym].frame) > 0:
+                    out[sym] = r1[sym]
                     continue
             except Exception:
                 pass
@@ -195,8 +203,8 @@ class MarketCrypto:
             try:
                 p2 = self._request_v2([sym], timeframe, limit, start)
                 r2 = self._build_out([sym], p2)
-                merged[sym] = r2[sym]
+                out[sym] = r2[sym]
             except Exception:
-                merged[sym] = BarResult(sym, pd.DataFrame(columns=["ts","open","high","low","close","volume"]))
+                out[sym] = BarResult(sym, pd.DataFrame(columns=["ts","open","high","low","close","volume"]))
 
-        return merged
+        return out
