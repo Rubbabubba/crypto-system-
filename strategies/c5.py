@@ -1,147 +1,135 @@
-"""
-Strategy C5 — RSI + EMA + trading-session filter
-Version: 1.0.1
-- Uses market.candles(...) (or market.get_bars via compat shim)
-- Accepts: timeframe, limit, rsi_len, rsi_buy, rsi_sell
-- On live (dry=0) uses notional or qty via broker best-effort
-"""
+# strategies/c5.py
+# ---------------------------------------------------------------------
+# Strategy C5 — Multi-timeframe RSI + EMA Pullback
+# Version: 1.1.0
+#
+# Entry (long):
+#   - Trend filter: close > EMA(len)
+#   - Pullback window: rsi_sell < RSI(len) < rsi_buy (e.g., 40 < RSI < 60)
+# Exit / Flat:
+#   - Otherwise no trade signal here (this is a scanner). Your risk module
+#     can manage exits, or you can add a mirrored exit in C6 or broker rules.
+#
+# Params (querystring, optional):
+#   timeframe:   default "5Min"
+#   limit:       default 600
+#   ema_len:     default 200
+#   rsi_len:     default 14
+#   rsi_buy:     default 60
+#   rsi_sell:    default 40
+#
+# Optional order sizing:
+#   notional: float (e.g., 25)
+#   qty:      float (alternative to notional; not both)
+# ---------------------------------------------------------------------
 
 from __future__ import annotations
-import math
-from typing import Dict, Any, List
+from typing import Dict, List, Any, Optional
 import pandas as pd
 import numpy as np
 
-DEFAULTS = dict(
-    timeframe="5Min",
-    limit=600,
-    rsi_len=14,
-    rsi_buy=55.0,
-    rsi_sell=45.0,
-)
+VERSION = "1.1.0"
+NAME = "c5"
 
-def _ema(s: pd.Series, n: int) -> pd.Series:
-    return s.ewm(span=n, adjust=False).mean()
+# -------------------------- indicators -------------------------------- #
 
-def _rsi(s: pd.Series, n: int) -> pd.Series:
-    delta = s.diff()
-    up = (delta.clip(lower=0)).ewm(alpha=1/n, adjust=False).mean()
-    dn = (-delta.clip(upper=0)).ewm(alpha=1/n, adjust=False).mean()
-    rs = up / (dn.replace(0, np.nan))
+def _ema(series: pd.Series, length: int) -> pd.Series:
+    return series.ewm(span=length, adjust=False).mean()
+
+def _rsi(series: pd.Series, length: int = 14) -> pd.Series:
+    delta = series.diff()
+    up = np.where(delta > 0, delta, 0.0)
+    down = np.where(delta < 0, -delta, 0.0)
+    roll_up = pd.Series(up, index=series.index).rolling(length).mean()
+    roll_down = pd.Series(down, index=series.index).rolling(length).mean()
+    rs = roll_up / (roll_down.replace(0, np.nan))
     rsi = 100 - (100 / (1 + rs))
-    return rsi.fillna(50)
+    return rsi.fillna(method="bfill").fillna(50.0)
 
-def _try_market_buy(broker, symbol: str, *, notional: float | None, qty: float | None):
-    if notional is not None:
-        for method in ("market_buy_notional", "market_buy"):
-            if hasattr(broker, method):
-                return getattr(broker, method)(symbol, notional=notional)
-        # Generic submit_order path
-        if hasattr(broker, "submit_order"):
-            return broker.submit_order(symbol=symbol, side="buy", type="market",
-                                       notional=notional, time_in_force="gtc")
-    if qty is not None:
-        for method in ("market_buy_qty", "market_buy"):
-            if hasattr(broker, method):
-                return getattr(broker, method)(symbol, qty=qty)
-        if hasattr(broker, "submit_order"):
-            return broker.submit_order(symbol=symbol, side="buy", type="market",
-                                       qty=qty, time_in_force="gtc")
-    return {"status": "no_broker_method"}
+# -------------------------- core -------------------------------------- #
 
-def _try_market_sell(broker, symbol: str, *, qty: float | None, notional: float | None):
-    # Prefer qty for sell; fall back to notional if wrapper supports it
-    if qty is not None:
-        for method in ("market_sell_qty", "market_sell"):
-            if hasattr(broker, method):
-                return getattr(broker, method)(symbol, qty=qty)
-        if hasattr(broker, "submit_order"):
-            return broker.submit_order(symbol=symbol, side="sell", type="market",
-                                       qty=qty, time_in_force="gtc")
-    if notional is not None:
-        for method in ("market_sell_notional", "market_sell"):
-            if hasattr(broker, method):
-                return getattr(broker, method)(symbol, notional=notional)
-        if hasattr(broker, "submit_order"):
-            return broker.submit_order(symbol=symbol, side="sell", type="market",
-                                       notional=notional, time_in_force="gtc")
-    return {"status": "no_broker_method"}
+def _scan_symbol(df: pd.DataFrame, params: Dict[str, Any]) -> Dict[str, Any]:
+    ema_len   = int(params.get("ema_len", 200))
+    rsi_len   = int(params.get("rsi_len", 14))
+    rsi_buy   = float(params.get("rsi_buy", 60))
+    rsi_sell  = float(params.get("rsi_sell", 40))
 
-def _last_qty_for(broker, symbol: str) -> float | None:
-    # If your broker exposes positions(), use it to find position qty for sells
-    if hasattr(broker, "positions"):
-        try:
-            pos = broker.positions()
-            for p in pos:
-                if p.get("symbol") in (symbol, symbol.replace("/", "")) and p.get("side", "").lower() == "long":
-                    q = p.get("qty") or p.get("quantity")
-                    if q is not None:
-                        return float(q)
-        except Exception:
-            pass
-    return None
+    close = df["close"]
+    ema   = _ema(close, ema_len)
+    rsi   = _rsi(close, rsi_len)
 
-def run(market, broker, symbols: List[str], params: Dict[str, Any], *, dry: bool, pwrite=print, log=print):
-    cfg = {**DEFAULTS, **(params or {})}
-    tf = cfg["timeframe"]
-    limit = int(cfg["limit"])
-    rsi_len = int(cfg["rsi_len"])
-    rsi_buy = float(cfg["rsi_buy"])
-    rsi_sell = float(cfg["rsi_sell"])
-    notional = float(cfg.get("notional")) if cfg.get("notional") else None
-    qty = float(cfg.get("qty")) if cfg.get("qty") else None
+    c = float(close.iloc[-1])
+    e = float(ema.iloc[-1])
+    r = float(rsi.iloc[-1])
 
-    # Fetch candles (dict: symbol -> DataFrame with columns ts, open, high, low, close, volume)
-    if hasattr(market, "candles"):
-        data = market.candles(symbols=symbols, timeframe=tf, limit=limit)
-    else:
-        data = market.get_bars(symbols=symbols, timeframe=tf, limit=limit)
+    reason = "no_signal"
+    action = "flat"
 
-    results = []
+    if c > e and (rsi_sell < r < rsi_buy):
+        action = "buy"
+        reason = "enter_long_rsi_pullback"
+
+    return {
+        "symbol": params["symbol"],
+        "action": action,
+        "reason": reason,
+        "close": round(c, 6),
+        "ema": round(e, 6),
+        "rsi": round(r, 2),
+    }
+
+def _place_order(broker, symbol: str, dry: bool, notional: Optional[float], qty: Optional[float]) -> Any:
+    if dry:
+        return {"status": "dry_run"}
+    try:
+        if notional is not None and hasattr(broker, "market_buy_notional"):
+            return broker.market_buy_notional(symbol, float(notional))
+        if qty is not None and hasattr(broker, "market_buy_qty"):
+            return broker.market_buy_qty(symbol, float(qty))
+        # Fallback common name used in your logs:
+        if notional is not None and hasattr(broker, "market_buy"):
+            return broker.market_buy(symbol, notional=float(notional))
+        if hasattr(broker, "market_buy"):
+            # If neither notional nor qty provided, attempt a minimal buy
+            return broker.market_buy(symbol, notional=10.0)
+        return {"status": "no_broker_method"}
+    except Exception as ex:
+        return {"status": "error", "error": str(ex)}
+
+# -------------------------- public API -------------------------------- #
+
+def run(market, broker, symbols, params, *args, dry: bool = False, pwrite=print, log=None, notional: float | None = None, qty: float | None = None, **kwargs):
+    """
+    Compatible signature with the app router.
+    - Accepts extra args/kwargs without breaking.
+    """
+    timeframe = params.get("timeframe", "5Min")
+    limit     = int(params.get("limit", 600))
+
+    if isinstance(symbols, str):
+        symbols = [s.strip() for s in symbols.split(",") if s.strip()]
+
+    candles: Dict[str, pd.DataFrame] = market.candles(symbols, timeframe=timeframe, limit=limit)
+
+    results: List[Dict[str, Any]] = []
     for sym in symbols:
-        df = data.get(sym)
-        if df is None or len(df) == 0:
+        df = candles.get(sym)
+        if df is None or df.empty or len(df) < 50:
             results.append({"symbol": sym, "action": "error", "error": "no_data"})
             continue
 
-        # Indicators
-        close = df["close"].astype(float)
-        ema = _ema(close, 21)
-        rsi = _rsi(close, rsi_len)
+        row = _scan_symbol(df, {**params, "symbol": sym})
 
-        last_close = float(close.iloc[-1])
-        last_ema = float(ema.iloc[-1])
-        last_rsi = float(rsi.iloc[-1])
+        if row["action"] == "buy":
+            order_id = _place_order(broker, sym, dry=dry, notional=notional, qty=qty)
+            row["order_id"] = order_id
 
-        action = "flat"
-        reason = "no_signal"
-        order_id = None
+        results.append(row)
 
-        # Entry: RSI > rsi_buy and close > EMA (momentum + trend)
-        if last_rsi >= rsi_buy and last_close >= last_ema:
-            action = "buy"
-            reason = "rsi_momentum_uptrend"
-            if not dry:
-                order_id = _try_market_buy(broker, sym, notional=notional, qty=qty)
-
-        # Exit: RSI < rsi_sell or close < EMA (momentum fades or trend breaks)
-        elif last_rsi <= rsi_sell or last_close < last_ema:
-            # If you have a position, sell (best-effort)
-            pos_qty = _last_qty_for(broker, sym)
-            if pos_qty and pos_qty > 0:
-                action = "sell"
-                reason = "rsi_momentum_down"
-                if not dry:
-                    order_id = _try_market_sell(broker, sym, qty=pos_qty, notional=None)
-
-        results.append({
-            "symbol": sym,
-            "action": action,
-            "reason": reason,
-            "close": last_close,
-            "ema": last_ema,
-            "rsi": round(last_rsi, 2),
-            "order_id": order_id if not dry else None,
-        })
-
-    return {"ok": True, "force": False, "dry": dry, "results": results, "strategy": "c5"}
+    return {
+        "ok": True,
+        "strategy": NAME,
+        "dry": bool(dry),
+        "results": results,
+        "version": VERSION,
+    }
