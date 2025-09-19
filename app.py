@@ -1,23 +1,38 @@
-# app.py
+# app.py  —  Crypto System Web API
+# Version: 1.6.8
 from __future__ import annotations
+
 import os, json, importlib
 from typing import Any, Dict, List, Callable
 from datetime import datetime, timezone
 
-from flask import Flask, request, jsonify, Response, redirect
 import requests
+from flask import Flask, request, jsonify, Response, redirect
 
 # ----------------------------
 # App / Env
 # ----------------------------
-APP_VERSION = os.environ.get("APP_VERSION", "1.6.7")
+APP_VERSION = os.environ.get("APP_VERSION", "1.6.8")
 SYSTEM_NAME = "crypto"
 
 CRYPTO_EXCHANGE = os.environ.get("CRYPTO_EXCHANGE", "alpaca")
-CRYPTO_SYMBOLS  = [s.strip() for s in os.environ.get("CRYPTO_SYMBOLS", "BTC/USD,ETH/USD,SOL/USD,DOGE/USD").split(",") if s.strip()]
+CRYPTO_SYMBOLS  = [
+    s.strip() for s in os.environ.get(
+        "CRYPTO_SYMBOLS",
+        "BTC/USD,ETH/USD,SOL/USD,DOGE/USD"
+    ).split(",") if s.strip()
+]
 
-ALPACA_TRADING_BASE = os.environ.get("CRYPTO_TRADING_BASE") or os.environ.get("ALPACA_TRADING_BASE") or "https://paper-api.alpaca.markets/v2"
-ALPACA_DATA_BASE    = os.environ.get("CRYPTO_DATA_BASE")    or os.environ.get("ALPACA_DATA_BASE")    or "https://data.alpaca.markets"
+ALPACA_TRADING_BASE = (
+    os.environ.get("CRYPTO_TRADING_BASE")
+    or os.environ.get("ALPACA_TRADING_BASE")
+    or "https://paper-api.alpaca.markets/v2"
+)
+ALPACA_DATA_BASE = (
+    os.environ.get("CRYPTO_DATA_BASE")
+    or os.environ.get("ALPACA_DATA_BASE")
+    or "https://data.alpaca.markets"
+)
 
 API_KEY    = os.environ.get("CRYPTO_API_KEY") or os.environ.get("APCA_API_KEY_ID")
 API_SECRET = os.environ.get("CRYPTO_API_SECRET") or os.environ.get("APCA_API_SECRET_KEY")
@@ -25,15 +40,18 @@ API_SECRET = os.environ.get("CRYPTO_API_SECRET") or os.environ.get("APCA_API_SEC
 # ----------------------------
 # Imports: Market & Broker
 # ----------------------------
+# MarketCrypto must exist at services/market_crypto.py and provide MarketCrypto (with .from_env() optional)
 try:
-    from services.market_crypto import MarketCrypto  # exposes MarketCrypto.from_env()
+    from services.market_crypto import MarketCrypto  # type: ignore
 except Exception:
     MarketCrypto = None  # type: ignore
 
+# ExchangeExec must exist at services/exchange_exec.py and provide ExchangeExec (with .from_env() optional)
 try:
-    from services.exchange_exec import ExchangeExec  # exposes ExchangeExec.from_env()
+    from services.exchange_exec import ExchangeExec  # type: ignore
 except Exception:
     ExchangeExec = None  # type: ignore
+
 
 def _make_market():
     if MarketCrypto is None:
@@ -42,12 +60,14 @@ def _make_market():
         return MarketCrypto.from_env()  # type: ignore[attr-defined]
     return MarketCrypto()  # type: ignore[call-arg]
 
+
 def _make_broker():
     if ExchangeExec is None:
         raise RuntimeError("services.exchange_exec.ExchangeExec not found. Ensure services/exchange_exec.py exists.")
     if hasattr(ExchangeExec, "from_env") and callable(getattr(ExchangeExec, "from_env")):
         return ExchangeExec.from_env()  # type: ignore[attr-defined]
     return ExchangeExec()  # type: ignore[call-arg]
+
 
 market = _make_market()
 broker = _make_broker()
@@ -63,22 +83,29 @@ app = Flask(__name__)
 def _ok(data: Dict[str, Any], headers: Dict[str, str] | None = None):
     resp = jsonify(data)
     if headers:
-        for k, v in headers.items(): resp.headers[k] = v
+        for k, v in headers.items():
+            resp.headers[k] = v
     return resp, 200
+
 
 def _err(msg: str, code: int = 400):
     return jsonify({"ok": False, "error": msg}), code
 
-def _bool(val: Any, default: bool=False) -> bool:
-    if val is None: return default
+
+def _bool(val: Any, default: bool = False) -> bool:
+    if val is None:
+        return default
     s = str(val).strip().lower()
-    return s in ("1","true","yes","y","on")
+    return s in ("1", "true", "yes", "y", "on")
+
 
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
+
 def _strategy_module(name: str):
     return importlib.import_module(f"strategies.{name}")
+
 
 def _mod_version(mod_name: str) -> str:
     try:
@@ -87,32 +114,42 @@ def _mod_version(mod_name: str) -> str:
     except Exception:
         return "error"
 
+
 def _collect_params_from_request(prefix: str = "param.") -> Dict[str, Any]:
     params: Dict[str, Any] = {}
+    # querystring
     for k, v in request.args.items():
         if k.startswith(prefix):
             params[k[len(prefix):]] = v
+    # json body
     if request.is_json:
         body = request.get_json(silent=True) or {}
         if isinstance(body, dict) and "params" in body and isinstance(body["params"], dict):
             params.update(body["params"])
     return params
 
+
 def _inline_logger(tag: str) -> Callable[[str], None]:
     def log_fn(msg: str):
         app.logger.info("[%s] %s", tag, msg)
     return log_fn
+
 
 # ----------------------------
 # Strategy runner
 # ----------------------------
 def _run_strategy_direct(tag: str, mod, symbols: List[str], params: Dict[str, Any], dry: bool):
     pbuf: List[str] = []
-    def pwrite(s: str): pbuf.append(str(s))
+
+    def pwrite(s: str):
+        pbuf.append(str(s))
+
     try:
+        # First try with log kwarg
         results = mod.run(market, broker, symbols, params, dry=dry, log=_inline_logger(tag), pwrite=pwrite)
         return {"ok": True, "results": results, "prints": pbuf}
     except TypeError:
+        # Fallback for older signatures without 'log'
         try:
             results = mod.run(market, broker, symbols, params, dry=dry, pwrite=pwrite)  # type: ignore
             return {"ok": True, "results": results, "prints": pbuf}
@@ -123,8 +160,9 @@ def _run_strategy_direct(tag: str, mod, symbols: List[str], params: Dict[str, An
         app.logger.error("[%s] inline run failed: %s", tag, e, exc_info=True)
         return {"ok": False, "error": str(e)}
 
+
 # ----------------------------
-# UI
+# UI (Dashboard)
 # ----------------------------
 DASHBOARD_HTML = """
 <!doctype html><html lang="en"><head><meta charset="utf-8">
@@ -190,9 +228,13 @@ window.addEventListener('load',()=>{refreshAll();setInterval(refreshMeta,30000);
 </body></html>
 """
 
+# ----------------------------
+# Routes: Dashboard & Root (single definitions)
+# ----------------------------
 @app.get("/dashboard")
 def dashboard():
     return Response(DASHBOARD_HTML, mimetype="text/html")
+
 
 @app.get("/")
 def index_root():
@@ -204,6 +246,7 @@ def index_root():
 @app.get("/health")
 def health():
     return _ok({"ok": True, "system": SYSTEM_NAME, "symbols": CRYPTO_SYMBOLS})
+
 
 @app.get("/health/versions")
 def health_versions():
@@ -233,6 +276,7 @@ def _alpaca_headers():
         "Accept": "application/json",
     }
 
+
 @app.get("/diag/crypto")
 def diag_crypto():
     # Account probe
@@ -242,13 +286,16 @@ def diag_crypto():
     try:
         r = requests.get(f"{ALPACA_TRADING_BASE}/account", headers=_alpaca_headers(), timeout=20)
         acct_ok = r.status_code < 300
-        acct_payload = r.json() if r.headers.get("content-type","").startswith("application/json") else {"status_code": r.status_code, "text": r.text}
+        acct_payload = (
+            r.json() if r.headers.get("content-type", "").startswith("application/json")
+            else {"status_code": r.status_code, "text": r.text}
+        )
         if not acct_ok:
             acct_err = f"HTTP {r.status_code}"
     except Exception as e:
         acct_err = str(e)
 
-    # Data probe (uses market client)
+    # Data probe (via market client)
     data_probe: Dict[str, Any] = {}
     effective_bars_url = ""
     last_data_error = None
@@ -295,7 +342,13 @@ def diag_crypto():
 def orders_recent():
     status = request.args.get("status", "all")
     limit  = int(request.args.get("limit", "50"))
-    params = {"status": status, "limit": str(limit), "direction": "desc", "nested": "true", "asset_class": "crypto"}
+    params = {
+        "status": status,
+        "limit": str(limit),
+        "direction": "desc",
+        "nested": "true",
+        "asset_class": "crypto",
+    }
     r = requests.get(f"{ALPACA_TRADING_BASE}/orders", headers=_alpaca_headers(), params=params, timeout=20)
     try:
         data = r.json()
@@ -303,6 +356,7 @@ def orders_recent():
         data = []
     data = data if isinstance(data, list) else []
     return _ok(data)
+
 
 @app.get("/positions")
 def positions():
@@ -313,10 +367,10 @@ def positions():
         rows = []
     out = []
     for p in rows if isinstance(rows, list) else []:
-        if str(p.get("asset_class","")).lower() == "crypto" or "/" in str(p.get("symbol","")):
+        if str(p.get("asset_class", "")).lower() == "crypto" or "/" in str(p.get("symbol", "")):
             out.append({
                 "symbol": p.get("symbol"),
-                "side": "long" if float(p.get("qty",0))>=0 else "short",
+                "side": "long" if float(p.get("qty", 0)) >= 0 else "short",
                 "qty": p.get("qty"),
                 "market_value": p.get("market_value"),
                 "unrealized_pl": p.get("unrealized_pl"),
@@ -343,14 +397,18 @@ def _scan(name: str):
     ver = getattr(mod, "__version__", "unknown")
     return _ok(payload, {"x-strategy-version": ver})
 
+
 @app.post("/scan/c1")
 def scan_c1(): return _scan("c1")
+
 
 @app.post("/scan/c2")
 def scan_c2(): return _scan("c2")
 
+
 @app.post("/scan/c3")
 def scan_c3(): return _scan("c3")
+
 
 @app.post("/scan/c4")
 def scan_c4(): return _scan("c4")
@@ -361,7 +419,7 @@ def scan_c4(): return _scan("c4")
 @app.get("/signals")
 def signals():
     out: Dict[str, Any] = {}
-    for name in ("c1","c2","c3","c4"):
+    for name in ("c1", "c2", "c3", "c4"):
         try:
             mod = _strategy_module(name)
             getter = getattr(mod, "signals", None)
@@ -382,16 +440,6 @@ def diag_inline():
         "server_time": _now_iso(),
     })
 
-# ----------------------------
-# Root / Dashboard
-# ----------------------------
-@app.get("/dashboard")
-def dashboard():
-    return Response(DASHBOARD_HTML, mimetype="text/html")
-
-@app.get("/")
-def index_root():
-    return redirect("/dashboard")
 
 # ----------------------------
 # Main
