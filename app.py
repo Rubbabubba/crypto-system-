@@ -1,23 +1,18 @@
 #!/usr/bin/env python3
 # app.py — Crypto System API
-# Version: 1.7.1
+# Version: 1.7.2
 
 import os
 import json
-import math
-import time
 import datetime as dt
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Tuple, Optional
 
 from flask import Flask, request, jsonify, Response, redirect
 
-# --------------------------------------------------------------------------------------
-# App/version
-# --------------------------------------------------------------------------------------
-APP_VERSION = "1.7.1"
-
+APP_VERSION = "1.7.2"
 app = Flask(__name__)
 
+# ----------------------------- utils -----------------------------
 def _bool(x: Any, default=False) -> bool:
     if x is None:
         return default
@@ -35,11 +30,7 @@ def _int(x: Any, default: int) -> int:
 def _now_iso() -> str:
     return dt.datetime.utcnow().replace(tzinfo=dt.timezone.utc).isoformat()
 
-# --------------------------------------------------------------------------------------
-# Import service layer (your existing modules)
-# --------------------------------------------------------------------------------------
-# These imports assume your current project layout from earlier messages.
-# If your paths differ, keep the functions below and adjust imports as needed.
+# ----------------------------- imports -----------------------------
 try:
     from services.exchange_exec import ExchangeExec
 except Exception:
@@ -50,85 +41,157 @@ try:
 except Exception:
     MarketCrypto = None  # type: ignore
 
-# Strategies (c1..c4) – expected to expose run(market, broker, symbols, params, *, dry, pwrite, log)
-# and optional STRATEGY_VERSION
-_strat_modules = {}
+# strategies c1..c4
+_strat_modules: Dict[str, Any] = {}
 for _name in ("c1", "c2", "c3", "c4"):
     try:
         _strat_modules[_name] = __import__(f"strategies.{_name}", fromlist=["*"])
     except Exception:
         _strat_modules[_name] = None
 
-# --------------------------------------------------------------------------------------
-# Build market/broker once
-# --------------------------------------------------------------------------------------
+# ----------------------------- market/broker -----------------------------
 def _make_broker():
     if ExchangeExec is None:
         return None
-    # ExchangeExec.from_env() was working for you earlier
     return ExchangeExec.from_env()
 
 def _make_market():
-    # Your MarketCrypto did not have from_env(); you were constructing directly.
-    # We keep it simple & let it read env for base URLs/keys internally.
     if MarketCrypto is None:
         return None
     return MarketCrypto()
 
 broker = _make_broker()
-market = _make_market()
+_underlying_market = _make_market()
 
-# --------------------------------------------------------------------------------------
-# Param normalization for scans (accepts timeframe/tf/param.timeframe and limit/param.limit)
-# --------------------------------------------------------------------------------------
+# ----------------------------- safe market wrapper -----------------------------
+class MarketProxy:
+    """
+    Defensive facade around your MarketCrypto to normalize `candles(...)`:
+    - Always supports multi-symbol by looping per symbol.
+    - Normalizes return_debug outputs into a dict + debug bundle.
+    """
+    def __init__(self, inner):
+        self.inner = inner
+        # bubble through common attrs if present
+        self.symbols = getattr(inner, "symbols", ["BTC/USD","ETH/USD","SOL/USD","DOGE/USD"])
+        self.last_bars_url = None
+        self.last_error = None
+
+    def _one(
+        self, symbol: str, timeframe: str, limit: int, return_debug: bool
+    ):
+        # Try inner.candles for a single symbol list [symbol]
+        if not hasattr(self.inner, "candles"):
+            raise RuntimeError("market.candles not available")
+        try:
+            if return_debug:
+                # could be (df_map, attempts, last_url, last_error) OR
+                # df_map only OR (df, attempts, last_url, last_error)
+                rv = self.inner.candles(symbols=[symbol], timeframe=timeframe, limit=limit, return_debug=True)
+            else:
+                rv = self.inner.candles(symbols=[symbol], timeframe=timeframe, limit=limit)
+        except TypeError:
+            # fallback without keywords
+            if return_debug:
+                rv = self.inner.candles([symbol], timeframe, limit, True)
+            else:
+                rv = self.inner.candles([symbol], timeframe, limit)
+
+        # Normalize per-symbol output
+        df_map: Dict[str, Any] = {}
+        attempts: List[str] = []
+        last_url: Optional[str] = None
+        last_error: Optional[str] = None
+
+        # Case A: dict mapping
+        if isinstance(rv, dict):
+            df_map = rv
+        # Case B: tuple length 4: (df_map or df, attempts, last_url, last_error)
+        elif isinstance(rv, tuple) and len(rv) == 4:
+            maybe_map, attempts, last_url, last_error = rv
+            if isinstance(maybe_map, dict):
+                df_map = maybe_map
+            else:
+                # assume it's a single DataFrame
+                df_map = {symbol: maybe_map}
+        # Case C: single DF
+        else:
+            df_map = {symbol: rv}
+
+        # Track last values for /diag/crypto
+        self.last_bars_url = last_url or self.last_bars_url
+        self.last_error = last_error
+
+        if return_debug:
+            return df_map, attempts, last_url, last_error
+        return df_map
+
+    def candles(
+        self,
+        symbols: List[str],
+        timeframe: str,
+        limit: int,
+        return_debug: bool = False
+    ):
+        all_map: Dict[str, Any] = {}
+        all_attempts: List[str] = []
+        last_url: Optional[str] = None
+        last_error: Optional[str] = None
+
+        for s in symbols:
+            if return_debug:
+                m, att, url, err = self._one(s, timeframe, limit, True)
+                all_map.update(m or {})
+                if isinstance(att, list):
+                    all_attempts.extend(att)
+                if url:
+                    last_url = url
+                if err:
+                    last_error = err
+            else:
+                m = self._one(s, timeframe, limit, False)
+                all_map.update(m or {})
+
+        if return_debug:
+            return all_map, all_attempts, last_url, last_error
+        return all_map
+
+# Use proxy everywhere strategies/UI need market access
+market = MarketProxy(_underlying_market) if _underlying_market else None
+
+# ----------------------------- scan params normalizer -----------------------------
 def _norm_scan_params(args) -> Dict[str, Any]:
     p: Dict[str, Any] = {}
-    # timeframe / tf
     tf = args.get("timeframe") or args.get("tf") or args.get("param.timeframe")
     if tf:
         p["timeframe"] = str(tf)
-    # limit
     lim = args.get("limit") or args.get("param.limit")
     if lim:
         p["limit"] = _int(lim, 300)
-    # symbols override (comma separated)
     syms = args.get("symbols")
     if syms:
-        # normalize commas/spaces, allow BTC/USD etc
         toks = [s.strip() for s in syms.split(",") if s.strip()]
         if toks:
             p["symbols"] = toks
-    # generic passthrough: param.foo=x -> foo=x (but keep known keys above)
     for k, v in list(args.items()):
         if k.startswith("param.") and k not in ("param.timeframe", "param.limit"):
             p[k[6:]] = v
     return p
 
-# --------------------------------------------------------------------------------------
-# Gate: crypto trades 24/7; allow manual gate off via env
-# --------------------------------------------------------------------------------------
+# ----------------------------- gate -----------------------------
 GATE_ON = _bool(os.getenv("CRYPTO_GATE_ON", "true"), True)
 GATE_REASON = os.getenv("CRYPTO_GATE_REASON", "")
 def _gate_state() -> Dict[str, Any]:
-    # For crypto we consider the "clock" open permanently
-    decision = "open" if GATE_ON else "closed"
-    clock = {
-        "is_open": True,
-        "next_open": None,
-        "next_close": None,
-        "source": "crypto-24x7",
-    }
+    clock = {"is_open": True, "next_open": None, "next_close": None, "source": "crypto-24x7"}
     return {
         "gate_on": GATE_ON,
-        "decision": decision,
+        "decision": "open" if GATE_ON else "closed",
         "reason": GATE_REASON or ("24/7 crypto" if GATE_ON else "manually disabled"),
         "clock": clock,
         "ts": _now_iso(),
     }
 
-# --------------------------------------------------------------------------------------
-# Health / versions
-# --------------------------------------------------------------------------------------
+# ----------------------------- versions -----------------------------
 def _strategy_versions() -> Dict[str, Dict[str, str]]:
     out: Dict[str, Dict[str, str]] = {}
     for name, mod in _strat_modules.items():
@@ -146,11 +209,7 @@ def health():
         syms = market.symbols if market and getattr(market, "symbols", None) else ["BTC/USD","ETH/USD","SOL/USD","DOGE/USD"]
     except Exception:
         syms = ["BTC/USD","ETH/USD","SOL/USD","DOGE/USD"]
-    return jsonify({
-        "ok": True,
-        "system": "crypto",
-        "symbols": syms,
-    })
+    return jsonify({"ok": True, "system": "crypto", "symbols": syms})
 
 @app.get("/health/versions")
 def health_versions():
@@ -159,7 +218,6 @@ def health_versions():
         "exchange": getattr(broker, "exchange_name", "alpaca") if broker else "unknown",
         "systems": _strategy_versions(),
     }
-    # Also mirror in headers like before
     headers = {
         "x-app-version": APP_VERSION,
         "x-c1-version": _strategy_versions().get("c1",{}).get("version",""),
@@ -169,9 +227,7 @@ def health_versions():
     }
     return (jsonify(resp), 200, headers)
 
-# --------------------------------------------------------------------------------------
-# Diagnostics: crypto account + candles + gate
-# --------------------------------------------------------------------------------------
+# ----------------------------- diagnostics -----------------------------
 @app.get("/diag/crypto")
 def diag_crypto():
     info: Dict[str, Any] = {
@@ -184,7 +240,6 @@ def diag_crypto():
         "api_key_present": _bool(os.getenv("APCA_API_KEY_ID") or os.getenv("ALPACA_API_KEY_ID") or "", False),
         "symbols": getattr(market, "symbols", ["BTC/USD","ETH/USD","SOL/USD","DOGE/USD"]),
     }
-    # sample account if available
     acct_sample = None
     acct_err = None
     if broker and hasattr(broker, "account_sample"):
@@ -205,17 +260,13 @@ def diag_candles():
     last_attempts: List[str] = []
     last_url = None
     last_error = None
-    rows_map: Dict[str, int] = {}
+    rows_map: Dict[str, int] = {s: 0 for s in syms}
 
-    if not market or not hasattr(market, "candles"):
+    if not market:
         return jsonify({
-            "symbols": syms,
-            "timeframe": tf,
-            "limit": limit,
-            "rows": {s: 0 for s in syms},
-            "last_attempts": last_attempts,
-            "last_url": last_url,
-            "last_error": "market.candles not available",
+            "symbols": syms, "timeframe": tf, "limit": limit,
+            "rows": rows_map, "last_attempts": last_attempts,
+            "last_url": last_url, "last_error": "no market"
         })
 
     try:
@@ -223,10 +274,13 @@ def diag_candles():
             symbols=syms, timeframe=tf, limit=limit, return_debug=True
         )
         for s in syms:
-            rows_map[s] = int(df_map.get(s).shape[0]) if s in df_map and df_map.get(s) is not None else 0
+            df = df_map.get(s)
+            try:
+                rows_map[s] = int(getattr(df, "shape", [0])[0]) if df is not None else 0
+            except Exception:
+                rows_map[s] = 0
     except Exception as e:
         last_error = f"{type(e).__name__}: {e}"
-        rows_map = {s: 0 for s in syms}
 
     return jsonify({
         "symbols": syms,
@@ -242,18 +296,14 @@ def diag_candles():
 def diag_gate():
     return jsonify(_gate_state())
 
-# --------------------------------------------------------------------------------------
-# Scans (c1..c4)
-# --------------------------------------------------------------------------------------
+# ----------------------------- scans -----------------------------
 def _pwrite(msg: str):
-    # streamed/inline writer stub
     try:
         print(msg, flush=True)
     except Exception:
         pass
 
 def _log(col: Dict[str, Any]):
-    # structured log sink (can be extended to persist)
     try:
         print(json.dumps(col), flush=True)
     except Exception:
@@ -266,21 +316,19 @@ def _run_strategy_direct(name: str, dry: bool, force: bool, params: Dict[str, An
     if not market or not broker:
         return False, [{"action": "error", "error": "market/broker unavailable"}]
 
+    # Pass the proxy market that guarantees multi-symbol candles
+    mkt = market
     try:
-        # Each strategy module must implement run(market, broker, symbols, params, *, dry, pwrite, log)
-        symbols = params.pop("symbols", getattr(market, "symbols", ["BTC/USD","ETH/USD","SOL/USD","DOGE/USD"]))
-        res = mod.run(market, broker, symbols, params, dry=dry, pwrite=_pwrite, log=_log)  # type: ignore
-        ok = True
+        symbols = params.pop("symbols", getattr(mkt, "symbols", ["BTC/USD","ETH/USD","SOL/USD","DOGE/USD"]))
+        res = mod.run(mkt, broker, symbols, params, dry=dry, pwrite=_pwrite, log=_log)  # type: ignore
         results = res if isinstance(res, list) else (res or [])
-        return ok, results
-    except TypeError as te:
-        # Older signatures: run(market, broker, symbols, params, *, dry, pwrite)
+        return True, results
+    except TypeError:
         try:
-            symbols = params.pop("symbols", getattr(market, "symbols", ["BTC/USD","ETH/USD","SOL/USD","DOGE/USD"]))
-            res = mod.run(market, broker, symbols, params, dry=dry, pwrite=_pwrite)  # type: ignore
-            ok = True
+            symbols = params.pop("symbols", getattr(mkt, "symbols", ["BTC/USD","ETH/USD","SOL/USD","DOGE/USD"]))
+            res = mod.run(mkt, broker, symbols, params, dry=dry, pwrite=_pwrite)  # type: ignore
             results = res if isinstance(res, list) else (res or [])
-            return ok, results
+            return True, results
         except Exception as e2:
             return False, [{"action": "error", "error": str(e2)}]
     except Exception as e:
@@ -290,35 +338,23 @@ def _scan_response(name: str, dry: bool, force: bool, params: Dict[str, Any]):
     ok, results = _run_strategy_direct(name, dry, force, params)
     headers = {
         "x-app-version": APP_VERSION,
-        f"x-strategy-version": getattr(_strat_modules.get(name), "STRATEGY_VERSION", "") if _strat_modules.get(name) else "",
+        "x-strategy-version": getattr(_strat_modules.get(name), "STRATEGY_VERSION", "") if _strat_modules.get(name) else "",
     }
-    body = {
-        "strategy": name,
-        "ok": ok,
-        "dry": dry,
-        "force": force,
-        "results": results,
-    }
+    body = {"strategy": name, "ok": ok, "dry": dry, "force": force, "results": results}
     return (jsonify(body), 200, headers)
 
 @app.post("/scan/<name>")
 def scan(name: str):
     n = name.lower()
     if n not in _strat_modules:
-        return jsonify({"ok": False, "dry": _bool(request.args.get("dry"), True), "force": False,
-                        "strategy": n, "error": "unknown strategy"}), 400
-
+        return jsonify({"ok": False, "dry": _bool(request.args.get("dry"), True),
+                        "force": False, "strategy": n, "error": "unknown strategy"}), 400
     dry = _bool(request.args.get("dry"), True)
     force = _bool(request.args.get("force"), False)
-
-    # normalize query params
     p = _norm_scan_params(request.args)
-
     return _scan_response(n, dry, force, p)
 
-# --------------------------------------------------------------------------------------
-# Orders / Positions / Signals passthroughs (using your broker/services)
-# --------------------------------------------------------------------------------------
+# ----------------------------- orders/positions/signals -----------------------------
 @app.get("/orders/recent")
 def orders_recent():
     status = request.args.get("status", "all")
@@ -342,7 +378,6 @@ def positions():
 
 @app.get("/signals")
 def signals():
-    # If you persist signals, expose them here. For now return empty list if store not present.
     try:
         if hasattr(market, "recent_signals"):
             return jsonify(getattr(market, "recent_signals"))
@@ -350,9 +385,7 @@ def signals():
         pass
     return jsonify([])
 
-# --------------------------------------------------------------------------------------
-# Dashboard (single definition to avoid duplicate-endpoint crash)
-# --------------------------------------------------------------------------------------
+# ----------------------------- dashboard -----------------------------
 DASHBOARD_HTML = """
 <!doctype html>
 <html lang="en">
@@ -361,12 +394,9 @@ DASHBOARD_HTML = """
 <title>Crypto Dashboard</title>
 <meta name="viewport" content="width=device-width, initial-scale=1" />
 <style>
-  :root {
-    --bg: #0b0f14; --panel: #121821; --text: #e6edf3; --muted: #8aa0b4;
-    --ok: #2ecc71; --warn: #f1c40f; --err: #e74c3c; --chip: #1b2430;
-  }
-  * { box-sizing: border-box; }
-  body { margin:0; font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial; background: var(--bg); color: var(--text); }
+  :root { --bg:#0b0f14; --panel:#121821; --text:#e6edf3; --muted:#8aa0b4; --ok:#2ecc71; --warn:#f1c40f; --err:#e74c3c; --chip:#1b2430; }
+  * { box-sizing:border-box; }
+  body { margin:0; font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial; background:var(--bg); color:var(--text);}
   header { padding:16px 20px; background: linear-gradient(180deg,#0e131a 0%,#0b0f14 100%); border-bottom:1px solid #1a2330; display:flex; align-items:center; justify-content:space-between; gap:12px; flex-wrap:wrap; }
   h1 { margin:0; font-size:18px; letter-spacing:.4px; font-weight:600; }
   .muted { color: var(--muted); }
@@ -537,15 +567,11 @@ window.addEventListener('load', () => {
 def dashboard():
     return Response(DASHBOARD_HTML, mimetype="text/html")
 
-# Root → redirect to dashboard (to avoid Not Found and health checks)
 @app.get("/")
 def index_root():
     return redirect("/dashboard")
 
-# --------------------------------------------------------------------------------------
-# Run
-# --------------------------------------------------------------------------------------
+# ----------------------------- run -----------------------------
 if __name__ == "__main__":
-    # Allow Render to bind its port; default 10000
     port = int(os.getenv("PORT", "10000"))
     app.run(host="0.0.0.0", port=port)
