@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # app.py — Crypto System API
-# Version: 1.7.7
+# Version: 1.7.8
 
 import os
 import json
@@ -9,7 +9,7 @@ from typing import Any, Dict, List, Tuple, Optional
 
 from flask import Flask, request, jsonify, Response, redirect
 
-APP_VERSION = "1.7.7"
+APP_VERSION = "1.7.8"
 app = Flask(__name__)
 
 # ----------------------------- utils -----------------------------
@@ -74,7 +74,6 @@ def _make_broker():
 def _make_market():
     if MarketCrypto is None:
         return None
-    # construct without from_env() — your class didn’t expose it earlier
     try:
         return MarketCrypto()
     except Exception:
@@ -96,8 +95,18 @@ def _alpaca_headers() -> Dict[str, str]:
         h["APCA-API-SECRET-KEY"] = sec
     return h
 
-def _http_candles_multi(symbols: List[str], timeframe: str, limit: int) -> Tuple[Dict[str,pd.DataFrame], List[str], Optional[str], Optional[str]]:
-    """One-shot v1beta3 multi-symbol fetch; returns map + attempts/url/error."""
+def _rename_bars_df(df: pd.DataFrame) -> pd.DataFrame:
+    rename_map = {
+        "t":"ts","o":"open","h":"high","l":"low","c":"close","v":"volume",
+        "timestamp":"ts","open":"open","high":"high","low":"low","close":"close","volume":"volume"
+    }
+    df = df.rename(columns=rename_map)
+    cols = [c for c in ["ts","open","high","low","close","volume"] if c in df.columns]
+    return df[cols] if cols else df
+
+def _http_candles_multi(symbols: List[str], timeframe: str, limit: int
+) -> Tuple[Dict[str,pd.DataFrame], List[str], Optional[str], Optional[str]]:
+    """Batch fetch; returns map + attempts/url/error (no per-symbol retries here)."""
     attempts: List[str] = []
     last_url: Optional[str] = None
     last_error: Optional[str] = None
@@ -119,44 +128,52 @@ def _http_candles_multi(symbols: List[str], timeframe: str, limit: int) -> Tuple
         for s in symbols:
             rows = bars_map.get(s, [])
             if rows:
-                df = pd.DataFrame(rows)
-                rename_map = {"t":"ts","o":"open","h":"high","l":"low","c":"close","v":"volume",
-                              "timestamp":"ts","open":"open","high":"high","low":"low","close":"close","volume":"volume"}
-                df = df.rename(columns=rename_map)
-                cols = [c for c in ["ts","open","high","low","close","volume"] if c in df.columns]
-                out[s] = df[cols]
+                out[s] = _rename_bars_df(pd.DataFrame(rows))
         return out, attempts, last_url, None
     except Exception as e:
         last_error = f"{type(e).__name__}: {e}"
         return out, attempts, last_url, last_error
 
+def _http_candles_single(symbol: str, timeframe: str, limit: int
+) -> Tuple[pd.DataFrame, str, Optional[str]]:
+    """Single-symbol fetch; returns df, url, error."""
+    base = _alpaca_base()
+    tf = _tf_norm(timeframe)
+    url = f"{base}/v1beta3/crypto/us/bars"
+    params = {"symbols": symbol, "timeframe": tf, "limit": str(limit)}
+    try:
+        r = requests.get(url, params=params, headers=_alpaca_headers(), timeout=12)
+        final_url = r.url
+        if r.status_code != 200:
+            return pd.DataFrame(), final_url, f"HTTP {r.status_code}: {r.text[:300]}"
+        data = r.json() or {}
+        bars_map = data.get("bars", {})
+        rows = bars_map.get(symbol, [])
+        if rows:
+            return _rename_bars_df(pd.DataFrame(rows)), final_url, None
+        return pd.DataFrame(), final_url, None
+    except Exception as e:
+        return pd.DataFrame(), url, f"{type(e).__name__}: {e}"
+
 # ----------------------------- safe market wrapper -----------------------------
 class MarketProxy:
-    """
-    Defensive facade around MarketCrypto with HTTP fallback to Alpaca v1beta3.
-    - Calls inner.candles per symbol (or once, if it returns a map).
-    - If empty, falls back to v1beta3.
-    - Always returns {symbol: DataFrame}; debug tuple returns attempts/url/error.
-    """
+    """Facade around MarketCrypto with HTTP fallback (batch + per-symbol)."""
     def __init__(self, inner):
         self.inner = inner
         self.symbols = getattr(inner, "symbols", ["BTC/USD","ETH/USD","SOL/USD","DOGE/USD"])
         self.last_bars_url: Optional[str] = None
         self.last_error: Optional[str] = None
+        self.last_attempts: List[str] = []
 
-    def _inner_try(self, symbols: List[str], timeframe: str, limit: int, want_debug: bool):
-        """Call inner; normalize to (map, attempts, url, err)."""
+    def _inner_try(self, symbols: List[str], timeframe: str, limit: int):
         attempts: List[str] = []
         url = None
         err = None
         out: Dict[str, pd.DataFrame] = {s: pd.DataFrame() for s in symbols}
-
         if not hasattr(self.inner, "candles"):
             return out, attempts, url, "inner: no candles()"
-
         try:
             rv = self.inner.candles(symbols=symbols, timeframe=timeframe, limit=limit, return_debug=True)
-            # Expected: (map, attempts, url, err)
             if isinstance(rv, tuple) and len(rv) == 4:
                 maybe_map, attempts, url, err = rv
                 if isinstance(maybe_map, dict):
@@ -164,10 +181,8 @@ class MarketProxy:
                         v = maybe_map.get(s)
                         if isinstance(v, pd.DataFrame):
                             out[s] = v
-                else:
-                    # Single DF? Apply to first symbol
-                    if isinstance(maybe_map, pd.DataFrame) and symbols:
-                        out[symbols[0]] = maybe_map
+                elif isinstance(maybe_map, pd.DataFrame) and symbols:
+                    out[symbols[0]] = maybe_map
             elif isinstance(rv, dict):
                 for s in symbols:
                     v = rv.get(s)
@@ -177,24 +192,20 @@ class MarketProxy:
                 out[symbols[0]] = rv
         except Exception as e:
             err = f"inner: {type(e).__name__}: {e}"
-
         return out, attempts, url, err
 
     def candles(self, symbols: List[str], timeframe: str, limit: int, return_debug: bool = False):
         tf = _tf_norm(timeframe)
-        # 1) Inner
-        m1, a1, u1, e1 = self._inner_try(symbols, tf, limit, True)
-        # Check if any symbol has data
+        m1, a1, u1, e1 = self._inner_try(symbols, tf, limit)
         has_any = any((not df.empty) for df in m1.values())
 
         attempts = list(a1)
         last_url = u1
         last_error = e1
 
-        # 2) Fallback if needed
+        # 1) Batch fallback
         if not has_any:
             m2, a2, u2, e2 = _http_candles_multi(symbols, tf, limit)
-            # merge/replace empties
             for s in symbols:
                 if m1.get(s) is None or m1[s].empty:
                     m1[s] = m2.get(s, pd.DataFrame())
@@ -202,6 +213,19 @@ class MarketProxy:
             last_url = u2 or last_url
             last_error = e2 or last_error
 
+        # 2) Per-symbol fallback for any that are still empty
+        empties = [s for s in symbols if m1.get(s) is None or m1[s].empty]
+        for s in empties:
+            df, url_s, err_s = _http_candles_single(s, tf, limit)
+            if url_s:
+                attempts.append(url_s)
+                last_url = url_s
+            if err_s and not last_error:
+                last_error = err_s
+            if not df.empty:
+                m1[s] = df
+
+        self.last_attempts = attempts
         self.last_bars_url = last_url
         self.last_error = last_error
 
@@ -236,13 +260,9 @@ GATE_ON = _bool(os.getenv("CRYPTO_GATE_ON", "true"), True)
 GATE_REASON = os.getenv("CRYPTO_GATE_REASON", "")
 def _gate_state() -> Dict[str, Any]:
     clock = {"is_open": True, "next_open": None, "next_close": None, "source": "crypto-24x7"}
-    return {
-        "gate_on": GATE_ON,
-        "decision": "open" if GATE_ON else "closed",
-        "reason": GATE_REASON or ("24/7 crypto" if GATE_ON else "manually disabled"),
-        "clock": clock,
-        "ts": _now_iso(),
-    }
+    return {"gate_on": GATE_ON, "decision": "open" if GATE_ON else "closed",
+            "reason": GATE_REASON or ("24/7 crypto" if GATE_ON else "manually disabled"),
+            "clock": clock, "ts": _now_iso()}
 
 # ----------------------------- versions -----------------------------
 def _strategy_versions() -> Dict[str, Dict[str, str]]:
@@ -251,8 +271,7 @@ def _strategy_versions() -> Dict[str, Dict[str, str]]:
         if mod is None:
             out[name] = {"version": ""}
         else:
-            ver = getattr(mod, "STRATEGY_VERSION", "")
-            out[name] = {"version": ver or ""}
+            out[name] = {"version": getattr(mod, "STRATEGY_VERSION", "") or ""}
     return out
 
 @app.get("/health")
@@ -293,6 +312,7 @@ def diag_crypto():
         "last_data_error": getattr(market, "last_error", None) if market else None,
         "api_key_present": bool(os.getenv("APCA_API_KEY_ID") or os.getenv("ALPACA_API_KEY_ID")),
         "symbols": getattr(market, "symbols", ["BTC/USD","ETH/USD","SOL/USD","DOGE/USD"]),
+        "last_attempts": getattr(market, "last_attempts", []),
     }
     acct_sample = None
     acct_err = None
@@ -316,7 +336,6 @@ def diag_candles():
     last_url = None
     last_error = None
 
-    # 1) Through MarketProxy (inner + fallback)
     df_map: Dict[str, Any] = {s: pd.DataFrame() for s in syms}
     try:
         if market:
@@ -329,18 +348,6 @@ def diag_candles():
     except Exception as e:
         last_error = f"{type(e).__name__}: {e}"
 
-    # 2) If everything is still zero, probe v1beta3 directly (multi) and report
-    all_zero = all(v == 0 for v in rows_map.values())
-    probe_attempts: List[str] = []
-    probe_url = None
-    probe_error = None
-    probe_rows: Dict[str,int] = {}
-
-    if all_zero:
-        http_map, probe_attempts, probe_url, probe_error = _http_candles_multi(syms, tf, limit)
-        for s in syms:
-            probe_rows[s] = int(getattr(http_map.get(s), "shape", [0])[0]) if http_map.get(s) is not None else 0
-
     return jsonify({
         "symbols": syms,
         "timeframe": tf,
@@ -349,10 +356,6 @@ def diag_candles():
         "last_attempts": attempts,
         "last_url": last_url,
         "last_error": last_error,
-        "probe_rows": probe_rows if all_zero else {},
-        "probe_attempts": probe_attempts if all_zero else [],
-        "probe_url": probe_url if all_zero else None,
-        "probe_error": probe_error if all_zero else None,
     })
 
 @app.get("/diag/gate")
