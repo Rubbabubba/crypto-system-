@@ -10,7 +10,7 @@ import requests
 # ----------------------------
 # App / Env
 # ----------------------------
-APP_VERSION = os.environ.get("APP_VERSION", "1.6.6")
+APP_VERSION = os.environ.get("APP_VERSION", "1.6.7")
 SYSTEM_NAME = "crypto"
 
 CRYPTO_EXCHANGE = os.environ.get("CRYPTO_EXCHANGE", "alpaca")
@@ -124,7 +124,7 @@ def _run_strategy_direct(tag: str, mod, symbols: List[str], params: Dict[str, An
         return {"ok": False, "error": str(e)}
 
 # ----------------------------
-# UI (compact dashboard)
+# UI
 # ----------------------------
 DASHBOARD_HTML = """
 <!doctype html><html lang="en"><head><meta charset="utf-8">
@@ -248,7 +248,7 @@ def diag_crypto():
     except Exception as e:
         acct_err = str(e)
 
-    # Data probe (uses market client; now v1beta3 only)
+    # Data probe (uses market client)
     data_probe: Dict[str, Any] = {}
     effective_bars_url = ""
     last_data_error = None
@@ -381,6 +381,17 @@ def diag_inline():
         "symbols": CRYPTO_SYMBOLS,
         "server_time": _now_iso(),
     })
+
+# ----------------------------
+# Root / Dashboard
+# ----------------------------
+@app.get("/dashboard")
+def dashboard():
+    return Response(DASHBOARD_HTML, mimetype="text/html")
+
+@app.get("/")
+def index_root():
+    return redirect("/dashboard")
 
 # ----------------------------
 # Main
