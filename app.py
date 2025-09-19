@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # app.py — Crypto System API
-# Version: 1.7.2
+# Version: 1.7.6
 
 import os
 import json
@@ -9,7 +9,7 @@ from typing import Any, Dict, List, Tuple, Optional
 
 from flask import Flask, request, jsonify, Response, redirect
 
-APP_VERSION = "1.7.2"
+APP_VERSION = "1.7.6"
 app = Flask(__name__)
 
 # ----------------------------- utils -----------------------------
@@ -30,6 +30,20 @@ def _int(x: Any, default: int) -> int:
 def _now_iso() -> str:
     return dt.datetime.utcnow().replace(tzinfo=dt.timezone.utc).isoformat()
 
+def _tf_norm(tf: str) -> str:
+    if not tf:
+        return "5Min"
+    s = str(tf).strip()
+    # Accept 1m, 3m, 5m, 15m, 30m, 1H, 1D, and *Min variants
+    m = {
+        "1m":"1Min","3m":"3Min","5m":"5Min","15m":"15Min","30m":"30Min",
+        "60m":"60Min","1h":"1Hour","1H":"1Hour","1d":"1Day","1D":"1Day",
+        "5min":"5Min","15min":"15Min","30min":"30Min","60min":"60Min",
+        "1Min":"1Min","3Min":"3Min","5Min":"5Min","15Min":"15Min","30Min":"30Min","60Min":"60Min",
+        "1Hour":"1Hour","1Day":"1Day"
+    }
+    return m.get(s, s)
+
 # ----------------------------- imports -----------------------------
 try:
     from services.exchange_exec import ExchangeExec
@@ -40,6 +54,9 @@ try:
     from services.market_crypto import MarketCrypto
 except Exception:
     MarketCrypto = None  # type: ignore
+
+import requests  # used by HTTP fallback
+import pandas as pd  # strategies expect DataFrames
 
 # strategies c1..c4
 _strat_modules: Dict[str, Any] = {}
@@ -58,7 +75,7 @@ def _make_broker():
 def _make_market():
     if MarketCrypto is None:
         return None
-    return MarketCrypto()
+    return MarketCrypto()  # constructed without from_env()
 
 broker = _make_broker()
 _underlying_market = _make_market()
@@ -66,65 +83,89 @@ _underlying_market = _make_market()
 # ----------------------------- safe market wrapper -----------------------------
 class MarketProxy:
     """
-    Defensive facade around your MarketCrypto to normalize `candles(...)`:
-    - Always supports multi-symbol by looping per symbol.
-    - Normalizes return_debug outputs into a dict + debug bundle.
+    Defensive facade around MarketCrypto with HTTP fallback to Alpaca v1beta3.
+    - Per-symbol inner call (avoids shape/tuple surprises).
+    - If inner returns empty/None, fetch from /v1beta3/crypto/us/bars.
+    - Always returns {symbol: pandas.DataFrame}, with debug tuple when requested.
     """
     def __init__(self, inner):
         self.inner = inner
-        # bubble through common attrs if present
         self.symbols = getattr(inner, "symbols", ["BTC/USD","ETH/USD","SOL/USD","DOGE/USD"])
-        self.last_bars_url = None
-        self.last_error = None
+        self.last_bars_url: Optional[str] = None
+        self.last_error: Optional[str] = None
 
-    def _one(
-        self, symbol: str, timeframe: str, limit: int, return_debug: bool
-    ):
-        # Try inner.candles for a single symbol list [symbol]
+    # -------- HTTP fallback (v1beta3) --------
+    def _alpaca_base(self) -> str:
+        # allow override; default official base
+        return os.getenv("ALPACA_DATA_BASE", "https://data.alpaca.markets")
+
+    def _http_fetch_one(self, symbol: str, timeframe: str, limit: int) -> Tuple[Optional[pd.DataFrame], List[str], Optional[str], Optional[str]]:
+        attempts: List[str] = []
+        last_url = None
+        last_error = None
+
+        # v1beta3 endpoint with slash symbols, us feed implied by path
+        base = self._alpaca_base().rstrip("/")
+        tf = _tf_norm(timeframe)
+        url = f"{base}/v1beta3/crypto/us/bars"
+        params = {
+            "symbols": symbol,  # keep slash e.g. BTC/USD
+            "timeframe": tf,
+            "limit": str(limit),
+        }
+        headers = {}
+        # Pass through Alpaca creds if present (helps on some accounts)
+        key = os.getenv("APCA_API_KEY_ID") or os.getenv("ALPACA_API_KEY_ID")
+        sec = os.getenv("APCA_API_SECRET_KEY") or os.getenv("ALPACA_API_SECRET_KEY")
+        if key and sec:
+            headers["APCA-API-KEY-ID"] = key
+            headers["APCA-API-SECRET-KEY"] = sec
+
+        try:
+            q = requests.get(url, params=params, headers=headers, timeout=10)
+            last_url = q.url
+            attempts.append(last_url or url)
+            if q.status_code != 200:
+                last_error = f"HTTP {q.status_code}: {q.text[:200]}"
+                return None, attempts, last_url, last_error
+            data = q.json()
+            # v1beta3 returns {"bars": {"BTC/USD": [ ... ]}}
+            bars = (data or {}).get("bars", {}).get(symbol, [])
+            if not bars:
+                return None, attempts, last_url, None
+            # Normalize into DataFrame (ts, open, high, low, close, volume)
+            df = pd.DataFrame(bars)
+            # Ensure expected columns exist
+            rename_map = {
+                "t":"ts","o":"open","h":"high","l":"low","c":"close","v":"volume",
+                "timestamp":"ts","open":"open","high":"high","low":"low","close":"close","volume":"volume"
+            }
+            df = df.rename(columns=rename_map)
+            # Keep ordered columns if present
+            cols = [c for c in ["ts","open","high","low","close","volume"] if c in df.columns]
+            df = df[cols]
+            return df, attempts, last_url, None
+        except Exception as e:
+            last_error = f"{type(e).__name__}: {e}"
+            return None, attempts, last_url, last_error
+
+    # -------- inner call (per symbol) --------
+    def _inner_one(self, symbol: str, timeframe: str, limit: int, return_debug: bool):
         if not hasattr(self.inner, "candles"):
             raise RuntimeError("market.candles not available")
+
+        # try keyword style first
         try:
             if return_debug:
-                # could be (df_map, attempts, last_url, last_error) OR
-                # df_map only OR (df, attempts, last_url, last_error)
-                rv = self.inner.candles(symbols=[symbol], timeframe=timeframe, limit=limit, return_debug=True)
+                return self.inner.candles(symbols=[symbol], timeframe=timeframe, limit=limit, return_debug=True)
             else:
-                rv = self.inner.candles(symbols=[symbol], timeframe=timeframe, limit=limit)
+                return self.inner.candles(symbols=[symbol], timeframe=timeframe, limit=limit)
         except TypeError:
-            # fallback without keywords
+            # fallback positional
             if return_debug:
-                rv = self.inner.candles([symbol], timeframe, limit, True)
+                return self.inner.candles([symbol], timeframe, limit, True)
             else:
-                rv = self.inner.candles([symbol], timeframe, limit)
-
-        # Normalize per-symbol output
-        df_map: Dict[str, Any] = {}
-        attempts: List[str] = []
-        last_url: Optional[str] = None
-        last_error: Optional[str] = None
-
-        # Case A: dict mapping
-        if isinstance(rv, dict):
-            df_map = rv
-        # Case B: tuple length 4: (df_map or df, attempts, last_url, last_error)
-        elif isinstance(rv, tuple) and len(rv) == 4:
-            maybe_map, attempts, last_url, last_error = rv
-            if isinstance(maybe_map, dict):
-                df_map = maybe_map
-            else:
-                # assume it's a single DataFrame
-                df_map = {symbol: maybe_map}
-        # Case C: single DF
-        else:
-            df_map = {symbol: rv}
-
-        # Track last values for /diag/crypto
-        self.last_bars_url = last_url or self.last_bars_url
-        self.last_error = last_error
-
-        if return_debug:
-            return df_map, attempts, last_url, last_error
-        return df_map
+                return self.inner.candles([symbol], timeframe, limit)
 
     def candles(
         self,
@@ -138,25 +179,68 @@ class MarketProxy:
         last_url: Optional[str] = None
         last_error: Optional[str] = None
 
+        tf = _tf_norm(timeframe)
         for s in symbols:
-            if return_debug:
-                m, att, url, err = self._one(s, timeframe, limit, True)
-                all_map.update(m or {})
-                if isinstance(att, list):
-                    all_attempts.extend(att)
-                if url:
-                    last_url = url
-                if err:
-                    last_error = err
+            # 1) Try inner market (per symbol)
+            df_from_inner: Optional[pd.DataFrame] = None
+            inner_attempts: List[str] = []
+            inner_url: Optional[str] = None
+            inner_err: Optional[str] = None
+
+            try:
+                rv = self._inner_one(s, tf, limit, return_debug=True)
+                # Normalize inner result
+                if isinstance(rv, dict):
+                    df_from_inner = rv.get(s)
+                elif isinstance(rv, tuple) and len(rv) == 4:
+                    maybe_map, attempts, url, err = rv
+                    if isinstance(maybe_map, dict):
+                        df_from_inner = maybe_map.get(s)
+                    else:
+                        df_from_inner = maybe_map  # single DataFrame
+                    inner_attempts = attempts or []
+                    inner_url = url
+                    inner_err = err
+                else:
+                    df_from_inner = rv  # single DataFrame
+            except Exception as e:
+                inner_err = f"inner: {type(e).__name__}: {e}"
+
+            used_http_fallback = False
+
+            # 2) Fallback to HTTP if inner empty/None
+            if df_from_inner is None or (hasattr(df_from_inner, "empty") and getattr(df_from_inner, "empty")):
+                df_http, http_attempts, http_url, http_err = self._http_fetch_one(s, tf, limit)
+                if df_http is not None and not df_http.empty:
+                    all_map[s] = df_http
+                else:
+                    all_map[s] = pd.DataFrame()  # keep key present
+                used_http_fallback = True
+                all_attempts.extend(http_attempts)
+                if http_url:
+                    last_url = http_url
+                if http_err:
+                    last_error = http_err
             else:
-                m = self._one(s, timeframe, limit, False)
-                all_map.update(m or {})
+                # We have inner data
+                all_map[s] = df_from_inner
+
+            # Track inner debug if not using fallback (or even if we did)
+            all_attempts.extend(inner_attempts)
+            if inner_url and not last_url:
+                last_url = inner_url
+            if inner_err and not last_error:
+                last_error = inner_err
+
+        # Remember for /diag/crypto
+        self.last_bars_url = last_url
+        self.last_error = last_error
 
         if return_debug:
             return all_map, all_attempts, last_url, last_error
         return all_map
 
-# Use proxy everywhere strategies/UI need market access
+# Use proxy everywhere
 market = MarketProxy(_underlying_market) if _underlying_market else None
 
 # ----------------------------- scan params normalizer -----------------------------
@@ -213,17 +297,18 @@ def health():
 
 @app.get("/health/versions")
 def health_versions():
+    versions = _strategy_versions()
     resp = {
         "app": APP_VERSION,
         "exchange": getattr(broker, "exchange_name", "alpaca") if broker else "unknown",
-        "systems": _strategy_versions(),
+        "systems": versions,
     }
     headers = {
         "x-app-version": APP_VERSION,
-        "x-c1-version": _strategy_versions().get("c1",{}).get("version",""),
-        "x-c2-version": _strategy_versions().get("c2",{}).get("version",""),
-        "x-c3-version": _strategy_versions().get("c3",{}).get("version",""),
-        "x-c4-version": _strategy_versions().get("c4",{}).get("version",""),
+        "x-c1-version": versions.get("c1",{}).get("version",""),
+        "x-c2-version": versions.get("c2",{}).get("version",""),
+        "x-c3-version": versions.get("c3",{}).get("version",""),
+        "x-c4-version": versions.get("c4",{}).get("version",""),
     }
     return (jsonify(resp), 200, headers)
 
@@ -237,7 +322,7 @@ def diag_crypto():
         "data_base_env": os.getenv("ALPACA_DATA_BASE") or "https://data.alpaca.markets",
         "effective_bars_url": getattr(market, "last_bars_url", None) if market else None,
         "last_data_error": getattr(market, "last_error", None) if market else None,
-        "api_key_present": _bool(os.getenv("APCA_API_KEY_ID") or os.getenv("ALPACA_API_KEY_ID") or "", False),
+        "api_key_present": bool(os.getenv("APCA_API_KEY_ID") or os.getenv("ALPACA_API_KEY_ID")),
         "symbols": getattr(market, "symbols", ["BTC/USD","ETH/USD","SOL/USD","DOGE/USD"]),
     }
     acct_sample = None
@@ -257,10 +342,10 @@ def diag_candles():
     limit = _int(request.args.get("limit", 3), 3)
     tf = request.args.get("tf") or request.args.get("timeframe") or "5m"
     syms = [s.strip() for s in symbols.split(",") if s.strip()]
+    rows_map: Dict[str, int] = {s: 0 for s in syms}
     last_attempts: List[str] = []
     last_url = None
     last_error = None
-    rows_map: Dict[str, int] = {s: 0 for s in syms}
 
     if not market:
         return jsonify({
@@ -275,10 +360,7 @@ def diag_candles():
         )
         for s in syms:
             df = df_map.get(s)
-            try:
-                rows_map[s] = int(getattr(df, "shape", [0])[0]) if df is not None else 0
-            except Exception:
-                rows_map[s] = 0
+            rows_map[s] = int(getattr(df, "shape", [0])[0]) if df is not None else 0
     except Exception as e:
         last_error = f"{type(e).__name__}: {e}"
 
@@ -316,7 +398,6 @@ def _run_strategy_direct(name: str, dry: bool, force: bool, params: Dict[str, An
     if not market or not broker:
         return False, [{"action": "error", "error": "market/broker unavailable"}]
 
-    # Pass the proxy market that guarantees multi-symbol candles
     mkt = market
     try:
         symbols = params.pop("symbols", getattr(mkt, "symbols", ["BTC/USD","ETH/USD","SOL/USD","DOGE/USD"]))
@@ -386,44 +467,29 @@ def signals():
     return jsonify([])
 
 # ----------------------------- dashboard -----------------------------
-DASHBOARD_HTML = """
-<!doctype html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<title>Crypto Dashboard</title>
+DASHBOARD_HTML = """<!doctype html><html lang="en"><head>
+<meta charset="utf-8"><title>Crypto Dashboard</title>
 <meta name="viewport" content="width=device-width, initial-scale=1" />
 <style>
   :root { --bg:#0b0f14; --panel:#121821; --text:#e6edf3; --muted:#8aa0b4; --ok:#2ecc71; --warn:#f1c40f; --err:#e74c3c; --chip:#1b2430; }
-  * { box-sizing:border-box; }
-  body { margin:0; font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial; background:var(--bg); color:var(--text);}
+  * { box-sizing:border-box; } body { margin:0; font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, Arial; background:var(--bg); color:var(--text);}
   header { padding:16px 20px; background: linear-gradient(180deg,#0e131a 0%,#0b0f14 100%); border-bottom:1px solid #1a2330; display:flex; align-items:center; justify-content:space-between; gap:12px; flex-wrap:wrap; }
-  h1 { margin:0; font-size:18px; letter-spacing:.4px; font-weight:600; }
-  .muted { color: var(--muted); }
+  h1 { margin:0; font-size:18px; letter-spacing:.4px; font-weight:600; } .muted { color: var(--muted); }
   .grid { display:grid; gap:16px; padding:16px; grid-template-columns: repeat(auto-fill, minmax(320px, 1fr)); }
   .card { background: var(--panel); border:1px solid #1a2330; border-radius:12px; padding:16px; }
   .card h2 { margin:0 0 12px; font-size:16px; letter-spacing:.3px; }
   .row { display:flex; gap:12px; align-items:center; flex-wrap:wrap; }
-  .chips { display:flex; gap:8px; flex-wrap:wrap; }
-  .chip { background: var(--chip); border:1px solid #1f2a38; color: var(--text); border-radius:999px; padding:6px 10px; font-size:12px; }
+  .chips { display:flex; gap:8px; flex-wrap:wrap; } .chip { background: var(--chip); border:1px solid #1f2a38; color: var(--text); border-radius:999px; padding:6px 10px; font-size:12px; }
   .ok { color: var(--ok); } .warn { color: var(--warn); } .err { color: var(--err); }
   button, .btn { cursor:pointer; background:#162335; color:var(--text); border:1px solid #233248; padding:8px 12px; border-radius:8px; font-size:13px; }
-  button:hover, .btn:hover { background:#1b2a40; }
-  table { width:100%; border-collapse: collapse; font-size: 13px; }
-  th, td { padding:8px; border-bottom:1px solid #1a2330; text-align:left; }
-  th { color: var(--muted); font-weight:500; }
-  .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, "Courier New", monospace; }
-  .right { text-align: right; }
-  .small { font-size: 12px; color: var(--muted); }
-  .notice { background:#0f1520; border:1px solid #203049; padding:10px 12px; border-radius:10px; font-size:13px; }
+  button:hover, .btn:hover { background:#1b2a40; } table { width:100%; border-collapse: collapse; font-size: 13px; }
+  th, td { padding:8px; border-bottom:1px solid #1a2330; text-align:left; } th { color: var(--muted); font-weight:500; }
+  .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, "Courier New", monospace; } .right { text-align: right; } .small { font-size: 12px; color: var(--muted); }
 </style>
-</head>
-<body>
+</head><body>
 <header>
-  <div>
-    <h1>Crypto Dashboard <span class="small muted mono" id="appVersion"></span></h1>
-    <div class="small muted">Gate <strong id="gateState">checking…</strong></div>
-  </div>
+  <div><h1>Crypto Dashboard <span class="small muted mono" id="appVersion"></span></h1>
+  <div class="small muted">Gate <strong id="gateState">checking…</strong></div></div>
   <div class="row">
     <button onclick="refreshAll()">Refresh</button>
     <a class="btn" href="/health/versions">Versions</a>
@@ -431,136 +497,28 @@ DASHBOARD_HTML = """
     <a class="btn" href="/diag/candles?symbols=BTC/USD,ETH/USD,SOL/USD,DOGE/USD&limit=3&tf=5m">Candles</a>
   </div>
 </header>
-
 <div class="grid">
-  <div class="card">
-    <h2>Gate</h2>
-    <div id="gateCard" class="notice">Loading…</div>
-    <div class="chips" style="margin-top:10px;">
-      <span class="chip">/diag/gate</span>
-      <span class="chip">24/7 crypto</span>
-    </div>
-  </div>
-
-  <div class="card">
-    <h2>Quick Scans</h2>
-    <div class="row">
-      <button onclick="triggerScan('c1')">Scan C1</button>
-      <button onclick="triggerScan('c2')">Scan C2</button>
-      <button onclick="triggerScan('c3')">Scan C3</button>
-      <button onclick="triggerScan('c4')">Scan C4</button>
-    </div>
-    <div class="small muted" id="scanResult" style="margin-top:10px;"></div>
-  </div>
-
-  <div class="card" style="grid-column: 1 / -1;">
-    <h2>Recent Orders</h2>
-    <div id="ordersTable">Loading…</div>
-  </div>
-
-  <div class="card" style="grid-column: 1 / -1;">
-    <h2>Positions</h2>
-    <div id="positionsTable">Loading…</div>
-  </div>
+  <div class="card"><h2>Gate</h2><div id="gateCard">Loading…</div></div>
+  <div class="card"><h2>Quick Scans</h2><div class="row">
+    <button onclick="triggerScan('c1')">Scan C1</button>
+    <button onclick="triggerScan('c2')">Scan C2</button>
+    <button onclick="triggerScan('c3')">Scan C3</button>
+    <button onclick="triggerScan('c4')">Scan C4</button>
+  </div><div class="small muted" id="scanResult" style="margin-top:10px;"></div></div>
+  <div class="card" style="grid-column: 1 / -1;"><h2>Recent Orders</h2><div id="ordersTable">Loading…</div></div>
+  <div class="card" style="grid-column: 1 / -1;"><h2>Positions</h2><div id="positionsTable">Loading…</div></div>
 </div>
-
 <script>
-async function jfetch(url, opts={}) {
-  const r = await fetch(url, opts);
-  if (!r.ok) throw new Error("HTTP "+r.status);
-  const ct = r.headers.get("content-type") || "";
-  if (ct.includes("application/json")) return r.json();
-  return r.text();
-}
-function esc(s){ return (s==null?"":String(s)).replace(/[&<>\"']/g, m => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]); }
-
-async function refreshGate() {
-  try {
-    const gate = await jfetch('/diag/gate');
-    const v = await jfetch('/health/versions');
-    document.getElementById('appVersion').textContent = "v" + esc(v.app);
-    const open = gate.decision === 'open';
-    document.getElementById('gateState').textContent = open ? 'OPEN' : (gate.decision || 'closed');
-    document.getElementById('gateState').className = open ? 'ok' : 'warn';
-    const clk = gate.clock || {};
-    const lines = [
-      `<div><strong>Gate:</strong> ${esc(gate.gate_on ? 'on' : 'off')} — <strong>Decision:</strong> ${esc(gate.decision)} — ${esc(gate.reason||'')}</div>`,
-      `<div><strong>Clock:</strong> is_open=${esc(clk.is_open)} · next_open=${esc(clk.next_open)} · next_close=${esc(clk.next_close)}</div>`
-    ];
-    document.getElementById('gateCard').innerHTML = lines.join('');
-  } catch (e) {
-    document.getElementById('gateCard').innerHTML = `<span class="err">Failed to load gate</span>`;
-  }
-}
-
-async function loadOrders() {
-  try {
-    const rows = await jfetch('/orders/recent?status=all&limit=200');
-    const arr = Array.isArray(rows) ? rows : [];
-    if (arr.length === 0) { document.getElementById('ordersTable').innerHTML = '<div class="muted">No orders</div>'; return; }
-    let html = '<table><thead><tr><th>Time</th><th>Symbol</th><th>Side</th><th>Qty</th><th>Type</th><th>Status</th><th class="right">Filled</th></tr></thead><tbody>';
-    for (const o of arr.slice(0,200)) {
-      html += `<tr>
-        <td class="mono small">${esc(o.submitted_at || o.created_at || '')}</td>
-        <td class="mono">${esc(o.symbol || '')}</td>
-        <td>${esc(o.side || '')}</td>
-        <td>${esc(o.qty || '')}</td>
-        <td>${esc(o.type || o.order_type || '')}</td>
-        <td>${esc(o.status || '')}</td>
-        <td class="right">${esc(o.filled_qty || '0')}</td>
-      </tr>`;
-    }
-    html += '</tbody></table>';
-    document.getElementById('ordersTable').innerHTML = html;
-  } catch(e) {
-    document.getElementById('ordersTable').innerHTML = `<div class="err">Failed to load orders</div>`;
-  }
-}
-
-async function loadPositions() {
-  try {
-    const rows = await jfetch('/positions');
-    const arr = Array.isArray(rows) ? rows : [];
-    if (arr.length === 0) { document.getElementById('positionsTable').innerHTML = '<div class="muted">No positions</div>'; return; }
-    let html = '<table><thead><tr><th>Symbol</th><th>Side</th><th>Qty</th><th class="right">Market Value</th><th class="right">Unrealized P/L</th></tr></thead><tbody>';
-    for (const p of arr) {
-      html += `<tr>
-        <td class="mono">${esc(p.symbol || p.asset_id || '')}</td>
-        <td>${esc(p.side || '')}</td>
-        <td>${esc(p.qty || '')}</td>
-        <td class="right mono">$${esc(p.market_value || '0')}</td>
-        <td class="right mono">$${esc(p.unrealized_pl || '0')}</td>
-      </tr>`;
-    }
-    html += '</tbody></table>';
-    document.getElementById('positionsTable').innerHTML = html;
-  } catch(e) {
-    document.getElementById('positionsTable').innerHTML = `<div class="err">Failed to load positions</div>`;
-  }
-}
-
-async function triggerScan(which) {
-  try {
-    const url = `/scan/${which}?dry=1&timeframe=5Min&limit=600`;
-    const res = await jfetch(url, { method: 'POST' });
-    document.getElementById('scanResult').textContent = JSON.stringify(res);
-  } catch(e) {
-    document.getElementById('scanResult').textContent = 'Scan failed';
-  }
-}
-
-function refreshAll() {
-  refreshGate();
-  loadOrders();
-  loadPositions();
-}
-window.addEventListener('load', () => {
-  refreshAll();
-  setInterval(refreshGate, 30000);
-});
+async function jfetch(u,o={}){const r=await fetch(u,o);if(!r.ok)throw new Error("HTTP "+r.status);const ct=r.headers.get("content-type")||"";return ct.includes("application/json")?r.json():r.text();}
+function esc(s){return (s==null?"":String(s)).replace(/[&<>\"']/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]));}
+async function refreshGate(){try{const g=await jfetch('/diag/gate');const v=await jfetch('/health/versions');document.getElementById('appVersion').textContent="v"+esc(v.app);const open=g.decision==='open';document.getElementById('gateState').textContent=open?'OPEN':(g.decision||'closed');document.getElementById('gateState').className=open?'ok':'warn';document.getElementById('gateCard').innerHTML=`<div><strong>Gate:</strong> ${esc(g.gate_on?'on':'off')} — <strong>Decision:</strong> ${esc(g.decision)} — ${esc(g.reason||'')}</div>`;}catch(e){document.getElementById('gateCard').innerHTML='<span class="err">Failed to load gate</span>';}}
+async function loadOrders(){try{const rows=await jfetch('/orders/recent?status=all&limit=200');const a=Array.isArray(rows)?rows:[];if(a.length===0){document.getElementById('ordersTable').innerHTML='<div class="muted">No orders</div>';return;}let h='<table><thead><tr><th>Time</th><th>Symbol</th><th>Side</th><th>Qty</th><th>Type</th><th>Status</th><th class="right">Filled</th></tr></thead><tbody>';for(const o of a.slice(0,200)){h+=`<tr><td class="mono small">${esc(o.submitted_at||o.created_at||'')}</td><td class="mono">${esc(o.symbol||'')}</td><td>${esc(o.side||'')}</td><td>${esc(o.qty||'')}</td><td>${esc(o.type||o.order_type||'')}</td><td>${esc(o.status||'')}</td><td class="right">${esc(o.filled_qty||'0')}</td></tr>`;}h+='</tbody></table>';document.getElementById('ordersTable').innerHTML=h;}catch(e){document.getElementById('ordersTable').innerHTML='<div class="err">Failed to load orders</div>';}}
+async function loadPositions(){try{const rows=await jfetch('/positions');const a=Array.isArray(rows)?rows:[];if(a.length===0){document.getElementById('positionsTable').innerHTML='<div class="muted">No positions</div>';return;}let h='<table><thead><tr><th>Symbol</th><th>Side</th><th>Qty</th><th class="right">Market Value</th><th class="right">Unrealized P/L</th></tr></thead><tbody>';for(const p of a){h+=`<tr><td class="mono">${esc(p.symbol||p.asset_id||'')}</td><td>${esc(p.side||'')}</td><td>${esc(p.qty||'')}</td><td class="right mono">$${esc(p.market_value||'0')}</td><td class="right mono">$${esc(p.unrealized_pl||'0')}</td></tr>`;}h+='</tbody></table>';document.getElementById('positionsTable').innerHTML=h;}catch(e){document.getElementById('positionsTable').innerHTML='<div class="err">Failed to load positions</div>';}}
+async function triggerScan(w){try{const res=await jfetch(`/scan/${w}?dry=1&timeframe=5Min&limit=600`,{method:'POST'});document.getElementById('scanResult').textContent=JSON.stringify(res);}catch(e){document.getElementById('scanResult').textContent='Scan failed';}}
+function refreshAll(){refreshGate();loadOrders();loadPositions();}
+window.addEventListener('load',()=>{refreshAll();setInterval(refreshGate,30000);});
 </script>
-</body>
-</html>
+</body></html>
 """
 
 @app.get("/dashboard")
