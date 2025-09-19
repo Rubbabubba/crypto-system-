@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
 # app.py — Crypto System API
-# Version: 1.8.0
+# Version: 1.8.1
 
 import os
 import json
 import datetime as dt
-from typing import Any, Dict, List, Tuple, Optional
+from typing import Any, Dict, List, Tuple, Optional, Iterable
 
 from flask import Flask, request, jsonify, Response, redirect
 
-APP_VERSION = "1.8.0"
+APP_VERSION = "1.8.1"
 app = Flask(__name__)
 
 # ----------------------------- utils -----------------------------
@@ -19,7 +19,7 @@ def _bool(x: Any, default=False) -> bool:
     if isinstance(x, bool):
         return x
     s = str(x).strip().lower()
-    return s in ("1", "true", "t", "yes", "y", "on")
+    return s in ("1","true","t","yes","y","on")
 
 def _int(x: Any, default: int) -> int:
     try:
@@ -35,8 +35,8 @@ def _tf_norm(tf: str) -> str:
         return "5Min"
     s = str(tf).strip()
     m = {
-        "1m":"1Min","3m":"3Min","5m":"5Min","15m":"15Min","30m":"30Min",
-        "60m":"60Min","1h":"1Hour","1H":"1Hour","1d":"1Day","1D":"1Day",
+        "1m":"1Min","3m":"3Min","5m":"5Min","15m":"15Min","30m":"30Min","60m":"60Min",
+        "1h":"1Hour","1H":"1Hour","1d":"1Day","1D":"1Day",
         "5min":"5Min","15min":"15Min","30min":"30Min","60min":"60Min",
         "1Min":"1Min","3Min":"3Min","5Min":"5Min","15Min":"15Min","30Min":"30Min","60Min":"60Min",
         "1Hour":"1Hour","1Day":"1Day"
@@ -47,7 +47,6 @@ def _to_utc_ts(x) -> Optional[dt.datetime]:
     try:
         if isinstance(x, (int, float)):
             return dt.datetime.fromtimestamp(float(x), tz=dt.timezone.utc)
-        # Alpaca returns RFC3339 strings
         return dt.datetime.fromisoformat(str(x).replace("Z","+00:00")).astimezone(dt.timezone.utc)
     except Exception:
         return None
@@ -68,13 +67,13 @@ import pandas as pd
 
 # strategies c1..c4
 _strat_modules: Dict[str, Any] = {}
-for _name in ("c1", "c2", "c3", "c4"):
+for _name in ("c1","c2","c3","c4"):
     try:
         _strat_modules[_name] = __import__(f"strategies.{_name}", fromlist=["*"])
     except Exception:
         _strat_modules[_name] = None
 
-# ----------------------------- market/broker -----------------------------
+# ----------------------------- broker/market -----------------------------
 def _make_broker():
     if ExchangeExec is None:
         return None
@@ -91,11 +90,11 @@ def _make_market():
 broker = _make_broker()
 _underlying_market = _make_market()
 
-# ----------------------------- HTTP helpers -----------------------------
+# ----------------------------- Alpaca HTTP helpers -----------------------------
 def _alpaca_base() -> str:
-    return os.getenv("ALPACA_DATA_BASE", "https://data.alpaca.markets").rstrip("/")
+    return os.getenv("ALPACA_DATA_BASE","https://data.alpaca.markets").rstrip("/")
 
-def _alpaca_headers() -> Dict[str, str]:
+def _alpaca_headers() -> Dict[str,str]:
     h: Dict[str,str] = {}
     key = os.getenv("APCA_API_KEY_ID") or os.getenv("ALPACA_API_KEY_ID")
     sec = os.getenv("APCA_API_SECRET_KEY") or os.getenv("ALPACA_API_SECRET_KEY")
@@ -104,40 +103,112 @@ def _alpaca_headers() -> Dict[str, str]:
         h["APCA-API-SECRET-KEY"] = sec
     return h
 
+# ----------------------------- normalization -----------------------------
 def _normalize_df(df: pd.DataFrame) -> pd.DataFrame:
-    """Return df with columns: time, ts, open, high, low, close, volume (UTC)."""
-    if df is None or df.empty:
+    """Ensure columns: time, ts, open, high, low, close, volume (UTC & sorted)."""
+    if df is None or getattr(df, "empty", False):
         return pd.DataFrame(columns=["time","ts","open","high","low","close","volume"])
-    # Accept both v1beta3 & generic names
+
     rename_map = {
-        "t":"time","timestamp":"time",
+        "t":"time","timestamp":"time","Timestamp":"time",
         "o":"open","h":"high","l":"low","c":"close","v":"volume",
         "Open":"open","High":"high","Low":"low","Close":"close","Volume":"volume",
+        "trade_count":"trade_count"
     }
-    df = df.rename(columns=rename_map)
-    # Create 'time' if missing but 'ts' exists
+    df = df.rename(columns=rename_map, errors="ignore")
+
     if "time" not in df.columns and "ts" in df.columns:
         df["time"] = df["ts"]
-    # Create 'ts' from 'time' for parity
     if "ts" not in df.columns and "time" in df.columns:
         df["ts"] = df["time"]
 
-    # Convert time columns to UTC datetime
     for col in ("time","ts"):
         if col in df.columns:
             try:
                 df[col] = pd.to_datetime(df[col], utc=True, errors="coerce")
             except Exception:
                 df[col] = [ _to_utc_ts(v) for v in df[col] ]
-    # Ensure OHLCV exist
+
     for col in ("open","high","low","close","volume"):
         if col not in df.columns:
             df[col] = pd.NA
-    # Order & drop dup rows by time
-    df = df[["time","ts","open","high","low","close","volume"]]
-    df = df.dropna(subset=["time"]).drop_duplicates(subset=["time"]).sort_values("time")
+
+    cols = ["time","ts","open","high","low","close","volume"]
+    df = df[[c for c in cols if c in df.columns]].dropna(subset=["time"]).drop_duplicates(subset=["time"]).sort_values("time")
     return df.reset_index(drop=True)
 
+def _bar_like_to_rows(obj: Any) -> List[Dict[str, Any]]:
+    """Coerce SDK Bar objects or dicts into a list of row dicts."""
+    rows: List[Dict[str,Any]] = []
+
+    # Pandas already? Return via to_dict
+    if isinstance(obj, pd.DataFrame):
+        try:
+            return obj.to_dict(orient="records")
+        except Exception:
+            pass
+
+    # Dict row or {symbol: rows}
+    if isinstance(obj, dict):
+        # If it's a raw row (has o/h/l/c/v keys) treat as single row
+        keys = set(k.lower() for k in obj.keys())
+        if {"o","h","l","c","v","t"}.issubset(keys) or {"open","high","low","close","volume","time"}.issubset(keys):
+            return [obj]
+        # Else assume mapping symbol -> rows
+        for v in obj.values():
+            rows.extend(_bar_like_to_rows(v))
+        return rows
+
+    # Iterable of rows/Bar objects
+    if isinstance(obj, (list, tuple, set)) or (hasattr(obj, "__iter__") and not isinstance(obj, (str, bytes))):
+        try:
+            for item in obj:
+                if isinstance(item, dict):
+                    rows.append(item)
+                else:
+                    # Try to read attributes (Alpaca SDK Bar)
+                    t = getattr(item, "t", getattr(item, "time", None))
+                    o = getattr(item, "o", getattr(item, "open", None))
+                    h = getattr(item, "h", getattr(item, "high", None))
+                    l = getattr(item, "l", getattr(item, "low", None))
+                    c = getattr(item, "c", getattr(item, "close", None))
+                    v = getattr(item, "v", getattr(item, "volume", None))
+                    if any(x is not None for x in (t,o,h,l,c,v)):
+                        rows.append({"t": t, "o": o, "h": h, "l": l, "c": c, "v": v})
+            return rows
+        except Exception:
+            pass
+
+    # SDK containers with common attributes
+    for attr in ("df", "data", "bars"):
+        if hasattr(obj, attr):
+            try:
+                return _bar_like_to_rows(getattr(obj, attr))
+            except Exception:
+                continue
+
+    # Last resort: nothing recognized
+    return rows
+
+def _coerce_to_df(obj: Any) -> pd.DataFrame:
+    """Convert any bar-ish object into our normalized DataFrame."""
+    if obj is None:
+        return _normalize_df(pd.DataFrame())
+    if isinstance(obj, pd.DataFrame):
+        return _normalize_df(obj)
+    if isinstance(obj, dict):
+        # If dict is symbol->rows, try flattening; if it's already rows, normalize directly
+        # Decide by checking values type
+        values = list(obj.values())
+        if values and (isinstance(values[0], (list, tuple, pd.DataFrame)) or hasattr(values[0], "__iter__")):
+            rows = _bar_like_to_rows(obj)
+            return _normalize_df(pd.DataFrame(rows))
+        return _normalize_df(pd.DataFrame(_bar_like_to_rows(obj)))
+    # lists / SDK objects
+    rows = _bar_like_to_rows(obj)
+    return _normalize_df(pd.DataFrame(rows))
+
+# ----------------------------- HTTP fetchers (fallback) -----------------------------
 def _http_candles_multi(symbols: List[str], timeframe: str, limit: int
 ) -> Tuple[Dict[str,pd.DataFrame], List[str], Optional[str], Optional[str]]:
     attempts: List[str] = []
@@ -161,7 +232,7 @@ def _http_candles_multi(symbols: List[str], timeframe: str, limit: int
         for s in symbols:
             rows = bars_map.get(s, [])
             if rows:
-                out[s] = _normalize_df(pd.DataFrame(rows))
+                out[s] = _coerce_to_df(rows)
         return out, attempts, last_url, None
     except Exception as e:
         last_error = f"{type(e).__name__}: {e}"
@@ -182,16 +253,16 @@ def _http_candles_single(symbol: str, timeframe: str, limit: int
         bars_map = data.get("bars", {})
         rows = bars_map.get(symbol, [])
         if rows:
-            return _normalize_df(pd.DataFrame(rows)), final_url, None
+            return _coerce_to_df(rows), final_url, None
         return pd.DataFrame(), final_url, None
     except Exception as e:
         return pd.DataFrame(), url, f"{type(e).__name__}: {e}"
 
-# ----------------------------- safe market wrapper -----------------------------
+# ----------------------------- safe market proxy -----------------------------
 class MarketProxy:
     """
     Facade around MarketCrypto with HTTP fallback and schema normalization.
-    Also offers common method aliases some strategies use.
+    Accepts pandas/JSON as well as Alpaca SDK types (BarResult/BarSet/Bar).
     """
     def __init__(self, inner):
         self.inner = inner
@@ -201,52 +272,76 @@ class MarketProxy:
         self.last_attempts: List[str] = []
         self._last_map: Dict[str, pd.DataFrame] = {}
 
+    def _coerce_map(self, symbols: List[str], obj: Any) -> Dict[str, pd.DataFrame]:
+        """Try to turn any 'map-ish' result into {symbol: DataFrame}."""
+        out: Dict[str, pd.DataFrame] = {s: pd.DataFrame() for s in symbols}
+
+        # Direct dict mapping
+        if isinstance(obj, dict):
+            # Some SDKs return {'bars': {...}} or similar
+            if "bars" in obj and isinstance(obj["bars"], dict):
+                for s in symbols:
+                    out[s] = _coerce_to_df(obj["bars"].get(s))
+                return out
+            # Otherwise assume keys may be symbols
+            for s in symbols:
+                if s in obj:
+                    out[s] = _coerce_to_df(obj[s])
+            # If nothing matched, but dict contains rows, spread to all? No: leave as is.
+            return out
+
+        # SDK containers with .items()
+        if hasattr(obj, "items"):
+            try:
+                for k, v in obj.items():
+                    if k in out:
+                        out[k] = _coerce_to_df(v)
+            except Exception:
+                pass
+            return out
+
+        # Single-frame fallback (first symbol)
+        if symbols:
+            out[symbols[0]] = _coerce_to_df(obj)
+        return out
+
     # ---- canonical method
     def candles(self, symbols: List[str], timeframe: str = "5Min", limit: int = 600, return_debug: bool = False):
         tf = _tf_norm(timeframe or "5Min")
         limit = int(limit or 600)
 
-        # Try inner market first (if present)
         out: Dict[str, pd.DataFrame] = {s: pd.DataFrame() for s in symbols}
         attempts: List[str] = []
-        last_url = None
-        last_error = None
+        last_url: Optional[str] = None
+        last_error: Optional[str] = None
 
-        def _norm_in_place(m: Dict[str, Any]):
-            for s in symbols:
-                df = m.get(s)
-                if isinstance(df, pd.DataFrame):
-                    m[s] = _normalize_df(df)
-
+        # 1) Try inner market (whatever it returns)
         if self.inner and hasattr(self.inner, "candles"):
             try:
                 rv = self.inner.candles(symbols=symbols, timeframe=tf, limit=limit, return_debug=True)
+                # Expected shape: (map, attempts, last_url, last_error) OR varying types
                 if isinstance(rv, tuple) and len(rv) == 4:
-                    maybe_map, attempts, last_url, last_error = rv
-                    if isinstance(maybe_map, dict):
-                        _norm_in_place(maybe_map)
-                        for s in symbols:
-                            out[s] = maybe_map.get(s, pd.DataFrame())
-                elif isinstance(rv, dict):
-                    _norm_in_place(rv)
-                    for s in symbols:
-                        out[s] = rv.get(s, pd.DataFrame())
-                elif isinstance(rv, pd.DataFrame) and symbols:
-                    out[symbols[0]] = _normalize_df(rv)
+                    maybe_map, a2, u2, e2 = rv
+                    attempts.extend(list(a2) if isinstance(a2, (list,tuple)) else [])
+                    last_url = u2 or last_url
+                    last_error = e2 or last_error
+                    out = self._coerce_map(symbols, maybe_map)
+                else:
+                    out = self._coerce_map(symbols, rv)
             except Exception as e:
                 last_error = f"inner: {type(e).__name__}: {e}"
 
-        # Batch fallback
-        if not any((not df.empty) for df in out.values()):
+        # 2) HTTP batch fallback if still empty
+        if not any((isinstance(df, pd.DataFrame) and not df.empty) for df in out.values()):
             m2, a2, u2, e2 = _http_candles_multi(symbols, tf, limit)
-            for s in symbols:
-                if out[s].empty and not m2.get(s, pd.DataFrame()).empty:
-                    out[s] = m2[s]
             attempts.extend(a2)
             last_url = u2 or last_url
             last_error = e2 or last_error
+            for s in symbols:
+                if out[s].empty and not m2.get(s, pd.DataFrame()).empty:
+                    out[s] = m2[s]
 
-        # Per-symbol fallback
+        # 3) Per-symbol fallback
         empties = [s for s in symbols if out[s].empty]
         for s in empties:
             df, url_s, err_s = _http_candles_single(s, tf, limit)
@@ -267,7 +362,7 @@ class MarketProxy:
             return out, attempts, last_url, last_error
         return out
 
-    # ---- aliases many strategies might call
+    # ---- aliases some strategies may call
     def bars(self, symbols: List[str], timeframe: str = "5Min", limit: int = 600, return_debug: bool = False):
         return self.candles(symbols, timeframe, limit, return_debug)
 
@@ -278,12 +373,10 @@ class MarketProxy:
     def candles_df(self, symbol: str, timeframe: str = "5Min", limit: int = 600) -> pd.DataFrame:
         return self.history(symbol, timeframe, limit)
 
-    # Convenience to see last fetched normalized frames
     @property
     def last_df_map(self) -> Dict[str, pd.DataFrame]:
         return self._last_map
 
-# Use proxy if underlying exists
 market = MarketProxy(_underlying_market) if _underlying_market else None
 
 # ----------------------------- scan params normalizer -----------------------------
@@ -306,8 +399,8 @@ def _norm_scan_params(args) -> Dict[str, Any]:
     return p
 
 # ----------------------------- gate -----------------------------
-GATE_ON = _bool(os.getenv("CRYPTO_GATE_ON", "true"), True)
-GATE_REASON = os.getenv("CRYPTO_GATE_REASON", "")
+GATE_ON = _bool(os.getenv("CRYPTO_GATE_ON","true"), True)
+GATE_REASON = os.getenv("CRYPTO_GATE_REASON","")
 def _gate_state() -> Dict[str, Any]:
     clock = {"is_open": True, "next_open": None, "next_close": None, "source": "crypto-24x7"}
     return {"gate_on": GATE_ON, "decision": "open" if GATE_ON else "closed",
@@ -321,7 +414,7 @@ def _strategy_versions() -> Dict[str, Dict[str, str]]:
         if mod is None:
             out[name] = {"version": ""}
         else:
-            out[name] = {"version": getattr(mod, "STRATEGY_VERSION", "") or ""}
+            out[name] = {"version": getattr(mod, "STRATEGY_VERSION","") or ""}
     return out
 
 @app.get("/health")
@@ -389,9 +482,11 @@ def diag_candles():
     df_map: Dict[str, Any] = {s: pd.DataFrame() for s in syms}
     try:
         if market:
-            df_map, attempts, last_url, last_error = market.candles(
-                symbols=syms, timeframe=tf, limit=limit, return_debug=True
-            )
+            rv = market.candles(symbols=syms, timeframe=tf, limit=limit, return_debug=True)
+            if isinstance(rv, tuple) and len(rv) == 4:
+                df_map, attempts, last_url, last_error = rv
+            else:
+                df_map = rv  # already a map
             for s in syms:
                 df = df_map.get(s)
                 rows_map[s] = int(getattr(df, "shape", [0])[0]) if df is not None else 0
@@ -433,7 +528,6 @@ def _run_strategy_direct(name: str, dry: bool, force: bool, params: Dict[str, An
     if not market or not broker:
         return False, [{"action": "error", "error": "market/broker unavailable"}]
 
-    # defaults if caller omitted
     params = dict(params or {})
     params.setdefault("timeframe", "5Min")
     params.setdefault("limit", 600)
@@ -477,7 +571,7 @@ def scan(name: str):
 # ----------------------------- orders/positions/signals -----------------------------
 @app.get("/orders/recent")
 def orders_recent():
-    status = request.args.get("status", "all")
+    status = request.args.get("status","all")
     limit = _int(request.args.get("limit", 50), 50)
     rows: List[Dict[str, Any]] = []
     try:
@@ -570,5 +664,5 @@ def index_root():
 
 # ----------------------------- run -----------------------------
 if __name__ == "__main__":
-    port = int(os.getenv("PORT", "10000"))
+    port = int(os.getenv("PORT","10000"))
     app.run(host="0.0.0.0", port=port)
