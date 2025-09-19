@@ -10,7 +10,7 @@ import requests
 # ----------------------------
 # App / Env
 # ----------------------------
-APP_VERSION = os.environ.get("APP_VERSION", "1.6.4")
+APP_VERSION = os.environ.get("APP_VERSION", "1.6.5")
 SYSTEM_NAME = "crypto"
 
 CRYPTO_EXCHANGE = os.environ.get("CRYPTO_EXCHANGE", "alpaca")
@@ -124,7 +124,7 @@ def _run_strategy_direct(tag: str, mod, symbols: List[str], params: Dict[str, An
         return {"ok": False, "error": str(e)}
 
 # ----------------------------
-# UI (dashboard – compact)
+# UI (same compact dashboard)
 # ----------------------------
 DASHBOARD_HTML = """
 <!doctype html><html lang="en"><head><meta charset="utf-8">
@@ -223,7 +223,7 @@ def health_versions():
     return _ok(body, headers)
 
 # ----------------------------
-# Diag: Crypto (Alpaca + 1-bar data probe with error echo)
+# Diag: Crypto (account + data probe)
 # ----------------------------
 def _alpaca_headers():
     return {
