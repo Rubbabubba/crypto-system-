@@ -10,7 +10,7 @@ import requests
 # ----------------------------
 # App / Env
 # ----------------------------
-APP_VERSION = os.environ.get("APP_VERSION", "1.6.5")
+APP_VERSION = os.environ.get("APP_VERSION", "1.6.6")
 SYSTEM_NAME = "crypto"
 
 CRYPTO_EXCHANGE = os.environ.get("CRYPTO_EXCHANGE", "alpaca")
@@ -26,12 +26,12 @@ API_SECRET = os.environ.get("CRYPTO_API_SECRET") or os.environ.get("APCA_API_SEC
 # Imports: Market & Broker
 # ----------------------------
 try:
-    from services.market_crypto import MarketCrypto  # must expose MarketCrypto.from_env()
+    from services.market_crypto import MarketCrypto  # exposes MarketCrypto.from_env()
 except Exception:
     MarketCrypto = None  # type: ignore
 
 try:
-    from services.exchange_exec import ExchangeExec  # must expose ExchangeExec.from_env()
+    from services.exchange_exec import ExchangeExec  # exposes ExchangeExec.from_env()
 except Exception:
     ExchangeExec = None  # type: ignore
 
@@ -124,7 +124,7 @@ def _run_strategy_direct(tag: str, mod, symbols: List[str], params: Dict[str, An
         return {"ok": False, "error": str(e)}
 
 # ----------------------------
-# UI (same compact dashboard)
+# UI (compact dashboard)
 # ----------------------------
 DASHBOARD_HTML = """
 <!doctype html><html lang="en"><head><meta charset="utf-8">
@@ -238,7 +238,7 @@ def diag_crypto():
     # Account probe
     acct_ok = False
     acct_payload: Any = None
-    acct_err: Optional[str] = None
+    acct_err: str | None = None
     try:
         r = requests.get(f"{ALPACA_TRADING_BASE}/account", headers=_alpaca_headers(), timeout=20)
         acct_ok = r.status_code < 300
@@ -248,7 +248,7 @@ def diag_crypto():
     except Exception as e:
         acct_err = str(e)
 
-    # Data probe
+    # Data probe (uses market client; now v1beta3 only)
     data_probe: Dict[str, Any] = {}
     effective_bars_url = ""
     last_data_error = None
