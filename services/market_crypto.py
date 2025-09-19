@@ -1,5 +1,5 @@
 # services/market_crypto.py
-# Version: 0.3.1
+# Version: 0.4.0
 from __future__ import annotations
 
 import os
@@ -26,21 +26,21 @@ _TIMEFRAME_MAP = {
     # days/weeks/months
     "1d": "1D", "1w": "1W", "1mo": "1M",
 }
+
 def _normalize_tf(tf: str | None, default: str = "5Min") -> str:
     if not tf:
         return default
     t = tf.strip()
-    # already Alpaca-style?
     if any(t.endswith(suf) for suf in ("Min", "H", "D", "W", "M")):
         return t
     return _TIMEFRAME_MAP.get(t.lower(), default)
 
 class MarketCrypto:
     """
-    Minimal Alpaca crypto data client focused on v1beta3 crypto/us bars.
-    - Symbols MUST be slash pairs like 'BTC/USD' (requests will URL-encode the slash).
-    - Do NOT pass unsupported params (feed, adjustment) to v1beta3.
-    - Accepts alias kwargs your strategies might send (tf, timeframe, bars, limit, start).
+    Robust Alpaca crypto data client.
+
+    Primary: v1beta3 /crypto/us/bars with slash pairs (BTC/USD).
+    Fallback: v2 /crypto/bars?feed=us (some accounts intermittently return empties on multi-symbol v1beta3).
     """
 
     def __init__(self,
@@ -54,6 +54,7 @@ class MarketCrypto:
         self.session = session or requests.Session()
         self.last_url: str = ""
         self.last_error: Optional[str] = None
+        self._last_used_path: str = "/v1beta3/crypto/us/bars"
 
     @classmethod
     def from_env(cls) -> "MarketCrypto":
@@ -67,71 +68,43 @@ class MarketCrypto:
         }
 
     def _bars_url(self) -> str:
-        # v1beta3 path (US crypto)
-        return f"{self.data_base}/v1beta3/crypto/us/bars"
+        return f"{self.data_base}{self._last_used_path}"
 
-    def candles(self,
-                symbols: List[str],
-                timeframe: str = "5Min",
-                limit: int = 300,
-                start: Optional[str] = None,
-                **kwargs) -> Dict[str, BarResult]:
-        """
-        Fetch recent bars for given symbols (slash pairs) and return dict of BarResult.
-
-        Accepts aliases via kwargs:
-          - tf / timeframe: bar size (e.g., '5m', '15m', '1h', or '5Min')
-          - bars / limit: number of rows
-          - start: ISO8601
-        """
-        # Aliases from strategy calls
-        tf = kwargs.get("tf")
-        if tf and not timeframe:
-            timeframe = tf
-        timeframe = _normalize_tf(timeframe or tf, default="5Min")
-
-        if "bars" in kwargs and not kwargs.get("limit"):
-            try:
-                limit = int(kwargs["bars"])
-            except Exception:
-                pass
-        if "limit" in kwargs:
-            try:
-                limit = int(kwargs["limit"])
-            except Exception:
-                pass
-        if kwargs.get("start") and not start:
-            start = kwargs.get("start")
-
-        self.last_error = None
-
-        # IMPORTANT: keep slash symbols ('BTC/USD')
-        syms_param = ",".join(symbols)
+    # ---------- core ----------
+    def _request_v1beta3(self, symbols: List[str], timeframe: str, limit: int, start: Optional[str]) -> Dict[str, Any]:
+        self._last_used_path = "/v1beta3/crypto/us/bars"
+        url = f"{self.data_base}{self._last_used_path}"
         params: Dict[str, Any] = {
-            "symbols": syms_param,
+            "symbols": ",".join(symbols),   # KEEP slashes
             "timeframe": timeframe,
             "limit": str(limit),
         }
         if start:
             params["start"] = start
+        self.last_url = requests.Request("GET", url, params=params).prepare().url or url
+        r = self.session.get(url, headers=self._headers(), params=params, timeout=20)
+        r.raise_for_status()
+        return r.json()
 
-        url = self._bars_url()
-        self.last_url = requests.Request("GET", url, params=params).prepare().url or url  # for diag
-        try:
-            r = self.session.get(url, headers=self._headers(), params=params, timeout=20)
-            r.raise_for_status()
-        except requests.HTTPError as e:
-            self.last_error = f"HTTP {r.status_code}: {r.text}" if 'r' in locals() else str(e)
-            raise
-        except Exception as e:
-            self.last_error = str(e)
-            raise
+    def _request_v2(self, symbols: List[str], timeframe: str, limit: int, start: Optional[str]) -> Dict[str, Any]:
+        self._last_used_path = "/v2/crypto/bars"
+        url = f"{self.data_base}{self._last_used_path}"
+        params: Dict[str, Any] = {
+            "symbols": ",".join(symbols),   # KEEP slashes
+            "timeframe": timeframe,
+            "limit": str(limit),
+            "feed": "us",
+        }
+        if start:
+            params["start"] = start
+        self.last_url = requests.Request("GET", url, params=params).prepare().url or url
+        r = self.session.get(url, headers=self._headers(), params=params, timeout=20)
+        r.raise_for_status()
+        return r.json()
 
-        j = r.json()
-        data = j.get("bars") or {}
+    def _build_out(self, symbols: List[str], payload: Dict[str, Any]) -> Dict[str, BarResult]:
+        data = payload.get("bars") or {}
         out: Dict[str, BarResult] = {}
-
-        # Ensure every requested symbol appears in output, even if empty
         for sym in symbols:
             rows = data.get(sym)
             if not isinstance(rows, list) or not rows:
@@ -147,5 +120,59 @@ class MarketCrypto:
                 if col in df.columns:
                     df[col] = pd.to_numeric(df[col], errors="coerce")
             out[sym] = BarResult(sym, df)
-
         return out
+
+    def candles(self,
+                symbols: List[str],
+                timeframe: str = "5Min",
+                limit: int = 300,
+                start: Optional[str] = None,
+                **kwargs) -> Dict[str, BarResult]:
+        """
+        Fetch bars for given symbols (slash pairs) and return {sym: BarResult}.
+
+        Accepts aliases:
+          - tf / timeframe: bar size (e.g., '5m', '15m', '1h', or '5Min')
+          - bars / limit: number of rows
+          - start: ISO8601
+        """
+        # Alias handling
+        tf = kwargs.get("tf")
+        if tf and not timeframe:
+            timeframe = tf
+        timeframe = _normalize_tf(timeframe or tf, default="5Min")
+
+        if "bars" in kwargs and not kwargs.get("limit"):
+            try: limit = int(kwargs["bars"])
+            except Exception: pass
+        if "limit" in kwargs:
+            try: limit = int(kwargs["limit"])
+            except Exception: pass
+        if kwargs.get("start") and not start:
+            start = kwargs.get("start")
+
+        self.last_error = None
+
+        # First try v1beta3
+        try:
+            payload = self._request_v1beta3(symbols, timeframe, limit, start)
+            out = self._build_out(symbols, payload)
+            if any(len(v.frame) for v in out.values()):
+                return out
+        except requests.HTTPError as e:
+            self.last_error = f"v1beta3 HTTP {getattr(e.response, 'status_code', '?')}: {getattr(e.response, 'text', str(e))}"
+        except Exception as e:
+            self.last_error = f"v1beta3 error: {str(e)}"
+
+        # Fallback to v2 if v1beta3 was empty or errored
+        try:
+            payload2 = self._request_v2(symbols, timeframe, limit, start)
+            out2 = self._build_out(symbols, payload2)
+            return out2
+        except requests.HTTPError as e2:
+            self.last_error = f"{self.last_error or ''} | v2 HTTP {getattr(e2.response, 'status_code', '?')}: {getattr(e2.response, 'text', str(e2))}".strip()
+            # Return empty frames for consistency
+            return {sym: BarResult(sym, pd.DataFrame(columns=["ts","open","high","low","close","volume"])) for sym in symbols}
+        except Exception as e2:
+            self.last_error = f"{self.last_error or ''} | v2 error: {str(e2)}".strip()
+            return {sym: BarResult(sym, pd.DataFrame(columns=["ts","open","high","low","close","volume"])) for sym in symbols}
