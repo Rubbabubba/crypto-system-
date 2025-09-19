@@ -2,8 +2,8 @@
 from __future__ import annotations
 import os
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Any, Iterable, Tuple
-from datetime import datetime, timezone
+from typing import Dict, List, Optional, Any, Iterable
+from datetime import datetime, timezone, timedelta
 import requests
 
 try:
@@ -27,47 +27,36 @@ DEFAULT_SCOPE = "v1beta3/crypto/us"
 
 DEFAULT_TIMEFRAME = _env("CRYPTO_TIMEFRAME", "5Min")
 DEFAULT_LIMIT = int(_env("CRYPTO_BARS_LIMIT", "500") or "500")
-
-# Optional default feed for crypto. If not set, we’ll add feed=us on retry only.
-DEFAULT_FEED = _env("CRYPTO_FEED", None)
+DEFAULT_FEED = _env("CRYPTO_FEED", "us")  # force 'us' unless explicitly overridden
 
 
 # ---- Helpers for symbol normalization ---------------------------------------
 
 def _to_data_sym(sym: str) -> str:
-    """
-    Alpaca data endpoints generally use symbols without the '/' (e.g., BTCUSD).
-    Trading often uses BTC/USD. We translate only for data requests.
-    """
     s = (sym or "").strip().upper()
     return s.replace("/", "") if "/" in s else s
 
 def _from_data_sym(sym: str) -> str:
-    """
-    Convert a data symbol form (BTCUSD) back to slashed (BTC/USD) for display,
-    when feasible. If already slashed, return as-is.
-    """
     s = (sym or "").strip().upper()
     if "/" in s or len(s) < 6:
         return s
-    # naive split for common XXXYYY forms
     return f"{s[:3]}/{s[3:]}"
 
 
 @dataclass
 class BarsResult:
-    """Container for one symbol worth of bars."""
     symbol: str
     frame: "pd.DataFrame"  # columns: o,h,l,c,v ; index: datetime (UTC)
 
 
 class MarketCrypto:
     """
-    Thin wrapper around Alpaca Crypto bars with:
-      • symbol translation (BTC/USD <-> BTCUSD)
-      • v1beta3 first, add feed=us on retry
-      • v2 fallback
+    Alpaca crypto bars client
+      • Only uses v1beta3/crypto/us/bars (v2 crypto endpoint does not exist)
+      • Symbol translation BTC/USD <-> BTCUSD
+      • feed=us and a sane default start window (now-48h) to ensure data
     """
+    __version__ = "1.1.1"
 
     def __init__(
         self,
@@ -82,7 +71,7 @@ class MarketCrypto:
     ):
         raw_base = (data_base or RAW_BASE or "https://data.alpaca.markets").rstrip("/")
 
-        # Detect if base already contains v1beta3/crypto
+        # Always v1beta3/crypto/us
         lowered = raw_base.lower()
         if "v1beta3/crypto" in lowered:
             self.data_base = raw_base
@@ -96,19 +85,18 @@ class MarketCrypto:
         self.s = session or requests.Session()
         self.default_timeframe = default_timeframe
         self.default_limit = default_limit
-        self.default_feed = default_feed
+        self.default_feed = default_feed or "us"
         self.last_error: Optional[str] = None
         self.last_url: Optional[str] = None
 
         if not self.key or not self.secret:
             raise RuntimeError("MarketCrypto: missing CRYPTO_API_KEY/CRYPTO_API_SECRET (or APCA_API_KEY_ID/APCA_API_SECRET_KEY)")
 
-    # Factory expected by app.py
+    # Factory used by app.py
     @classmethod
     def from_env(cls) -> "MarketCrypto":
         return cls()
 
-    # Basic utilities
     @staticmethod
     def now_utc() -> datetime:
         return datetime.now(timezone.utc)
@@ -124,12 +112,6 @@ class MarketCrypto:
         if self.data_scope:
             return f"{self.data_base}/{self.data_scope}/bars"
         return f"{self.data_base}/bars"
-
-    def _bars_url_v2(self) -> str:
-        base = self.data_base
-        if "v1beta3/crypto" in base.lower():
-            base = base.split("/v1beta3/crypto", 1)[0]
-        return f"{base}/v2/crypto/bars"
 
     # ---- Normalization -------------------------------------------------------
 
@@ -153,13 +135,6 @@ class MarketCrypto:
 
     @staticmethod
     def _unpack_response(json_obj: Dict[str, Any]) -> Dict[str, List[Dict[str, Any]]]:
-        """
-        Supports both:
-          { "bars": { "BTCUSD": [ ... ] } }
-          and
-          { "bars": [ {...,"S":"BTCUSD"}, ... ] }   # some v2 variants
-        Returns map data_symbol -> rows
-        """
         bars = (json_obj or {}).get("bars")
         if isinstance(bars, dict):
             return {k: (v or []) for k, v in bars.items()}
@@ -171,24 +146,26 @@ class MarketCrypto:
             return out
         return {}
 
-    def _fetch_bars_with_strategy(self, url: str, params: Dict[str, Any]) -> Tuple[Optional[Dict[str, Any]], Optional[int]]:
+    def _fetch_json(self, url: str, params: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         self.last_url = f"{url}?{requests.compat.urlencode(params)}"
-        r = self.s.get(url, headers=self._hdrs(), params=params, timeout=30)
-        status = r.status_code
-        if status >= 400:
-            try:
-                err = r.json()
-                self.last_error = f"HTTP {status}: {err}"
-            except Exception:
-                self.last_error = f"HTTP {status}: {r.text}"
-            return None, status
         try:
-            return r.json(), status
+            r = self.s.get(url, headers=self._hdrs(), params=params, timeout=30)
+            if r.status_code >= 400:
+                try:
+                    self.last_error = f"HTTP {r.status_code}: {r.json()}"
+                except Exception:
+                    self.last_error = f"HTTP {r.status_code}: {r.text}"
+                return None
+            try:
+                return r.json()
+            except Exception as e:
+                self.last_error = f"JSON decode error: {e}"
+                return None
         except Exception as e:
-            self.last_error = f"JSON decode error: {e}"
-            return None, status
+            self.last_error = str(e)
+            return None
 
-    # ---- Core fetch with retries --------------------------------------------
+    # ---- Core fetch ----------------------------------------------------------
 
     def candles(
         self,
@@ -200,66 +177,50 @@ class MarketCrypto:
         adjustment: str = "raw",
         feed: Optional[str] = None,
     ) -> Dict[str, BarsResult]:
-        """
-        Fetch OHLCV bars for 1..N symbols.
-        Returns a dict slashed_symbol -> BarsResult(pd.DataFrame with columns o,h,l,c,v, ts (UTC))
-        """
         req_syms = [s.strip() for s in symbols if s and str(s).strip()]
         if not req_syms:
             return {}
 
-        # Translate to data symbols (no slash)
         data_syms = [_to_data_sym(s) for s in req_syms]
 
-        # Base params
-        base_params: Dict[str, Any] = {
+        # Default start = now-48h to ensure non-empty results
+        if not start:
+            start_dt = self.now_utc() - timedelta(hours=48)
+            # RFC3339 with Z
+            start = start_dt.isoformat().replace("+00:00", "Z")
+
+        params: Dict[str, Any] = {
             "symbols": ",".join(data_syms),
             "timeframe": timeframe or self.default_timeframe,
             "limit": str(limit or self.default_limit),
             "adjustment": adjustment,
+            "feed": feed or self.default_feed or "us",
+            "start": start,
         }
-        if start: base_params["start"] = start
-        if end: base_params["end"] = end
-        if feed: base_params["feed"] = feed
+        if end:
+            params["end"] = end
 
-        # 1) v1beta3 (as-is)
-        url1 = self._bars_url()
-        data, status = self._fetch_bars_with_strategy(url1, dict(base_params))
-        # 2) v1beta3 + feed=us retry (only if 4xx or empty)
-        if (data is None and status is not None and 400 <= status < 500) or (data and not (data.get("bars") or {})):
-            retry_params = dict(base_params)
-            retry_params.setdefault("feed", self.default_feed or "us")
-            data, status = self._fetch_bars_with_strategy(url1, retry_params)
-        # 3) v2 fallback
-        if data is None or not (data.get("bars") or {}):
-            url2 = self._bars_url_v2()
-            v2_params = dict(base_params)
-            v2_params.pop("adjustment", None)  # not needed for v2 crypto
-            v2_params.setdefault("feed", self.default_feed or "us")
-            data, status = self._fetch_bars_with_strategy(url2, v2_params)
+        url = self._bars_url()
+        data = self._fetch_json(url, params)
 
+        out: Dict[str, BarsResult] = {}
         if data is None:
-            out_empty: Dict[str, BarsResult] = {}
+            # return empty frames but keep last_error/last_url for diagnostics
             for sym in req_syms:
                 if pd is None:
-                    out_empty[sym] = BarsResult(sym, [])  # type: ignore
+                    out[sym] = BarsResult(sym, [])  # type: ignore
                 else:
-                    out_empty[sym] = BarsResult(sym, pd.DataFrame(columns=["o","h","l","c","v"]))
-            return out_empty
+                    out[sym] = BarsResult(sym, pd.DataFrame(columns=["o","h","l","c","v"]))
+            return out
 
-        # Normalize and map back to requested slashed symbols
-        out: Dict[str, BarsResult] = {}
         bars_map = self._unpack_response(data)
-
-        # Build a reverse lookup: data_sym -> requested_slashed_sym
-        rev: Dict[str, str] = { _to_data_sym(req): req for req in req_syms }
+        rev_map = { _to_data_sym(req): req for req in req_syms }
 
         for key, rows in (bars_map or {}).items():
-            req_sym = rev.get(key) or rev.get(_to_data_sym(key)) or _from_data_sym(key)
+            req_sym = rev_map.get(key) or rev_map.get(_to_data_sym(key)) or _from_data_sym(key)
             frame = self._df_from_rows(rows or [])
             out[req_sym] = BarsResult(symbol=req_sym, frame=frame)
 
-        # Ensure all req_syms present
         for sym in req_syms:
             if sym not in out:
                 if pd is None:
@@ -268,7 +229,6 @@ class MarketCrypto:
                     out[sym] = BarsResult(sym, pd.DataFrame(columns=["o","h","l","c","v"]))
         return out
 
-    # Convenience
     def last_price(self, symbol: str) -> Optional[float]:
         res = self.candles([symbol], limit=1)
         br = res.get(symbol)
