@@ -1,78 +1,120 @@
 # strategies/c3.py
+from __future__ import annotations
+import math
+from typing import Any, Dict, Iterable, List, Mapping
 import numpy as np
 import pandas as pd
 
-def _sma(series: pd.Series, n: int):
+
+# ---------- helpers ----------
+def _to_param_dict(p: Any) -> Dict[str, Any]:
+    if isinstance(p, dict):
+        return dict(p)
+    out: Dict[str, Any] = {}
+    if isinstance(p, Iterable) and not isinstance(p, (str, bytes)):
+        for item in p:
+            if isinstance(item, dict):
+                out.update(item)
+            elif isinstance(item, str) and "=" in item:
+                k, v = item.split("=", 1)
+                out[k.strip()] = v.strip()
+    return out
+
+
+def _as_int(d: Mapping[str, Any], key: str, default: int) -> int:
+    try:
+        return int(d.get(key, default))
+    except Exception:
+        return default
+
+
+def _sma(series: pd.Series, n: int) -> pd.Series:
     return series.rolling(n).mean()
 
-def _atr(df: pd.DataFrame, atr_len: int):
-    h, l, c = df['high'], df['low'], df['close']
+
+def _atr(df: pd.DataFrame, atr_len: int) -> pd.Series:
+    h, l, c = df["high"], df["low"], df["close"]
     prev_c = c.shift(1)
     tr = pd.concat([(h - l).abs(), (h - prev_c).abs(), (l - prev_c).abs()], axis=1).max(axis=1)
     return tr.rolling(atr_len).mean()
 
-def _extract_ctx(args, kwargs):
-    dry = kwargs.get("dry", args[0] if len(args) > 0 else True)
-    notional = kwargs.get("notional", args[1] if len(args) > 1 else None)
-    return bool(dry), notional
 
-def run(symbol: str,
-        df: pd.DataFrame,
-        params: dict,
-        *args,
-        **kwargs):
-    """
-    MA cross + ATR filter. Always returns a dict.
-    Accepts dry/notional flexibly.
-    """
-    dry, notional = _extract_ctx(args, kwargs)
+def _extract_trade_ctx(pdict: Mapping[str, Any], kwargs: Dict[str, Any]):
+    dry = bool(kwargs.get("dry", pdict.get("dry", True)))
+    notional = kwargs.get("notional", pdict.get("notional"))
+    try:
+        notional = float(notional) if notional is not None else None
+    except Exception:
+        notional = None
+    return dry, notional
 
-    ma_fast = int(params.get("ma_fast", 20))
-    ma_slow = int(params.get("ma_slow", 50))
-    atr_len = int(params.get("atr_len", 14))
+
+# ---------- strategy ----------
+def run(market, broker, symbols: Iterable[str], params, *args, **kwargs) -> List[Dict[str, Any]]:
+    """
+    C3: MA( fast/slow ) cross with ATR context.
+    """
+    pdict = _to_param_dict(params)
+    dry, notional = _extract_trade_ctx(pdict, kwargs)
+
+    timeframe = str(pdict.get("timeframe", "5Min"))
+    limit = _as_int(pdict, "limit", 600)
+    ma_fast = _as_int(pdict, "ma_fast", 20)
+    ma_slow = _as_int(pdict, "ma_slow", 50)
+    atr_len = _as_int(pdict, "atr_len", 14)
 
     need = max(ma_fast, ma_slow, atr_len) + 2
-    if df is None or len(df) < need:
-        return {"symbol": symbol, "action": "flat", "reason": "insufficient_bars", "order_id": None}
+    if limit < need:
+        limit = need
 
-    df = df.copy()
-    df["ma1"] = _sma(df["close"], ma_fast)
-    df["ma2"] = _sma(df["close"], ma_slow)
-    df["atr"] = _atr(df, atr_len)
+    bars: Dict[str, pd.DataFrame] = market.candles(symbols, timeframe=timeframe, limit=limit)
 
-    last = df.iloc[-1]
-    prev = df.iloc[-2]
+    results: List[Dict[str, Any]] = []
+    for sym in symbols:
+        df = bars.get(sym)
+        if df is None or len(df) < need:
+            results.append({"symbol": sym, "action": "flat", "reason": "insufficient_bars", "order_id": None})
+            continue
 
-    close = float(last["close"])
-    ma1   = float(last["ma1"])
-    ma2   = float(last["ma2"])
-    atr   = float(last["atr"]) if np.isfinite(last["atr"]) else np.nan
+        df = df.copy()
+        df["ma1"] = _sma(df["close"], ma_fast)
+        df["ma2"] = _sma(df["close"], ma_slow)
+        df["atr"] = _atr(df, atr_len)
 
-    prev_ma1 = float(prev["ma1"])
-    prev_ma2 = float(prev["ma2"])
+        last = df.iloc[-1]
+        prev = df.iloc[-2]
 
-    crossed_up   = prev_ma1 <= prev_ma2 and ma1 > ma2
-    crossed_down = prev_ma1 >= prev_ma2 and ma1 < ma2
+        close = float(last["close"])
+        ma1 = float(last["ma1"])
+        ma2 = float(last["ma2"])
+        atr = float(last["atr"]) if math.isfinite(float(last["atr"])) else float("nan")
 
-    action = "flat"
-    reason = "no_signal"
+        prev_ma1 = float(prev["ma1"])
+        prev_ma2 = float(prev["ma2"])
 
-    if crossed_up:
-        action = "buy"
-        reason = "ma_cross_up"
-    elif crossed_down:
-        action = "sell"
-        reason = "ma_cross_down"
+        crossed_up = prev_ma1 <= prev_ma2 and ma1 > ma2
+        crossed_down = prev_ma1 >= prev_ma2 and ma1 < ma2
 
-    return {
-        "symbol": symbol,
-        "action": action,
-        "reason": reason,
-        "close": close,
-        "ma1": ma1,
-        "ma2": ma2,
-        "atr": atr,
-        "order_id": None,
-        "dry": dry,
-        "notional": notional
-    }
+        action = "flat"
+        reason = "no_signal"
+        if crossed_up:
+            action = "buy"
+            reason = "ma_cross_up"
+        elif crossed_down:
+            action = "sell"
+            reason = "ma_cross_down"
+
+        results.append({
+            "symbol": sym,
+            "action": action,
+            "reason": reason,
+            "close": close,
+            "ma1": ma1,
+            "ma2": ma2,
+            "atr": atr,
+            "order_id": None,
+            "dry": dry,
+            "notional": notional
+        })
+
+    return results
