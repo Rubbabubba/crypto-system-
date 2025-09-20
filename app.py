@@ -1,6 +1,6 @@
 # app.py
 # Crypto Trading System - Flask Service
-# Version: 1.7.1 (2025-09-19)
+# Version: 1.7.2 (2025-09-20)
 #
 # - Single-file Flask app with embedded dashboard HTML
 # - Safe bootstrapping for market/broker (never None)
@@ -45,19 +45,16 @@ from flask import Flask, Response, jsonify, redirect, request
 # Optional .env support (silent if not present)
 try:
     from dotenv import load_dotenv
-
     load_dotenv()
 except Exception:
     pass
 
-APP_VERSION = "1.7.1"
+APP_VERSION = "1.7.2"
 
 # --- Service wrappers (your project modules) ---
-# We only import symbols we actually reference here.
 try:
     from services.market_crypto import MarketCrypto
 except Exception as e:
-    # Provide a helpful error early if module missing
     print("ERROR: failed to import services.market_crypto.MarketCrypto:", e, file=sys.stderr)
     MarketCrypto = None  # type: ignore
 
@@ -66,7 +63,6 @@ try:
 except Exception as e:
     print("ERROR: failed to import services.exchange_exec.ExchangeExec:", e, file=sys.stderr)
     ExchangeExec = None  # type: ignore
-
 
 # --- Flask app ---
 app = Flask(__name__)
@@ -94,7 +90,6 @@ def _ensure_context():
         if hasattr(MarketCrypto, "from_env") and callable(getattr(MarketCrypto, "from_env")):
             market = MarketCrypto.from_env()
         else:
-            # Fallback to direct constructor if your class expects env vars inside __init__
             market = MarketCrypto()
 
     # Broker (execution)
@@ -133,9 +128,7 @@ def _parse_symbols() -> List[str]:
     # Accept either `symbols=` or `symbol=` (comma-separated)
     s = request.args.get("symbols") or request.args.get("symbol")
     if not s:
-        # Default universe
         return ["BTC/USD", "ETH/USD", "SOL/USD", "DOGE/USD"]
-    # split on commas, trim
     return [x.strip() for x in s.split(",") if x.strip()]
 
 
@@ -265,7 +258,7 @@ def root():
 
 @app.get("/dashboard")
 def dashboard():
-    # Minimal, responsive dashboard; no external assets.
+    # Note: All literal braces {{ }} below are doubled to be valid inside an f-string.
     html = f"""<!doctype html>
 <html lang="en">
 <head>
@@ -348,7 +341,7 @@ footer {{ color:var(--muted); text-align:center; padding:12px; }}
         <button onclick="runScan()">Run Scan</button>
         <button class="secondary" onclick="runAllDry()">Run C1–C6 (dry)</button>
       </div>
-      <pre id="scan-out">{}</pre>
+      <pre id="scan-out">{{}}</pre>
     </div>
 
     <div class="card">
@@ -359,7 +352,7 @@ footer {{ color:var(--muted); text-align:center; padding:12px; }}
         <input id="cand-limit" type="text" value="3">
         <button onclick="loadCandles()">Fetch</button>
       </div>
-      <pre id="cand-out">{}</pre>
+      <pre id="cand-out">{{}}</pre>
     </div>
 
     <div class="card">
@@ -431,9 +424,9 @@ async function runScan() {{
   const notional = document.getElementById("notional").value;
   const qty = document.getElementById("qty").value;
 
-  let url = `/scan/${strat}?dry=${enc(dry)}&symbols=${enc(syms)}&timeframe=${enc(tf)}&limit=${enc(limit)}`;
-  if (notional) url += `&notional=${enc(notional)}`;
-  if (qty) url += `&qty=${enc(qty)}`;
+  let url = `/scan/${{strat}}?dry=${{enc(dry)}}&symbols=${{enc(syms)}}&timeframe=${{enc(tf)}}&limit=${{enc(limit)}}`;
+  if (notional) url += `&notional=${{enc(notional)}}`;
+  if (qty) url += `&qty=${{enc(qty)}}`;
 
   const res = await jpost(url);
   setText("scan-out", res);
@@ -446,7 +439,7 @@ async function runAllDry() {{
   const names = ["c1","c2","c3","c4","c5","c6"];
   const out = {{}};
   for (const n of names) {{
-    const url = `/scan/${n}?dry=1&symbols=${enc(syms)}&timeframe=${enc(tf)}&limit=${enc(limit)}`;
+    const url = `/scan/${{n}}?dry=1&symbols=${{enc(syms)}}&timeframe=${{enc(tf)}}&limit=${{enc(limit)}}`;
     out[n] = await jpost(url);
   }}
   setText("scan-out", out);
@@ -456,7 +449,7 @@ async function loadCandles() {{
   const syms = document.getElementById("cand-syms").value;
   const tf = document.getElementById("cand-tf").value;
   const limit = document.getElementById("cand-limit").value;
-  const url = `/diag/candles?symbols=${enc(syms)}&tf=${enc(tf)}&limit=${enc(limit)}`;
+  const url = `/diag/candles?symbols=${{enc(syms)}}&tf=${{enc(tf)}}&limit=${{enc(limit)}}`;
   const res = await jget(url);
   setText("cand-out", res);
 }}
@@ -469,7 +462,7 @@ async function loadPositions() {{
 async function loadOrders() {{
   const status = document.getElementById("ord-status").value;
   const limit = document.getElementById("ord-limit").value;
-  const url = `/orders/recent?status=${enc(status)}&limit=${enc(limit)}`;
+  const url = `/orders/recent?status=${{enc(status)}}&limit=${{enc(limit)}}`;
   const res = await jget(url);
   setText("ord-out", res);
 }}
@@ -496,7 +489,6 @@ def health_versions():
         "systems": systems,
     }
 
-    # Convenience: surface base URLs if the wrappers expose them
     try:
         payload["data_base"] = getattr(mkt, "data_base", None) or getattr(mkt, "bars_base", None)
     except Exception:
@@ -547,14 +539,12 @@ def diag_candles():
     last_err: str = ""
 
     def _rows(df_like) -> int:
-        # Accept pandas DataFrame or list-like
         try:
             import pandas as pd  # type: ignore
             if isinstance(df_like, pd.DataFrame):
                 return int(df_like.shape[0])
         except Exception:
             pass
-        # Alpaca SDK sometimes returns objects with .df or .data
         if hasattr(df_like, "df"):
             try:
                 return int(getattr(df_like, "df").shape[0])
@@ -566,29 +556,23 @@ def diag_candles():
                 return len(data) if hasattr(data, "__len__") else 0
             except Exception:
                 pass
-        # List of dicts
         if isinstance(df_like, (list, tuple)):
             return len(df_like)
-        # Fallback
         try:
-            # If object has 'empty' attr (like DataFrame)
             if getattr(df_like, "empty", False) is True:
                 return 0
         except Exception:
             pass
         return 0
 
-    # Batch attempt, if MarketCrypto exposes a multi-fetch (candles for multiple symbols).
     try:
         if hasattr(mkt, "candles"):
-            last_url = ""
             attempts.append("batch")
             data = mkt.candles(symbols, timeframe=tf, limit=limit)  # expected dict: sym -> df
             if isinstance(data, dict):
                 for s in symbols:
                     rows_map[s] = _rows(data.get(s))
             else:
-                # If a single object returned for batch (unlikely), count once for first symbol
                 n = _rows(data)
                 if symbols:
                     rows_map[symbols[0]] = n
@@ -597,7 +581,6 @@ def diag_candles():
     except Exception as e:
         last_err = f"batch error: {e}"
 
-    # Per-symbol fallback for any that remain zero
     for s in symbols:
         if rows_map[s] > 0:
             continue
@@ -608,7 +591,7 @@ def diag_candles():
                 one = mkt.candles([s], timeframe=tf, limit=limit)
                 if isinstance(one, dict):
                     one = one.get(s)
-            elif hasattr(mkt, "get_bars"):  # legacy signatures
+            elif hasattr(mkt, "get_bars"):
                 one = mkt.get_bars(s, timeframe=tf, limit=limit)
             rows_map[s] = _rows(one)
         except Exception as e:
@@ -630,7 +613,6 @@ def diag_candles():
 def positions():
     try:
         _, brk = _ensure_context()
-        # Try common method names
         if hasattr(brk, "positions"):
             data = brk.positions()
         elif hasattr(brk, "get_positions"):
@@ -662,7 +644,6 @@ def orders_recent():
         return _err_json(str(e))
 
 
-# Unified scan endpoint family
 @app.post("/scan/<name>")
 def scan_name(name: str):
     dry = _parse_bool(request.args.get("dry"), default=True)  # default to dry=1 if omitted
@@ -675,7 +656,6 @@ def scan_name(name: str):
 # -------------------------
 
 if __name__ == "__main__":
-    # Bind host/port if present in env (Render uses PORT)
     host = os.environ.get("HOST", "0.0.0.0")
     port = int(os.environ.get("PORT", "10000"))
     app.run(host=host, port=port)
