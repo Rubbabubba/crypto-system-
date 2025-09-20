@@ -66,11 +66,11 @@ def _extract_trade_ctx(pdict: Mapping[str, Any], kwargs: Dict[str, Any]):
 
 
 # ---------- strategy ----------
-def run(market, broker, symbols: Iterable[str], params, *args, **kwargs) -> List[Dict[str, Any]]:
+def run(market, broker, symbols: Iterable[str], params, *args, **kwargs) -> Dict[str, Any]:
     """
     C2: EMA + Highest-High + ATR breakout filter.
     Router calls: run(market, broker, symbols, params, dry=..., log=...)
-    Returns: list[dict] one dict per symbol.
+    Returns: dict with 'ok' and 'results' (list of per-symbol dicts).
     """
     pdict = _to_param_dict(params)
     dry, notional = _extract_trade_ctx(pdict, kwargs)
@@ -134,4 +134,9 @@ def run(market, broker, symbols: Iterable[str], params, *args, **kwargs) -> List
             "notional": notional
         })
 
-    return results
+    return {
+        "ok": True,
+        "strategy": "c2",
+        "dry": dry,
+        "results": results
+    }

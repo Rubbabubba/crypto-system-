@@ -57,9 +57,10 @@ def _extract_trade_ctx(pdict: Mapping[str, Any], kwargs: Dict[str, Any]):
 
 
 # ---------- strategy ----------
-def run(market, broker, symbols: Iterable[str], params, *args, **kwargs) -> List[Dict[str, Any]]:
+def run(market, broker, symbols: Iterable[str], params, *args, **kwargs) -> Dict[str, Any]:
     """
     C4: EMA + Highest-High + momentum delta vs ATR (delta_frac).
+    Returns dict with 'ok' and 'results'.
     """
     pdict = _to_param_dict(params)
     dry, notional = _extract_trade_ctx(pdict, kwargs)
@@ -123,4 +124,9 @@ def run(market, broker, symbols: Iterable[str], params, *args, **kwargs) -> List
             "notional": notional
         })
 
-    return results
+    return {
+        "ok": True,
+        "strategy": "c4",
+        "dry": dry,
+        "results": results
+    }

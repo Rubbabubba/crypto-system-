@@ -50,9 +50,10 @@ def _extract_trade_ctx(pdict: Mapping[str, Any], kwargs: Dict[str, Any]):
 
 
 # ---------- strategy ----------
-def run(market, broker, symbols: Iterable[str], params, *args, **kwargs) -> List[Dict[str, Any]]:
+def run(market, broker, symbols: Iterable[str], params, *args, **kwargs) -> Dict[str, Any]:
     """
     C3: MA( fast/slow ) cross with ATR context.
+    Returns dict with 'ok' and 'results'.
     """
     pdict = _to_param_dict(params)
     dry, notional = _extract_trade_ctx(pdict, kwargs)
@@ -117,4 +118,9 @@ def run(market, broker, symbols: Iterable[str], params, *args, **kwargs) -> List
             "notional": notional
         })
 
-    return results
+    return {
+        "ok": True,
+        "strategy": "c3",
+        "dry": dry,
+        "results": results
+    }
