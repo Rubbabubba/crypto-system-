@@ -1,141 +1,91 @@
 # strategies/c6.py
-# ---------------------------------------------------------------------
-# Strategy C6 — MACD Trend + EMA Filter
-# Version: 1.1.0
-#
-# Entry (long):
-#   - MACD > Signal
-#   - close > EMA(filter_len)
-# Exit signal (reported as "sell", up to broker/risk module to act):
-#   - MACD < Signal  OR  close < EMA(filter_len)
-#
-# Params (querystring, optional):
-#   timeframe:   default "5Min"
-#   limit:       default 600
-#   fast:        default 12
-#   slow:        default 26
-#   signal:      default 9
-#   filter_len:  default 200 (EMA trend filter)
-#
-# Optional order sizing:
-#   notional: float
-#   qty:      float
-# ---------------------------------------------------------------------
+# Version: 1.7.3
+# Fast/slow EMA cross with ATR trend filter and HH confirmation.
 
 from __future__ import annotations
-from typing import Dict, List, Any, Optional
-import pandas as pd
+
+from typing import Any, Dict, List
+
 import numpy as np
+import pandas as pd
 
-VERSION = "1.1.0"
-NAME = "c6"
 
-# -------------------------- indicators -------------------------------- #
+def _ema(s: pd.Series, span: int) -> pd.Series:
+    return s.ewm(span=span, adjust=False).mean()
 
-def _ema(series: pd.Series, length: int) -> pd.Series:
-    return series.ewm(span=length, adjust=False).mean()
 
-def _macd(series: pd.Series, fast: int = 12, slow: int = 26, signal: int = 9):
-    ema_fast = _ema(series, fast)
-    ema_slow = _ema(series, slow)
-    macd = ema_fast - ema_slow
-    sig = macd.ewm(span=signal, adjust=False).mean()
-    hist = macd - sig
-    return macd, sig, hist
+def _atr(df: pd.DataFrame, length: int = 14) -> pd.Series:
+    h, l, c = df["high"], df["low"], df["close"]
+    prev = c.shift(1)
+    tr = pd.concat([(h - l).abs(), (h - prev).abs(), (l - prev).abs()], axis=1).max(axis=1)
+    return tr.ewm(alpha=1/length, adjust=False).mean()
 
-# -------------------------- core -------------------------------------- #
 
-def _scan_symbol(df: pd.DataFrame, params: Dict[str, Any]) -> Dict[str, Any]:
-    fast       = int(params.get("fast", 12))
-    slow       = int(params.get("slow", 26))
-    sig_len    = int(params.get("signal", 9))
-    filter_len = int(params.get("filter_len", 200))
-
-    close = df["close"]
-    macd, sig, hist = _macd(close, fast=fast, slow=slow, signal=sig_len)
-    ema_filter = _ema(close, filter_len)
-
-    c  = float(close.iloc[-1])
-    m  = float(macd.iloc[-1])
-    s  = float(sig.iloc[-1])
-    h  = float(hist.iloc[-1])
-    ef = float(ema_filter.iloc[-1])
-
-    action = "flat"
-    reason = "no_signal"
-
-    # Entry
-    if (m > s) and (c > ef):
-        action = "buy"
-        reason = "enter_long_macd_trend"
-
-    # Exit (signal only)
-    if (m < s) or (c < ef):
-        if action != "buy":
-            action = "flat"  # we report flat in scanner unless explicitly exiting a live position
-        # reason remains no_signal when not acting; you can wire broker-side exits as needed
-
-    return {
-        "symbol": params["symbol"],
-        "action": action,
-        "reason": reason,
-        "close": round(c, 6),
-        "macd": round(m, 6),
-        "signal": round(s, 6),
-        "hist": round(h, 6),
-        "ema_filter": round(ef, 6),
-    }
-
-def _place_order(broker, symbol: str, dry: bool, notional: Optional[float], qty: Optional[float]) -> Any:
-    if dry:
-        return {"status": "dry_run"}
-    try:
-        if notional is not None and hasattr(broker, "market_buy_notional"):
-            return broker.market_buy_notional(symbol, float(notional))
-        if qty is not None and hasattr(broker, "market_buy_qty"):
-            return broker.market_buy_qty(symbol, float(qty))
-        if notional is not None and hasattr(broker, "market_buy"):
-            return broker.market_buy(symbol, notional=float(notional))
-        if hasattr(broker, "market_buy"):
-            return broker.market_buy(symbol, notional=10.0)
-        return {"status": "no_broker_method"}
-    except Exception as ex:
-        return {"status": "error", "error": str(ex)}
-
-# -------------------------- public API -------------------------------- #
-
-def run(market, broker, symbols, params, *args, dry: bool = False, pwrite=print, log=None, notional: float | None = None, qty: float | None = None, **kwargs):
-    """
-    Compatible signature with the app router.
-    - Accepts extra args/kwargs without breaking.
-    """
-    timeframe = params.get("timeframe", "5Min")
-    limit     = int(params.get("limit", 600))
-
-    if isinstance(symbols, str):
-        symbols = [s.strip() for s in symbols.split(",") if s.strip()]
-
-    candles: Dict[str, pd.DataFrame] = market.candles(symbols, timeframe=timeframe, limit=limit)
+def run(market, broker, symbols: List[str], params: Dict[str, Any], *, dry: bool, log):
+    tf = str(params.get("timeframe", "5Min"))
+    limit = int(params.get("limit", 600))
+    fast = int(params.get("fast", 12))
+    slow = int(params.get("slow", 26))
+    lookback = int(params.get("lookback", 20))
+    hh_confirm = int(params.get("hh_confirm", 5))   # bars to confirm HH
+    atr_min = float(params.get("atr_min", 0.0))
+    notional = float(params.get("notional", 0.0))
 
     results: List[Dict[str, Any]] = []
+    try:
+        data = market.candles(symbols, timeframe=tf, limit=limit)
+    except Exception as e:
+        return {"ok": False, "strategy": "c6", "dry": dry, "error": f"candles fetch failed: {e}", "results": []}
+
     for sym in symbols:
-        df = candles.get(sym)
-        if df is None or df.empty or len(df) < 50:
+        df = data.get(sym)
+        if df is None or len(df) < max(slow + lookback + hh_confirm + 5, 60):
             results.append({"symbol": sym, "action": "error", "error": "no_data"})
             continue
 
-        row = _scan_symbol(df, {**params, "symbol": sym})
+        close = df["close"].astype(float)
+        high = df["high"].astype(float)
 
-        if row["action"] == "buy":
-            order_id = _place_order(broker, sym, dry=dry, notional=notional, qty=qty)
-            row["order_id"] = order_id
+        ema_f = _ema(close, fast)
+        ema_s = _ema(close, slow)
+        atr = _atr(df, 14)
 
-        results.append(row)
+        c = float(close.iloc[-1])
+        ef = float(ema_f.iloc[-1])
+        es = float(ema_s.iloc[-1])
+        atr_last = float(atr.iloc[-1])
 
-    return {
-        "ok": True,
-        "strategy": NAME,
-        "dry": bool(dry),
-        "results": results,
-        "version": VERSION,
-    }
+        crossed_up = ema_f.iloc[-2] <= ema_s.iloc[-2] and ef > es
+        hh = float(high.rolling(lookback).max().iloc[-(1+hh_confirm)])
+
+        action = "flat"
+        reason = "no_signal"
+        order_id: Any = None
+
+        cond_atr = (atr_min == 0.0) or (atr_last >= atr_min)
+        cond_hh = c >= hh
+
+        if crossed_up and cond_atr and cond_hh:
+            action = "buy"
+            reason = "ema_cross_breakout"
+            if not dry and notional > 0 and broker is not None:
+                try:
+                    order_id = broker.paper_buy(sym, notional=notional)
+                except Exception as oe:
+                    order_id = {"status": "order_error", "error": str(oe)}
+            else:
+                order_id = {"status": "paper_buy", "notional": notional}
+
+        results.append({
+            "symbol": sym,
+            "action": action,
+            "reason": reason,
+            "close": round(c, 6),
+            "ema_fast": round(ef, 6),
+            "ema_slow": round(es, 6),
+            "atr": atr_last,
+            "hh": hh,
+            "order_id": order_id,
+        })
+
+    return {"ok": True, "strategy": "c6", "dry": dry, "results": results}
