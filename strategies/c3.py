@@ -1,9 +1,11 @@
 # strategies/c3.py
-# Version: 1.8.2
-# Simple MA cross with symmetric exits.
+# Version: 1.8.3
+# - MA cross entries/exits.
+# - Robust order_id extraction and OHLC handling.
+# - Passes params for client attribution.
+
 from __future__ import annotations
 from typing import Any, Dict, List, Tuple
-import math
 import pandas as pd
 
 def _p(d,k,dv):
@@ -34,6 +36,19 @@ def _qty_from_positions(positions, symbol)->float:
             except Exception: return 0.0
     return 0.0
 
+def _order_id(res):
+    if not res: return None
+    if isinstance(res, dict):
+        for k in ("id","order_id","client_order_id","clientOrderId"):
+            v = res.get(k)
+            if v: return v
+        data = res.get("data")
+        if isinstance(data, dict):
+            for k in ("id","order_id","client_order_id","clientOrderId"):
+                v = data.get(k)
+                if v: return v
+    return None
+
 def run(market, broker, symbols, params, *, dry, log):
     tf=_p(params,"timeframe","5Min"); limit=_p(params,"limit",600); notional=_p(params,"notional",0.0)
     fast=_p(params,"ma_fast",10); slow=_p(params,"ma_slow",30)
@@ -60,7 +75,7 @@ def run(market, broker, symbols, params, *, dry, log):
 
         ma1=_ma(c,fast); ma2=_ma(c,slow)
         m1_prev=float(ma1.iloc[-2]); m2_prev=float(ma2.iloc[-2])
-        m1=float(ma1.iloc[-1]); m2=float(ma2.iloc[-1])
+        m1=float(ma1.iloc[-1]);  m2=float(ma2.iloc[-1])
         close=float(c.iloc[-1])
 
         cross_up = m1_prev <= m2_prev and m1 > m2
@@ -74,7 +89,7 @@ def run(market, broker, symbols, params, *, dry, log):
             if not dry and notional>0:
                 try:
                     res=broker.notional(s,"buy",usd=notional,params=params)
-                    order_id=(res or {}).get("id")
+                    order_id=_order_id(res)
                 except Exception as e:
                     action,reason="flat",f"buy_error:{e}"
         elif pos_qty>0 and cross_dn:
@@ -82,7 +97,7 @@ def run(market, broker, symbols, params, *, dry, log):
             if not dry:
                 try:
                     res=broker.paper_sell(s,qty=pos_qty,params=params)
-                    order_id=(res or {}).get("id")
+                    order_id=_order_id(res)
                 except Exception as e:
                     action,reason="flat",f"sell_error:{e}"
 

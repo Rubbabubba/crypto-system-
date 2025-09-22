@@ -1,12 +1,15 @@
 # strategies/c2.py
-# Version: 1.8.2
-# EMA breakout + ATR sizing. Buy on close > EMA; sell on close < EMA or ATR stop.
+# Version: 1.8.3
+# - EMA breakout + ATR stop sizing.
+# - Robust order_id extraction and OHLC handling.
+# - Symmetric sell on close < EMA or ATR stop.
+# - Passes params for client attribution.
+
 from __future__ import annotations
 from typing import Any, Dict, List, Tuple
-import math
 import pandas as pd
 
-def _p(d, k, dv): 
+def _p(d, k, dv):
     v=d.get(k,dv)
     try:
         if isinstance(dv,int): return int(v)
@@ -39,6 +42,19 @@ def _qty_from_positions(positions: List[Dict[str, Any]], symbol: str)->float:
             try: return float(p.get("qty") or p.get("quantity") or 0)
             except Exception: return 0.0
     return 0.0
+
+def _order_id(res):
+    if not res: return None
+    if isinstance(res, dict):
+        for k in ("id","order_id","client_order_id","clientOrderId"):
+            v = res.get(k)
+            if v: return v
+        data = res.get("data")
+        if isinstance(data, dict):
+            for k in ("id","order_id","client_order_id","clientOrderId"):
+                v = data.get(k)
+                if v: return v
+    return None
 
 def run(market, broker, symbols, params, *, dry, log):
     tf=_p(params,"timeframe","5Min"); limit=_p(params,"limit",600); notional=_p(params,"notional",0.0)
@@ -76,7 +92,7 @@ def run(market, broker, symbols, params, *, dry, log):
             if not dry and notional>0:
                 try:
                     res=broker.notional(s,"buy",usd=notional,params=params)
-                    order_id=(res or {}).get("id")
+                    order_id=_order_id(res)
                 except Exception as e:
                     action,reason="flat",f"buy_error:{e}"
         elif pos_qty>0 and (close<ema_now or close<ema_now-atr_now*atr_mult):
@@ -84,7 +100,7 @@ def run(market, broker, symbols, params, *, dry, log):
             if not dry:
                 try:
                     res=broker.paper_sell(s,qty=pos_qty,params=params)
-                    order_id=(res or {}).get("id")
+                    order_id=_order_id(res)
                 except Exception as e:
                     action,reason="flat",f"sell_error:{e}"
 

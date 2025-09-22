@@ -1,12 +1,14 @@
 # strategies/c4.py
-# Version: 1.8.2
-# EMA + ATR filter; symmetric exits.
+# Version: 1.8.3
+# - EMA + ATR delta filter; symmetric exits.
+# - Robust order_id extraction and OHLC handling.
+# - Passes params for client attribution.
+
 from __future__ import annotations
 from typing import Any, Dict, List, Tuple
-import math
 import pandas as pd
 
-def _p(d,k,dv): 
+def _p(d,k,dv):
     v=d.get(k,dv)
     try:
         if isinstance(dv,int): return int(v)
@@ -37,9 +39,22 @@ def _qty_from_positions(positions, symbol)->float:
             except Exception: return 0.0
     return 0.0
 
+def _order_id(res):
+    if not res: return None
+    if isinstance(res, dict):
+        for k in ("id","order_id","client_order_id","clientOrderId"):
+            v = res.get(k)
+            if v: return v
+        data = res.get("data")
+        if isinstance(data, dict):
+            for k in ("id","order_id","client_order_id","clientOrderId"):
+                v = data.get(k)
+                if v: return v
+    return None
+
 def run(market, broker, symbols, params, *, dry, log):
     tf=_p(params,"timeframe","5Min"); limit=_p(params,"limit",600); notional=_p(params,"notional",0.0)
-    ema_len=_p(params,"ema_len",20); atr_len=_p(params,"atr_len",14); delta_frac=_p(params,"delta_frac",1.0) # % of ATR
+    ema_len=_p(params,"ema_len",20); atr_len=_p(params,"atr_len",14); delta_frac=_p(params,"delta_frac",1.0) # percentage of ATR
 
     out={"ok":True,"strategy":"c4","dry":dry,"results":[]}
     positions=[]
@@ -63,7 +78,7 @@ def run(market, broker, symbols, params, *, dry, log):
 
         ema=_ema(c,ema_len); atr=_atr_from_hlc(h,l,c,atr_len)
         close=float(c.iloc[-1]); ema_now=float(ema.iloc[-1]); atr_now=float(atr.iloc[-1])
-        # signal when price is above EMA by delta_frac * ATR; exit below EMA by same
+
         above = close >= ema_now + atr_now*delta_frac/100.0
         below = close <= ema_now - atr_now*delta_frac/100.0
         pos_qty=_qty_from_positions(positions,s) if not dry else 0.0
@@ -74,7 +89,7 @@ def run(market, broker, symbols, params, *, dry, log):
             if not dry and notional>0:
                 try:
                     res=broker.notional(s,"buy",usd=notional,params=params)
-                    order_id=(res or {}).get("id")
+                    order_id=_order_id(res)
                 except Exception as e:
                     action,reason="flat",f"buy_error:{e}"
         elif pos_qty>0 and below:
@@ -82,7 +97,7 @@ def run(market, broker, symbols, params, *, dry, log):
             if not dry:
                 try:
                     res=broker.paper_sell(s,qty=pos_qty,params=params)
-                    order_id=(res or {}).get("id")
+                    order_id=_order_id(res)
                 except Exception as e:
                     action,reason="flat",f"sell_error:{e}"
 
