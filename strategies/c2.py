@@ -1,142 +1,93 @@
 # strategies/c2.py
+# Version: 1.8.2
+# EMA breakout + ATR sizing. Buy on close > EMA; sell on close < EMA or ATR stop.
 from __future__ import annotations
+from typing import Any, Dict, List, Tuple
 import math
-from typing import Any, Dict, Iterable, List, Mapping
-import numpy as np
 import pandas as pd
 
+def _p(d, k, dv): 
+    v=d.get(k,dv)
+    try:
+        if isinstance(dv,int): return int(v)
+        if isinstance(dv,float): return float(v)
+        if isinstance(dv,bool): return str(v).lower() not in ("0","false","")
+        return v
+    except Exception: return dv
 
-# ---------- helpers ----------
-def _to_param_dict(p: Any) -> Dict[str, Any]:
-    """
-    Normalize params into a dict. Supports:
-      - dict
-      - list like ["ema_len=34", {"limit": 600}]
-      - None
-    """
-    if isinstance(p, Mapping):
-        return dict(p)
-    out: Dict[str, Any] = {}
-    if isinstance(p, Iterable) and not isinstance(p, (str, bytes)):
-        for item in p:
-            if isinstance(item, Mapping):
-                out.update(item)
-            elif isinstance(item, str) and "=" in item:
-                k, v = item.split("=", 1)
-                out[k.strip()] = v.strip()
+def _resolve_ohlc(df)->Tuple[pd.Series,pd.Series,pd.Series]:
+    cols=getattr(df,"columns",[])
+    def first(*names):
+        for n in names:
+            if n in cols: return df[n]
+        raise KeyError(f"missing columns {names}")
+    h=first("h","high","High"); l=first("l","low","Low"); c=first("c","close","Close")
+    return h,l,c
+
+def _ema(s: pd.Series, span:int)->pd.Series: return s.ewm(span=span, adjust=False).mean()
+
+def _atr_from_hlc(h,l,c,length:int):
+    prev=c.shift(1)
+    a=(h-l).abs(); b=(h-prev).abs(); c_=(l-prev).abs()
+    tr=a.combine(b,max).combine(c_,max)
+    return tr.rolling(length).mean()
+
+def _qty_from_positions(positions: List[Dict[str, Any]], symbol: str)->float:
+    for p in positions or []:
+        sym = p.get("symbol") or p.get("asset_symbol") or ""
+        if sym==symbol:
+            try: return float(p.get("qty") or p.get("quantity") or 0)
+            except Exception: return 0.0
+    return 0.0
+
+def run(market, broker, symbols, params, *, dry, log):
+    tf=_p(params,"timeframe","5Min"); limit=_p(params,"limit",600); notional=_p(params,"notional",0.0)
+    ema_len=_p(params,"ema_len",20); atr_len=_p(params,"atr_len",14); atr_mult=_p(params,"atr_mult",1.5)
+
+    out={"ok":True,"strategy":"c2","dry":dry,"results":[]}
+
+    positions=[]
+    if not dry:
+        try: positions=broker.positions()
+        except Exception as e: log(event="positions_error", error=str(e))
+
+    try:
+        data = market.candles(symbols, timeframe=tf, limit=limit)
+    except Exception as e:
+        return {"ok":False,"strategy":"c2","error":f"candles_error:{e}"}
+
+    for s in symbols:
+        df = (data or {}).get(s)
+        if df is None or len(df)<max(ema_len,atr_len)+2:
+            out["results"].append({"symbol":s,"action":"flat","reason":"insufficient_bars"}); continue
+        try:
+            h,l,c=_resolve_ohlc(df)
+        except KeyError:
+            out["results"].append({"symbol":s,"action":"flat","reason":"bad_columns"}); continue
+
+        ema=_ema(c,ema_len); atr=_atr_from_hlc(h,l,c,atr_len)
+        close=float(c.iloc[-1]); ema_now=float(ema.iloc[-1]); atr_now=float(atr.iloc[-1])
+        pos_qty=_qty_from_positions(positions,s) if not dry else 0.0
+
+        action,reason,order_id="flat","no_signal",None
+
+        if close>ema_now:
+            action,reason="buy","close_above_ema"
+            if not dry and notional>0:
+                try:
+                    res=broker.notional(s,"buy",usd=notional,params=params)
+                    order_id=(res or {}).get("id")
+                except Exception as e:
+                    action,reason="flat",f"buy_error:{e}"
+        elif pos_qty>0 and (close<ema_now or close<ema_now-atr_now*atr_mult):
+            action,reason="sell","close_below_ema" if close<ema_now else "atr_stop"
+            if not dry:
+                try:
+                    res=broker.paper_sell(s,qty=pos_qty,params=params)
+                    order_id=(res or {}).get("id")
+                except Exception as e:
+                    action,reason="flat",f"sell_error:{e}"
+
+        out["results"].append({"symbol":s,"action":action,"reason":reason,"close":close,"ema":ema_now,"atr":atr_now,"order_id":order_id})
+
     return out
-
-
-def _as_int(d: Mapping[str, Any], key: str, default: int) -> int:
-    v = d.get(key, default)
-    try:
-        return int(v)
-    except Exception:
-        return default
-
-
-def _as_float(d: Mapping[str, Any], key: str, default: float) -> float:
-    v = d.get(key, default)
-    try:
-        return float(v)
-    except Exception:
-        return default
-
-
-def _ema(series: pd.Series, span: int) -> pd.Series:
-    return series.ewm(span=span, adjust=False).mean()
-
-
-def _atr(df: pd.DataFrame, atr_len: int) -> pd.Series:
-    h, l, c = df["high"], df["low"], df["close"]
-    prev_c = c.shift(1)
-    tr = pd.concat([(h - l).abs(), (h - prev_c).abs(), (l - prev_c).abs()], axis=1).max(axis=1)
-    return tr.rolling(atr_len).mean()
-
-
-def _extract_trade_ctx(pdict: Mapping[str, Any], kwargs: Dict[str, Any]):
-    # dry/notional may appear in kwargs or params
-    dry = bool(kwargs.get("dry", pdict.get("dry", True)))
-    notional = kwargs.get("notional", pdict.get("notional"))
-    try:
-        notional = float(notional) if notional is not None else None
-    except Exception:
-        notional = None
-    return dry, notional
-
-
-# ---------- strategy ----------
-def run(market, broker, symbols: Iterable[str], params, *args, **kwargs) -> Dict[str, Any]:
-    """
-    C2: EMA + Highest-High + ATR breakout filter.
-    Router calls: run(market, broker, symbols, params, dry=..., log=...)
-    Returns: dict with 'ok' and 'results' (list of per-symbol dicts).
-    """
-    pdict = _to_param_dict(params)
-    dry, notional = _extract_trade_ctx(pdict, kwargs)
-
-    # Inputs / defaults
-    timeframe = str(pdict.get("timeframe", "5Min"))
-    limit = _as_int(pdict, "limit", 600)
-    ema_len = _as_int(pdict, "ema_len", 34)
-    hh_len = _as_int(pdict, "hh_len", 34)
-    atr_len = _as_int(pdict, "atr_len", 14)
-    atr_mult = _as_float(pdict, "atr_mult", 0.5)
-
-    need = max(ema_len, hh_len, atr_len) + 2
-    if limit < need:
-        limit = need
-
-    # Fetch candles (expects dict[symbol] -> DataFrame)
-    bars: Dict[str, pd.DataFrame] = market.candles(symbols, timeframe=timeframe, limit=limit)
-
-    results: List[Dict[str, Any]] = []
-    for sym in symbols:
-        df = bars.get(sym)
-        if df is None or len(df) < need:
-            results.append({
-                "symbol": sym, "action": "flat", "reason": "insufficient_bars",
-                "order_id": None
-            })
-            continue
-
-        df = df.copy()
-        df["ema"] = _ema(df["close"], ema_len)
-        df["hh"] = df["high"].rolling(hh_len).max()
-        df["atr"] = _atr(df, atr_len)
-
-        last = df.iloc[-1]
-        close = float(last["close"])
-        ema = float(last["ema"])
-        hh = float(last["hh"])
-        atr = float(last["atr"]) if math.isfinite(float(last["atr"])) else float("nan")
-
-        action = "flat"
-        reason = "no_signal"
-
-        if np.isfinite(atr) and close > hh and close > ema:
-            action = "buy"
-            reason = "breakout_long"
-        elif np.isfinite(atr) and close < ema - atr_mult * atr:
-            action = "flat"
-            reason = "below_ema_atr"
-
-        results.append({
-            "symbol": sym,
-            "action": action,
-            "reason": reason,
-            "close": close,
-            "ema": ema,
-            "hh": hh,
-            "atr": atr,
-            "order_id": None,
-            "dry": dry,
-            "notional": notional
-        })
-
-    return {
-        "ok": True,
-        "strategy": "c2",
-        "dry": dry,
-        "results": results
-    }

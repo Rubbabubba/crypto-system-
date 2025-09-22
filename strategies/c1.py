@@ -1,102 +1,111 @@
 # strategies/c1.py
-# Version: 1.7.3
-# RSI pullback into EMA trend. Expects app to call run(market, broker, symbols, params, *, dry, log)
-
+# Version: 1.8.2
+# RSI pullback into EMA trend. Buy when RSI recovers in uptrend; sell when RSI fades / below EMA.
 from __future__ import annotations
-
-from typing import Any, Dict, List
-
-import numpy as np
+from typing import Any, Dict, List, Tuple
+import math
 import pandas as pd
 
+def _p(d: Dict[str, Any], k: str, dv: Any): 
+    v = d.get(k, dv)
+    try:
+        if isinstance(dv, int): return int(v)
+        if isinstance(dv, float): return float(v)
+        if isinstance(dv, bool): return str(v).lower() not in ("0","false","")
+        return v
+    except Exception: return dv
 
-def _ema(series: pd.Series, span: int) -> pd.Series:
-    return series.ewm(span=span, adjust=False).mean()
+def _resolve_ohlc(df) -> Tuple[pd.Series, pd.Series, pd.Series]:
+    cols = getattr(df, "columns", [])
+    def first(*names):
+        for n in names:
+            if n in cols: return df[n]
+        raise KeyError(f"missing columns {names}")
+    h = first("h","high","High")
+    l = first("l","low","Low")
+    c = first("c","close","Close")
+    return h, l, c
 
+def _ema(s: pd.Series, span: int) -> pd.Series:
+    return s.ewm(span=span, adjust=False).mean()
 
-def _rsi(series: pd.Series, length: int = 14) -> pd.Series:
-    delta = series.diff()
+def _rsi(close: pd.Series, length=14) -> pd.Series:
+    delta = close.diff()
     up = delta.clip(lower=0)
     down = -delta.clip(upper=0)
-    ma_up = up.ewm(com=length - 1, adjust=False).mean()
-    ma_down = down.ewm(com=length - 1, adjust=False).mean()
-    rs = ma_up / (ma_down.replace(0, np.nan))
-    rsi = 100 - (100 / (1 + rs))
-    return rsi.fillna(50)
+    gain = up.ewm(alpha=1/length, adjust=False).mean()
+    loss = down.ewm(alpha=1/length, adjust=False).mean()
+    rs = gain / (loss.replace(0, 1e-12))
+    return 100 - (100 / (1 + rs))
 
+def _qty_from_positions(positions: List[Dict[str, Any]], symbol: str) -> float:
+    for p in positions or []:
+        sym = p.get("symbol") or p.get("asset_symbol") or ""
+        if sym == symbol:
+            try: return float(p.get("qty") or p.get("quantity") or 0)
+            except Exception: return 0.0
+    return 0.0
 
-def run(market, broker, symbols: List[str], params: Dict[str, Any], *, dry: bool, log):
-    """
-    Required by app.py:
-      - returns dict with ok/strategy/dry/results
-      - never raises for normal conditions
+def run(market, broker, symbols, params, *, dry, log):
+    tf       = _p(params, "timeframe", "5Min")
+    limit    = _p(params, "limit", 600)
+    notional = _p(params, "notional", 0.0)
 
-    params:
-      timeframe (str)  default "5Min"
-      limit (int)      default 600
-      rsi_len (int)    default 14
-      ema_len (int)    default 50
-      rsi_buy (float)  default 60
-      rsi_sell (float) default 40
-      notional (float) default 0 (live only)
-    """
-    tf = str(params.get("timeframe", "5Min"))
-    limit = int(params.get("limit", 600))
-    rsi_len = int(params.get("rsi_len", 14))
-    ema_len = int(params.get("ema_len", 50))
-    rsi_buy = float(params.get("rsi_buy", 60))
-    rsi_sell = float(params.get("rsi_sell", 40))
-    notional = float(params.get("notional", 0.0))
+    ema_len  = _p(params, "ema_len", 50)
+    rsi_len  = _p(params, "rsi_len", 14)
+    rsi_buy  = _p(params, "rsi_buy", 55.0)
+    rsi_sell = _p(params, "rsi_sell", 40.0)
 
-    results: List[Dict[str, Any]] = []
+    out = {"ok": True, "strategy": "c1", "dry": dry, "results": []}
+
+    positions = []
+    if not dry:
+        try: positions = broker.positions()
+        except Exception as e: log(event="positions_error", error=str(e))
 
     try:
-        data = market.candles(symbols, timeframe=tf, limit=limit)  # Dict[str, DataFrame]
+        data = market.candles(symbols, timeframe=tf, limit=limit)
     except Exception as e:
-        return {"ok": False, "error": f"candles fetch failed: {e}", "results": []}
+        return {"ok": False, "strategy": "c1", "error": f"candles_error:{e}"}
 
-    for sym in symbols:
-        df = data.get(sym)
-        if df is None or len(df) < max(ema_len, rsi_len) + 5:
-            results.append({"symbol": sym, "action": "error", "error": "no_data"})
-            continue
+    for s in symbols:
+        df = (data or {}).get(s)
+        if df is None or len(df) < max(ema_len, rsi_len) + 2:
+            out["results"].append({"symbol": s, "action": "flat", "reason": "insufficient_bars"}); continue
+        try:
+            _, _, c = _resolve_ohlc(df)
+        except KeyError:
+            out["results"].append({"symbol": s, "action": "flat", "reason": "bad_columns"}); continue
 
-        # Expect columns: time/ts, open, high, low, close, volume (normalized by MarketCrypto)
-        close = df["close"].astype(float)
+        ema = _ema(c, ema_len)
+        rsi = _rsi(c, rsi_len)
+        close = float(c.iloc[-1]); ema_now = float(ema.iloc[-1]); rsi_now = float(rsi.iloc[-1])
+        uptrend = close > ema_now
+        pos_qty = _qty_from_positions(positions, s) if not dry else 0.0
 
-        ema = _ema(close, ema_len)
-        rsi = _rsi(close, rsi_len)
+        action, reason, order_id = "flat", "no_signal", None
 
-        c = float(close.iloc[-1])
-        e = float(ema.iloc[-1])
-        r = float(rsi.iloc[-1])
-
-        action = "flat"
-        reason = "no_signal"
-        order_id: Any = None
-
-        # Simple logic:
-        # - Uptrend (price above EMA) & RSI crosses up through rsi_buy -> buy
-        # - Downtrend (price below EMA) & RSI crosses down through rsi_sell -> (optional) sell/short (disabled here)
-        if c > e and r >= rsi_buy:
-            action = "buy"
-            reason = "enter_long_rsi_pullback"
-            if not dry and notional > 0 and broker is not None:
+        if uptrend and rsi_now >= rsi_buy:
+            action, reason = "buy", "rsi_recovery_uptrend"
+            if not dry and notional > 0:
                 try:
-                    order_id = broker.paper_buy(sym, notional=notional)
-                except Exception as oe:
-                    order_id = {"status": "order_error", "error": str(oe)}
-            else:
-                order_id = {"status": "paper_buy", "notional": notional}
+                    res = broker.notional(s, "buy", usd=notional, params=params)
+                    order_id = (res or {}).get("id")
+                except Exception as e:
+                    action, reason = "flat", f"buy_error:{e}"
 
-        results.append({
-            "symbol": sym,
-            "action": action,
-            "reason": reason,
-            "close": round(c, 6),
-            "ema": round(e, 6),
-            "rsi": round(r, 2),
-            "order_id": order_id,
+        elif pos_qty > 0 and (rsi_now <= rsi_sell or close < ema_now):
+            action, reason = "sell", "rsi_fade_or_below_ema"
+            if not dry:
+                try:
+                    res = broker.paper_sell(s, qty=pos_qty, params=params)
+                    order_id = (res or {}).get("id")
+                except Exception as e:
+                    action, reason = "flat", f"sell_error:{e}"
+
+        out["results"].append({
+            "symbol": s, "action": action, "reason": reason,
+            "close": close, "ema": ema_now, "rsi": rsi_now, "order_id": order_id
         })
 
-    return {"ok": True, "strategy": "c1", "dry": dry, "results": results}
+    return out
