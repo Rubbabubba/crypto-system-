@@ -1,14 +1,13 @@
 # app.py — Crypto System API + Dashboard (rich UI)
-# Version: 1.8.5
+# Version: 1.8.6
+# - Fix: escaped JS template expressions in dashboard HTML (no f-string parsing issues)
 # - Full HTML dashboard with P&L cards, calendar heatmap, per-strategy attribution,
 #   positions, recent orders, symbols editor, and one-click scan runners.
 # - Per-strategy version reporting in /health/versions
-# - /admin/reload (dev-gated by ALLOW_ADMIN_RELOAD=1) to hot-reload c1..c6
+# - /admin/reload (dev-gated via ALLOW_ADMIN_RELOAD=1) to hot-reload c1..c6
 # - /config/symbols (GET/POST) persisted in ./config/symbols.json
 # - /pnl/summary and /pnl/daily (calendar heatmap backend)
 # - Keeps legacy response shapes (orders/recent wraps { value, Count }, positions = plain array)
-#
-# NOTE: Set APCA_API_KEY_ID / APCA_API_SECRET_KEY in env. Uses Alpaca Paper endpoints by default.
 
 import os
 import json
@@ -20,7 +19,7 @@ from typing import Dict, Any, List, Tuple
 import requests
 from flask import Flask, request, jsonify, Response
 
-APP_VERSION = "1.8.5"
+APP_VERSION = "1.8.6"
 
 # --------------------------------
 # Environment / Config
@@ -519,11 +518,11 @@ def scan_named(name: str):
         return jsonify({"ok": False, "error": str(e), "trace": traceback.format_exc(), "strategy": name}), 500
 
 # -----------------------------
-# Rich Dashboard
+# Rich Dashboard (no f-string; we replace a token instead)
 # -----------------------------
 @app.get("/dashboard")
 def dashboard():
-    html = f"""
+    html = """
 <!doctype html>
 <html>
 <head>
@@ -531,7 +530,7 @@ def dashboard():
   <title>Crypto Dashboard</title>
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <style>
-    :root {{
+    :root {
       --bg: #0b1220;
       --panel: #0f172a;
       --muted: #94a3b8;
@@ -541,64 +540,65 @@ def dashboard():
       --red: #ef4444;
       --yellow: #f59e0b;
       --border: #1f2a44;
-    }}
-    * {{ box-sizing: border-box; }}
-    body {{
+    }
+    * { box-sizing: border-box; }
+    body {
       margin: 0;
       background: radial-gradient(1200px 800px at 30% -10%, #12233f, transparent), var(--bg);
       color: var(--text);
       font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
-    }}
-    header {{
+    }
+    header {
       display: flex; align-items: center; justify-content: space-between;
       padding: 16px 20px; border-bottom: 1px solid var(--border);
       position: sticky; top: 0; background: rgba(11,18,32,0.8); backdrop-filter: blur(8px); z-index: 10;
-    }}
-    h1 {{ margin: 0; font-size: 20px; letter-spacing: .5px; }}
-    .tag {{ color: var(--muted); font-size: 12px; }}
-    main {{ padding: 20px; max-width: 1280px; margin: 0 auto; }}
-    .cards {{
+    }
+    h1 { margin: 0; font-size: 20px; letter-spacing: .5px; }
+    .tag { color: var(--muted); font-size: 12px; }
+    main { padding: 20px; max-width: 1280px; margin: 0 auto; }
+    .cards {
       display: grid; grid-template-columns: repeat(6, minmax(160px, 1fr)); gap: 12px;
-    }}
-    .card {{
+    }
+    .card {
       background: linear-gradient(180deg, #0f172a, #0c1426);
       border: 1px solid var(--border); border-radius: 12px; padding: 12px;
-    }}
-    .k {{ color: var(--muted); font-size: 12px; }}
-    .v {{ font-size: 22px; font-weight: 700; margin-top: 6px; }}
-    .grid2 {{
+    }
+    .k { color: var(--muted); font-size: 12px; }
+    .v { font-size: 22px; font-weight: 700; margin-top: 6px; }
+    .grid2 {
       display: grid; grid-template-columns: 2fr 1fr; gap: 16px; margin-top: 16px;
-    }}
-    .panel {{ background: var(--panel); border: 1px solid var(--border); border-radius: 12px; padding: 12px; }}
-    .panel h3 {{ margin: 0 0 10px 0; font-size: 16px; }}
-    .calendar {{ display: grid; grid-template-columns: repeat(14, 12px); gap: 4px; }}
-    .cell {{ width: 12px; height: 12px; border-radius: 3px; background: #334155; }}
-    .cell.pos {{ background: var(--green); }}
-    .cell.neg {{ background: var(--red); }}
-    .cell.zero {{ background: #64748b; }}
-    table {{ width: 100%; border-collapse: collapse; font-size: 12px; }}
-    th, td {{ padding: 8px; border-bottom: 1px solid var(--border); }}
-    th {{ text-align: left; color: var(--muted); font-weight: 500; }}
-    td.mono {{ font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }}
-    .row {{ display: flex; gap: 12px; flex-wrap: wrap; }}
-    .controls input, .controls select, .controls button, .controls textarea {{
+    }
+    .panel { background: var(--panel); border: 1px solid var(--border); border-radius: 12px; padding: 12px; }
+    .panel h3 { margin: 0 0 10px 0; font-size: 16px; }
+    .calendar { display: grid; grid-template-columns: repeat(14, 12px); gap: 4px; }
+    .cell { width: 12px; height: 12px; border-radius: 3px; background: #334155; }
+    .cell.pos { background: var(--green); }
+    .cell.neg { background: var(--red); }
+    .cell.zero { background: #64748b; }
+    table { width: 100%; border-collapse: collapse; font-size: 12px; }
+    th, td { padding: 8px; border-bottom: 1px solid var(--border); }
+    th { text-align: left; color: var(--muted); font-weight: 500; }
+    td.mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+    .row { display: flex; gap: 12px; flex-wrap: wrap; }
+    .controls input, .controls select, .controls button, .controls textarea {
       background: #0b1220; color: var(--text); border: 1px solid var(--border); border-radius: 8px; padding: 8px;
       font-size: 12px;
-    }}
-    .controls button.primary {{ background: #0ea5e9; border-color: #0284c7; }}
-    .pill {{ display:inline-block; padding:2px 8px; border-radius:999px; font-size:11px; background:#0b1220; border:1px solid var(--border); color:var(--muted); }}
-    .ok {{ color: var(--green); }} .bad {{ color: var(--red); }} .warn {{ color: var(--yellow); }}
-    .footer {{ color: var(--muted); font-size: 12px; margin-top: 20px; text-align: right; }}
-    @media (max-width: 1100px) {{
-      .cards {{ grid-template-columns: repeat(2, minmax(160px, 1fr)); }}
-      .grid2 {{ grid-template-columns: 1fr; }}
-    }}
+    }
+    .controls button.primary { background: #0ea5e9; border-color: #0284c7; }
+    .pill { display:inline-block; padding:2px 8px; border-radius:999px; font-size:11px; background:#0b1220; border:1px solid var(--border); color:var(--muted); }
+    .ok { color: var(--green); } .bad { color: var(--red); } .warn { color: var(--yellow); }
+    .right { text-align: right; }
+    .footer { color: var(--muted); font-size: 12px; margin-top: 20px; text-align: right; }
+    @media (max-width: 1100px) {
+      .cards { grid-template-columns: repeat(2, minmax(160px, 1fr)); }
+      .grid2 { grid-template-columns: 1fr; }
+    }
   </style>
 </head>
 <body>
 <header>
   <div>
-    <h1>Crypto Dashboard <span class="tag">v{APP_VERSION}</span></h1>
+    <h1>Crypto Dashboard <span class="tag">v__APP_VERSION__</span></h1>
     <div class="tag" id="env"></div>
   </div>
   <div class="row controls">
@@ -685,69 +685,69 @@ def dashboard():
 </main>
 
 <script>
-async function getJSON(u) {{ const r = await fetch(u); return r.json(); }}
-async function postJSON(u, body) {{
-  const r = await fetch(u, {{
+async function getJSON(u) { const r = await fetch(u); return r.json(); }
+async function postJSON(u, body) {
+  const r = await fetch(u, {
     method: 'POST',
-    headers: {{ 'Content-Type': 'application/json' }},
+    headers: { 'Content-Type': 'application/json' },
     body: body ? JSON.stringify(body) : null
-  }});
+  });
   return r.json();
-}}
+}
 
-function fmt2(n) {{ if (n===null||n===undefined||isNaN(n)) return "0.00"; return Number(n).toFixed(2); }}
-function clsSign(n) {{ if (n>0) return 'ok'; if (n<0) return 'bad'; return 'warn'; }}
-function stratFromCOID(coid) {{
+function fmt2(n) { if (n===null||n===undefined||isNaN(n)) return "0.00"; return Number(n).toFixed(2); }
+function clsSign(n) { if (n>0) return 'ok'; if (n<0) return 'bad'; return 'warn'; }
+function stratFromCOID(coid) {
   if (!coid) return 'unknown';
   const i = coid.indexOf('-');
   if (i<=0) return 'unknown';
   return coid.slice(0,i);
-}}
+}
 
-async function loadEnv() {{
+async function loadEnv() {
   const h = await getJSON('/health/versions');
-  document.getElementById('env').textContent = `exchange={h.exchange}  trading_base={h.trading_base}  data_base={h.data_base}`;
-  const systems = h.systems || {{}};
-  const s = Object.entries(systems).map(([k,v]) => `${{k}}: ${{v}}`).join('  ·  ');
+  document.getElementById('env').textContent = `exchange=${h.exchange}  trading_base=${h.trading_base}  data_base=${h.data_base}`;
+  const systems = h.systems || {};
+  const s = Object.entries(systems).map(([k,v]) => `${k}: ${v}`).join('  ·  ');
   document.getElementById('sys').textContent = `systems → ${s}`;
-}}
+}
 
-async function loadCards() {{
+async function loadCards() {
   const s = await getJSON('/pnl/summary');
   const cards = [
-    {{k:'Realized Today', v: fmt2(s.realized.today)}},
-    {{k:'Realized Week',  v: fmt2(s.realized.week)}},
-    {{k:'Realized Month', v: fmt2(s.realized.month)}},
-    {{k:'Unrealized P&L', v: fmt2(s.unrealized)}},
-    {{k:'Win Rate (30d)', v: (s.trades.win_rate_30d||0).toFixed(2) + '%'}},
-    {{k:'Trades (30d)',   v: s.trades.count_30d||0}},
+    {k:'Realized Today', v: fmt2(s.realized.today)},
+    {k:'Realized Week',  v: fmt2(s.realized.week)},
+    {k:'Realized Month', v: fmt2(s.realized.month)},
+    {k:'Unrealized P&L', v: fmt2(s.unrealized)},
+    {k:'Win Rate (30d)', v: (s.trades.win_rate_30d||0).toFixed(2) + '%'},
+    {k:'Trades (30d)',   v: s.trades.count_30d||0},
   ];
   const el = document.getElementById('cards');
   el.innerHTML = cards.map(c => `
     <div class="card">
-      <div class="k">${{c.k}}</div>
-      <div class="v ${{clsSign(parseFloat(c.v))}}">${{c.v}}</div>
+      <div class="k">${c.k}</div>
+      <div class="v ${clsSign(parseFloat(c.v))}">${c.v}</div>
     </div>
-  `).join('');
-}}
+  ).join('');
+}
 
-async function loadCalendar(days=120) {{
+async function loadCalendar(days=120) {
   const d = await getJSON('/pnl/daily?days=' + days);
   const el = document.getElementById('cal');
-  const cells = d.series.map(x => {{
+  const cells = d.series.map(x => {
     const v = Number(x.pnl||0);
     const c = v>0 ? 'pos' : (v<0 ? 'neg' : 'zero');
     return `<div class="cell ${c}" title="${x.date} → ${fmt2(v)}"></div>`;
-  }}).join('');
+  }).join('');
   el.innerHTML = cells;
   document.getElementById('calRange').textContent = `${d.start} → ${d.end}`;
-}}
+}
 
-async function loadAttribution(days) {{
+async function loadAttribution(days) {
   const d = await getJSON('/orders/attribution?days=' + days);
   document.getElementById('attrDays').textContent = days;
   const tb = document.querySelector('#attrTable tbody');
-  const rows = Object.entries(d.per_strategy || {{}}).map(([k,v]) => `
+  const rows = Object.entries(d.per_strategy || {}).map(([k,v]) => `
     <tr>
       <td>${k}</td>
       <td class="mono">${v.count||0}</td>
@@ -757,9 +757,9 @@ async function loadAttribution(days) {{
     </tr>
   `).join('');
   tb.innerHTML = rows || '<tr><td colspan="5" class="tag">No orders in window.</td></tr>';
-}}
+}
 
-async function loadPositions() {{
+async function loadPositions() {
   const arr = await getJSON('/positions');
   const tb = document.querySelector('#posTable tbody');
   const rows = (arr||[]).map(p => `
@@ -772,12 +772,12 @@ async function loadPositions() {{
     </tr>
   `).join('');
   tb.innerHTML = rows || '<tr><td colspan="5" class="tag">No positions.</td></tr>';
-}}
+}
 
-async function loadOrders() {{
+async function loadOrders() {
   const status = document.getElementById('orderStatus').value;
   const limit  = document.getElementById('orderLimit').value;
-  const data = await getJSON(`/orders/recent?status=${{encodeURIComponent(status)}}&limit=${{encodeURIComponent(limit)}}`);
+  const data = await getJSON(`/orders/recent?status=${encodeURIComponent(status)}&limit=${encodeURIComponent(limit)}`);
   const arr = data.value || data || [];
   const tb = document.querySelector('#ordTable tbody');
   const rows = (arr||[]).map(o => `
@@ -793,51 +793,50 @@ async function loadOrders() {{
     </tr>
   `).join('');
   tb.innerHTML = rows || '<tr><td colspan="8" class="tag">No recent orders.</td></tr>';
-}}
+}
 
-async function loadSymbols() {{
+async function loadSymbols() {
   const d = await getJSON('/config/symbols');
   const box = document.getElementById('symbols');
   const list = (d.symbols||[]).join('\\n');
   box.value = list;
   document.getElementById('symbolsMsg').textContent = `Loaded ${d.count||0} symbols`;
-}}
+}
 
-async function saveSymbols() {{
+async function saveSymbols() {
   const raw = document.getElementById('symbols').value||'';
   const arr = raw.split(/\\n|,|\\s+/).map(s => s.trim()).filter(Boolean);
   const cleaned = [];
-  for (const s of arr) {{
+  for (const s of arr) {
     const u = s.toUpperCase();
     if (u.includes('/')) cleaned.push(u);
-  }}
-  const res = await postJSON('/config/symbols', {{ symbols: cleaned }});
+  }
+  const res = await postJSON('/config/symbols', { symbols: cleaned });
   document.getElementById('symbolsMsg').textContent = res.ok ? `Saved ${res.count||0} symbols` : (res.error||'Error');
   return cleaned;
-}}
+}
 
-async function runScan() {{
+async function runScan() {
   const strat = document.getElementById('scanStrategy').value;
   const tf = document.getElementById('tf').value;
   const limit = document.getElementById('limit').value;
   const notional = document.getElementById('notional').value;
-  const url = `/scan/${{encodeURIComponent(strat)}}?dry=0&timeframe=${{encodeURIComponent(tf)}}&limit=${{encodeURIComponent(limit)}}&notional=${{encodeURIComponent(notional)}}`;
+  const url = `/scan/${encodeURIComponent(strat)}?dry=0&timeframe=${encodeURIComponent(tf)}&limit=${encodeURIComponent(limit)}&notional=${encodeURIComponent(notional)}`;
   const res = await postJSON(url, null);
-  // soft toast:
   alert(res.ok ? `Scan ${strat} queued: ${res.results?.length||0} results` : `Error: ${res.error||'unknown'}`);
   await Promise.all([loadOrders(), loadPositions(), loadCards()]);
-}}
+}
 
-document.getElementById('refreshAttr').addEventListener('click', () => {{
+document.getElementById('refreshAttr').addEventListener('click', () => {
   const d = parseInt(document.getElementById('attrDaysInput').value||'1',10);
   loadAttribution(Math.max(1, Math.min(30, d)));
-}});
+});
 document.getElementById('refreshOrders').addEventListener('click', loadOrders);
 document.getElementById('loadSymbols').addEventListener('click', loadSymbols);
 document.getElementById('saveSymbols').addEventListener('click', saveSymbols);
 document.getElementById('runScan').addEventListener('click', runScan);
 
-(async function init(){{
+(async function init(){
   await loadEnv();
   await loadCards();
   await loadCalendar(120);
@@ -845,12 +844,12 @@ document.getElementById('runScan').addEventListener('click', runScan);
   await loadPositions();
   await loadOrders();
   await loadSymbols();
-}})();
+})();
 </script>
 </body>
 </html>
 """
-    return Response(html, mimetype="text/html")
+    return Response(html.replace("__APP_VERSION__", APP_VERSION), mimetype="text/html")
 
 # -----------------------------
 # Admin: reload strategies (dev only)
