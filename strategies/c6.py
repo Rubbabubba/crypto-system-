@@ -1,13 +1,12 @@
 # strategies/c6.py
-# Version: 1.8.1
-# - Adds SELL logic to EMA cross + HH confirmation.
+# Version: 1.8.2
+# - Adds SELL logic to EMA cross + HH confirmation (v1.8.1).
+# - NEW: Robust candle column handling (h/l/c OR high/low/close).
 # - Sell on EMA fast < EMA slow (cross-down) or ATR stop.
 # - Uses notional buys; sells current position qty if any.
-# - Client attribution via params["client_tag"] (used by ExchangeExec to build client_order_id).
 
 from __future__ import annotations
-
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Tuple
 import math
 
 def _p(d: Dict[str, Any], k: str, dv: Any) -> Any:
@@ -20,17 +19,30 @@ def _p(d: Dict[str, Any], k: str, dv: Any) -> Any:
     except Exception:
         return dv
 
+def _resolve_ohlc(df) -> Tuple:
+    cols = df.columns if hasattr(df, "columns") else []
+    def first(*names):
+        for n in names:
+            if n in cols: return df[n]
+        raise KeyError(f"missing columns {names}")
+    h = first("h","high","High")
+    l = first("l","low","Low")
+    c = first("c","close","Close")
+    return h, l, c
+
 def _ema(series, length: int):
     try:
         return series.ewm(span=length, adjust=False).mean()
     except Exception:
         return None
 
-def _atr(df, length: int):
+def _atr_from_hlc(h, l, c, length: int):
     try:
-        h, l, c = df["h"], df["l"], df["c"]
         prev_c = c.shift(1)
-        tr = (h - l).abs().combine((h - prev_c).abs(), max).combine((l - prev_c).abs(), max)
+        a = (h - l).abs()
+        b = (h - prev_c).abs()
+        c_ = (l - prev_c).abs()
+        tr = a.combine(b, max).combine(c_, max)
         return tr.rolling(length).mean()
     except Exception:
         return None
@@ -57,11 +69,11 @@ def run(market, broker, symbols, params, *, dry, log):
     limit    = _p(params, "limit", 600)
     notional = _p(params, "notional", 0.0)
 
-    fast_len   = _p(params, "ema_fast_len", 12)
-    slow_len   = _p(params, "ema_slow_len", 26)
-    confirm_hh = _p(params, "confirm_hh_len", 20)  # require price > HH for confirmation
-    atr_len    = _p(params, "atr_len", 14)
-    atr_mult_stop = _p(params, "atr_mult_stop", 1.5)
+    fast_len     = _p(params, "ema_fast_len", 12)
+    slow_len     = _p(params, "ema_slow_len", 26)
+    confirm_hh   = _p(params, "confirm_hh_len", 20)
+    atr_len      = _p(params, "atr_len", 14)
+    atr_mult_stop= _p(params, "atr_mult_stop", 1.5)
 
     out = {"ok": True, "strategy": "c6", "dry": dry, "results": []}
 
@@ -85,32 +97,31 @@ def run(market, broker, symbols, params, *, dry, log):
             continue
 
         try:
-            c = df["c"]
-            h = df["h"]
+            h, l, c = _resolve_ohlc(df)
         except KeyError:
             out["results"].append({"symbol": s, "action": "flat", "reason": "bad_columns"})
             continue
 
         ema_fast = _ema(c, fast_len)
         ema_slow = _ema(c, slow_len)
-        atr = _atr(df, atr_len)
-        hh  = _highest(h, confirm_hh)
+        atr      = _atr_from_hlc(h, l, c, atr_len)
+        hh       = _highest(h, confirm_hh)
 
-        close = float(c.iloc[-1])
+        close  = float(c.iloc[-1])
         ef_now = float(ema_fast.iloc[-1]) if ema_fast is not None else float("nan")
         es_now = float(ema_slow.iloc[-1]) if ema_slow is not None else float("nan")
-        atr_now = float(atr.iloc[-1]) if atr is not None else float("nan")
+        atr_now= float(atr.iloc[-1]) if atr is not None else float("nan")
         hh_now = float(hh.iloc[-1]) if hh is not None else float("nan")
 
-        # Cross detection (use previous bar as well)
+        # previous for cross detection
         ef_prev = float(ema_fast.iloc[-2]) if ema_fast is not None else float("nan")
         es_prev = float(ema_slow.iloc[-2]) if ema_slow is not None else float("nan")
+
         cross_up = (not math.isnan(ef_prev) and not math.isnan(es_prev) and not math.isnan(ef_now) and not math.isnan(es_now)
                     and ef_prev <= es_prev and ef_now > es_now)
         cross_dn = (not math.isnan(ef_prev) and not math.isnan(es_prev) and not math.isnan(ef_now) and not math.isnan(es_now)
                     and ef_prev >= es_prev and ef_now < es_now)
 
-        # Confirmation: price above recent HH
         confirm = (not math.isnan(hh_now)) and (close >= hh_now)
 
         action = "flat"
@@ -132,7 +143,7 @@ def run(market, broker, symbols, params, *, dry, log):
                     action = "flat"
 
         # --- Exits
-        elif pos_qty > 0 and (cross_dn or (not math.isnan(atr_now) and close < es_now - atr_now * atr_mult_stop)):
+        elif pos_qty > 0 and (cross_dn or (not math.isnan(es_now) and not math.isnan(atr_now) and close < es_now - atr_now * atr_mult_stop)):
             action = "sell"
             reason = "ema_cross_down" if cross_dn else "atr_stop"
             if not dry:

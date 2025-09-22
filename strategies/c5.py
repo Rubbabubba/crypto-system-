@@ -1,13 +1,12 @@
 # strategies/c5.py
-# Version: 1.8.1
-# - Adds SELL logic to the percent-breakout strategy.
-# - Exits on EMA giveback or ATR stop.
+# Version: 1.8.2
+# - Adds SELL logic to the percent-breakout strategy (v1.8.1).
+# - NEW: Robust candle column handling (h/l/c OR high/low/close).
 # - Uses notional buys; sells current position qty if any.
-# - Client attribution via params["client_tag"] (used by ExchangeExec to build client_order_id).
+# - Client attribution via params["client_tag"] (ExchangeExec builds client_order_id).
 
 from __future__ import annotations
-
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Tuple
 import math
 
 def _p(d: Dict[str, Any], k: str, dv: Any) -> Any:
@@ -20,18 +19,32 @@ def _p(d: Dict[str, Any], k: str, dv: Any) -> Any:
     except Exception:
         return dv
 
+def _resolve_ohlc(df) -> Tuple:
+    # Accept short or long names; raise if missing
+    cols = df.columns if hasattr(df, "columns") else []
+    def first(*names):
+        for n in names:
+            if n in cols: return df[n]
+        raise KeyError(f"missing columns {names}")
+    h = first("h","high","High")
+    l = first("l","low","Low")
+    c = first("c","close","Close")
+    return h, l, c
+
 def _ema(series, length: int):
     try:
         return series.ewm(span=length, adjust=False).mean()
     except Exception:
         return None
 
-def _atr(df, length: int):
+def _atr_from_hlc(h, l, c, length: int):
     try:
-        # expects columns: h, l, c
-        h, l, c = df["h"], df["l"], df["c"]
         prev_c = c.shift(1)
-        tr = (h - l).abs().combine((h - prev_c).abs(), max).combine((l - prev_c).abs(), max)
+        # True Range components
+        a = (h - l).abs()
+        b = (h - prev_c).abs()
+        c_ = (l - prev_c).abs()
+        tr = a.combine(b, max).combine(c_, max)
         return tr.rolling(length).mean()
     except Exception:
         return None
@@ -60,20 +73,19 @@ def _qty_from_positions(positions: List[Dict[str, Any]], symbol: str) -> float:
     return 0.0
 
 def run(market, broker, symbols, params, *, dry, log):
-    tf      = _p(params, "timeframe", "5Min")
-    limit   = _p(params, "limit", 600)
-    notional= _p(params, "notional", 0.0)
+    tf       = _p(params, "timeframe", "5Min")
+    limit    = _p(params, "limit", 600)
+    notional = _p(params, "notional", 0.0)
 
     # Breakout / exit params (overridable via query string)
-    breakout_len   = _p(params, "breakout_len", 20)   # lookback for highest-high
-    ema_len        = _p(params, "ema_len", 20)        # baseline EMA for giveback
-    atr_len        = _p(params, "atr_len", 14)
-    atr_mult_stop  = _p(params, "atr_mult_stop", 1.5) # stop below close by k*ATR
-    giveback_pct   = _p(params, "giveback_pct", 0.005) # 0.5% giveback below EMA
+    breakout_len  = _p(params, "breakout_len", 20)   # lookback for highest-high
+    ema_len       = _p(params, "ema_len", 20)        # baseline EMA for giveback
+    atr_len       = _p(params, "atr_len", 14)
+    giveback_pct  = _p(params, "giveback_pct", 0.005)  # 0.5% below EMA triggers exit
+    atr_stop_frac = _p(params, "atr_stop_frac", 0.25)  # combine with local low
 
     out = {"ok": True, "strategy": "c5", "dry": dry, "results": []}
 
-    # Prefetch positions once if we might need to sell
     positions = []
     if not dry:
         try:
@@ -88,44 +100,36 @@ def run(market, broker, symbols, params, *, dry, log):
 
     for s in symbols:
         df = (data or {}).get(s)
-        if df is None or getattr(df, "shape", [0])[0] < max(breakout_len, ema_len, atr_len) + 1:
-            out["results"].append({
-                "symbol": s, "action": "flat", "reason": "insufficient_bars"
-            })
+        need = max(breakout_len, ema_len, atr_len) + 2
+        if df is None or getattr(df, "shape", [0])[0] < need:
+            out["results"].append({"symbol": s, "action": "flat", "reason": "insufficient_bars"})
             continue
 
-        # Expect columns: t, o, h, l, c, v
         try:
-            c = df["c"]
-            h = df["h"]
+            h, l, c = _resolve_ohlc(df)
         except KeyError:
             out["results"].append({"symbol": s, "action": "flat", "reason": "bad_columns"})
             continue
 
         ema = _ema(c, ema_len)
-        atr = _atr(df, atr_len)
+        atr = _atr_from_hlc(h, l, c, atr_len)
         hh  = _highest(h, breakout_len)
-        close = float(c.iloc[-1])
+        ll  = _lowest(c, max(5, atr_len))
+
+        close   = float(c.iloc[-1])
         ema_now = float(ema.iloc[-1]) if ema is not None else float("nan")
         atr_now = float(atr.iloc[-1]) if atr is not None else float("nan")
         hh_now  = float(hh.iloc[-1])  if hh  is not None else float("nan")
+        ll_now  = float(ll.iloc[-1])  if ll  is not None else float("nan")
 
         action = "flat"
         reason = "no_signal"
         order_id = None
 
-        # --- Entry: breakout above rolling HH
-        broke_out = (not math.isnan(hh_now)) and close >= hh_now
-
-        # --- Exit conditions
+        broke_out    = (not math.isnan(hh_now)) and close >= hh_now
         ema_giveback = (not math.isnan(ema_now)) and (close < ema_now * (1 - giveback_pct))
-        atr_stop     = (not math.isnan(atr_now)) and (close < (close - atr_now * atr_mult_stop))  # always False mathematically
-        # Note: use a trailing idea: compare to recent lowest of close since breakout not tracked statefully; approximate:
-        ll = _lowest(c, max(5, atr_len))
-        ll_now = float(ll.iloc[-1]) if ll is not None else float("nan")
-        atr_stop = atr_stop or (not math.isnan(ll_now) and not math.isnan(atr_now) and (close <= ll_now - atr_now * 0.25))
+        atr_stop     = (not math.isnan(ll_now) and not math.isnan(atr_now) and (close <= ll_now - atr_now * atr_stop_frac))
 
-        # Determine if we currently hold a position to decide sell qty
         pos_qty = _qty_from_positions(positions, s) if not dry else 0.0
 
         if broke_out:
@@ -133,12 +137,12 @@ def run(market, broker, symbols, params, *, dry, log):
             reason = "breakout_hh"
             if not dry and notional > 0:
                 try:
-                    # notional buy, attribution via params["client_tag"]
                     res = broker.notional(s, "buy", usd=notional, params=params)
                     order_id = (res or {}).get("id")
                 except Exception as e:
                     reason = f"buy_error:{e}"
                     action = "flat"
+
         elif pos_qty > 0 and (ema_giveback or atr_stop):
             action = "sell"
             reason = "exit_giveback" if ema_giveback else "exit_atr_stop"
