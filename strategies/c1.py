@@ -1,8 +1,8 @@
-# c1.py — v1.8.7
+# strategies/c1.py — v1.8.8
 import pandas as pd
 
 NAME = "c1"
-VERSION = "1.8.7"
+VERSION = "1.8.8"
 
 def _ema(s, n):
     return s.ewm(span=n, adjust=False).mean()

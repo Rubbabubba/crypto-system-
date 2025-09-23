@@ -1,8 +1,8 @@
-# c5.py — v1.8.7
+# strategies/c5.py — v1.8.8
 import pandas as pd
 
 NAME = "c5"
-VERSION = "1.8.7"
+VERSION = "1.8.8"
 
 def _ema(s, n): return s.ewm(span=n, adjust=False).mean()
 
@@ -13,7 +13,7 @@ def run(df_map, params, positions):
     for sym, df in df_map.items():
         if df is None or len(df) < max(n, ema_len) + 2:
             continue
-        hh = df["high"].rolling(n).max().iloc[-2]  # confirm on close
+        hh = df["high"].rolling(n).max().iloc[-2]
         c0 = df["close"].iloc[-1]
         e0 = _ema(df["close"], ema_len).iloc[-1]
         have = float(positions.get(sym, 0.0)) > 0.0

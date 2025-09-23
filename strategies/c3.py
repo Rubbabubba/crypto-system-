@@ -1,8 +1,8 @@
-# c3.py — v1.8.7
+# strategies/c3.py — v1.8.8
 import pandas as pd
 
 NAME = "c3"
-VERSION = "1.8.7"
+VERSION = "1.8.8"
 
 def run(df_map, params, positions):
     ma_fast = int(params.get("ma_fast", 12))

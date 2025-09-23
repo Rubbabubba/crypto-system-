@@ -1,9 +1,9 @@
-# c4.py — v1.8.7
+# strategies/c4.py — v1.8.8
 import pandas as pd
 import numpy as np
 
 NAME = "c4"
-VERSION = "1.8.7"
+VERSION = "1.8.8"
 
 def _rsi(s, n=14):
     d = s.diff()
