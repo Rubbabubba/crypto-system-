@@ -1,18 +1,21 @@
-# app.py  — v1.8.7
+# app.py  — v1.8.8
 import os
+import re
+import glob
 import time
 import json
+import importlib
 import threading
 from datetime import datetime, timedelta, timezone
 from collections import defaultdict, deque
 
 import pandas as pd
-from flask import Flask, request, jsonify, Response, render_template_string
+from flask import Flask, request, jsonify, render_template_string
 
-# ---- Versions ----
-APP_VERSION = "1.8.7"
+APP_VERSION = "1.8.8"
+UTC = timezone.utc
 
-# ---- Broker (Alpaca paper) ----
+# ---------- Broker ----------
 from services.exchange_exec import Broker as AlpacaBroker
 
 broker = AlpacaBroker(
@@ -22,7 +25,7 @@ broker = AlpacaBroker(
     data_base=os.environ.get("DATA_API_BASE_URL", "https://data.alpaca.markets"),
 )
 
-# ---- Symbols / config ----
+# ---------- Symbols / config ----------
 DEFAULT_SYMBOLS = [
     "BTC/USD","ETH/USD","SOL/USD","DOGE/USD","XRP/USD","AVAX/USD","LINK/USD","BCH/USD","LTC/USD"
 ]
@@ -42,53 +45,75 @@ def set_symbols(new_list):
     global _symbols
     _symbols = list(dict.fromkeys([s.strip() for s in new_list if s.strip()]))
 
-# ---- Load strategies (each exposes: NAME, VERSION, run(df_map, params, positions)) ----
-import c1, c2, c3, c4, c5, c6
-STRATS = [c1, c2, c3, c4, c5, c6]
+# ---------- Strategy loader (robust) ----------
+# We support:
+#  - strategies/c1.py ... c6.py  (preferred)
+#  - c1.py ... c6.py at repo root (fallback)
+def load_strategies():
+    modules = []
+    tried = []
+
+    # Preferred: strategies package
+    try:
+        base_pkg = "strategies"
+        for i in range(1, 7):
+            name = f"c{i}"
+            mod = importlib.import_module(f"{base_pkg}.{name}")
+            modules.append(mod)
+            tried.append(f"{base_pkg}.{name}")
+    except Exception:
+        # Fallback: plain modules in root
+        modules = []
+        tried.clear()
+        for i in range(1, 7):
+            name = f"c{i}"
+            try:
+                mod = importlib.import_module(name)
+                modules.append(mod)
+                tried.append(name)
+            except Exception:
+                pass
+
+    # keep only modules that declare NAME and VERSION
+    valid = []
+    for m in modules:
+        if getattr(m, "NAME", None) and hasattr(m, "run"):
+            valid.append(m)
+    return valid, tried
+
+STRATS, _TRIED = load_strategies()
 STRAT_MAP = {m.NAME: m for m in STRATS}
 
-# ---- Flask ----
+# ---------- Flask ----------
 app = Flask(__name__)
 
-# ---- Helpers ----
-UTC = timezone.utc
-
-def _now_utc():
-    return datetime.now(tz=UTC)
+# ---------- Helpers ----------
+def _now_utc(): return datetime.now(tz=UTC)
 
 def _parse_dt_utc(s):
     if not s:
         return None
     try:
-        # Accept "Z" and offsets
         return datetime.fromisoformat(s.replace("Z","+00:00")).astimezone(UTC)
     except Exception:
         return None
 
 def _safe_float(x, default=0.0):
-    try:
-        return float(x)
-    except Exception:
-        return default
+    try: return float(x)
+    except Exception: return default
 
 def strat_from_coid(coid):
-    if not coid or "-" not in coid:
-        return "unknown"
+    if not coid or "-" not in coid: return "unknown"
     return coid.split("-",1)[0].lower()
 
 def compute_realized_fifo(orders, start_dt=None, end_dt=None):
-    """
-    Compute realized P&L by symbol with a simple FIFO over filled orders.
-    Returns (realized_total, realized_by_day: dict[date->float], realized_by_strat: dict[strat->summary])
-    """
-    # Filter by time window and 'filled'
     filled = []
     for o in orders:
         st = (o.get("status") or "").lower()
         if st != "filled": 
             continue
         ft = _parse_dt_utc(o.get("filled_at") or o.get("submitted_at") or o.get("created_at"))
-        if not ft:
+        if not ft: 
             continue
         if start_dt and ft < start_dt: 
             continue
@@ -98,16 +123,15 @@ def compute_realized_fifo(orders, start_dt=None, end_dt=None):
         px  = _safe_float(o.get("filled_avg_price") or o.get("avg_price"))
         sym = o.get("symbol") or o.get("asset_symbol")
         side = (o.get("side") or "").lower()
-        if not sym or qty <= 0 or px <= 0:
+        if not sym or qty <= 0 or px <= 0: 
             continue
         filled.append({"t":ft,"symbol":sym,"side":side,"qty":qty,"px":px,"coid":o.get("client_order_id")})
 
-    # FIFO per symbol
     realized_total = 0.0
     realized_by_day = defaultdict(float)
     realized_by_strat = defaultdict(lambda: {"count":0,"wins":0,"losses":0,"realized":0.0})
+    inv = defaultdict(lambda: deque())  # symbol -> deque of [qty, px]
 
-    inv = defaultdict(lambda: deque())  # symbol -> deque of (qty,px)
     for row in sorted(filled, key=lambda r: r["t"]):
         d = row["t"].date()
         sym, side, q, px = row["symbol"], row["side"], row["qty"], row["px"]
@@ -115,27 +139,23 @@ def compute_realized_fifo(orders, start_dt=None, end_dt=None):
 
         if side == "buy":
             inv[sym].append([q, px])
-            # no realized P&L yet
             continue
 
-        # side == sell
-        qty = q
         pnl = 0.0
+        qty = q
         while qty > 0 and inv[sym]:
             q0, px0 = inv[sym][0]
             take = min(qty, q0)
             pnl += (px - px0) * take
             q0 -= take
             qty -= take
-            if q0 <= 1e-12:  # consumed
+            if q0 <= 1e-12:
                 inv[sym].popleft()
             else:
                 inv[sym][0][0] = q0
-        # If inventory empty and still qty left, treat remaining as opened short then closed immediately (zero cost) — but we’ll ignore for crypto long-only flow.
 
         realized_total += pnl
         realized_by_day[d] += pnl
-        # attribute to strategy if present
         realized_by_strat[strat]["count"] += 1
         if pnl > 0: realized_by_strat[strat]["wins"] += 1
         if pnl < 0: realized_by_strat[strat]["losses"] += 1
@@ -146,7 +166,6 @@ def compute_realized_fifo(orders, start_dt=None, end_dt=None):
 def positions_unrealized(positions):
     total = 0.0
     for p in positions or []:
-        # prefer broker-provided unrealized_pl; fallback to (market_value - cost)
         u = p.get("unrealized_pl")
         if u is not None:
             total += _safe_float(u)
@@ -158,8 +177,7 @@ def positions_unrealized(positions):
                 total += (mv - qty*avg)
     return total
 
-# ---- Routes ----
-
+# ---------- Routes ----------
 @app.get("/health/versions")
 def health_versions():
     systems = {m.NAME: getattr(m, "VERSION", "unknown") for m in STRATS}
@@ -169,13 +187,12 @@ def health_versions():
         "trading_base": broker.trading_base,
         "data_base": broker.data_base,
         "systems": systems,
+        "loaded_from": _TRIED,
     })
 
 @app.get("/routes")
 def list_routes():
-    rv = []
-    for r in app.url_map.iter_rules():
-        rv.append(str(r))
+    rv = [str(r) for r in app.url_map.iter_rules()]
     return jsonify({"routes": rv})
 
 @app.get("/config/symbols")
@@ -214,14 +231,12 @@ def positions():
 
 @app.get("/orders/attribution")
 def orders_attribution():
-    # ?days=1
     days = int(request.args.get("days","1"))
     end = _now_utc()
     start = (end - timedelta(days=days)).replace(microsecond=0)
     try:
-        orders = broker.list_orders(status="all", limit=1000)  # most recent
+        orders = broker.list_orders(status="all", limit=2000)
         _, _, by_strat = compute_realized_fifo(orders, start_dt=start, end_dt=end)
-        # ensure all strats appear (even if 0)
         for name in ["c1","c2","c3","c4","c5","c6","unknown"]:
             by_strat.setdefault(name, {"count":0,"wins":0,"losses":0,"realized":0.0})
         return jsonify({"per_strategy": by_strat, "version": APP_VERSION})
@@ -232,8 +247,7 @@ def orders_attribution():
 def pnl_summary():
     try:
         now = _now_utc()
-        orders = broker.list_orders(status="all", limit=2000)  # recent window
-        # daily/week/month realized using FIFO
+        orders = broker.list_orders(status="all", limit=4000)
         today_start = datetime(now.year, now.month, now.day, tzinfo=UTC)
         wk_start = (now - timedelta(days=7)).replace(hour=0, minute=0, second=0, microsecond=0)
         mo_start = (now - timedelta(days=31)).replace(hour=0, minute=0, second=0, microsecond=0)
@@ -249,7 +263,6 @@ def pnl_summary():
         pos = broker.list_positions()
         unreal = positions_unrealized(pos)
 
-        # trades summary (30d)
         start30 = now - timedelta(days=30)
         _, _, attr30 = compute_realized_fifo(orders, start_dt=start30, end_dt=now)
         trade_count = sum(v["count"] for v in attr30.values())
@@ -269,14 +282,12 @@ def pnl_summary():
 
 @app.get("/pnl/daily")
 def pnl_daily():
-    # returns per-day realized over last N days (overall portfolio)
     days = int(request.args.get("days","30"))
     end = _now_utc()
     start = (end - timedelta(days=days)).replace(microsecond=0)
     try:
-        orders = broker.list_orders(status="all", limit=5000)
+        orders = broker.list_orders(status="all", limit=8000)
         _, by_day, _ = compute_realized_fifo(orders, start_dt=start, end_dt=end)
-        # build series for each day inclusive
         series = []
         d = start.date()
         while d <= end.date():
@@ -288,7 +299,6 @@ def pnl_daily():
 
 @app.get("/diag/candles")
 def diag_candles():
-    # lightweight probe: return row counts per symbol
     syms = request.args.get("symbols","")
     tf   = request.args.get("tf","1Min")
     limit= int(request.args.get("limit","100"))
@@ -300,12 +310,10 @@ def diag_candles():
             rows[s] = int(len(df)) if df is not None else 0
         return jsonify({"rows": rows})
     except Exception as e:
-        # never 500 this endpoint; return zeros
         for s in [s.strip() for s in syms.split(",") if s.strip()] or get_symbols():
             rows[s] = 0
         return jsonify({"rows": rows, "error": str(e)})
 
-# ---- SCAN endpoint (kept for API completeness; dashboard no longer uses it) ----
 @app.post("/scan/<name>")
 def scan(name):
     name = name.lower()
@@ -316,8 +324,6 @@ def scan(name):
     timeframe = request.args.get("timeframe","1Min")
     limit = int(request.args.get("limit","600"))
     notional = _safe_float(request.args.get("notional","5"), 5.0)
-
-    # collect extra params for the strategy
     params = {k:v for k,v in request.args.items() if k not in ("dry","timeframe","limit","notional")}
     symbols = get_symbols()
 
@@ -329,7 +335,6 @@ def scan(name):
         strat = STRAT_MAP[name]
         results = strat.run(df_map, params, long_map)
 
-        # place orders if needed
         placed = []
         if not dry:
             now_epoch = int(time.time())
@@ -338,13 +343,11 @@ def scan(name):
                 symbol = r.get("symbol")
                 if action not in ("buy","sell") or not symbol:
                     continue
-                # skip duplicate/inverted actions based on position
                 qty_have = long_map.get(symbol, 0.0)
-                if action == "buy" and qty_have > 0:  # already long
+                if action == "buy" and qty_have > 0:  # avoid rebuy
                     continue
                 if action == "sell" and qty_have <= 0:
                     continue
-
                 coid = f"{name}-{symbol.replace('/','')}-{now_epoch}"
                 o = broker.submit_order(symbol=symbol, side=action, notional=notional,
                                         client_order_id=coid, time_in_force="gtc", type="market")
@@ -354,8 +357,8 @@ def scan(name):
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 500
 
-# ---- Background automation (runs all strategies every N seconds) ----
-_last_bar_ts = {}  # (symbol, timeframe) -> last bar timestamp we processed
+# ---------- Background automation ----------
+_last_bar_ts = {}  # (strategy, symbol, timeframe) -> last bar time processed
 
 def autorun_worker():
     enabled = os.environ.get("AUTORUN_ENABLED","false").lower() == "true"
@@ -374,7 +377,6 @@ def autorun_worker():
 
             df_map = broker.get_bars(symbols, timeframe=timeframe, limit=limit, merge=False)
 
-            # Dedupe per latest bar time, so we don’t spam per cycle
             latest_by_symbol = {}
             for sym, df in df_map.items():
                 if df is None or df.empty: 
@@ -392,32 +394,26 @@ def autorun_worker():
                         continue
                     if symbol not in latest_by_symbol:
                         continue
-                    # dedupe on (symbol, timeframe) last bar
                     key = (strat.NAME, symbol, timeframe)
                     last_t = _last_bar_ts.get(key)
                     if last_t == latest_by_symbol[symbol]:
                         continue
-                    # Position guard
                     qty_have = long_map.get(symbol, 0.0)
                     if action == "buy" and qty_have > 0:
                         continue
                     if action == "sell" and qty_have <= 0:
                         continue
-                    # place paper order
                     coid = f"{strat.NAME}-{symbol.replace('/','')}-{now_epoch}"
                     broker.submit_order(symbol=symbol, side=action, notional=notional,
                                         client_order_id=coid, time_in_force="gtc", type="market")
                     _last_bar_ts[key] = latest_by_symbol[symbol]
-
-        except Exception as e:
-            # keep running no matter what
+        except Exception:
             pass
         time.sleep(interval)
 
-# Start background worker
 threading.Thread(target=autorun_worker, daemon=True).start()
 
-# ---- Dashboard (snapshot only, no manual scan buttons) ----
+# ---------- Dashboard (HTML) ----------
 DASH_HTML = r"""{% raw %}
 <!doctype html>
 <html>
@@ -491,7 +487,6 @@ DASH_HTML = r"""{% raw %}
 <script>
 function fmt(x){ if(x===null||x===undefined) return "—"; const s = Number(x).toFixed(2); const n = Number(x); const cls = n>0?'pos':(n<0?'neg':'z'); return `<span class="${cls}">${s}</span>`; }
 function clsPn(x){ const n=Number(x); return n>0?'g':(n<0?'r':'z'); }
-
 async function fetchJSON(u){ const r = await fetch(u); if(!r.ok) throw new Error(await r.text()); return r.json(); }
 
 async function loadAll(){
@@ -503,7 +498,6 @@ async function loadAll(){
       fetchJSON('/health/versions')
     ]);
 
-    // KPIs
     document.getElementById('k_unr').innerHTML = fmt(sum.unrealized);
     document.getElementById('k_rt').innerText = (sum.realized?.today ?? 0).toFixed(2);
     document.getElementById('k_rw').innerText = (sum.realized?.week ?? 0).toFixed(2);
@@ -511,7 +505,6 @@ async function loadAll(){
     document.getElementById('asof').innerText = `as of ${sum.as_of_utc}`;
     document.getElementById('appv').innerText = `app ${hv.app}`;
 
-    // Per-strategy
     const tb = document.querySelector('#tbl_attr tbody');
     tb.innerHTML = '';
     const keys = ['c1','c2','c3','c4','c5','c6','unknown'];
@@ -522,7 +515,6 @@ async function loadAll(){
       tb.appendChild(tr);
     });
 
-    // Calendar
     const cal = document.getElementById('cal'); cal.innerHTML = '';
     (daily.series||[]).forEach(d=>{
       const div = document.createElement('div');
@@ -531,12 +523,10 @@ async function loadAll(){
       cal.appendChild(div);
     });
 
-  }catch(e){
-    console.error(e);
-  }
+  }catch(e){ console.error(e); }
 }
 loadAll();
-setInterval(loadAll, 60000); // refresh every minute
+setInterval(loadAll, 60000);
 </script>
 </body>
 </html>
