@@ -1,41 +1,27 @@
-# c6.py — Dual EMA + HH confirm (v1.8.6)
-VERSION = "1.8.6"
-NAME = "c6"
-import time
+# c5.py — v1.8.7
+import pandas as pd
 
-def _ema(xs, n):
-    if not xs: return None
-    k = 2/(n+1)
-    ema = xs[0]
-    for v in xs[1:]:
-        ema = v*k + ema*(1-k)
-    return ema
+NAME = "c5"
+VERSION = "1.8.7"
 
-class System:
-    def __init__(self, version):
-        self.version=version
-        self.name=NAME
+def _ema(s, n): return s.ewm(span=n, adjust=False).mean()
 
-    def scan(self, get_bars, symbols, timeframe, limit, params, notional, dry, tag, broker):
-        fast = int(params.get("ema_fast_len", 12))
-        slow = int(params.get("ema_slow_len", 26))
-        hh_n = int(params.get("confirm_hh_len", 10))
-        out=[]
-        for s in symbols:
-            bars = get_bars(s, timeframe, limit)
-            if not bars:
-                out.append({"symbol": s, "action":"flat", "reason":"no_bars"}); continue
-            closes=[b.get("c") or b.get("close") or 0 for b in bars]
-            highs =[b.get("h") or b.get("high") or 0 for b in bars]
-            ef=_ema(closes, fast); es=_ema(closes, slow); px=closes[-1]; hh=max(highs[-hh_n:]) if len(highs)>=hh_n else None
-            if ef and es and px and hh and ef>es and px>=hh:
-                action="buy"; reason="ema_fast>slow & close>=HH"
-                if not dry and notional>0:
-                    coid=f"{tag}-{s.replace('/','')}-{int(time.time())}"
-                    broker.place_order(symbol=s, side="buy", notional=notional, client_order_id=coid)
-            else:
-                action="flat"; reason="no_signal"
-            out.append({"symbol":s, "action":action, "reason":reason, "close":px, "ema_fast":ef, "ema_slow":es, "hh":hh})
-        return out
+def run(df_map, params, positions):
+    n = int(params.get("breakout_len", 20))
+    ema_len = int(params.get("ema_len", 20))
+    results = []
+    for sym, df in df_map.items():
+        if df is None or len(df) < max(n, ema_len) + 2:
+            continue
+        hh = df["high"].rolling(n).max().iloc[-2]  # confirm on close
+        c0 = df["close"].iloc[-1]
+        e0 = _ema(df["close"], ema_len).iloc[-1]
+        have = float(positions.get(sym, 0.0)) > 0.0
 
-system = System(VERSION)
+        if not have and c0 > hh:
+            results.append({"symbol": sym, "action": "buy", "reason": f"breakout_{n}"})
+        elif have and c0 < e0:
+            results.append({"symbol": sym, "action": "sell", "reason": f"exit_ema{ema_len}"})
+        else:
+            results.append({"symbol": sym, "action": "flat", "reason": "no_signal"})
+    return results

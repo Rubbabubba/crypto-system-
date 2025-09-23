@@ -1,31 +1,27 @@
-# c5.py — Breakout (v1.8.6)
-VERSION = "1.8.6"
+# c5.py — v1.8.7
+import pandas as pd
+
 NAME = "c5"
-import time
+VERSION = "1.8.7"
 
-class System:
-    def __init__(self, version):
-        self.version=version
-        self.name=NAME
+def _ema(s, n): return s.ewm(span=n, adjust=False).mean()
 
-    def scan(self, get_bars, symbols, timeframe, limit, params, notional, dry, tag, broker):
-        length = int(params.get("breakout_len", 20))
-        out=[]
-        for s in symbols:
-            bars = get_bars(s, timeframe, limit)
-            if not bars or len(bars)<length:
-                out.append({"symbol": s, "action":"flat", "reason":"no_bars"}); continue
-            highs=[b.get("h") or b.get("high") or 0 for b in bars]
-            closes=[b.get("c") or b.get("close") or 0 for b in bars]
-            hh=max(highs[-length:]); px=closes[-1]
-            if px>=hh:
-                action="buy"; reason="close>=HH"
-                if not dry and notional>0:
-                    coid=f"{tag}-{s.replace('/','')}-{int(time.time())}"
-                    broker.place_order(symbol=s, side="buy", notional=notional, client_order_id=coid)
-            else:
-                action="flat"; reason="no_signal"
-            out.append({"symbol":s, "action":action, "reason":reason, "close":px, "hh":hh})
-        return out
+def run(df_map, params, positions):
+    n = int(params.get("breakout_len", 20))
+    ema_len = int(params.get("ema_len", 20))
+    results = []
+    for sym, df in df_map.items():
+        if df is None or len(df) < max(n, ema_len) + 2:
+            continue
+        hh = df["high"].rolling(n).max().iloc[-2]  # confirm on close
+        c0 = df["close"].iloc[-1]
+        e0 = _ema(df["close"], ema_len).iloc[-1]
+        have = float(positions.get(sym, 0.0)) > 0.0
 
-system = System(VERSION)
+        if not have and c0 > hh:
+            results.append({"symbol": sym, "action": "buy", "reason": f"breakout_{n}"})
+        elif have and c0 < e0:
+            results.append({"symbol": sym, "action": "sell", "reason": f"exit_ema{ema_len}"})
+        else:
+            results.append({"symbol": sym, "action": "flat", "reason": "no_signal"})
+    return results
