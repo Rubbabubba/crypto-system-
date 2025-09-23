@@ -1,106 +1,38 @@
-# strategies/c3.py
-# Version: 1.8.3
-# - MA cross entries/exits.
-# - Robust order_id extraction and OHLC handling.
-# - Passes params for client attribution.
+# c3.py — MA Crossover (v1.8.6)
+VERSION = "1.8.6"
+NAME = "c3"
+import time
 
-from __future__ import annotations
-from typing import Any, Dict, List, Tuple
-import pandas as pd
+from statistics import mean
 
-def _p(d,k,dv):
-    v=d.get(k,dv)
-    try:
-        if isinstance(dv,int): return int(v)
-        if isinstance(dv,float): return float(v)
-        if isinstance(dv,bool): return str(v).lower() not in ("0","false","")
-        return v
-    except Exception: return dv
+def _sma(xs, n):
+    if not xs: return None
+    n = max(1,int(n))
+    return sum(xs[-n:])/min(len(xs),n)
 
-def _resolve_ohlc(df)->Tuple[pd.Series,pd.Series,pd.Series]:
-    cols=getattr(df,"columns",[])
-    def first(*names):
-        for n in names:
-            if n in cols: return df[n]
-        raise KeyError(f"missing columns {names}")
-    h=first("h","high","High"); l=first("l","low","Low"); c=first("c","close","Close")
-    return h,l,c
+class System:
+    def __init__(self, version):
+        self.version = version
+        self.name = NAME
 
-def _ma(s: pd.Series, n:int)->pd.Series: return s.rolling(n).mean()
+    def scan(self, get_bars, symbols, timeframe, limit, params, notional, dry, tag, broker):
+        ma_fast = int(params.get("ma_fast", 5))
+        ma_slow = int(params.get("ma_slow", 9))
+        out=[]
+        for s in symbols:
+            bars = get_bars(s, timeframe, limit)
+            if not bars:
+                out.append({"symbol": s, "action":"flat", "reason":"no_bars"}); continue
+            closes=[b.get("c") or b.get("close") or 0 for b in bars]
+            ma1=_sma(closes, ma_fast); ma2=_sma(closes, ma_slow); px=closes[-1]
+            if ma1 and ma2 and ma1>ma2:
+                action="buy"; reason="ma_fast>ma_slow"
+                if not dry and notional>0:
+                    coid=f"{tag}-{s.replace('/','')}-{int(time.time())}"
+                    broker.place_order(symbol=s, side="buy", notional=notional, client_order_id=coid)
+            else:
+                action="flat"; reason="no_signal"
+            out.append({"symbol":s, "action":action, "reason":reason, "close":px, "ma1":ma1, "ma2":ma2})
+        return out
 
-def _qty_from_positions(positions, symbol)->float:
-    for p in positions or []:
-        sym=p.get("symbol") or p.get("asset_symbol") or ""
-        if sym==symbol:
-            try: return float(p.get("qty") or p.get("quantity") or 0)
-            except Exception: return 0.0
-    return 0.0
-
-def _order_id(res):
-    if not res: return None
-    if isinstance(res, dict):
-        for k in ("id","order_id","client_order_id","clientOrderId"):
-            v = res.get(k)
-            if v: return v
-        data = res.get("data")
-        if isinstance(data, dict):
-            for k in ("id","order_id","client_order_id","clientOrderId"):
-                v = data.get(k)
-                if v: return v
-    return None
-
-def run(market, broker, symbols, params, *, dry, log):
-    tf=_p(params,"timeframe","5Min"); limit=_p(params,"limit",600); notional=_p(params,"notional",0.0)
-    fast=_p(params,"ma_fast",10); slow=_p(params,"ma_slow",30)
-
-    out={"ok":True,"strategy":"c3","dry":dry,"results":[]}
-    positions=[]
-    if not dry:
-        try: positions=broker.positions()
-        except Exception as e: log(event="positions_error", error=str(e))
-
-    try:
-        data=market.candles(symbols,timeframe=tf,limit=limit)
-    except Exception as e:
-        return {"ok":False,"strategy":"c3","error":f"candles_error:{e}"}
-
-    for s in symbols:
-        df=(data or {}).get(s)
-        if df is None or len(df)<slow+2:
-            out["results"].append({"symbol":s,"action":"flat","reason":"insufficient_bars"}); continue
-        try:
-            _,_,c=_resolve_ohlc(df)
-        except KeyError:
-            out["results"].append({"symbol":s,"action":"flat","reason":"bad_columns"}); continue
-
-        ma1=_ma(c,fast); ma2=_ma(c,slow)
-        m1_prev=float(ma1.iloc[-2]); m2_prev=float(ma2.iloc[-2])
-        m1=float(ma1.iloc[-1]);  m2=float(ma2.iloc[-1])
-        close=float(c.iloc[-1])
-
-        cross_up = m1_prev <= m2_prev and m1 > m2
-        cross_dn = m1_prev >= m2_prev and m1 < m2
-
-        pos_qty=_qty_from_positions(positions,s) if not dry else 0.0
-        action,reason,order_id="flat","no_signal",None
-
-        if cross_up:
-            action,reason="buy","ma_cross_up"
-            if not dry and notional>0:
-                try:
-                    res=broker.notional(s,"buy",usd=notional,params=params)
-                    order_id=_order_id(res)
-                except Exception as e:
-                    action,reason="flat",f"buy_error:{e}"
-        elif pos_qty>0 and cross_dn:
-            action,reason="sell","ma_cross_down"
-            if not dry:
-                try:
-                    res=broker.paper_sell(s,qty=pos_qty,params=params)
-                    order_id=_order_id(res)
-                except Exception as e:
-                    action,reason="flat",f"sell_error:{e}"
-
-        out["results"].append({"symbol":s,"action":action,"reason":reason,"close":close,"ma1":m1,"ma2":m2,"order_id":order_id})
-
-    return out
+system = System(VERSION)
