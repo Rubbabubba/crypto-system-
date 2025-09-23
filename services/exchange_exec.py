@@ -1,8 +1,7 @@
-# services/exchange_exec.py — v1.8.7
+# services/exchange_exec.py — v1.8.8
 import os
-import time
 import json
-from datetime import datetime, timezone
+from datetime import timezone
 from typing import List, Dict
 
 import requests
@@ -40,14 +39,8 @@ class Broker:
         return r.json()
 
     def list_orders(self, status="all", limit=50):
-        # direction=desc, most recent first
         url = f"{self.trading_base}/v2/orders"
-        params = {
-            "status": status,
-            "limit": str(limit),
-            "direction": "desc",
-            "nested": "false",
-        }
+        params = {"status": status, "limit": str(limit), "direction": "desc", "nested": "false"}
         r = self._sess.get(url, params=params, timeout=20)
         r.raise_for_status()
         return r.json()
@@ -58,24 +51,14 @@ class Broker:
         if r.status_code == 404:
             return []
         r.raise_for_status()
-        rows = r.json()
-        # normalize numeric fields to strings; caller will parse floats
-        return rows
+        return r.json()
 
     # -------- Market Data (Crypto) --------
     def get_bars(self, symbols:List[str], timeframe:str="1Min", limit:int=600, merge=False) -> Dict[str, pd.DataFrame]:
-        """
-        Returns dict[symbol] -> DataFrame indexed by timestamp with columns [open,high,low,close,volume].
-        Uses Alpaca v1beta3 crypto bars.
-        """
         if not symbols:
             return {}
         url = f"{self.data_base}/v1beta3/crypto/us/bars"
-        params = {
-            "symbols": ",".join(symbols),
-            "timeframe": timeframe,
-            "limit": str(limit),
-        }
+        params = {"symbols": ",".join(symbols), "timeframe": timeframe, "limit": str(limit)}
         r = self._sess.get(url, params=params, timeout=30)
         r.raise_for_status()
         js = r.json() or {}
@@ -87,13 +70,8 @@ class Broker:
                 out[sym] = pd.DataFrame(columns=["open","high","low","close","volume"])
                 continue
             df = pd.DataFrame(arr)
-            # Normalize fields
-            # Alpaca bars: {"t": "2024-01-01T00:00:00Z", "o":..., "h":..., "l":..., "c":..., "v":...}
             df["t"] = pd.to_datetime(df["t"], utc=True)
             df = df.set_index("t").sort_index()
             df = df.rename(columns={"o":"open","h":"high","l":"low","c":"close","v":"volume"})
             out[sym] = df[["open","high","low","close","volume"]]
-        if merge:
-            # Optional: merge all symbols by outer join on time, with MultiIndex columns
-            pass
         return out
