@@ -1,4 +1,4 @@
-# app.py  — v1.8.8
+# app.py  — v1.8.9
 import os
 import re
 import glob
@@ -12,7 +12,7 @@ from collections import defaultdict, deque
 import pandas as pd
 from flask import Flask, request, jsonify, render_template_string
 
-APP_VERSION = "1.8.8"
+APP_VERSION = "1.8.9"
 UTC = timezone.utc
 
 # ---------- Broker ----------
@@ -416,118 +416,235 @@ threading.Thread(target=autorun_worker, daemon=True).start()
 # ---------- Dashboard (HTML) ----------
 DASH_HTML = r"""{% raw %}
 <!doctype html>
-<html>
+<html lang="en">
 <head>
-<meta charset="utf-8"/>
-<title>Crypto System — Dashboard</title>
-<meta name="viewport" content="width=device-width, initial-scale=1"/>
-<link rel="preconnect" href="https://fonts.googleapis.com"/>
-<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&display=swap" rel="stylesheet"/>
-<style>
-  :root { --bg:#0f1320; --card:#151a2c; --text:#e6eefc; --muted:#9db2d7; --green:#1db954; --red:#ff4d4f; --amber:#ffb020; }
-  *{box-sizing:border-box} body{margin:0;background:var(--bg);color:var(--text);font-family:Inter,system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial}
-  .wrap{max-width:1100px;margin:32px auto;padding:0 16px}
-  h1{margin:0 0 8px;font-size:26px}
-  .sub{color:var(--muted);margin-bottom:24px}
-  .grid{display:grid;grid-template-columns:repeat(12,1fr);gap:16px}
-  .card{background:var(--card);border-radius:14px;padding:16px;box-shadow:0 8px 24px rgba(0,0,0,.25)}
-  .span-4{grid-column:span 4} .span-8{grid-column:span 8} .span-12{grid-column:span 12}
-  .kpi{display:flex;align-items:center;justify-content:space-between}
-  .kpi .v{font-size:28px;font-weight:700}
-  .kpi .l{color:var(--muted);font-size:12px}
-  .row{display:flex;gap:16px;flex-wrap:wrap}
-  .pill{padding:6px 10px;border-radius:9999px;background:#0e1425;color:var(--muted);font-size:12px}
-  table{width:100%;border-collapse:collapse}
-  th,td{padding:8px 6px;border-bottom:1px solid rgba(255,255,255,.06);font-size:14px}
-  th{color:var(--muted);text-align:left}
-  .pos{color:var(--green);font-weight:600}
-  .neg{color:var(--red);font-weight:600}
-  .calendar{display:grid;grid-template-columns:repeat(7,1fr);gap:8px}
-  .cell{background:#10162a;border-radius:10px;padding:10px;min-height:70px;display:flex;flex-direction:column;justify-content:space-between}
-  .date{font-size:11px;color:var(--muted)}
-  .pn{font-size:14px;font-weight:700}
-  .g{color:var(--green)} .r{color:var(--red)} .z{color:var(--muted)}
-  .foot{color:var(--muted);font-size:12px;margin-top:8px}
-</style>
+  <meta charset="utf-8" />
+  <title>Crypto System Dashboard — v1.8.9</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <style>
+    :root {
+      --bg: #0b0f14; --panel:#111723; --muted:#8091a7; --text:#eaf2ff; --green:#2dcc70; --red:#ff5c5c; --accent:#5aa5ff;
+      --tableRow:#0f1520; --tableAlt:#0c111b; --chip:#1b2433; --border:#1e2a3a;
+    }
+    html,body{background:var(--bg);color:var(--text);font-family:Inter,system-ui,Segoe UI,Roboto,Helvetica,Arial,sans-serif;margin:0}
+    h1,h2,h3{margin:0 0 8px}
+    .wrap{max-width:1200px;margin:0 auto;padding:24px}
+    .grid{display:grid;grid-template-columns:1fr 1fr;gap:16px}
+    .panel{background:var(--panel);border:1px solid var(--border);border-radius:16px;padding:16px;box-shadow:0 6px 24px rgba(0,0,0,.25)}
+    .muted{color:var(--muted)}
+    .pill{display:inline-flex;align-items:center;gap:8px;background:var(--chip);border:1px solid var(--border);border-radius:999px;padding:6px 10px;font-size:12px}
+    .kpi{display:flex;align-items:baseline;gap:8px}
+    .kpi .big{font-size:28px;font-weight:700}
+    .kpi .delta{font-size:13px}
+    .pos{color:var(--green)} .neg{color:var(--red)}
+    table{width:100%;border-collapse:collapse}
+    th,td{padding:10px;border-bottom:1px solid var(--border);vertical-align:middle}
+    thead th{position:sticky;top:0;background:var(--panel);z-index:1}
+    tbody tr:nth-child(odd){background:var(--tableRow)}
+    tbody tr:nth-child(even){background:var(--tableAlt)}
+    .right{text-align:right}
+    .mono{font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;}
+    .small{font-size:12px}
+    .badge{display:inline-block;padding:2px 8px;border-radius:8px;font-size:11px;border:1px solid var(--border);background:#0e1523}
+    .toolbar{display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin:8px 0 0}
+    .calendar{display:grid;grid-template-columns:repeat(7,1fr);gap:8px}
+    .day{background:var(--tableAlt);border:1px solid var(--border);border-radius:12px;padding:10px;min-height:70px}
+    .day .d{font-size:11px;color:var(--muted)}
+    .day .p{margin-top:6px;font-weight:600}
+    a{color:var(--accent);text-decoration:none} a:hover{text-decoration:underline}
+    .hint{margin-top:8px}
+  </style>
 </head>
 <body>
-<div class="wrap">
-  <h1>Crypto System — Dashboard</h1>
-  <div class="sub">Snapshot of current and past performance. Automated paper trading enabled via Alpaca.</div>
+  <div class="wrap">
+    <h1>Crypto System <span class="pill">Dashboard <span id="appVersion" class="mono">v1.8.9</span></span></h1>
 
-  <div class="grid">
-    <div class="card span-4">
-      <div class="kpi"><div class="l">Unrealized</div><div id="k_unr" class="v z">—</div></div>
-      <div class="row" style="margin-top:8px">
-        <div class="pill">Today: <span id="k_rt">—</span></div>
-        <div class="pill">Week: <span id="k_rw">—</span></div>
-        <div class="pill">Month: <span id="k_rm">—</span></div>
+    <div class="grid" style="grid-template-columns: 1.1fr .9fr;">
+      <!-- P&L Summary -->
+      <div class="panel">
+        <h2>P&amp;L Snapshot</h2>
+        <div class="toolbar small">
+          <span id="asOf" class="muted">as of —</span>
+        </div>
+        <div class="grid" style="grid-template-columns: repeat(3,1fr); margin-top:10px;">
+          <div class="kpi"><span class="big" id="pnlToday">—</span><span class="delta muted">today</span></div>
+          <div class="kpi"><span class="big" id="pnlWeek">—</span><span class="delta muted">week</span></div>
+          <div class="kpi"><span class="big" id="pnlMonth">—</span><span class="delta muted">month</span></div>
+        </div>
+        <div class="hint small muted">Unrealized: <span id="unrealized" class="mono">—</span></div>
       </div>
-      <div class="foot" id="asof">—</div>
+
+      <!-- Calendar P&L -->
+      <div class="panel">
+        <h2>Daily P&amp;L (last 14d)</h2>
+        <div class="calendar" id="cal"></div>
+      </div>
     </div>
 
-    <div class="card span-8">
-      <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:8px">
-        <div style="font-weight:700">Per-Strategy (last 24h)</div>
-        <div class="pill" id="appv">—</div>
+    <!-- Recent Fills Table -->
+    <div class="panel" style="margin-top:16px;">
+      <h2>Recent Fills</h2>
+      <div class="toolbar small">
+        <span class="muted">Source: <code>/orders/recent?status=all&limit=200</code></span>
+        <span class="muted">•</span>
+        <span class="muted">Auto-refresh: 20s</span>
       </div>
-      <table id="tbl_attr">
-        <thead><tr><th>Strategy</th><th>Count</th><th>Wins</th><th>Losses</th><th>Realized</th></tr></thead>
-        <tbody></tbody>
-      </table>
+      <div style="overflow:auto; max-height: 520px; margin-top:10px;">
+        <table>
+          <thead>
+            <tr>
+              <th style="min-width:280px;">Description</th>
+              <th>Type</th>
+              <th class="right">Qty</th>
+              <th class="right">Amount</th>
+              <th class="right">Date</th>
+            </tr>
+          </thead>
+          <tbody id="fills"></tbody>
+        </table>
+      </div>
+      <div class="hint small muted">Shows both buys and sells. Amount uses order notional: negative for buys, positive for sells.</div>
     </div>
 
-    <div class="card span-12">
-      <div style="font-weight:700;margin-bottom:8px">Daily Realized P&L (last 30 days)</div>
-      <div id="cal" class="calendar"></div>
+    <div class="small muted" style="margin-top:12px;">
+      Need raw JSON? Try <a href="/orders/recent?status=all&limit=20" target="_blank">/orders/recent</a>,
+      <a href="/pnl/summary" target="_blank">/pnl/summary</a>, <a href="/pnl/daily?days=14" target="_blank">/pnl/daily</a>.
     </div>
   </div>
-</div>
 
-<script>
-function fmt(x){ if(x===null||x===undefined) return "—"; const s = Number(x).toFixed(2); const n = Number(x); const cls = n>0?'pos':(n<0?'neg':'z'); return `<span class="${cls}">${s}</span>`; }
-function clsPn(x){ const n=Number(x); return n>0?'g':(n<0?'r':'z'); }
-async function fetchJSON(u){ const r = await fetch(u); if(!r.ok) throw new Error(await r.text()); return r.json(); }
+  <script>
+    // --- helpers ---
+    const $ = sel => document.querySelector(sel);
+    const fmtUsd = n => {
+      if (n === null || n === undefined || isNaN(n)) return "—";
+      try { return new Intl.NumberFormat(undefined,{style:'currency',currency:'USD',maximumFractionDigits:2}).format(n); }
+      catch { return `$${(+n).toFixed(2)}`; }
+    };
+    const parseNum = (v) => { if (v===null||v===undefined) return null; const x = +v; return isNaN(x)? null : x; };
+    const parseDate = (s) => { try { return new Date(s); } catch { return null; } };
+    const preferTime = (o, keys) => { for (const k of keys) if (o && o[k]) return o[k]; return null; };
 
-async function loadAll(){
-  try{
-    const [sum, attr, daily, hv] = await Promise.all([
-      fetchJSON('/pnl/summary'),
-      fetchJSON('/orders/attribution?days=1'),
-      fetchJSON('/pnl/daily?days=30'),
-      fetchJSON('/health/versions')
-    ]);
+    // --- P&L summary ---
+    async function loadSummary() {
+      const r = await fetch('/pnl/summary');
+      const j = await r.json();
+      $('#asOf').textContent = `as of ${j.as_of_utc || ''}`;
+      const month = j.realized?.month ?? 0;
+      const week  = j.realized?.week ?? 0;
+      const today = j.realized?.today ?? 0;
+      const unreal = j.unrealized ?? 0;
+      $('#pnlToday').textContent = fmtUsd(today);
+      $('#pnlWeek').textContent  = fmtUsd(week);
+      $('#pnlMonth').textContent = fmtUsd(month);
+      $('#unrealized').textContent = fmtUsd(unreal);
+      $('#pnlToday').className = 'big ' + (today>=0?'pos':'neg');
+      $('#pnlWeek').className  = 'big ' + (week>=0?'pos':'neg');
+      $('#pnlMonth').className = 'big ' + (month>=0?'pos':'neg');
+    }
 
-    document.getElementById('k_unr').innerHTML = fmt(sum.unrealized);
-    document.getElementById('k_rt').innerText = (sum.realized?.today ?? 0).toFixed(2);
-    document.getElementById('k_rw').innerText = (sum.realized?.week ?? 0).toFixed(2);
-    document.getElementById('k_rm').innerText = (sum.realized?.month ?? 0).toFixed(2);
-    document.getElementById('asof').innerText = `as of ${sum.as_of_utc}`;
-    document.getElementById('appv').innerText = `app ${hv.app}`;
+    // --- Calendar 14d ---
+    async function loadDaily() {
+      const r = await fetch('/pnl/daily?days=14');
+      const j = await r.json();
+      const el = $('#cal'); el.innerHTML = '';
+      const series = j.series || [];
+      for (const d of series) {
+        const pnl = +d.pnl || 0;
+        const box = document.createElement('div');
+        box.className = 'day';
+        const date = document.createElement('div'); date.className='d'; date.textContent = d.date;
+        const pv = document.createElement('div'); pv.className='p mono ' + (pnl>=0?'pos':'neg'); pv.textContent = fmtUsd(pnl);
+        box.appendChild(date); box.appendChild(pv);
+        el.appendChild(box);
+      }
+    }
 
-    const tb = document.querySelector('#tbl_attr tbody');
-    tb.innerHTML = '';
-    const keys = ['c1','c2','c3','c4','c5','c6','unknown'];
-    keys.forEach(k=>{
-      const v = (attr.per_strategy||{})[k] || {};
-      const tr = document.createElement('tr');
-      tr.innerHTML = `<td>${k}</td><td>${v.count||0}</td><td>${v.wins||0}</td><td>${v.losses||0}</td><td>${(v.realized||0).toFixed(2)}</td>`;
-      tb.appendChild(tr);
-    });
+    // --- Recent fills from /orders/recent ---
+    function coalesceSymbol(o){ return o.symbol || o.asset_symbol || ''; }
+    function sideToSign(side){ return (String(side||'').toLowerCase()==='sell') ? +1 : -1; }
 
-    const cal = document.getElementById('cal'); cal.innerHTML = '';
-    (daily.series||[]).forEach(d=>{
-      const div = document.createElement('div');
-      div.className = 'cell';
-      div.innerHTML = `<div class="date">${d.date}</div><div class="pn ${clsPn(d.pnl)}">${Number(d.pnl).toFixed(2)}</div>`;
-      cal.appendChild(div);
-    });
+    function mkDesc(side, qty, sym) {
+      const s = (String(side||'').toLowerCase()==='sell')?'Sell':'Buy';
+      const q = qty!=null ? (+qty).toFixed(8).replace(/0+$/,'').replace(/\.$/,'') : '0';
+      return `${s} ${q} ${sym}`;
+    }
 
-  }catch(e){ console.error(e); }
-}
-loadAll();
-setInterval(loadAll, 60000);
-</script>
+    function typeFromStatus(status){
+      const s = String(status||'').toLowerCase();
+      if (s==='filled') return 'FILL';
+      if (s==='partially_filled') return 'PARTIAL';
+      return (status||'').toString().toUpperCase();
+    }
+
+    function pickQty(o){
+      const cands = [o.filled_qty, o.qty, o.quantity];
+      for (const c of cands) if (c!==undefined && c!==null && !isNaN(+c)) return +c;
+      return null;
+    }
+
+    function pickNotional(o){
+      const cands = [o.notional, o.amount, o.order_notional];
+      for (const c of cands) if (c!==undefined && c!==null && !isNaN(+c)) return +c;
+      return null;
+    }
+
+    function pickTime(o){
+      const s = preferTime(o, ['filled_at','completed_at','submitted_at','created_at','timestamp']);
+      return parseDate(s);
+    }
+
+    async function loadFills() {
+      const r = await fetch('/orders/recent?status=all&limit=200');
+      let j = await r.json();
+      // Flatten shape: either { value:[...] } or just [...]
+      let arr = Array.isArray(j) ? j : (Array.isArray(j.value) ? j.value : []);
+      // Filter to orders that are meaningful to display (filled or buy/sell intents)
+      arr = arr.filter(o => o && (o.status || o.side));
+      // Map → table rows
+      const rows = arr.map(o => {
+        const sym = coalesceSymbol(o);
+        const qty = pickQty(o);
+        const side = (o.side || '').toLowerCase();
+        const notional = pickNotional(o);
+        const dt = pickTime(o);
+        const desc = mkDesc(side, qty, sym);
+        const typ = typeFromStatus(o.status);
+        // Amount: buy is negative cash outflow; sell positive inflow
+        const amt = (notional!=null) ? sideToSign(side) * Math.abs(+notional) : null;
+        return {
+          desc, type: typ, qty, amt,
+          date: dt ? dt : null,
+          sortKey: dt ? dt.getTime() : 0
+        };
+      }).sort((a,b)=> b.sortKey - a.sortKey);
+
+      // Render
+      const tbody = $('#fills'); tbody.innerHTML = '';
+      for (const r of rows) {
+        const tr = document.createElement('tr');
+        const d = document.createElement('td'); d.textContent = r.desc; d.className='mono';
+        const t = document.createElement('td'); t.innerHTML = `<span class="badge">${r.type}</span>`;
+        const q = document.createElement('td'); q.className='right mono'; q.textContent = (r.qty!=null)? r.qty.toFixed(8).replace(/0+$/,'').replace(/\.$/,'') : '—';
+        const a = document.createElement('td'); a.className='right mono ' + (r.amt>=0?'pos':'neg'); a.textContent = (r.amt!=null)? fmtUsd(r.amt) : '—';
+        const dt = document.createElement('td'); dt.className='right small muted mono'; dt.textContent = r.date ? r.date.toLocaleString() : '—';
+        tr.appendChild(d); tr.appendChild(t); tr.appendChild(q); tr.appendChild(a); tr.appendChild(dt);
+        tbody.appendChild(tr);
+      }
+    }
+
+    async function boot(){
+      // Version stamp (optional, we just show what’s in the title unless /health/versions says otherwise)
+      try {
+        const hv = await (await fetch('/health/versions')).json();
+        if (hv?.app) { document.getElementById('appVersion').textContent = `v${hv.app}`; }
+      } catch {}
+      await Promise.all([loadSummary(), loadDaily(), loadFills()]);
+      setInterval(loadSummary, 20000);
+      setInterval(loadDaily, 60000);
+      setInterval(loadFills, 20000);
+    }
+    boot();
+  </script>
 </body>
 </html>
 {% endraw %}"""
