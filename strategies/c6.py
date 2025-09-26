@@ -1,6 +1,5 @@
 # strategies/c6.py — v1.9.0
 # EMA fast/slow (MACD-style) + higher-high confirmation; exits = cross-down or ATR-vs-slow stop.
-# Signature: run(df_map, params, positions) -> List[{symbol, action, reason}]
 
 from __future__ import annotations
 from typing import Dict, Any, List

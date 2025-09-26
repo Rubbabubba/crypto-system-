@@ -1,6 +1,6 @@
 # strategies/c3.py — v1.9.0
-# MA menu (EMA/SMA/WMA/HMA/DEMA/T3/VWMA/VWAP/HEMA) cross-up entries; exits = cross-down or ATR-vs-trend stop.
-# Signature: run(df_map, params, positions) -> List[{symbol, action, reason}]
+# MA menu (EMA/SMA/WMA/HMA/DEMA/T3/VWMA/VWAP/HEMA) cross-up entries;
+# exits = cross-down or ATR-vs-trend stop.
 
 from __future__ import annotations
 from typing import Dict, Any, List

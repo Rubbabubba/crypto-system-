@@ -1,6 +1,5 @@
 # strategies/c4.py — v1.9.0
 # Volume Bubbles Breakout (LuxAlgo-inspired) with stateless exits.
-# Signature: run(df_map, params, positions) -> List[{symbol, action, reason}]
 
 from __future__ import annotations
 from typing import Dict, Any, List, Optional
@@ -17,7 +16,7 @@ def _atr(df,n:int)->pd.Series:
     return tr.rolling(int(n)).mean()
 
 def _split_vol_row(o,h,l,c,v):
-    bar_top=h-max(o,c); bar_bot=min(o,c)-l; bar_rng=h-l; bull=(c-o)>0
+    bar_top=h - max(o,c); bar_bot=min(o,c) - l; bar_rng=h - l; bull=(c-o)>0
     buy_rng = bar_rng if bull else (bar_top+bar_bot)
     sell_rng= (bar_top+bar_bot) if bull else bar_rng
     total_r = bar_rng + bar_top + bar_bot
@@ -63,9 +62,10 @@ def run(df_map: Dict[str,pd.DataFrame], params: Dict[str,Any], positions: Dict[s
             out.append({"symbol":sym,"action":"flat","reason":"warming_up"}); continue
 
         c=float(intraday["close"].iloc[-1])
-        atr_now=float(_atr(intraday,atr_len).iloc[-1]) if not pd.isna(_atr(intraday,atr_len).iloc[-1]) else np.nan
-        if pd.isna(atr_now):
+        atr_series=_atr(intraday,atr_len)
+        if len(atr_series)==0 or pd.isna(atr_series.iloc[-1]):
             out.append({"symbol":sym,"action":"flat","reason":"atr_nan"}); continue
+        atr_now=float(atr_series.iloc[-1])
 
         bdf=bubble_map.get(sym)
         bub=_bubble_from_df(bdf) if _ok_df(bdf) and len(bdf)>=2 else _bubble_emulate_from_intraday(intraday, bars_per_bubble)

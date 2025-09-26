@@ -1,18 +1,6 @@
 # strategies/c1.py — v1.9.2
 # Crypto analog of S1 (VWAP + EMA slope + sigma band) with stateless exits.
-# /scan route signature: run(df_map, params, positions) -> List[{symbol, action, reason}]
-#
-# ENTRY (flat):
-#   Reversion: crossed up VWAP AND ema_slope >= min
-#   OR
-#   Trend: close > VWAP AND ema_slope >= min AND "recent touch" of lower VWAP sigma band
-#
-# EXIT (have):
-#   EMA cross-down on bar close (close <= EMA)
-#
-# Notes:
-#   • Stateless (no persisted trail). Clean for /scan.
-#   • Defaults tuned for 5Min, but timeframe is controlled by your router/bar fetcher.
+# Signature: run(df_map, params, positions) -> List[{symbol, action, reason}]
 
 from __future__ import annotations
 from typing import Dict, Any, List
@@ -57,7 +45,6 @@ def run(df_map: Dict[str, pd.DataFrame], params: Dict[str, Any], positions: Dict
     ema_slope_min   = float(params.get("ema_slope_min", 0.0))
     vwap_sigma      = float(params.get("vwap_sigma", 1.0))
     band_lookback   = int(params.get("band_lookback", 10))
-    # Everything else (timeframe, notional) is handled by the router/engine.
 
     out: List[Dict[str, Any]] = []
 
@@ -71,7 +58,6 @@ def run(df_map: Dict[str, pd.DataFrame], params: Dict[str, Any], positions: Dict
             out.append({"symbol": sym, "action": "flat", "reason": "nan_tail"})
             continue
 
-        # Indicators
         ema = _ema(df["close"], ema_len)
         ema_slope = ema - ema.shift(1)
         vwap = _vwap(df)
@@ -79,12 +65,10 @@ def run(df_map: Dict[str, pd.DataFrame], params: Dict[str, Any], positions: Dict
         z = _zscore(dev, max(20, ema_len))
         lower_touch = z <= -abs(vwap_sigma)
 
-        # Compute recent "touch" state from the last window (stateless)
         idx_last = len(df) - 1
         start = max(0, idx_last - band_lookback)
         touched_recent = bool(lower_touch.iloc[start:idx_last+1].any())
 
-        # Crosses / comparisons (prev vs now)
         c_prev, c_now = df["close"].iloc[-2], df["close"].iloc[-1]
         vw_prev, vw_now = vwap.iloc[-2], vwap.iloc[-1]
         ema_prev, ema_now = ema.iloc[-2], ema.iloc[-1]
@@ -112,6 +96,6 @@ def run(df_map: Dict[str, pd.DataFrame], params: Dict[str, Any], positions: Dict
             why = []
             if not (crossed_up or trend_ok): why.append("no_vwap_signal")
             if not ema_slope_ok: why.append("slope_fail")
-            out.append({"symbol": sym, "action": "flat", "reason": " & ".join(why) if why else "no_signal"})
+            out.append({"symbol": sym, "action": "flat", "reason": "no_signal" if not why else " & ".join(why)})
 
     return out

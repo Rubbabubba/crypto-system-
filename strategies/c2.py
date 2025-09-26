@@ -1,6 +1,5 @@
 # strategies/c2.py — v1.9.1
 # MACD up-cross with trend & volume gates; exits = MACD down or ATR-vs-trend stop.
-# Signature: run(df_map, params, positions) -> List[{symbol, action, reason}]
 
 from __future__ import annotations
 from typing import Dict, Any, List

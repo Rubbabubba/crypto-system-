@@ -1,6 +1,5 @@
 # strategies/c5.py — v1.9.0
 # Breakout above prior N-bar high with EMA/ATR context; exits = failed breakout, EMA cross-down.
-# Signature: run(df_map, params, positions) -> List[{symbol, action, reason}]
 
 from __future__ import annotations
 from typing import Dict, Any, List
@@ -30,7 +29,6 @@ def run(df_map: Dict[str,pd.DataFrame], params: Dict[str,Any], positions: Dict[s
     vol_sma_len=int(params.get("vol_sma_len",20))
     min_atr_frac=float(params.get("min_atr_frac",0.0))
     k_fail=float(params.get("k_fail",0.25))
-    # k_trail retained in interface but stateless approximation is intentionally not used here
 
     results: List[Dict[str,Any]]=[]
     for sym, df in df_map.items():
