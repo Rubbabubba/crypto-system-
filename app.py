@@ -1,4 +1,4 @@
-# app.py  — v1.8.9 (restored) + normalization + strategy attribution panel
+# app.py  — v1.8.9 (“everything” app) + bars normalization + positions symbol normalization + strategy attribution panel
 import os
 import re
 import glob
@@ -56,7 +56,7 @@ def bars_to_df(bars: Any) -> pd.DataFrame:
     return df[["open","high","low","close","volume"]]
 
 # ---------- Broker glue ----------
-import broker  # your existing wrapper; must expose the used methods below
+import broker  # must exist as broker.py in project root (we provided a drop-in earlier)
 
 # ---------- Utilities ----------
 def _safe_float(x, default=0.0):
@@ -65,6 +65,21 @@ def _safe_float(x, default=0.0):
 
 def _now_utc():
     return datetime.now(tz=UTC).replace(microsecond=0)
+
+def _norm_sym_slash(sym: str) -> str:
+    """Turn BTCUSD -> BTC/USD, ETHUSDT -> ETH/USDT, etc. Leaves already-slashed symbols alone."""
+    if not sym:
+        return sym
+    s = str(sym).replace(" ", "")
+    if "/" in s:
+        return s
+    QUOTES = ("USD", "USDT", "USDC")
+    for q in QUOTES:
+        if s.endswith(q):
+            base = s[:-len(q)]
+            if base:
+                return f"{base}/{q}"
+    return s
 
 # Symbols config (persisted via env or file)
 _SYMBOLS_FILE = os.environ.get("SYMBOLS_FILE","symbols.txt")
@@ -246,7 +261,7 @@ def orders_recent():
 def positions():
     try:
         rows = broker.list_positions()
-        return jsonify(rows)
+        return jsonify({"value": rows, "Count": len(rows)})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
@@ -285,7 +300,8 @@ def pnl_summary():
         unrealized = 0.0
         try:
             pos = broker.list_positions()
-            last = broker.last_trade_map([p.get("symbol") or p.get("asset_symbol") for p in pos])
+            syms = [p.get("symbol") or p.get("asset_symbol") for p in pos]
+            last = broker.last_trade_map(syms)
             for p in pos:
                 sym = p.get("symbol") or p.get("asset_symbol")
                 qty = _safe_float(p.get("qty") or p.get("quantity"))
@@ -346,14 +362,20 @@ def scan(name):
     notional = _safe_float(request.args.get("notional","5"), 5.0)
     params = {k:v for k,v in request.args.items() if k not in ("dry","timeframe","limit","notional")}
     symbols = get_symbols()
+    if "symbols" in request.args:
+        symbols = [s.strip() for s in request.args.get("symbols","").split(",") if s.strip()]
 
     try:
         pos = broker.list_positions()
-        long_map = { (p.get("symbol") or p.get("asset_symbol")): _safe_float(p.get("qty") or p.get("quantity")) for p in pos }
+        # 🔒 normalize position symbols to slashed form so they match strategy symbols
+        long_map = {
+            _norm_sym_slash(p.get("symbol") or p.get("asset_symbol")): _safe_float(p.get("qty") or p.get("quantity"))
+            for p in pos
+        }
 
-        df_map = broker.get_bars(symbols, timeframe=timeframe, limit=limit, merge=False)
+        df_map_raw = broker.get_bars(symbols, timeframe=timeframe, limit=limit, merge=False)
         # 🔒 normalize bars to the format strategies expect
-        df_map = {sym: bars_to_df(b) for sym, b in df_map.items()}
+        df_map = {sym: bars_to_df(b) for sym, b in df_map_raw.items()}
 
         strat = STRAT_MAP[name]
         results = strat.run(df_map, params, long_map)
@@ -378,7 +400,6 @@ def scan(name):
 
         return jsonify({"ok": True, "dry": dry, "results": results, "placed": placed})
     except Exception as e:
-        # Log in your hosting environment for traceback; return message here
         return jsonify({"ok": False, "error": str(e)}), 500
 
 # ---------- Background automation ----------
@@ -397,11 +418,15 @@ def autorun_worker():
         try:
             symbols = get_symbols()
             pos = broker.list_positions()
-            long_map = { (p.get("symbol") or p.get("asset_symbol")): _safe_float(p.get("qty") or p.get("quantity")) for p in pos }
+            # 🔒 normalize position symbols here too
+            long_map = {
+                _norm_sym_slash(p.get("symbol") or p.get("asset_symbol")): _safe_float(p.get("qty") or p.get("quantity"))
+                for p in pos
+            }
 
-            df_map = broker.get_bars(symbols, timeframe=timeframe, limit=limit, merge=False)
+            df_map_raw = broker.get_bars(symbols, timeframe=timeframe, limit=limit, merge=False)
             # 🔒 normalize here too
-            df_map = {sym: bars_to_df(b) for sym, b in df_map.items()}
+            df_map = {sym: bars_to_df(b) for sym, b in df_map_raw.items()}
 
             latest_by_symbol = {}
             for sym, df in df_map.items():
@@ -462,7 +487,7 @@ DASH_HTML = r"""{% raw %}
     .wrap{max-width:1200px;margin:0 auto;padding:24px}
     .grid{display:grid;grid-template-columns:1fr 1fr;gap:16px}
     .panel{background:var(--panel);border:1px solid var(--border);border-radius:16px;padding:16px;box-shadow:0 6px 24px rgba(0,0,0,.25)}
-    .muted{color:var(--muted)}
+    .muted{color:var(--muted")}
     .pill{display:inline-flex;align-items:center;gap:8px;background:var(--chip);border:1px solid var(--border);border-radius:999px;padding:6px 10px;font-size:12px}
     .kpi{display:flex;align-items:baseline;gap:8px}
     .kpi .big{font-size:28px;font-weight:700}
@@ -479,6 +504,10 @@ DASH_HTML = r"""{% raw %}
     .d{font-size:12px;color:#a7b1c2;margin-bottom:6px}
     .p{font-size:16px}
     footer{color:#9aa6b2;text-align:center;padding:16px}
+    .form-row{display:flex;flex-wrap:wrap;gap:8px;margin-bottom:8px}
+    .form-row input, .form-row select {padding:8px 10px;border-radius:8px;border:1px solid var(--border);background:#0f1624;color:#eaf2ff}
+    .btn{padding:8px 12px;border-radius:8px;border:1px solid var(--border);background:#0f1624;color:#eaf2ff;cursor:pointer}
+    .btn:hover{background:#152039}
   </style>
 </head>
 <body>
@@ -501,10 +530,31 @@ DASH_HTML = r"""{% raw %}
       </div>
     </div>
 
-    <!-- New: Strategies (server) -->
     <div class="panel" style="margin-top:16px">
       <h3>Strategies (server)</h3>
       <div id="strats" class="muted">Loading…</div>
+    </div>
+
+    <div class="panel" style="margin-top:16px">
+      <h3>Run Scan</h3>
+      <div class="form-row">
+        <select id="strategy">
+          <option value="c1">C1</option><option value="c2">C2</option><option value="c3">C3</option>
+          <option value="c4">C4</option><option value="c5">C5</option><option value="c6">C6</option>
+        </select>
+        <input id="symbols" value="BTC/USD" placeholder="Symbols CSV (e.g. BTC/USD,ETH/USD)" />
+        <input id="tf" value="5Min" />
+        <input id="limit" type="number" value="300" />
+        <input id="notional" type="number" value="25" />
+        <label class="pill"><input id="dry" type="checkbox" checked /> dry run</label>
+        <button class="btn" onclick="runScan()">Run Scan</button>
+      </div>
+      <table>
+        <thead>
+          <tr><th>Symbol</th><th>Action</th><th>Reason</th></tr>
+        </thead>
+        <tbody id="scanRows"><tr><td colspan="3" class="muted">Awaiting scan…</td></tr></tbody>
+      </table>
     </div>
 
     <div class="panel" style="margin-top:16px">
@@ -520,7 +570,7 @@ DASH_HTML = r"""{% raw %}
     </div>
 
     <footer>
-      <div class="muted">Exchange: Alpaca &middot; (we just show what’s in the title unless /health/versions says otherwise)</div>
+      <div class="muted">Exchange: Alpaca &middot; Data normalized for strategies &middot; Symbols normalized (BTCUSD→BTC/USD)</div>
     </footer>
   </div>
 
@@ -529,6 +579,20 @@ DASH_HTML = r"""{% raw %}
     const fmtUsd = (x) => (x>=0?'+':'') + (x||0).toLocaleString(undefined,{style:'currency',currency:'USD',maximumFractionDigits:2});
     const parseDate = (s) => { try { return new Date(s); } catch { return null; } };
     const preferTime = (o, keys) => { for (const k of keys) if (o && o[k]) return o[k]; return null; };
+
+    async function runScan() {
+      const name = $('#strategy').value;
+      const symbols = encodeURIComponent($('#symbols').value || 'BTC/USD');
+      const tf = encodeURIComponent($('#tf').value || '5Min');
+      const limit = +($('#limit').value || 300);
+      const notional = +($('#notional').value || 25);
+      const dry = $('#dry').checked ? 1 : 0;
+      const url = `/scan/${name}?dry=${dry}&symbols=${symbols}&timeframe=${tf}&limit=${limit}&notional=${notional}`;
+      const r = await fetch(url, { method: 'POST' });
+      const j = await r.json();
+      const rows = (j.results||[]).map(r => `<tr><td>${r.symbol}</td><td>${r.action.toUpperCase()}</td><td>${r.reason||''}</td></tr>`).join('');
+      $('#scanRows').innerHTML = rows || `<tr><td colspan="3" class="muted">No results.</td></tr>`;
+    }
 
     // --- P&L summary ---
     async function loadSummary() {
@@ -594,11 +658,8 @@ DASH_HTML = r"""{% raw %}
     async function loadFills() {
       const r = await fetch('/orders/recent?status=all&limit=200');
       let j = await r.json();
-      // Flatten shape: either { value:[...] } or just [...]
       let arr = Array.isArray(j) ? j : (Array.isArray(j.value) ? j.value : []);
-      // Filter to orders that are meaningful to display (filled or buy/sell intents)
       arr = arr.filter(o => o && (o.status || o.side));
-      // Map → table rows
       const rows = arr.map(o => {
         const sym = coalesceSymbol(o);
         const qty = pickQty(o);
@@ -625,7 +686,6 @@ DASH_HTML = r"""{% raw %}
     }
 
     async function boot() {
-      // (we just show what’s in the title unless /health/versions says otherwise)
       try {
         const hv = await (await fetch('/health/versions')).json();
         if (hv?.app) { document.getElementById('appVersion').textContent = `v${hv.app}`; }
@@ -646,7 +706,7 @@ DASH_HTML = r"""{% raw %}
 def index():
     return render_template_string(DASH_HTML)
 
-# ---- start background loop if enabled (good for single-process dev) ----
+# ---- start background loop if enabled ----
 def start_background():
     try:
         enabled = os.environ.get("AUTORUN_ENABLED","false").lower() == "true"
