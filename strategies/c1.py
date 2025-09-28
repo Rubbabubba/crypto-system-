@@ -1,4 +1,4 @@
-# strategies/c1.py — v1.9.2
+# strategies/c1.py — v1.9.3
 # Crypto analog of S1 (VWAP + EMA slope + sigma band) with stateless exits.
 # Signature: run(df_map, params, positions) -> List[{symbol, action, reason}]
 
@@ -8,7 +8,7 @@ import pandas as pd
 import numpy as np
 
 NAME = "c1"
-VERSION = "1.9.2"
+VERSION = "1.9.3"
 
 # ---------- helpers ----------
 def _ok_df(df: pd.DataFrame) -> bool:
@@ -22,7 +22,8 @@ def _vwap(df: pd.DataFrame) -> pd.Series:
     tp = (df["high"] + df["low"] + df["close"]) / 3.0
     vol = df["volume"].replace(0, np.nan)
     vwap = (tp * vol).cumsum() / vol.cumsum()
-    return vwap.fillna(method="ffill").fillna(df["close"])
+    # FutureWarning-safe forward fill:
+    return vwap.ffill().fillna(df["close"])
 
 def _zscore(series: pd.Series, window: int) -> pd.Series:
     r = series.rolling(window)
