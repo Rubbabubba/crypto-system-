@@ -1,10 +1,9 @@
-# app.py — v1.9.5 “everything” build
-# - Bars & positions symbol normalization
-# - DRY scan + autorun loop
-# - P&L summary that counts sells in-window but uses full history for FIFO pairing
-# - P&L daily & monthly calendar endpoints
-# - Per-strategy attribution (P&L/wins/losses/trades)
-# - Mobile-friendly dashboard with monthly calendar grid
+# app.py — v1.9.6 “everything + seeded PnL”
+# - Realized P&L via FIFO across full history
+# - If earlier BUYs are missing, seed FIFO from current positions (avg_entry_price)
+# - Monthly Calendar, Per-Strategy attribution, Summary, Data Check
+# - Mobile-friendly dashboard
+# - Unrealized fallback: sum(market_value - cost_basis) when last prices unavailable
 
 import os
 import re
@@ -18,7 +17,7 @@ from typing import Any, Iterable
 import pandas as pd
 from flask import Flask, request, jsonify, render_template_string
 
-APP_VERSION = "1.9.5"
+APP_VERSION = "1.9.6"
 UTC = timezone.utc
 
 # ---------- Bars normalizer ----------
@@ -59,7 +58,7 @@ def bars_to_df(bars: Any) -> pd.DataFrame:
     return df[["open","high","low","close","volume"]]
 
 # ---------- Broker ----------
-import broker  # must exist as broker.py
+import broker  # must exist as broker.py (your wrapper around Alpaca)
 
 # ---------- Utilities ----------
 def _safe_float(x, default=0.0):
@@ -132,20 +131,36 @@ def load_strategies():
 STRATS, _TRIED = load_strategies()
 STRAT_MAP = {m.NAME: m for m in STRATS}
 
-# ---------- FIFO P&L ----------
+# ---------- P&L (FIFO) ----------
 def _pick_time(o):
     for k in ("filled_at","completed_at","submitted_at","created_at","timestamp"):
         v = o.get(k)
         if v:
-            try: return datetime.fromisoformat(str(v).replace("Z","+00:00")).astimezone(UTC)
-            except Exception: pass
+            try:
+                return datetime.fromisoformat(str(v).replace("Z","+00:00")).astimezone(UTC)
+            except Exception:
+                pass
     return None
 
-def compute_fifo_all(orders):
-    """Build FIFO matches for the FULL order list (no date filtering yet).
-       Returns a list of realized legs: dict(time, symbol, pnl, qty, buy_px, sell_px, strat)."""
-    inv = defaultdict(deque)  # sym -> deque[qty, price, strat]
-    legs = []
+def _extract_order(o):
+    sym  = o.get("symbol") or o.get("asset_symbol") or ""
+    side = (o.get("side") or "").lower()
+    qty  = abs(_safe_float(o.get("qty") or o.get("quantity") or o.get("filled_qty"), 0.0))
+    notional = _safe_float(o.get("notional"), 0.0)
+    price = _safe_float(o.get("filled_avg_price") or (notional/qty if qty>0 else 0.0), 0.0)
+    coid = (o.get("client_order_id") or "")
+    strat = "unknown"
+    m = re.match(r"(c[1-6])[-_]", coid, re.I)
+    if m: strat = m.group(1).lower()
+    return sym, side, qty, price, strat
+
+def compute_fifo_all_with_seed(orders, positions):
+    """
+    Build FIFO matches. If FIFO would start with a SELL and we have no earlier BUYs
+    in history, we seed inventory from the *current* position average price so the
+    realized P&L is meaningful (approximate) instead of zero.
+    """
+    # 1) Collect all orders with times
     rows = []
     for o in (orders or []):
         t = _pick_time(o)
@@ -154,24 +169,37 @@ def compute_fifo_all(orders):
         rows.append((t,o))
     rows.sort(key=lambda x: x[0])
 
+    # 2) Build a seed lot per symbol at the earliest order time
+    seed_by_sym = {}
+    for p in (positions or []):
+        sym = p.get("symbol") or p.get("asset_symbol")
+        q   = _safe_float(p.get("qty") or p.get("quantity"))
+        px  = _safe_float(p.get("avg_entry_price"))
+        if sym and q>0 and px>0:
+            seed_by_sym[sym] = (q, px)
+
+    inv = defaultdict(deque)  # sym -> deque([qty, px, strat])
+    legs = []
+
+    # Pre-seed just once (if needed) right before we process the first order
+    earliest = rows[0][0] - timedelta(seconds=1) if rows else _now_utc()
+
+    # 3) Walk orders and match FIFO, seeding if required
     for t, o in rows:
-        sym  = o.get("symbol") or o.get("asset_symbol") or ""
-        side = (o.get("side") or "").lower()
-        qty  = abs(_safe_float(o.get("qty") or o.get("quantity") or o.get("filled_qty"), 0.0))
-        notional = _safe_float(o.get("notional"), 0.0)
-        price = _safe_float(o.get("filled_avg_price") or (notional/qty if qty>0 else 0.0), 0.0)
-        coid = (o.get("client_order_id") or "")
-        strat = "unknown"
-        m = re.match(r"(c[1-6])[-_]", coid, re.I)
-        if m: strat = m.group(1).lower()
-        if qty <= 0 or price <= 0:
+        sym, side, qty, price, strat = _extract_order(o)
+        if qty <= 0 or price <= 0 or side not in ("buy","sell"):
             continue
 
         if side == "buy":
             inv[sym].append([qty, price, strat])
             continue
-        if side != "sell":
-            continue
+
+        # SELL path:
+        # If there is no inventory and we have a position seed, inject it *once*
+        if not inv[sym] and sym in seed_by_sym:
+            sq, spx = seed_by_sym.pop(sym)  # only once
+            # Use a neutral strat for seed
+            inv[sym].append([sq, spx, "seed"])
 
         qsell = qty
         while qsell > 1e-12 and inv[sym]:
@@ -188,7 +216,7 @@ def compute_fifo_all(orders):
                 inv[sym].popleft()
             else:
                 inv[sym][0][0] = q0
-        # if no inventory left, we ignore the excess sell (cannot price it reliably)
+        # If still leftover qsell and no inventory, we cannot price it → ignored.
 
     return legs
 
@@ -258,13 +286,14 @@ def positions():
 
 @app.get("/orders/attribution")
 def orders_attribution():
-    days = int(request.args.get("days","7"))
+    days = int(request.args.get("days","30"))
     end = _now_utc()
     start = (end - timedelta(days=days)).replace(hour=0, minute=0, second=0, microsecond=0)
     orders = broker.list_orders(status="all", limit=4000)
-    legs = compute_fifo_all(orders)  # full history pairing
+    positions = broker.list_positions()
+    legs = compute_fifo_all_with_seed(orders, positions)
     _, _, by_strat = realized_window_from_legs(legs, start, end)
-    for name in ["c1","c2","c3","c4","c5","c6","unknown"]:
+    for name in ["c1","c2","c3","c4","c5","c6","seed","unknown"]:
         by_strat.setdefault(name, {"count":0,"wins":0,"losses":0,"realized":0.0})
     return jsonify({"per_strategy": by_strat, "start": start.isoformat(), "end": end.isoformat(), "version": APP_VERSION})
 
@@ -276,7 +305,8 @@ def pnl_summary():
     mo_start = datetime(now.year, now.month, 1, tzinfo=UTC)
 
     orders = broker.list_orders(status="all", limit=4000)
-    legs = compute_fifo_all(orders)
+    positions = broker.list_positions()
+    legs = compute_fifo_all_with_seed(orders, positions)
 
     def realized_between(a,b):
         t, _, _ = realized_window_from_legs(legs, a, b)
@@ -286,19 +316,31 @@ def pnl_summary():
     realized_week  = realized_between(wk_start, now)
     realized_month = realized_between(mo_start, now)
 
-    # unrealized via positions * last trade price
+    # Unrealized:
     unrealized = 0.0
+    # Preferred: last prices; Fallback: market_value - cost_basis
     try:
-        pos = broker.list_positions()
-        syms = [p.get("symbol") or p.get("asset_symbol") for p in pos]
-        last = broker.last_trade_map(syms)  # your broker helper
-        for p in pos:
-            sym = p.get("symbol") or p.get("asset_symbol")
-            qty = _safe_float(p.get("qty") or p.get("quantity"))
-            px  = _safe_float(p.get("avg_entry_price"))
-            last_px = _safe_float((last.get(sym) or {}).get("price"))
-            if qty and last_px:
-                unrealized += (last_px - px) * qty
+        syms = [p.get("symbol") or p.get("asset_symbol") for p in positions]
+        last = {}
+        try:
+            last = broker.last_trade_map(syms) or {}
+        except Exception:
+            last = {}
+        if last:
+            for p in positions:
+                sym = p.get("symbol") or p.get("asset_symbol")
+                qty = _safe_float(p.get("qty") or p.get("quantity"))
+                px  = _safe_float(p.get("avg_entry_price"))
+                last_px = _safe_float((last.get(sym) or {}).get("price"))
+                if qty and last_px:
+                    unrealized += (last_px - px) * qty
+        else:
+            # Fallback using Alpaca position fields
+            for p in positions:
+                mv = _safe_float(p.get("market_value"))
+                cb = _safe_float(p.get("cost_basis"))
+                if mv or cb:
+                    unrealized += (mv - cb)
     except Exception:
         pass
 
@@ -310,13 +352,14 @@ def pnl_summary():
 
 @app.get("/pnl/daily")
 def pnl_daily():
-    # keep the 14-day mini view for convenience
     days = int(request.args.get("days","14"))
     end = _now_utc()
     start = (end - timedelta(days=days)).replace(hour=0, minute=0, second=0, microsecond=0)
 
     orders = broker.list_orders(status="all", limit=4000)
-    legs = compute_fifo_all(orders)
+    positions = broker.list_positions()
+    legs = compute_fifo_all_with_seed(orders, positions)
+
     _, by_day, _ = realized_window_from_legs(legs, start, end)
     series = [{"date": d, "pnl": pnl} for d, pnl in sorted(by_day.items())]
     return jsonify({"series": series, "as_of_utc": end.isoformat()})
@@ -324,7 +367,7 @@ def pnl_daily():
 @app.get("/pnl/calendar_month")
 def pnl_calendar_month():
     """
-    Returns a full month grid of realized P&L (sell legs only) computed with full-history FIFO pairing.
+    Returns a full month grid of realized P&L (sell legs only) computed with full-history FIFO pairing plus position seeding.
     Query: ?month=YYYY-MM  (default = current month)
     """
     q = request.args.get("month","")
@@ -339,11 +382,13 @@ def pnl_calendar_month():
         first = datetime(now.year, now.month, 1, tzinfo=UTC)
 
     # start Monday grid and cover 6 weeks
-    start = first - timedelta(days=(first.weekday() % 7))  # Monday as first column
+    start = first - timedelta(days=(first.weekday() % 7))
     end   = start + timedelta(days=6*7) - timedelta(seconds=1)
 
     orders = broker.list_orders(status="all", limit=4000)
-    legs = compute_fifo_all(orders)
+    positions = broker.list_positions()
+    legs = compute_fifo_all_with_seed(orders, positions)
+
     _, by_day, _ = realized_window_from_legs(legs, start, end)
 
     days = []
