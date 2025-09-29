@@ -1,13 +1,14 @@
-# app.py  — v1.8.9 (“everything” app) + bars normalization + positions symbol normalization + strategy attribution panel
+# app.py  — v1.8.9 (“everything” app) + bars normalization + positions symbol normalization
+# + Data Check panel + Strategy Attribution panel
 import os
 import re
-import glob
 import time
 import json
 import importlib
 import threading
 from datetime import datetime, timedelta, timezone
 from collections import defaultdict, deque
+from typing import Any, Iterable
 
 import pandas as pd
 from flask import Flask, request, jsonify, render_template_string
@@ -16,7 +17,6 @@ APP_VERSION = "1.8.9"
 UTC = timezone.utc
 
 # ---------- Bars normalizer (maps columns to open/high/low/close/volume) ----------
-from typing import Any, Iterable
 def bars_to_df(bars: Any) -> pd.DataFrame:
     """Accepts list[dict] / dict / DataFrame and returns a DataFrame with
     columns: open, high, low, close, volume, ascending index (uses 'timestamp' if present)"""
@@ -56,7 +56,7 @@ def bars_to_df(bars: Any) -> pd.DataFrame:
     return df[["open","high","low","close","volume"]]
 
 # ---------- Broker glue ----------
-import broker  # must exist as broker.py in project root (we provided a drop-in earlier)
+import broker  # must exist as broker.py in project root
 
 # ---------- Utilities ----------
 def _safe_float(x, default=0.0):
@@ -267,15 +267,15 @@ def positions():
 
 @app.get("/orders/attribution")
 def orders_attribution():
-    days = int(request.args.get("days","1"))
+    days = int(request.args.get("days","7"))
     end = _now_utc()
     start = (end - timedelta(days=days)).replace(microsecond=0)
     try:
-        orders = broker.list_orders(status="all", limit=2000)
+        orders = broker.list_orders(status="all", limit=4000)
         _, _, by_strat = compute_realized_fifo(orders, start_dt=start, end_dt=end)
         for name in ["c1","c2","c3","c4","c5","c6","unknown"]:
             by_strat.setdefault(name, {"count":0,"wins":0,"losses":0,"realized":0.0})
-        return jsonify({"per_strategy": by_strat, "version": APP_VERSION})
+        return jsonify({"per_strategy": by_strat, "start": start.isoformat(), "end": end.isoformat(), "version": APP_VERSION})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
@@ -360,7 +360,7 @@ def scan(name):
     timeframe = request.args.get("timeframe","1Min")
     limit = int(request.args.get("limit","600"))
     notional = _safe_float(request.args.get("notional","5"), 5.0)
-    params = {k:v for k,v in request.args.items() if k not in ("dry","timeframe","limit","notional")}
+    params = {k:v for k,v in request.args.items() if k not in ("dry","timeframe","limit","notional","symbols")}
     symbols = get_symbols()
     if "symbols" in request.args:
         symbols = [s.strip() for s in request.args.get("symbols","").split(",") if s.strip()]
@@ -569,8 +569,35 @@ DASH_HTML = r"""{% raw %}
       </table>
     </div>
 
+    <div class="panel" style="margin-top:16px">
+      <h3>Data Check</h3>
+      <div class="form-row">
+        <input id="dcSymbols" value="BTC/USD,ETH/USD,SOL/USD,DOGE/USD,XRP/USD,AVAX/USD,LINK/USD,BCH/USD,LTC/USD" size="80"/>
+        <input id="dcTf" value="5Min" />
+        <input id="dcLimit" type="number" value="600" />
+        <button class="btn" onclick="runDataCheck()">Check</button>
+      </div>
+      <table>
+        <thead><tr><th>Symbol</th><th>Rows</th></tr></thead>
+        <tbody id="dcRows"><tr><td colspan="2" class="muted">Awaiting check…</td></tr></tbody>
+      </table>
+    </div>
+
+    <div class="panel" style="margin-top:16px">
+      <h3>Attribution (last 7 days)</h3>
+      <div class="form-row">
+        <input id="attrDays" type="number" value="7" />
+        <button class="btn" onclick="loadAttr()">Refresh</button>
+      </div>
+      <table>
+        <thead><tr><th>Strategy</th><th class="mono">Trades</th><th class="mono">Wins</th><th class="mono">Losses</th><th class="mono">Realized</th></tr></thead>
+        <tbody id="attrRows"><tr><td colspan="5" class="muted">Loading…</td></tr></tbody>
+      </table>
+      <div class="muted" id="attrWindow"></div>
+    </div>
+
     <footer>
-      <div class="muted">Exchange: Alpaca &middot; Data normalized for strategies &middot; Symbols normalized (BTCUSD→BTC/USD)</div>
+      <div class="muted">Exchange: Alpaca · Data normalized for strategies · Symbols normalized (BTCUSD→BTC/USD)</div>
     </footer>
   </div>
 
@@ -685,16 +712,45 @@ DASH_HTML = r"""{% raw %}
       document.getElementById('fills').innerHTML = rows || `<tr><td colspan="8" class="muted">No recent orders.</td></tr>`;
     }
 
+    // --- Data Check panel ---
+    async function runDataCheck(){
+      const sy=encodeURIComponent(document.getElementById('dcSymbols').value);
+      const tf=encodeURIComponent(document.getElementById('dcTf').value);
+      const lim=document.getElementById('dcLimit').value;
+      const r=await fetch(`/diag/candles?symbols=${sy}&tf=${tf}&limit=${lim}`);
+      const j=await r.json();
+      const rows=Object.entries(j.rows||{}).map(([s,n])=>`<tr><td>${s}</td><td class="mono">${n}</td></tr>`).join('');
+      document.getElementById('dcRows').innerHTML=rows||`<tr><td colspan="2" class="muted">No data.</td></tr>`;
+    }
+
+    // --- Attribution panel ---
+    async function loadAttr(){
+      const days = +document.getElementById('attrDays').value || 7;
+      const r = await fetch(`/orders/attribution?days=${days}`);
+      const j = await r.json();
+      const m = j.per_strategy || {};
+      const names = Object.keys(m).sort();
+      const rows = names.map(k => {
+        const v = m[k] || {};
+        const rzd = +v.realized || 0;
+        return `<tr><td>${k.toUpperCase()}</td><td class="mono">${v.count||0}</td><td class="mono">${v.wins||0}</td><td class="mono">${v.losses||0}</td><td class="mono ${rzd>=0?'pos':'neg'}">${fmtUsd(rzd)}</td></tr>`;
+      }).join('');
+      document.getElementById('attrRows').innerHTML = rows || `<tr><td colspan="5" class="muted">No data.</td></tr>`;
+      const w = (j.start||'') + ' — ' + (j.end||'');
+      document.getElementById('attrWindow').textContent = w;
+    }
+
     async function boot() {
       try {
         const hv = await (await fetch('/health/versions')).json();
         if (hv?.app) { document.getElementById('appVersion').textContent = `v${hv.app}`; }
       } catch {}
-      await Promise.all([loadSummary(), loadDaily(), loadFills(), loadStrats()]);
+      await Promise.all([loadSummary(), loadDaily(), loadFills(), loadStrats(), loadAttr()]);
       setInterval(loadSummary, 20000);
       setInterval(loadDaily, 60000);
       setInterval(loadFills, 20000);
       setInterval(loadStrats, 60000);
+      setInterval(loadAttr, 30000);
     }
     boot();
   </script>
