@@ -1,10 +1,15 @@
-# app.py  — v1.8.9 (“everything” app) + bars normalization + positions symbol normalization
-# + Data Check panel + Strategy Attribution panel
+# app.py — v1.9.5 “everything” build
+# - Bars & positions symbol normalization
+# - DRY scan + autorun loop
+# - P&L summary that counts sells in-window but uses full history for FIFO pairing
+# - P&L daily & monthly calendar endpoints
+# - Per-strategy attribution (P&L/wins/losses/trades)
+# - Mobile-friendly dashboard with monthly calendar grid
+
 import os
 import re
 import time
 import json
-import importlib
 import threading
 from datetime import datetime, timedelta, timezone
 from collections import defaultdict, deque
@@ -13,13 +18,11 @@ from typing import Any, Iterable
 import pandas as pd
 from flask import Flask, request, jsonify, render_template_string
 
-APP_VERSION = "1.8.9"
+APP_VERSION = "1.9.5"
 UTC = timezone.utc
 
-# ---------- Bars normalizer (maps columns to open/high/low/close/volume) ----------
+# ---------- Bars normalizer ----------
 def bars_to_df(bars: Any) -> pd.DataFrame:
-    """Accepts list[dict] / dict / DataFrame and returns a DataFrame with
-    columns: open, high, low, close, volume, ascending index (uses 'timestamp' if present)"""
     if isinstance(bars, pd.DataFrame):
         df = bars.copy()
     elif isinstance(bars, Iterable) and not isinstance(bars, (str, bytes, dict)):
@@ -30,9 +33,9 @@ def bars_to_df(bars: Any) -> pd.DataFrame:
         return pd.DataFrame(columns=["open","high","low","close","volume"])
 
     col_maps = [
-        {"o": "open", "h": "high", "l": "low", "c": "close", "v": "volume", "t": "timestamp"},
-        {"open": "open", "high": "high", "low": "low", "close": "close", "volume": "volume", "timestamp": "timestamp"},
-        {"Open": "open", "High": "high", "Low": "low", "Close": "close", "Volume": "volume", "Timestamp": "timestamp"},
+        {"o":"open","h":"high","l":"low","c":"close","v":"volume","t":"timestamp"},
+        {"open":"open","high":"high","low":"low","close":"close","volume":"volume","timestamp":"timestamp"},
+        {"Open":"open","High":"high","Low":"low","Close":"close","Volume":"volume","Timestamp":"timestamp"},
     ]
     lower = {str(c).lower(): c for c in df.columns}
     for cmap in col_maps:
@@ -55,8 +58,8 @@ def bars_to_df(bars: Any) -> pd.DataFrame:
 
     return df[["open","high","low","close","volume"]]
 
-# ---------- Broker glue ----------
-import broker  # must exist as broker.py in project root
+# ---------- Broker ----------
+import broker  # must exist as broker.py
 
 # ---------- Utilities ----------
 def _safe_float(x, default=0.0):
@@ -67,21 +70,17 @@ def _now_utc():
     return datetime.now(tz=UTC).replace(microsecond=0)
 
 def _norm_sym_slash(sym: str) -> str:
-    """Turn BTCUSD -> BTC/USD, ETHUSDT -> ETH/USDT, etc. Leaves already-slashed symbols alone."""
-    if not sym:
-        return sym
+    if not sym: return sym
     s = str(sym).replace(" ", "")
-    if "/" in s:
-        return s
-    QUOTES = ("USD", "USDT", "USDC")
-    for q in QUOTES:
+    if "/" in s: return s
+    for q in ("USD","USDT","USDC"):
         if s.endswith(q):
             base = s[:-len(q)]
             if base:
                 return f"{base}/{q}"
     return s
 
-# Symbols config (persisted via env or file)
+# ---------- Symbols persistence ----------
 _SYMBOLS_FILE = os.environ.get("SYMBOLS_FILE","symbols.txt")
 
 def get_symbols():
@@ -94,7 +93,6 @@ def get_symbols():
                 return [ln.strip() for ln in f if ln.strip()]
         except Exception:
             pass
-    # default seed
     return ["BTC/USD","ETH/USD","SOL/USD","DOGE/USD","XRP/USD","AVAX/USD","LINK/USD","BCH/USD","LTC/USD"]
 
 def set_symbols(symbols):
@@ -113,103 +111,105 @@ def load_strategies():
         base_pkg = "strategies"
         for i in range(1, 7):
             name = f"c{i}"
-            mod = importlib.import_module(f"{base_pkg}.{name}")
+            mod = __import__(f"{base_pkg}.{name}", fromlist=[name])
             modules.append(mod)
             tried.append(f"{base_pkg}.{name}")
     except Exception:
-        # Fallback: plain modules in root
         modules = []
         tried.clear()
         for i in range(1, 7):
             name = f"c{i}"
             try:
-                mod = importlib.import_module(name)
+                mod = __import__(name)
                 modules.append(mod)
                 tried.append(name)
             except Exception:
                 pass
 
-    # keep only modules that declare NAME and VERSION
-    valid = []
-    for m in modules:
-        if getattr(m, "NAME", None) and hasattr(m, "run"):
-            valid.append(m)
+    valid = [m for m in modules if getattr(m, "NAME", None) and hasattr(m, "run")]
     return valid, tried
 
 STRATS, _TRIED = load_strategies()
 STRAT_MAP = {m.NAME: m for m in STRATS}
 
-# ---------- P&L / FIFO realization ----------
-def compute_realized_fifo(orders, start_dt=None, end_dt=None):
-    """Compute realized P&L FIFO using buy/sell orders within [start_dt, end_dt].
-       Returns: (realized_total, realized_by_day, realized_by_strat)"""
-    def pick_time(o):
-        for k in ("filled_at","completed_at","submitted_at","created_at","timestamp"):
-            v = o.get(k)
-            if v: 
-                try: return datetime.fromisoformat(str(v).replace("Z","+00:00")).astimezone(UTC)
-                except Exception: pass
-        return None
+# ---------- FIFO P&L ----------
+def _pick_time(o):
+    for k in ("filled_at","completed_at","submitted_at","created_at","timestamp"):
+        v = o.get(k)
+        if v:
+            try: return datetime.fromisoformat(str(v).replace("Z","+00:00")).astimezone(UTC)
+            except Exception: pass
+    return None
 
-    inv = defaultdict(deque)   # sym -> deque of [qty, price, strat]
-    realized_total = 0.0
-    realized_by_day = defaultdict(float)  # 'YYYY-MM-DD' -> pnl
-    realized_by_strat = defaultdict(lambda: {"count":0,"wins":0,"losses":0,"realized":0.0})
-
-    # sort by time
+def compute_fifo_all(orders):
+    """Build FIFO matches for the FULL order list (no date filtering yet).
+       Returns a list of realized legs: dict(time, symbol, pnl, qty, buy_px, sell_px, strat)."""
+    inv = defaultdict(deque)  # sym -> deque[qty, price, strat]
+    legs = []
     rows = []
     for o in (orders or []):
-        t = pick_time(o)
-        if not t: continue
-        if start_dt and t < start_dt: continue
-        if end_dt and t > end_dt: continue
+        t = _pick_time(o)
+        if not t: 
+            continue
         rows.append((t,o))
     rows.sort(key=lambda x: x[0])
 
     for t, o in rows:
-        sym = o.get("symbol") or o.get("asset_symbol") or ""
+        sym  = o.get("symbol") or o.get("asset_symbol") or ""
         side = (o.get("side") or "").lower()
         qty  = abs(_safe_float(o.get("qty") or o.get("quantity") or o.get("filled_qty"), 0.0))
         notional = _safe_float(o.get("notional"), 0.0)
         price = _safe_float(o.get("filled_avg_price") or (notional/qty if qty>0 else 0.0), 0.0)
-        strat = "unknown"
         coid = (o.get("client_order_id") or "")
+        strat = "unknown"
         m = re.match(r"(c[1-6])[-_]", coid, re.I)
         if m: strat = m.group(1).lower()
-
-        if qty <= 0 or price <= 0: 
+        if qty <= 0 or price <= 0:
             continue
 
         if side == "buy":
             inv[sym].append([qty, price, strat])
             continue
-
         if side != "sell":
             continue
 
-        # FIFO match sells
         qsell = qty
-        d = t.strftime("%Y-%m-%d")
-        pnl = 0.0
         while qsell > 1e-12 and inv[sym]:
             q0, px0, strat0 = inv[sym][0]
             take = min(qsell, q0)
-            pnl += (price - px0) * take
+            pnl = (price - px0) * take
+            legs.append({
+                "time": t, "symbol": sym, "pnl": pnl, "qty": take,
+                "buy_px": px0, "sell_px": price, "strat": strat0 or strat
+            })
             qsell -= take
             q0 -= take
             if q0 <= 1e-12:
                 inv[sym].popleft()
             else:
                 inv[sym][0][0] = q0
+        # if no inventory left, we ignore the excess sell (cannot price it reliably)
 
-        realized_total += pnl
-        realized_by_day[d] += pnl
-        realized_by_strat[strat]["count"] += 1
-        if pnl > 0: realized_by_strat[strat]["wins"] += 1
-        if pnl < 0: realized_by_strat[strat]["losses"] += 1
-        realized_by_strat[strat]["realized"] += pnl
+    return legs
 
-    return realized_total, realized_by_day, realized_by_strat
+def realized_window_from_legs(legs, start_dt, end_dt):
+    total = 0.0
+    by_day = defaultdict(float)
+    by_strat = defaultdict(lambda: {"count":0,"wins":0,"losses":0,"realized":0.0})
+    for leg in legs:
+        t = leg["time"]
+        if (start_dt and t < start_dt) or (end_dt and t > end_dt):
+            continue
+        pnl = float(leg["pnl"])
+        total += pnl
+        d = t.strftime("%Y-%m-%d")
+        by_day[d] += pnl
+        s = leg.get("strat","unknown") or "unknown"
+        by_strat[s]["count"] += 1
+        if pnl > 0: by_strat[s]["wins"] += 1
+        if pnl < 0: by_strat[s]["losses"] += 1
+        by_strat[s]["realized"] += pnl
+    return total, by_day, by_strat
 
 # ---------- Flask ----------
 app = Flask(__name__)
@@ -237,101 +237,129 @@ def get_config_symbols():
 
 @app.post("/config/symbols")
 def post_config_symbols():
-    try:
-        payload = request.get_json(force=True) or {}
-        symbols = payload.get("symbols") or []
-        if not symbols:
-            return jsonify({"ok": False, "error": "no symbols"}), 400
-        set_symbols(symbols)
-        return jsonify({"ok": True, "symbols": get_symbols(), "count": len(get_symbols()), "version": APP_VERSION})
-    except Exception as e:
-        return jsonify({"ok": False, "error": str(e)}), 500
+    payload = request.get_json(force=True) or {}
+    symbols = payload.get("symbols") or []
+    if not symbols:
+        return jsonify({"ok": False, "error": "no symbols"}), 400
+    set_symbols(symbols)
+    return jsonify({"ok": True, "symbols": get_symbols(), "count": len(get_symbols()), "version": APP_VERSION})
 
 @app.get("/orders/recent")
 def orders_recent():
     status = request.args.get("status","all")
     limit  = int(request.args.get("limit","200"))
-    try:
-        rows = broker.list_orders(status=status, limit=limit)
-        return jsonify({"value": rows, "Count": len(rows)})
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
+    rows = broker.list_orders(status=status, limit=limit)
+    return jsonify({"value": rows, "Count": len(rows)})
 
 @app.get("/positions")
 def positions():
-    try:
-        rows = broker.list_positions()
-        return jsonify({"value": rows, "Count": len(rows)})
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
+    rows = broker.list_positions()
+    return jsonify({"value": rows, "Count": len(rows)})
 
 @app.get("/orders/attribution")
 def orders_attribution():
     days = int(request.args.get("days","7"))
     end = _now_utc()
-    start = (end - timedelta(days=days)).replace(microsecond=0)
-    try:
-        orders = broker.list_orders(status="all", limit=4000)
-        _, _, by_strat = compute_realized_fifo(orders, start_dt=start, end_dt=end)
-        for name in ["c1","c2","c3","c4","c5","c6","unknown"]:
-            by_strat.setdefault(name, {"count":0,"wins":0,"losses":0,"realized":0.0})
-        return jsonify({"per_strategy": by_strat, "start": start.isoformat(), "end": end.isoformat(), "version": APP_VERSION})
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
+    start = (end - timedelta(days=days)).replace(hour=0, minute=0, second=0, microsecond=0)
+    orders = broker.list_orders(status="all", limit=4000)
+    legs = compute_fifo_all(orders)  # full history pairing
+    _, _, by_strat = realized_window_from_legs(legs, start, end)
+    for name in ["c1","c2","c3","c4","c5","c6","unknown"]:
+        by_strat.setdefault(name, {"count":0,"wins":0,"losses":0,"realized":0.0})
+    return jsonify({"per_strategy": by_strat, "start": start.isoformat(), "end": end.isoformat(), "version": APP_VERSION})
 
 @app.get("/pnl/summary")
 def pnl_summary():
+    now = _now_utc()
+    today_start = datetime(now.year, now.month, now.day, tzinfo=UTC)
+    wk_start = (now - timedelta(days=7)).replace(hour=0, minute=0, second=0, microsecond=0)
+    mo_start = datetime(now.year, now.month, 1, tzinfo=UTC)
+
+    orders = broker.list_orders(status="all", limit=4000)
+    legs = compute_fifo_all(orders)
+
+    def realized_between(a,b):
+        t, _, _ = realized_window_from_legs(legs, a, b)
+        return t
+
+    realized_today = realized_between(today_start, now)
+    realized_week  = realized_between(wk_start, now)
+    realized_month = realized_between(mo_start, now)
+
+    # unrealized via positions * last trade price
+    unrealized = 0.0
     try:
-        now = _now_utc()
-        orders = broker.list_orders(status="all", limit=4000)
-        today_start = datetime(now.year, now.month, now.day, tzinfo=UTC)
-        wk_start = (now - timedelta(days=7)).replace(hour=0, minute=0, second=0, microsecond=0)
-        mo_start = (now - timedelta(days=31)).replace(hour=0, minute=0, second=0, microsecond=0)
+        pos = broker.list_positions()
+        syms = [p.get("symbol") or p.get("asset_symbol") for p in pos]
+        last = broker.last_trade_map(syms)  # your broker helper
+        for p in pos:
+            sym = p.get("symbol") or p.get("asset_symbol")
+            qty = _safe_float(p.get("qty") or p.get("quantity"))
+            px  = _safe_float(p.get("avg_entry_price"))
+            last_px = _safe_float((last.get(sym) or {}).get("price"))
+            if qty and last_px:
+                unrealized += (last_px - px) * qty
+    except Exception:
+        pass
 
-        def realized_between(a,b):
-            r, _, _ = compute_realized_fifo(orders, start_dt=a, end_dt=b)
-            return r
-
-        realized_today = realized_between(today_start, now)
-        realized_week  = realized_between(wk_start, now)
-        realized_month = realized_between(mo_start, now)
-
-        # unrealized via positions * last
-        unrealized = 0.0
-        try:
-            pos = broker.list_positions()
-            syms = [p.get("symbol") or p.get("asset_symbol") for p in pos]
-            last = broker.last_trade_map(syms)
-            for p in pos:
-                sym = p.get("symbol") or p.get("asset_symbol")
-                qty = _safe_float(p.get("qty") or p.get("quantity"))
-                px  = _safe_float(p.get("avg_entry_price"))
-                last_px = _safe_float((last.get(sym) or {}).get("price"))
-                if qty and last_px:
-                    unrealized += (last_px - px) * qty
-        except Exception:
-            pass
-
-        return jsonify({
-            "as_of_utc": now.isoformat(),
-            "realized": {"today": realized_today, "week": realized_week, "month": realized_month},
-            "unrealized": unrealized,
-        })
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
+    return jsonify({
+        "as_of_utc": now.isoformat(),
+        "realized": {"today": realized_today, "week": realized_week, "month": realized_month},
+        "unrealized": unrealized,
+    })
 
 @app.get("/pnl/daily")
 def pnl_daily():
+    # keep the 14-day mini view for convenience
     days = int(request.args.get("days","14"))
+    end = _now_utc()
+    start = (end - timedelta(days=days)).replace(hour=0, minute=0, second=0, microsecond=0)
+
+    orders = broker.list_orders(status="all", limit=4000)
+    legs = compute_fifo_all(orders)
+    _, by_day, _ = realized_window_from_legs(legs, start, end)
+    series = [{"date": d, "pnl": pnl} for d, pnl in sorted(by_day.items())]
+    return jsonify({"series": series, "as_of_utc": end.isoformat()})
+
+@app.get("/pnl/calendar_month")
+def pnl_calendar_month():
+    """
+    Returns a full month grid of realized P&L (sell legs only) computed with full-history FIFO pairing.
+    Query: ?month=YYYY-MM  (default = current month)
+    """
+    q = request.args.get("month","")
+    now = _now_utc()
     try:
-        end = _now_utc()
-        start = (end - timedelta(days=days)).replace(microsecond=0)
-        orders = broker.list_orders(status="all", limit=4000)
-        _, by_day, _ = compute_realized_fifo(orders, start_dt=start, end_dt=end)
-        series = [{"date": d, "pnl": pnl} for d, pnl in sorted(by_day.items())]
-        return jsonify({"series": series, "as_of_utc": end.isoformat()})
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        if q:
+            y, m = [int(x) for x in q.split("-")]
+            first = datetime(y, m, 1, tzinfo=UTC)
+        else:
+            first = datetime(now.year, now.month, 1, tzinfo=UTC)
+    except Exception:
+        first = datetime(now.year, now.month, 1, tzinfo=UTC)
+
+    # start Monday grid and cover 6 weeks
+    start = first - timedelta(days=(first.weekday() % 7))  # Monday as first column
+    end   = start + timedelta(days=6*7) - timedelta(seconds=1)
+
+    orders = broker.list_orders(status="all", limit=4000)
+    legs = compute_fifo_all(orders)
+    _, by_day, _ = realized_window_from_legs(legs, start, end)
+
+    days = []
+    d = start
+    while d <= end:
+        key = d.strftime("%Y-%m-%d")
+        days.append({"date": key, "pnl": by_day.get(key, 0.0),
+                     "in_month": d.month == first.month})
+        d += timedelta(days=1)
+
+    return jsonify({
+        "month": first.strftime("%Y-%m"),
+        "start": start.strftime("%Y-%m-%d"),
+        "end": end.strftime("%Y-%m-%d"),
+        "days": days
+    })
 
 @app.get("/diag/candles")
 def diag_candles():
@@ -339,16 +367,11 @@ def diag_candles():
     tf   = request.args.get("tf","1Min")
     limit= int(request.args.get("limit","100"))
     rows = {}
-    try:
-        symbols = [s.strip() for s in syms.split(",") if s.strip()] or get_symbols()
-        df_map = broker.get_bars(symbols, timeframe=tf, limit=limit, merge=False)
-        for s, df in df_map.items():
-            rows[s] = int(len(df)) if df is not None else 0
-        return jsonify({"rows": rows})
-    except Exception as e:
-        for s in [s.strip() for s in syms.split(",") if s.strip()] or get_symbols():
-            rows[s] = 0
-        return jsonify({"rows": rows, "error": str(e)})
+    symbols = [s.strip() for s in syms.split(",") if s.strip()] or get_symbols()
+    df_map = broker.get_bars(symbols, timeframe=tf, limit=limit, merge=False)
+    for s, df in df_map.items():
+        rows[s] = int(len(df)) if df is not None else 0
+    return jsonify({"rows": rows})
 
 @app.post("/scan/<name>")
 def scan(name):
@@ -365,50 +388,44 @@ def scan(name):
     if "symbols" in request.args:
         symbols = [s.strip() for s in request.args.get("symbols","").split(",") if s.strip()]
 
-    try:
-        pos = broker.list_positions()
-        # 🔒 normalize position symbols to slashed form so they match strategy symbols
-        long_map = {
-            _norm_sym_slash(p.get("symbol") or p.get("asset_symbol")): _safe_float(p.get("qty") or p.get("quantity"))
-            for p in pos
-        }
+    # positions normalized
+    pos = broker.list_positions()
+    long_map = {
+        _norm_sym_slash(p.get("symbol") or p.get("asset_symbol")): _safe_float(p.get("qty") or p.get("quantity"))
+        for p in pos
+    }
 
-        df_map_raw = broker.get_bars(symbols, timeframe=timeframe, limit=limit, merge=False)
-        # 🔒 normalize bars to the format strategies expect
-        df_map = {sym: bars_to_df(b) for sym, b in df_map_raw.items()}
+    df_map_raw = broker.get_bars(symbols, timeframe=timeframe, limit=limit, merge=False)
+    df_map = {sym: bars_to_df(b) for sym, b in df_map_raw.items()}
 
-        strat = STRAT_MAP[name]
-        results = strat.run(df_map, params, long_map)
+    strat = STRAT_MAP[name]
+    results = strat.run(df_map, params, long_map)
 
-        placed = []
-        if not dry:
-            now_epoch = int(time.time())
-            for r in results:
-                symbol = r.get("symbol")
-                action = r.get("action")
-                if not symbol or action not in ("buy","sell"):
-                    continue
-                qty_have = long_map.get(symbol, 0.0)
-                if action == "buy" and qty_have > 0:
-                    continue
-                if action == "sell" and qty_have <= 0:
-                    continue
-                coid = f"{name}-{symbol.replace('/','')}-{now_epoch}"
-                o = broker.submit_order(symbol=symbol, side=action, notional=notional,
-                                        client_order_id=coid, time_in_force="gtc", type="market")
-                placed.append(o)
+    placed = []
+    if not dry:
+        now_epoch = int(time.time())
+        for r in results:
+            symbol = r.get("symbol"); action = r.get("action")
+            if not symbol or action not in ("buy","sell"): 
+                continue
+            qty_have = long_map.get(symbol, 0.0)
+            if action == "buy" and qty_have > 0: 
+                continue
+            if action == "sell" and qty_have <= 0: 
+                continue
+            coid = f"{name}-{symbol.replace('/','')}-{now_epoch}"
+            o = broker.submit_order(symbol=symbol, side=action, notional=notional,
+                                    client_order_id=coid, time_in_force="gtc", type="market")
+            placed.append(o)
 
-        return jsonify({"ok": True, "dry": dry, "results": results, "placed": placed})
-    except Exception as e:
-        return jsonify({"ok": False, "error": str(e)}), 500
+    return jsonify({"ok": True, "dry": dry, "results": results, "placed": placed})
 
-# ---------- Background automation ----------
-_last_bar_ts = {}  # (strategy, symbol, timeframe) -> last bar time processed
+# ---------- Autorun loop ----------
+_last_bar_ts = {}
 
 def autorun_worker():
     enabled = os.environ.get("AUTORUN_ENABLED","false").lower() == "true"
-    if not enabled:
-        return
+    if not enabled: return
     interval = int(os.environ.get("AUTORUN_INTERVAL_SECS","60"))
     timeframe = os.environ.get("AUTORUN_TIMEFRAME","1Min")
     limit = int(os.environ.get("AUTORUN_LIMIT","600"))
@@ -418,26 +435,19 @@ def autorun_worker():
         try:
             symbols = get_symbols()
             pos = broker.list_positions()
-            # 🔒 normalize position symbols here too
             long_map = {
                 _norm_sym_slash(p.get("symbol") or p.get("asset_symbol")): _safe_float(p.get("qty") or p.get("quantity"))
                 for p in pos
             }
-
             df_map_raw = broker.get_bars(symbols, timeframe=timeframe, limit=limit, merge=False)
-            # 🔒 normalize here too
             df_map = {sym: bars_to_df(b) for sym, b in df_map_raw.items()}
 
             latest_by_symbol = {}
             for sym, df in df_map.items():
                 if df is None or df.empty: 
                     continue
-                try:
-                    tlast = pd.to_datetime(df.index[-1]).to_pydatetime().replace(tzinfo=UTC)
-                except Exception:
-                    tlast = None
-                if tlast:
-                    latest_by_symbol[sym] = tlast
+                tlast = pd.to_datetime(df.index[-1]).to_pydatetime().replace(tzinfo=UTC)
+                latest_by_symbol[sym] = tlast
 
             now_epoch = int(time.time())
             for strat in STRATS:
@@ -445,21 +455,19 @@ def autorun_worker():
                     results = strat.run(df_map, {}, long_map)
                 except Exception:
                     continue
-
                 for r in (results or []):
                     symbol = r.get("symbol"); action = r.get("action")
-                    if action not in ("buy","sell"):
+                    if action not in ("buy","sell"): 
                         continue
-                    if symbol not in latest_by_symbol:
+                    if symbol not in latest_by_symbol: 
                         continue
                     key = (strat.NAME, symbol, timeframe)
-                    last_t = _last_bar_ts.get(key)
-                    if last_t == latest_by_symbol[symbol]:
+                    if _last_bar_ts.get(key) == latest_by_symbol[symbol]:
                         continue
                     qty_have = long_map.get(symbol, 0.0)
-                    if action == "buy" and qty_have > 0:
+                    if action == "buy" and qty_have > 0: 
                         continue
-                    if action == "sell" and qty_have <= 0:
+                    if action == "sell" and qty_have <= 0: 
                         continue
                     coid = f"{strat.NAME}-{symbol.replace('/','')}-{now_epoch}"
                     broker.submit_order(symbol=symbol, side=action, notional=notional,
@@ -469,107 +477,138 @@ def autorun_worker():
             pass
         time.sleep(interval)
 
-# ---------- Dashboard (HTML) ----------
+# ---------- Dashboard HTML ----------
 DASH_HTML = r"""{% raw %}
 <!doctype html>
 <html lang="en">
 <head>
   <meta charset="utf-8" />
-  <title>Crypto System Dashboard — v1.8.9</title>
+  <title>Crypto System — v{{version}}</title>
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <style>
     :root {
-      --bg: #0b0f14; --panel:#111723; --muted:#8091a7; --text:#eaf2ff; --green:#2dcc70; --red:#ff5c5c; --accent:#5aa5ff;
-      --tableRow:#0f1520; --tableAlt:#0c111b; --chip:#1b2433; --border:#1e2a3a;
+      --bg:#0b0f14; --panel:#111723; --muted:#93a4ba; --text:#eaf2ff; --green:#22c55e; --red:#ef4444; --accent:#60a5fa;
+      --chip:#1b2433; --border:#1f2a3a; --row:#0f1520; --row2:#0c111b;
     }
-    html,body{background:var(--bg);color:var(--text);font-family:-apple-system,BlinkMacSystemFont,system-ui,Segoe UI,Roboto,Helvetica,Arial,sans-serif;margin:0}
-    h1,h2,h3{margin:0 0 8px}
-    .wrap{max-width:1200px;margin:0 auto;padding:24px}
-    .grid{display:grid;grid-template-columns:1fr 1fr;gap:16px}
-    .panel{background:var(--panel);border:1px solid var(--border);border-radius:16px;padding:16px;box-shadow:0 6px 24px rgba(0,0,0,.25)}
-    .muted{color:var(--muted")}
+    *{box-sizing:border-box}
+    html,body{margin:0;background:var(--bg);color:var(--text);font-family:system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif}
+    h1,h2,h3{margin:0 0 10px}
+    .wrap{max-width:1200px;margin:0 auto;padding:18px}
+    .grid{display:grid;grid-template-columns:1fr 1fr;gap:14px}
+    .grid-3{display:grid;grid-template-columns:1fr 1fr 1fr;gap:14px}
+    .panel{background:var(--panel);border:1px solid var(--border);border-radius:16px;padding:14px;box-shadow:0 6px 24px rgba(0,0,0,.22)}
+    .muted{color:var(--muted)}
     .pill{display:inline-flex;align-items:center;gap:8px;background:var(--chip);border:1px solid var(--border);border-radius:999px;padding:6px 10px;font-size:12px}
-    .kpi{display:flex;align-items:baseline;gap:8px}
-    .kpi .big{font-size:28px;font-weight:700}
-    .kpi .delta{font-size:13px}
+    .kpi{display:flex;align-items:baseline;gap:10px}
+    .big{font-size:28px;font-weight:700}
     .pos{color:var(--green)} .neg{color:var(--red)}
     table{width:100%;border-collapse:collapse}
     th,td{padding:10px;border-bottom:1px solid var(--border);vertical-align:middle}
     thead th{position:sticky;top:0;background:var(--panel);z-index:1}
-    tbody tr:nth-child(odd){background:var(--tableRow)}
-    tbody tr:nth-child(even){background:var(--tableAlt)}
+    tbody tr:nth-child(odd){background:var(--row)}
+    tbody tr:nth-child(even){background:var(--row2)}
     .mono{font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,"Liberation Mono","Courier New",monospace}
-    .calendar{display:grid;grid-template-columns:repeat(7,1fr);gap:8px}
-    .day{background:#0c1220;border:1px solid var(--border);border-radius:12px;padding:10px}
-    .d{font-size:12px;color:#a7b1c2;margin-bottom:6px}
-    .p{font-size:16px}
-    footer{color:#9aa6b2;text-align:center;padding:16px}
     .form-row{display:flex;flex-wrap:wrap;gap:8px;margin-bottom:8px}
-    .form-row input, .form-row select {padding:8px 10px;border-radius:8px;border:1px solid var(--border);background:#0f1624;color:#eaf2ff}
-    .btn{padding:8px 12px;border-radius:8px;border:1px solid var(--border);background:#0f1624;color:#eaf2ff;cursor:pointer}
+    input,select{padding:8px 10px;border-radius:8px;border:1px solid var(--border);background:#0f1624;color:var(--text)}
+    .btn{padding:8px 12px;border-radius:8px;border:1px solid var(--border);background:#0f1624;color:var(--text);cursor:pointer}
     .btn:hover{background:#152039}
+    /* Monthly calendar */
+    .cal-wrap{display:grid;grid-template-columns:repeat(7,1fr);gap:6px}
+    .cal-day{border:1px solid var(--border);border-radius:12px;padding:8px;background:#0d1526;min-height:74px;display:flex;flex-direction:column;justify-content:space-between}
+    .cal-day.mute{opacity:.45}
+    .cal-date{font-size:12px;color:#9fb1c9}
+    .cal-pnl{font-size:16px}
+    .nav{display:flex;gap:8px;align-items:center}
+    /* Mobile */
+    @media (max-width: 860px){
+      .grid, .grid-3{grid-template-columns:1fr}
+      .wrap{padding:12px}
+      .big{font-size:24px}
+      .cal-day{min-height:64px}
+    }
   </style>
 </head>
 <body>
   <div class="wrap">
-    <h1>Crypto System <span id="appVersion" class="pill">v1.8.9</span></h1>
+    <h1>Crypto System <span class="pill">v{{version}}</span></h1>
 
-    <div class="grid" style="margin-top:12px">
+    <div class="grid" style="margin-top:10px">
       <div class="panel">
         <h3>Summary</h3>
-        <div class="kpi"><span class="muted">Today</span> <span id="pnlToday" class="big mono">—</span></div>
-        <div class="kpi"><span class="muted">Week</span>  <span id="pnlWeek"  class="big mono">—</span></div>
-        <div class="kpi"><span class="muted">Month</span> <span id="pnlMonth" class="big mono">—</span></div>
-        <div class="kpi"><span class="muted">Unrealized</span> <span id="unrealized" class="big mono">—</span></div>
+        <div class="kpi"><span class="muted">Today</span> <span id="pToday" class="big mono">—</span></div>
+        <div class="kpi"><span class="muted">Week</span>  <span id="pWeek"  class="big mono">—</span></div>
+        <div class="kpi"><span class="muted">Month</span> <span id="pMonth" class="big mono">—</span></div>
+        <div class="kpi"><span class="muted">Unrealized</span> <span id="pUnreal" class="big mono">—</span></div>
         <div class="muted" style="margin-top:6px"><span id="asOf" class="mono"></span></div>
       </div>
 
       <div class="panel">
-        <h3>P&amp;L (last 14 days)</h3>
-        <div id="cal" class="calendar"></div>
+        <div class="nav" style="justify-content:space-between">
+          <h3>Calendar (monthly realized)</h3>
+          <div class="nav">
+            <button class="btn" onclick="shiftMonth(-1)">◀</button>
+            <span id="calLabel" class="pill">—</span>
+            <button class="btn" onclick="shiftMonth(1)">▶</button>
+          </div>
+        </div>
+        <div class="cal-wrap" style="margin-top:10px">
+          <div class="muted" style="grid-column: span 7">Mon Tue Wed Thu Fri Sat Sun</div>
+          <div id="calGrid" style="grid-column: span 7; display:grid; grid-template-columns:repeat(7,1fr); gap:6px"></div>
+        </div>
       </div>
     </div>
 
-    <div class="panel" style="margin-top:16px">
-      <h3>Strategies (server)</h3>
-      <div id="strats" class="muted">Loading…</div>
-    </div>
-
-    <div class="panel" style="margin-top:16px">
-      <h3>Run Scan</h3>
-      <div class="form-row">
-        <select id="strategy">
-          <option value="c1">C1</option><option value="c2">C2</option><option value="c3">C3</option>
-          <option value="c4">C4</option><option value="c5">C5</option><option value="c6">C6</option>
-        </select>
-        <input id="symbols" value="BTC/USD" placeholder="Symbols CSV (e.g. BTC/USD,ETH/USD)" />
-        <input id="tf" value="5Min" />
-        <input id="limit" type="number" value="300" />
-        <input id="notional" type="number" value="25" />
-        <label class="pill"><input id="dry" type="checkbox" checked /> dry run</label>
-        <button class="btn" onclick="runScan()">Run Scan</button>
+    <div class="grid-3" style="margin-top:14px">
+      <div class="panel">
+        <h3>Strategies (server)</h3>
+        <div id="strats">Loading…</div>
       </div>
-      <table>
-        <thead>
-          <tr><th>Symbol</th><th>Action</th><th>Reason</th></tr>
-        </thead>
-        <tbody id="scanRows"><tr><td colspan="3" class="muted">Awaiting scan…</td></tr></tbody>
-      </table>
+
+      <div class="panel">
+        <h3>Run Scan</h3>
+        <div class="form-row">
+          <select id="strategy">
+            <option value="c1">C1</option><option value="c2">C2</option><option value="c3">C3</option>
+            <option value="c4">C4</option><option value="c5">C5</option><option value="c6">C6</option>
+          </select>
+          <input id="symbols" value="BTC/USD" />
+          <input id="tf" value="5Min" />
+          <input id="limit" type="number" value="300" />
+          <input id="notional" type="number" value="25" />
+          <label class="pill"><input id="dry" type="checkbox" checked /> dry</label>
+          <button class="btn" onclick="runScan()">Run</button>
+        </div>
+        <table>
+          <thead><tr><th>Symbol</th><th>Action</th><th>Reason</th></tr></thead>
+          <tbody id="scanRows"><tr><td colspan="3" class="muted">Awaiting scan…</td></tr></tbody>
+        </table>
+      </div>
+
+      <div class="panel">
+        <h3>P&amp;L by Strategy (last 30d)</h3>
+        <div class="form-row">
+          <input id="attrDays" type="number" value="30" />
+          <button class="btn" onclick="loadAttr()">Refresh</button>
+        </div>
+        <table>
+          <thead><tr><th>Strategy</th><th class="mono">Trades</th><th class="mono">Wins</th><th class="mono">Losses</th><th class="mono">Realized</th></tr></thead>
+          <tbody id="attrRows"><tr><td colspan="5" class="muted">Loading…</td></tr></tbody>
+        </table>
+        <div class="muted" id="attrWindow"></div>
+      </div>
     </div>
 
-    <div class="panel" style="margin-top:16px">
+    <div class="panel" style="margin-top:14px">
       <h3>Recent fills</h3>
       <table>
         <thead>
           <tr><th>Time</th><th>Side</th><th>Symbol</th><th class="mono">Qty</th><th class="mono">Price</th><th class="mono">Notional</th><th>Client ID</th><th>Status</th></tr>
         </thead>
-        <tbody id="fills">
-          <tr><td colspan="8" class="muted">Loading…</td></tr>
-        </tbody>
+        <tbody id="fills"><tr><td colspan="8" class="muted">Loading…</td></tr></tbody>
       </table>
     </div>
 
-    <div class="panel" style="margin-top:16px">
+    <div class="panel" style="margin-top:14px">
       <h3>Data Check</h3>
       <div class="form-row">
         <input id="dcSymbols" value="BTC/USD,ETH/USD,SOL/USD,DOGE/USD,XRP/USD,AVAX/USD,LINK/USD,BCH/USD,LTC/USD" size="80"/>
@@ -583,173 +622,117 @@ DASH_HTML = r"""{% raw %}
       </table>
     </div>
 
-    <div class="panel" style="margin-top:16px">
-      <h3>Attribution (last 7 days)</h3>
-      <div class="form-row">
-        <input id="attrDays" type="number" value="7" />
-        <button class="btn" onclick="loadAttr()">Refresh</button>
-      </div>
-      <table>
-        <thead><tr><th>Strategy</th><th class="mono">Trades</th><th class="mono">Wins</th><th class="mono">Losses</th><th class="mono">Realized</th></tr></thead>
-        <tbody id="attrRows"><tr><td colspan="5" class="muted">Loading…</td></tr></tbody>
-      </table>
-      <div class="muted" id="attrWindow"></div>
-    </div>
-
-    <footer>
-      <div class="muted">Exchange: Alpaca · Data normalized for strategies · Symbols normalized (BTCUSD→BTC/USD)</div>
-    </footer>
+    <footer class="muted" style="text-align:center;padding:18px">Exchange: Alpaca · Data & symbols normalized · v{{version}}</footer>
   </div>
 
   <script>
-    const $ = (sel) => document.querySelector(sel);
-    const fmtUsd = (x) => (x>=0?'+':'') + (x||0).toLocaleString(undefined,{style:'currency',currency:'USD',maximumFractionDigits:2});
-    const parseDate = (s) => { try { return new Date(s); } catch { return null; } };
-    const preferTime = (o, keys) => { for (const k of keys) if (o && o[k]) return o[k]; return null; };
+    const $ = sel => document.querySelector(sel);
+    const fmtUsd = x => (x>=0?'+':'') + (x||0).toLocaleString(undefined,{style:'currency',currency:'USD',maximumFractionDigits:2});
+    const parseDate = s => { try { return new Date(s); } catch { return null; } };
+    const preferTime = (o,keys)=>{ for(const k of keys) if(o && o[k]) return o[k]; return null; };
 
-    async function runScan() {
-      const name = $('#strategy').value;
-      const symbols = encodeURIComponent($('#symbols').value || 'BTC/USD');
-      const tf = encodeURIComponent($('#tf').value || '5Min');
-      const limit = +($('#limit').value || 300);
-      const notional = +($('#notional').value || 25);
-      const dry = $('#dry').checked ? 1 : 0;
-      const url = `/scan/${name}?dry=${dry}&symbols=${symbols}&timeframe=${tf}&limit=${limit}&notional=${notional}`;
-      const r = await fetch(url, { method: 'POST' });
+    // --- Summary ---
+    async function loadSummary(){
+      const r = await fetch('/pnl/summary'); const j = await r.json();
+      const M=j.realized||{};
+      $('#pToday').textContent = fmtUsd(M.today||0); $('#pToday').className='big mono '+((M.today||0)>=0?'pos':'neg');
+      $('#pWeek').textContent  = fmtUsd(M.week||0);  $('#pWeek').className='big mono '+((M.week||0)>=0?'pos':'neg');
+      $('#pMonth').textContent = fmtUsd(M.month||0); $('#pMonth').className='big mono '+((M.month||0)>=0?'pos':'neg');
+      $('#pUnreal').textContent= fmtUsd(j.unrealized||0); $('#pUnreal').className='big mono '+((j.unrealized||0)>=0?'pos':'neg');
+      $('#asOf').textContent = `as of ${j.as_of_utc||''}`;
+    }
+
+    // --- Monthly calendar ---
+    let calCursor = new Date(); // current month
+    const ym = d => `${d.getUTCFullYear()}-${String(d.getUTCMonth()+1).padStart(2,'0')}`;
+
+    function shiftMonth(delta){
+      calCursor.setUTCMonth(calCursor.getUTCMonth()+delta);
+      loadCalendar();
+    }
+
+    async function loadCalendar(){
+      const label = ym(calCursor);
+      $('#calLabel').textContent = label;
+      const r = await fetch(`/pnl/calendar_month?month=${label}`);
       const j = await r.json();
-      const rows = (j.results||[]).map(r => `<tr><td>${r.symbol}</td><td>${r.action.toUpperCase()}</td><td>${r.reason||''}</td></tr>`).join('');
+      const grid = $('#calGrid'); grid.innerHTML = '';
+      for(const d of (j.days||[])){
+        const el = document.createElement('div');
+        el.className = 'cal-day'+(d.in_month?'':' mute');
+        const dt = document.createElement('div'); dt.className='cal-date'; dt.textContent = d.date.slice(-2);
+        const pv = document.createElement('div'); const pnl=+d.pnl||0; pv.className='cal-pnl mono '+(pnl>=0?'pos':'neg'); pv.textContent = fmtUsd(pnl);
+        el.appendChild(dt); el.appendChild(pv);
+        grid.appendChild(el);
+      }
+    }
+
+    // --- Strategies list ---
+    async function loadStrats(){
+      try{
+        const hv = await (await fetch('/health/versions')).json();
+        const keys = Object.keys(hv.systems||{}).sort();
+        const rows = keys.map(k=>`<tr><td>${k.toUpperCase()}</td><td>v${hv.systems[k]}</td></tr>`).join('');
+        const tbl = `<table><thead><tr><th>Strategy</th><th>Version</th></tr></thead><tbody>${rows}</tbody></table>`;
+        $('#strats').innerHTML = tbl;
+      }catch{ $('#strats').textContent='Failed to load'; }
+    }
+
+    // --- P&L by Strategy ---
+    async function loadAttr(){
+      const days = +$('#attrDays').value || 30;
+      const r = await fetch(`/orders/attribution?days=${days}`);
+      const j = await r.json(); const m = j.per_strategy||{};
+      const names = Object.keys(m).sort();
+      const rows = names.map(k=>{
+        const v=m[k]||{}; const rzd=+v.realized||0;
+        return `<tr><td>${k.toUpperCase()}</td><td class="mono">${v.count||0}</td><td class="mono">${v.wins||0}</td><td class="mono">${v.losses||0}</td><td class="mono ${rzd>=0?'pos':'neg'}">${fmtUsd(rzd)}</td></tr>`;
+      }).join('');
+      $('#attrRows').innerHTML = rows || `<tr><td colspan="5" class="muted">No data.</td></tr>`;
+      $('#attrWindow').textContent = `${j.start||''} — ${j.end||''}`;
+    }
+
+    // --- Scan ---
+    async function runScan(){
+      const name=$('#strategy').value, symbols=encodeURIComponent($('#symbols').value||'BTC/USD');
+      const tf=encodeURIComponent($('#tf').value||'5Min'); const limit=+($('#limit').value||300);
+      const notional=+($('#notional').value||25); const dry=$('#dry').checked?1:0;
+      const url=`/scan/${name}?dry=${dry}&symbols=${symbols}&timeframe=${tf}&limit=${limit}&notional=${notional}`;
+      const r=await fetch(url,{method:'POST'}); const j=await r.json();
+      const rows=(j.results||[]).map(r=>`<tr><td>${r.symbol}</td><td>${(r.action||'').toUpperCase()}</td><td>${r.reason||''}</td></tr>`).join('');
       $('#scanRows').innerHTML = rows || `<tr><td colspan="3" class="muted">No results.</td></tr>`;
     }
 
-    // --- P&L summary ---
-    async function loadSummary() {
-      const r = await fetch('/pnl/summary');
-      const j = await r.json();
-      $('#asOf').textContent = `as of ${j.as_of_utc || ''}`;
-      const month = j.realized?.month ?? 0;
-      const week  = j.realized?.week ?? 0;
-      const today = j.realized?.today ?? 0;
-      const unreal = j.unrealized ?? 0;
-      $('#pnlToday').textContent = fmtUsd(today);
-      $('#pnlWeek').textContent  = fmtUsd(week);
-      $('#pnlMonth').textContent = fmtUsd(month);
-      $('#unrealized').textContent = fmtUsd(unreal);
-      $('#pnlToday').className = 'big ' + (today>=0?'pos':'neg');
-      $('#pnlWeek').className  = 'big ' + (week>=0?'pos':'neg');
-      $('#pnlMonth').className = 'big ' + (month>=0?'pos':'neg');
-    }
-
-    // --- Strategies (NAME + VERSION) ---
-    async function loadStrats() {
-      try {
-        const hv = await (await fetch('/health/versions')).json();
-        if (hv?.app) { document.getElementById('appVersion').textContent = `v${hv.app}`; }
-        const keys = Object.keys(hv.systems || {}).sort();
-        const rows = keys.map(k => `<tr><td>${k.toUpperCase()}</td><td>v${hv.systems[k]}</td></tr>`).join('');
-        const tbl = `<table><thead><tr><th>Strategy</th><th>Version</th></tr></thead><tbody>${rows}</tbody></table>`;
-        document.getElementById('strats').innerHTML = tbl;
-      } catch (e) {
-        document.getElementById('strats').textContent = 'Failed to load strategies';
-      }
-    }
-
-    // --- Calendar 14d ---
-    async function loadDaily() {
-      const r = await fetch('/pnl/daily?days=14');
-      const j = await r.json();
-      const el = $('#cal'); el.innerHTML = '';
-      const series = j.series || [];
-      for (const d of series) {
-        const pnl = +d.pnl || 0;
-        const box = document.createElement('div');
-        box.className = 'day';
-        const date = document.createElement('div'); date.className='d'; date.textContent = d.date;
-        const pv = document.createElement('div'); pv.className='p mono ' + (pnl>=0?'pos':'neg'); pv.textContent = fmtUsd(pnl);
-        box.appendChild(date); box.appendChild(pv);
-        el.appendChild(box);
-      }
-    }
-
-    // --- Recent fills from /orders/recent ---
+    // --- Fills ---
     function coalesceSymbol(o){ return o.symbol || o.asset_symbol || ''; }
-    function sideToSign(side){ return (side||'').toLowerCase()==='sell' ? '-' : '+'; }
-    function pickQty(o){ return +((o.qty || o.quantity || o.filled_qty) ?? 0); }
-    function pickNotional(o){ return +(o.notional ?? (pickQty(o) * (+o.filled_avg_price || 0))); }
-    function pickPx(o){ return +(o.filled_avg_price || 0); }
-
-    function pickTime(o){
-      const s = preferTime(o, ['filled_at','completed_at','submitted_at','created_at','timestamp']);
-      return parseDate(s);
-    }
-
-    async function loadFills() {
-      const r = await fetch('/orders/recent?status=all&limit=200');
-      let j = await r.json();
-      let arr = Array.isArray(j) ? j : (Array.isArray(j.value) ? j.value : []);
-      arr = arr.filter(o => o && (o.status || o.side));
-      const rows = arr.map(o => {
-        const sym = coalesceSymbol(o);
-        const qty = pickQty(o);
-        const side = (o.side || '').toLowerCase();
-        const notional = pickNotional(o);
-        const px = pickPx(o);
-        const ts = pickTime(o);
-        const dt = ts ? ts.toISOString().replace('T',' ').replace('Z','') : '';
-        const coid = o.client_order_id || '';
-        const status = (o.status || '').toUpperCase();
-        const sign = sideToSign(side);
-        return `<tr>
-          <td class="mono">${dt}</td>
-          <td>${side.toUpperCase()}</td>
-          <td>${sym}</td>
-          <td class="mono">${sign}${qty.toFixed(6)}</td>
-          <td class="mono">${px ? px.toFixed(6): ''}</td>
-          <td class="mono">${notional ? notional.toFixed(2) : ''}</td>
-          <td class="mono">${coid}</td>
-          <td>${status}</td>
-        </tr>`;
+    function pickQty(o){ return +((o.qty||o.quantity||o.filled_qty)||0); }
+    function pickPx(o){ return +(o.filled_avg_price||0); }
+    function pickNotional(o){ const q=pickQty(o), px=pickPx(o); return +(o.notional || (q*px)); }
+    function pickTime(o){ const s = preferTime(o, ['filled_at','completed_at','submitted_at','created_at','timestamp']); return parseDate(s); }
+    async function loadFills(){
+      const r=await fetch('/orders/recent?status=all&limit=200'); let j=await r.json();
+      let arr=Array.isArray(j)?j:(Array.isArray(j.value)?j.value:[]); arr=arr.filter(o=>o&&(o.status||o.side));
+      const rows=arr.map(o=>{
+        const ts=pickTime(o), dt=ts?ts.toISOString().replace('T',' ').replace('Z',''):'';
+        const side=(o.side||'').toUpperCase(), sym=coalesceSymbol(o), qty=pickQty(o), px=pickPx(o), notional=pickNotional(o);
+        const coid=o.client_order_id||'', status=(o.status||'').toUpperCase();
+        return `<tr><td class="mono">${dt}</td><td>${side}</td><td>${sym}</td><td class="mono">${qty.toFixed(6)}</td><td class="mono">${px?px.toFixed(6):''}</td><td class="mono">${notional?notional.toFixed(2):''}</td><td class="mono">${coid}</td><td>${status}</td></tr>`;
       }).join('');
-      document.getElementById('fills').innerHTML = rows || `<tr><td colspan="8" class="muted">No recent orders.</td></tr>`;
+      $('#fills').innerHTML = rows || `<tr><td colspan="8" class="muted">No recent orders.</td></tr>`;
     }
 
-    // --- Data Check panel ---
+    // --- Data check ---
     async function runDataCheck(){
-      const sy=encodeURIComponent(document.getElementById('dcSymbols').value);
-      const tf=encodeURIComponent(document.getElementById('dcTf').value);
-      const lim=document.getElementById('dcLimit').value;
-      const r=await fetch(`/diag/candles?symbols=${sy}&tf=${tf}&limit=${lim}`);
-      const j=await r.json();
+      const sy=encodeURIComponent($('#dcSymbols').value), tf=encodeURIComponent($('#dcTf').value), lim=$('#dcLimit').value;
+      const r=await fetch(`/diag/candles?symbols=${sy}&tf=${tf}&limit=${lim}`); const j=await r.json();
       const rows=Object.entries(j.rows||{}).map(([s,n])=>`<tr><td>${s}</td><td class="mono">${n}</td></tr>`).join('');
-      document.getElementById('dcRows').innerHTML=rows||`<tr><td colspan="2" class="muted">No data.</td></tr>`;
+      $('#dcRows').innerHTML = rows || `<tr><td colspan="2" class="muted">No data.</td></tr>`;
     }
 
-    // --- Attribution panel ---
-    async function loadAttr(){
-      const days = +document.getElementById('attrDays').value || 7;
-      const r = await fetch(`/orders/attribution?days=${days}`);
-      const j = await r.json();
-      const m = j.per_strategy || {};
-      const names = Object.keys(m).sort();
-      const rows = names.map(k => {
-        const v = m[k] || {};
-        const rzd = +v.realized || 0;
-        return `<tr><td>${k.toUpperCase()}</td><td class="mono">${v.count||0}</td><td class="mono">${v.wins||0}</td><td class="mono">${v.losses||0}</td><td class="mono ${rzd>=0?'pos':'neg'}">${fmtUsd(rzd)}</td></tr>`;
-      }).join('');
-      document.getElementById('attrRows').innerHTML = rows || `<tr><td colspan="5" class="muted">No data.</td></tr>`;
-      const w = (j.start||'') + ' — ' + (j.end||'');
-      document.getElementById('attrWindow').textContent = w;
-    }
-
-    async function boot() {
-      try {
-        const hv = await (await fetch('/health/versions')).json();
-        if (hv?.app) { document.getElementById('appVersion').textContent = `v${hv.app}`; }
-      } catch {}
-      await Promise.all([loadSummary(), loadDaily(), loadFills(), loadStrats(), loadAttr()]);
+    async function boot(){
+      await Promise.all([loadSummary(), loadStrats(), loadAttr(), loadFills(), loadCalendar()]);
       setInterval(loadSummary, 20000);
-      setInterval(loadDaily, 60000);
       setInterval(loadFills, 20000);
-      setInterval(loadStrats, 60000);
       setInterval(loadAttr, 30000);
     }
     boot();
@@ -760,16 +743,14 @@ DASH_HTML = r"""{% raw %}
 
 @app.get("/")
 def index():
-    return render_template_string(DASH_HTML)
+    return render_template_string(DASH_HTML, version=APP_VERSION)
 
-# ---- start background loop if enabled ----
+# ---------- Start autorun if enabled ----------
 def start_background():
     try:
-        enabled = os.environ.get("AUTORUN_ENABLED","false").lower() == "true"
-        if not enabled:
-            return
-        t = threading.Thread(target=autorun_worker, daemon=True)
-        t.start()
+        if os.environ.get("AUTORUN_ENABLED","false").lower() == "true":
+            t = threading.Thread(target=autorun_worker, daemon=True)
+            t.start()
     except Exception:
         pass
 
