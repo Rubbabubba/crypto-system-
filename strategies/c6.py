@@ -1,76 +1,83 @@
-# strategies/c6.py — v1.9.0
-# EMA fast/slow (MACD-style) + higher-high confirmation; exits = cross-down or ATR-vs-slow stop.
-
+# strategies/c6.py — v1.9.4
+# EMA fast/slow (MACD-style) + higher-high confirmation. Exit on EMA cross-down or ATR stop vs slow EMA.
 from __future__ import annotations
 from typing import Dict, Any, List
+import numpy as np
 import pandas as pd
 
-NAME="c6"; VERSION="1.9.0"
+NAME = "c6"
+VERSION = "1.9.4"
 
-def _ok_df(df: pd.DataFrame)->bool:
-    need={"open","high","low","close","volume"}; return isinstance(df,pd.DataFrame) and need.issubset(df.columns) and len(df)>=60
-def _ema(s,n): return s.ewm(span=int(n),adjust=False).mean()
-def _sma(s,n): return s.rolling(int(n)).mean()
-def _atr(df,n):
-    h,l,c=df["high"],df["low"],df["close"]; pc=c.shift(1)
-    tr=pd.concat([(h-l).abs(),(h-pc).abs(),(l-pc).abs()],axis=1).max(axis=1)
-    return _sma(tr,int(n))
-def _in_pos(positions: Dict[str,float], sym:str)->bool:
-    try: return float(positions.get(sym,0.0))>0.0
-    except: return False
-def _cross_up(x,y): return len(x)>=2 and len(y)>=2 and pd.notna(x.iloc[-2]) and pd.notna(y.iloc[-2]) and (x.iloc[-2] <= y.iloc[-2]) and (x.iloc[-1] > y.iloc[-1])
-def _cross_dn(x,y): return len(x)>=2 and len(y)>=2 and pd.notna(x.iloc[-2]) and pd.notna(y.iloc[-2]) and (x.iloc[-2] >= y.iloc[-2]) and (x.iloc[-1] < y.iloc[-1])
+NEED_COLS = {"open","high","low","close","volume"}
 
-def run(df_map: Dict[str,pd.DataFrame], params: Dict[str,Any], positions: Dict[str,float])->List[Dict[str,Any]]:
-    ef=int(params.get("ema_fast_len",12)); es=int(params.get("ema_slow_len",26))
-    hh_n=int(params.get("confirm_hh_len",10))
-    atr_len=int(params.get("atr_len",14)); atr_mult_stop=float(params.get("atr_mult_stop",1.0))
-    use_vol=bool(params.get("use_vol",False)); vol_sma_len=int(params.get("vol_sma_len",20))
+def _ok_df(df: pd.DataFrame, need_len: int = 80) -> bool:
+    return (
+        isinstance(df, pd.DataFrame) and
+        NEED_COLS.issubset(df.columns) and
+        len(df) >= need_len and
+        not df.tail(2).isna().any().any()
+    )
 
-    out: List[Dict[str,Any]]=[]
+def _ema(s: pd.Series, n: int) -> pd.Series:
+    return s.ewm(span=int(n), adjust=False).mean()
+
+def _atr(df: pd.DataFrame, n: int) -> pd.Series:
+    h, l, c = df["high"], df["low"], df["close"]
+    prev_c = c.shift(1)
+    tr = pd.concat([(h-l), (h-prev_c).abs(), (l-prev_c).abs()], axis=1).max(axis=1)
+    return tr.rolling(int(n)).mean()
+
+def _in_pos(positions: Dict[str, float], sym: str) -> bool:
+    try: return float(positions.get(sym, 0.0)) > 0.0
+    except Exception: return False
+
+def run(df_map: Dict[str, pd.DataFrame], params: Dict[str, Any], positions: Dict[str, float]) -> List[Dict[str, Any]]:
+    ema_fast_len   = int(params.get("ema_fast_len", 12))
+    ema_slow_len   = int(params.get("ema_slow_len", 26))
+    confirm_hh_len = int(params.get("confirm_hh_len", 10))
+    atr_len        = int(params.get("atr_len", 14))
+    atr_mult_stop  = float(params.get("atr_mult_stop", 1.0))
+
+    out: List[Dict[str, Any]] = []
+
+    need_len = max(ema_slow_len + confirm_hh_len + 5, atr_len + 5, 80)
+
     for sym, df in df_map.items():
-        if not _ok_df(df): out.append({"symbol":sym,"action":"flat","reason":"insufficient_data"}); continue
-        df=df.sort_index()
-        if df.tail(2).isna().any().any(): out.append({"symbol":sym,"action":"flat","reason":"nan_tail"}); continue
+        if not _ok_df(df, need_len=need_len):
+            out.append({"symbol": sym, "action": "flat", "reason": "insufficient_data"})
+            continue
 
-        close=df["close"]; high=df["high"]; vol=df["volume"]
-        fast=_ema(close,ef); slow=_ema(close,es)
-        atr_now=_atr(df,atr_len).iloc[-1]
-        if pd.isna(fast.iloc[-2]) or pd.isna(slow.iloc[-2]) or pd.isna(atr_now):
-            out.append({"symbol":sym,"action":"flat","reason":"warming_up"}); continue
+        df = df.sort_index()
+        c = df["close"]
+        h = df["high"]
 
-        have=_in_pos(positions,sym)
-        c=close.iloc[-1]
+        f = _ema(c, ema_fast_len)
+        s = _ema(c, ema_slow_len)
+        atr = _atr(df, atr_len)
 
-        if len(high) < hh_n + 2:
-            hh_confirm=False
-        else:
-            prior_max = high.rolling(hh_n).max().shift(1).iloc[-1]
-            hh_confirm = pd.notna(prior_max) and (high.iloc[-1] > prior_max)
+        f_prev, f_now = float(f.iloc[-2]), float(f.iloc[-1])
+        s_prev, s_now = float(s.iloc[-2]), float(s.iloc[-1])
+        c_now = float(c.iloc[-1])
+        atr_now = float(atr.iloc[-1])
 
-        if use_vol:
-            if len(vol)<vol_sma_len+1: vol_ok=False
-            else: vol_ok = vol.iloc[-1] > _sma(vol,vol_sma_len).iloc[-1]
-        else:
-            vol_ok=True
+        have = _in_pos(positions, sym)
+        stop_line = s_now - atr_mult_stop * atr_now
 
-        up=_cross_up(fast,slow); dn=_cross_dn(fast,slow)
+        # Higher-high confirmation vs last N bars (excluding current)
+        hh_prev = float(h.rolling(confirm_hh_len).max().iloc[-2])
 
         if have:
-            if dn:
-                out.append({"symbol":sym,"action":"sell","reason":"ema_cross_down"}); continue
-            stop_line = slow.iloc[-1] - atr_mult_stop*atr_now if pd.notna(slow.iloc[-1]) else None
-            if (stop_line is not None) and (c < stop_line):
-                out.append({"symbol":sym,"action":"sell","reason":"atr_vs_slow_ema_stop"}); continue
-            out.append({"symbol":sym,"action":"flat","reason":"hold_in_pos"}); continue
+            if (f_prev > s_prev and f_now <= s_now) or (atr_mult_stop > 0 and c_now < stop_line):
+                reason = "ema_cross_down" if (f_prev > s_prev and f_now <= s_now) else "atr_stop"
+                out.append({"symbol": sym, "action": "sell", "reason": reason})
+                continue
+            out.append({"symbol": sym, "action": "flat", "reason": "hold_in_pos"})
+            continue
 
-        if up and hh_confirm and vol_ok:
-            out.append({"symbol":sym,"action":"buy","reason":"cross_up_hh_confirm" + ("_vol_ok" if use_vol else "")})
+        # Entry: fast>slow and close makes a higher-high than prior window
+        if (f_now > s_now) and (c_now > hh_prev):
+            out.append({"symbol": sym, "action": "buy", "reason": "ema_trend_hh_confirm"})
         else:
-            bits=[]
-            if not up: bits.append("no_cross_up")
-            if not hh_confirm: bits.append("no_higher_high")
-            if not vol_ok: bits.append("vol_fail")
-            out.append({"symbol":sym,"action":"flat","reason":" & ".join(bits) if bits else "no_signal"})
+            out.append({"symbol": sym, "action": "flat", "reason": "no_signal"})
 
     return out

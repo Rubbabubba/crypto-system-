@@ -1,78 +1,77 @@
-# strategies/c5.py — v1.9.0
-# Breakout above prior N-bar high with EMA/ATR context; exits = failed breakout, EMA cross-down.
-
+# strategies/c5.py — v1.9.4
+# Highest-high breakout with EMA/ATR context. Exit on failed breakout or close<EMA.
 from __future__ import annotations
 from typing import Dict, Any, List
+import numpy as np
 import pandas as pd
 
-NAME="c5"; VERSION="1.9.0"
+NAME = "c5"
+VERSION = "1.9.4"
 
-def _ok_df(df: pd.DataFrame)->bool:
-    need={"open","high","low","close","volume"}
-    return isinstance(df,pd.DataFrame) and need.issubset(df.columns) and len(df)>=60
-def _ema(s,n): return s.ewm(span=int(n),adjust=False).mean()
-def _sma(s,n): return s.rolling(int(n)).mean()
-def _atr(df,n):
-    h,l,c=df["high"],df["low"],df["close"]; pc=c.shift(1)
-    tr=pd.concat([(h-l).abs(),(h-pc).abs(),(l-pc).abs()],axis=1).max(axis=1)
-    return _sma(tr,int(n))
-def _in_pos(positions: Dict[str,float], sym:str)->bool:
-    try: return float(positions.get(sym,0.0))>0.0
-    except: return False
+NEED_COLS = {"open","high","low","close","volume"}
 
-def run(df_map: Dict[str,pd.DataFrame], params: Dict[str,Any], positions: Dict[str,float])->List[Dict[str,Any]]:
-    breakout_len=int(params.get("breakout_len",20))
-    ema_len=int(params.get("ema_len",20))
-    atr_len=int(params.get("atr_len",14))
-    use_ema_filter=bool(params.get("use_ema_filter",True))
-    use_vol=bool(params.get("use_vol",False))
-    vol_sma_len=int(params.get("vol_sma_len",20))
-    min_atr_frac=float(params.get("min_atr_frac",0.0))
-    k_fail=float(params.get("k_fail",0.25))
+def _ok_df(df: pd.DataFrame, need_len: int = 100) -> bool:
+    return (
+        isinstance(df, pd.DataFrame) and
+        NEED_COLS.issubset(df.columns) and
+        len(df) >= need_len and
+        not df.tail(2).isna().any().any()
+    )
 
-    results: List[Dict[str,Any]]=[]
+def _ema(s: pd.Series, n: int) -> pd.Series:
+    return s.ewm(span=int(n), adjust=False).mean()
+
+def _atr(df: pd.DataFrame, n: int) -> pd.Series:
+    h, l, c = df["high"], df["low"], df["close"]
+    prev_c = c.shift(1)
+    tr = pd.concat([(h-l), (h-prev_c).abs(), (l-prev_c).abs()], axis=1).max(axis=1)
+    return tr.rolling(int(n)).mean()
+
+def _in_pos(positions: Dict[str, float], sym: str) -> bool:
+    try: return float(positions.get(sym, 0.0)) > 0.0
+    except Exception: return False
+
+def run(df_map: Dict[str, pd.DataFrame], params: Dict[str, Any], positions: Dict[str, float]) -> List[Dict[str, Any]]:
+    breakout_len = int(params.get("breakout_len", 20))
+    ema_len      = int(params.get("ema_len", 20))
+    atr_len      = int(params.get("atr_len", 14))
+    k_fail       = float(params.get("k_fail", 0.0))  # percentage pullback tolerated after breakout (0..0.2)
+
+    out: List[Dict[str, Any]] = []
+
+    need_len = max(breakout_len + 5, ema_len + 5, atr_len + 5, 100)
+
     for sym, df in df_map.items():
-        if not _ok_df(df): results.append({"symbol":sym,"action":"flat","reason":"insufficient_data"}); continue
-        df=df.sort_index()
-        if df.tail(2).isna().any().any(): results.append({"symbol":sym,"action":"flat","reason":"nan_tail"}); continue
+        if not _ok_df(df, need_len=need_len):
+            out.append({"symbol": sym, "action": "flat", "reason": "insufficient_data"})
+            continue
 
-        close=df["close"]; vol=df["volume"]
-        roll = df["high"].rolling(breakout_len).max()
-        if len(roll)<2 or pd.isna(roll.iloc[-2]):
-            results.append({"symbol":sym,"action":"flat","reason":"warming_up"}); continue
-        hh = roll.iloc[-2]
+        df = df.sort_index()
+        c = df["close"]
+        ema = _ema(c, ema_len)
+        atr = _atr(df, atr_len)
 
-        ema_now=_ema(close,ema_len).iloc[-1]; atr_now=_atr(df,atr_len).iloc[-1]
-        if pd.isna(ema_now) or pd.isna(atr_now):
-            results.append({"symbol":sym,"action":"flat","reason":"warming_up"}); continue
+        # Prior highest high
+        hh_prev = df["high"].rolling(breakout_len).max().iloc[-2]
+        c_prev, c_now = float(c.iloc[-2]), float(c.iloc[-1])
+        ema_now = float(ema.iloc[-1])
 
-        c = close.iloc[-1]
-        ema_ok = (c > ema_now) if use_ema_filter else True
-        if use_vol:
-            if len(vol)<vol_sma_len+1: vol_ok=False
-            else: vol_ok = vol.iloc[-1] > _sma(vol,vol_sma_len).iloc[-1]
-        else:
-            vol_ok=True
-        atr_ok = True if min_atr_frac<=0 else ((atr_now / max(c,1e-9)) >= min_atr_frac)
-
-        have=_in_pos(positions,sym)
+        have = _in_pos(positions, sym)
 
         if have:
-            if k_fail>=0 and c <= (hh - k_fail*atr_now):
-                results.append({"symbol":sym,"action":"sell","reason":"failed_breakout"}); continue
-            if c < ema_now:
-                results.append({"symbol":sym,"action":"sell","reason":f"ema_cross_down_{ema_len}"}); continue
-            results.append({"symbol":sym,"action":"flat","reason":"hold_in_pos"}); continue
+            # Exit if failed breakout (price back below hh_prev by k_fail fraction) or close below EMA
+            fail_line = hh_prev * (1 - abs(k_fail))
+            if (k_fail > 0 and c_now < fail_line) or (c_now < ema_now):
+                reason = "failed_breakout" if (k_fail > 0 and c_now < fail_line) else "ema_break"
+                out.append({"symbol": sym, "action": "sell", "reason": reason})
+                continue
+            out.append({"symbol": sym, "action": "flat", "reason": "hold_in_pos"})
+            continue
 
-        broke_out = c > hh
-        if broke_out and ema_ok and vol_ok and atr_ok:
-            results.append({"symbol":sym,"action":"buy","reason":f"breakout_{breakout_len}"+("_ema_ok" if use_ema_filter else "")+("_vol_ok" if use_vol else "")})
+        # Entry: breakout + above EMA
+        if (c_prev <= hh_prev) and (c_now > hh_prev) and (c_now > ema_now):
+            out.append({"symbol": sym, "action": "buy", "reason": "hh_breakout"})
         else:
-            bits=[]
-            if not broke_out: bits.append("no_break")
-            if use_ema_filter and not ema_ok: bits.append("ema_fail")
-            if use_vol and not vol_ok: bits.append("vol_fail")
-            if min_atr_frac>0 and not atr_ok: bits.append("atr_frac_fail")
-            results.append({"symbol":sym,"action":"flat","reason":" & ".join(bits) if bits else "no_signal"})
+            out.append({"symbol": sym, "action": "flat", "reason": "no_signal"})
 
-    return results
+    return out

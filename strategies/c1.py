@@ -1,19 +1,23 @@
-# strategies/c1.py — v1.9.3
-# Crypto analog of S1 (VWAP + EMA slope + sigma band) with stateless exits.
-# Signature: run(df_map, params, positions) -> List[{symbol, action, reason}]
-
+# strategies/c1.py — v1.9.4
+# VWAP + EMA slope pullback/confirmation. Stateless exits on EMA cross-down.
 from __future__ import annotations
 from typing import Dict, Any, List
-import pandas as pd
 import numpy as np
+import pandas as pd
 
 NAME = "c1"
-VERSION = "1.9.3"
+VERSION = "1.9.4"
 
 # ---------- helpers ----------
-def _ok_df(df: pd.DataFrame) -> bool:
-    need = {"open","high","low","close","volume"}
-    return isinstance(df, pd.DataFrame) and need.issubset(df.columns) and len(df) >= 60
+NEED_COLS = {"open","high","low","close","volume"}
+
+def _ok_df(df: pd.DataFrame, need_len: int = 60) -> bool:
+    return (
+        isinstance(df, pd.DataFrame) and
+        NEED_COLS.issubset(df.columns) and
+        len(df) >= need_len and
+        not df.tail(2).isna().any().any()
+    )
 
 def _ema(s: pd.Series, n: int) -> pd.Series:
     return s.ewm(span=int(n), adjust=False).mean()
@@ -22,7 +26,6 @@ def _vwap(df: pd.DataFrame) -> pd.Series:
     tp = (df["high"] + df["low"] + df["close"]) / 3.0
     vol = df["volume"].replace(0, np.nan)
     vwap = (tp * vol).cumsum() / vol.cumsum()
-    # FutureWarning-safe forward fill:
     return vwap.ffill().fillna(df["close"])
 
 def _zscore(series: pd.Series, window: int) -> pd.Series:
@@ -35,10 +38,8 @@ def _cross_dn(x_prev, x_now, y_prev, y_now) -> bool:
     return (x_prev > y_prev) and (x_now <= y_now)
 
 def _in_pos(positions: Dict[str, float], sym: str) -> bool:
-    try:
-        return float(positions.get(sym, 0.0)) > 0.0
-    except Exception:
-        return False
+    try: return float(positions.get(sym, 0.0)) > 0.0
+    except Exception: return False
 
 # ---------- main ----------
 def run(df_map: Dict[str, pd.DataFrame], params: Dict[str, Any], positions: Dict[str, float]) -> List[Dict[str, Any]]:
@@ -50,15 +51,11 @@ def run(df_map: Dict[str, pd.DataFrame], params: Dict[str, Any], positions: Dict
     out: List[Dict[str, Any]] = []
 
     for sym, df in df_map.items():
-        if not _ok_df(df):
+        if not _ok_df(df, need_len=max(ema_len, 60)):
             out.append({"symbol": sym, "action": "flat", "reason": "insufficient_data"})
             continue
 
         df = df.sort_index()
-        if df.tail(2).isna().any().any():
-            out.append({"symbol": sym, "action": "flat", "reason": "nan_tail"})
-            continue
-
         ema = _ema(df["close"], ema_len)
         ema_slope = ema - ema.shift(1)
         vwap = _vwap(df)
@@ -73,7 +70,7 @@ def run(df_map: Dict[str, pd.DataFrame], params: Dict[str, Any], positions: Dict
         c_prev, c_now = df["close"].iloc[-2], df["close"].iloc[-1]
         vw_prev, vw_now = vwap.iloc[-2], vwap.iloc[-1]
         ema_prev, ema_now = ema.iloc[-2], ema.iloc[-1]
-        slope_now = ema_slope.iloc[-1]
+        slope_now = float(ema_slope.iloc[-1])
 
         crossed_up = (c_prev < vw_prev) and (c_now > vw_now)
         ema_slope_ok = (slope_now >= ema_slope_min)
@@ -94,9 +91,6 @@ def run(df_map: Dict[str, pd.DataFrame], params: Dict[str, Any], positions: Dict
             reason = "entry_reversion" if (crossed_up and ema_slope_ok) else "entry_trend"
             out.append({"symbol": sym, "action": "buy", "reason": reason})
         else:
-            why = []
-            if not (crossed_up or trend_ok): why.append("no_vwap_signal")
-            if not ema_slope_ok: why.append("slope_fail")
-            out.append({"symbol": sym, "action": "flat", "reason": "no_signal" if not why else " & ".join(why)})
+            out.append({"symbol": sym, "action": "flat", "reason": "no_signal"})
 
     return out
