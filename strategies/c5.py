@@ -4,9 +4,10 @@ from __future__ import annotations
 import os, time
 from typing import Any, Dict, List
 import requests
+import broker as br
 
 STRATEGY_NAME="c5"
-STRATEGY_VERSION="1.2.0"
+STRATEGY_VERSION="1.2.1"
 
 ALPACA_TRADE_HOST=os.getenv("ALPACA_TRADE_HOST","https://paper-api.alpaca.markets")
 ALPACA_DATA_HOST =os.getenv("ALPACA_DATA_HOST","https://data.alpaca.markets")
@@ -18,20 +19,18 @@ def _hdr():
     return {"APCA-API-KEY-ID":ALPACA_KEY_ID,"APCA-API-SECRET-KEY":ALPACA_SECRET_KEY,"Accept":"application/json","Content-Type":"application/json"}
 def _sym(s): return s.replace("/","")
 
-def _bars(symbol, timeframe, limit):
-    if not _hdr(): return []
+def _bars(symbol: str, timeframe: str, limit: int) -> List[Dict[str,Any]]:
     try:
-        r=requests.get(f"{ALPACA_DATA_HOST}/v1beta3/crypto/us/bars",headers=_hdr(),
-                       params={"symbols":_sym(symbol),"timeframe":timeframe,"limit":limit,"feed":"us"},timeout=20)
-        return r.json().get("bars",{}).get(_sym(symbol),[]) if r.status_code==200 else []
-    except Exception: return []
+        m = br.get_bars(symbol, timeframe=timeframe, limit=limit)
+        return m.get(symbol, [])
+    except Exception:
+        return []
 
-def _positions():
-    if not _hdr(): return []
+def _positions() -> List[Dict[str,Any]]:
     try:
-        r=requests.get(f"{ALPACA_TRADE_HOST}/v2/positions",headers=_hdr(),timeout=20)
-        return r.json() if r.status_code==200 else []
-    except Exception: return []
+        return br.list_positions()
+    except Exception:
+        return []
 
 def _has_long(symbol):
     sym=_sym(symbol)
@@ -40,14 +39,11 @@ def _has_long(symbol):
             return p
     return None
 
-def _place(symbol, side, notional, client_id):
-    if not _hdr(): return {"error":"no_alpaca_creds"}
-    payload={"symbol":_sym(symbol),"side":side,"type":"market","time_in_force":"ioc","notional":str(notional),"client_order_id":client_id}
+def _place(symbol: str, side: str, notional: float, client_id: str) -> Dict[str,Any]:
     try:
-        r=requests.post(f"{ALPACA_TRADE_HOST}/v2/orders",headers=_hdr(),json=payload,timeout=20)
-        return r.json() if r.status_code in (200,201) else {"error":f"order_http_{r.status_code}","details":r.text}
-    except Exception as e:
-        return {"error":"order_exc","details":str(e)}
+        return br.place_order(symbol, side, notional, client_id)
+    except Exception as ex:
+        return {"error": str(ex)}
 
 def _ema(vals, n):
     if not vals: return []

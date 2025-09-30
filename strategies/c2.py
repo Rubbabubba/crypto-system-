@@ -3,10 +3,11 @@
 from __future__ import annotations
 import os, time
 from typing import Any, Dict, List
-import requests, math
+import requests
+import broker as br, math
 
 STRATEGY_NAME = "c2"
-STRATEGY_VERSION = "1.3.0"
+STRATEGY_VERSION = "1.3.1"
 
 ALPACA_TRADE_HOST = os.getenv("ALPACA_TRADE_HOST", "https://paper-api.alpaca.markets")
 ALPACA_DATA_HOST  = os.getenv("ALPACA_DATA_HOST",  "https://data.alpaca.markets")
@@ -20,21 +21,15 @@ def _hdr():
 def _sym(s:str)->str: return s.replace("/","")
 
 def _bars(symbol: str, timeframe: str, limit: int) -> List[Dict[str,Any]]:
-    if not _hdr(): return []
-    url = f"{ALPACA_DATA_HOST}/v1beta3/crypto/us/bars"
-    params = {"symbols": _sym(symbol), "timeframe": timeframe, "limit": limit, "feed":"us"}
     try:
-        r = requests.get(url, headers=_hdr(), params=params, timeout=20)
-        if r.status_code != 200: return []
-        return r.json().get("bars",{}).get(_sym(symbol),[])
+        m = br.get_bars(symbol, timeframe=timeframe, limit=limit)
+        return m.get(symbol, [])
     except Exception:
         return []
 
 def _positions() -> List[Dict[str,Any]]:
-    if not _hdr(): return []
     try:
-        r = requests.get(f"{ALPACA_TRADE_HOST}/v2/positions", headers=_hdr(), timeout=20)
-        return r.json() if r.status_code == 200 else []
+        return br.list_positions()
     except Exception:
         return []
 
@@ -46,13 +41,10 @@ def _has_long(symbol: str):
     return None
 
 def _place(symbol: str, side: str, notional: float, client_id: str) -> Dict[str,Any]:
-    if not _hdr(): return {"error":"no_alpaca_creds"}
-    payload = {"symbol": _sym(symbol),"side":side,"type":"market","time_in_force":"ioc","notional":str(notional),"client_order_id":client_id}
     try:
-        r = requests.post(f"{ALPACA_TRADE_HOST}/v2/orders", headers=_hdr(), json=payload, timeout=20)
-        return r.json() if r.status_code in (200,201) else {"error": f"order_http_{r.status_code}", "details": r.text}
-    except Exception as e:
-        return {"error":"order_exc","details":str(e)}
+        return br.place_order(symbol, side, notional, client_id)
+    except Exception as ex:
+        return {"error": str(ex)}
 
 def _rsi(closes: List[float], n: int=14) -> List[float]:
     if len(closes) < n+1: return []
