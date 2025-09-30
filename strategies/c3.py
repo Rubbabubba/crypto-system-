@@ -1,83 +1,63 @@
-# strategies/c3.py — v1.9.4
-# MA crossover (default EMA 13/34). Exit on cross-down or ATR stop below slow MA.
+# strategies/c3.py
+# ============================================================
+# Strategy: Donchian Channel Breakout (Position-aware)
+# Version: 1.3.0  (2025-09-29)
+# ============================================================
+
 from __future__ import annotations
-from typing import Dict, Any, List
-import numpy as np
+import typing as T
 import pandas as pd
 
-NAME = "c3"
-VERSION = "1.9.4"
+STRAT_ID = "c3"
+STRAT_VERSION = "1.3.0"
 
-NEED_COLS = {"open","high","low","close","volume"}
+def _donchian(df: pd.DataFrame, n: int):
+    hh = df["high"].rolling(n, min_periods=n).max()
+    ll = df["low"].rolling(n, min_periods=n).min()
+    return hh, ll
 
-def _ok_df(df: pd.DataFrame, need_len: int = 60) -> bool:
-    return (
-        isinstance(df, pd.DataFrame) and
-        NEED_COLS.issubset(df.columns) and
-        len(df) >= need_len and
-        not df.tail(2).isna().any().any()
-    )
+def _gate(symbol: str, desired: str, reason: str, params: dict) -> tuple[str, str]:
+    pos = (params or {}).get("positions", {}).get(symbol)
+    allow_add = bool((params or {}).get("allow_add", False))
+    allow_conf = bool((params or {}).get("allow_conflicts", False))
+    allow_shorts = bool((params or {}).get("allow_shorts", False))
+    held_action = (params or {}).get("held_action", "flat")
+    if not pos:
+        if desired == "sell" and not allow_shorts:
+            return "flat", "no_shorts"
+        return desired, reason
+    holder = pos.get("strategy")
+    side = pos.get("side", "long")
+    if side == "long":
+        if holder and holder != STRAT_ID and not allow_conf:
+            return (held_action if held_action in ("flat","note") else "flat", f"held_by_{holder}")
+        if holder == STRAT_ID:
+            return ("sell", reason) if desired == "sell" else (("buy", reason) if allow_add else ("flat","hold_in_pos"))
+        return (desired, reason) if allow_conf else ("flat", f"held_by_{holder or 'unknown'}")
+    return "flat", "unsupported_short_state"
 
-def _ema(s: pd.Series, n: int) -> pd.Series:
-    return s.ewm(span=int(n), adjust=False).mean()
+def _decide_one(df: pd.DataFrame, params: dict):
+    if df is None or df.empty:
+        return "flat", "no_data"
+    n = int(params.get("don_n", 20))
+    if df.shape[0] < n + 1:
+        return "flat", "insufficient_bars"
+    hh, ll = _donchian(df, n)
+    cl = df["close"].iloc[-1]
+    if cl > hh.iloc[-1]:
+        return "buy", "breakout_up"
+    if cl < ll.iloc[-1]:
+        return "sell", "breakout_down"
+    return "flat", "hold_in_pos"
 
-def _sma(s: pd.Series, n: int) -> pd.Series:
-    return s.rolling(int(n)).mean()
-
-def _atr(df: pd.DataFrame, n: int) -> pd.Series:
-    h, l, c = df["high"], df["low"], df["close"]
-    prev_c = c.shift(1)
-    tr = pd.concat([(h-l), (h-prev_c).abs(), (l-prev_c).abs()], axis=1).max(axis=1)
-    return tr.rolling(int(n)).mean()
-
-def _in_pos(positions: Dict[str, float], sym: str) -> bool:
-    try: return float(positions.get(sym, 0.0)) > 0.0
-    except Exception: return False
-
-def run(df_map: Dict[str, pd.DataFrame], params: Dict[str, Any], positions: Dict[str, float]) -> List[Dict[str, Any]]:
-    ma1_type = str(params.get("ma_fast_type", params.get("ma1_type", "EMA"))).upper()
-    ma2_type = str(params.get("ma_slow_type", params.get("ma2_type", "EMA"))).upper()
-    ma_fast  = int(params.get("ma_fast", params.get("ma1_len", 13)))
-    ma_slow  = int(params.get("ma_slow", params.get("ma2_len", 34)))
-    atr_len  = int(params.get("atr_len", 14))
-    atr_mult = float(params.get("atr_mult", 1.0))
-
-    out: List[Dict[str, Any]] = []
-
-    need_len = max(ma_slow + 5, atr_len + 5, 60)
-
-    def _ma(series: pd.Series, t: str, n: int) -> pd.Series:
-        return _ema(series, n) if t == "EMA" else _sma(series, n)
-
-    for sym, df in df_map.items():
-        if not _ok_df(df, need_len=need_len):
-            out.append({"symbol": sym, "action": "flat", "reason": "insufficient_data"})
-            continue
-
-        df = df.sort_index()
-        f = _ma(df["close"], ma1_type, ma_fast)
-        s = _ma(df["close"], ma2_type, ma_slow)
-        atr = _atr(df, atr_len)
-
-        f_prev, f_now = f.iloc[-2], f.iloc[-1]
-        s_prev, s_now = s.iloc[-2], s.iloc[-1]
-        c_now = df["close"].iloc[-1]
-        atr_now = float(atr.iloc[-1])
-
-        have = _in_pos(positions, sym)
-        stop_line = s_now - atr_mult * atr_now
-
-        if have:
-            if (f_prev > s_prev and f_now <= s_now) or (atr_mult > 0 and c_now < stop_line):
-                reason = "ma_cross_down" if (f_prev > s_prev and f_now <= s_now) else "atr_stop"
-                out.append({"symbol": sym, "action": "sell", "reason": reason})
-                continue
-            out.append({"symbol": sym, "action": "flat", "reason": "hold_in_pos"})
-            continue
-
-        if f_prev <= s_prev and f_now > s_now:
-            out.append({"symbol": sym, "action": "buy", "reason": "ma_cross_up"})
-        else:
-            out.append({"symbol": sym, "action": "flat", "reason": "no_signal"})
-
-    return out
+def run(df_map: T.Dict[str, pd.DataFrame], params: dict) -> dict:
+    decisions = []
+    p = params or {}
+    for sym, df in (df_map or {}).items():
+        try:
+            desired, reason = _decide_one(df, p)
+            action, gated_reason = _gate(sym, desired, reason, p)
+        except Exception as e:
+            action, gated_reason = "flat", f"error:{e}"
+        decisions.append({"symbol": sym, "action": action, "reason": gated_reason})
+    return {"strategy": STRAT_ID, "version": STRAT_VERSION, "decisions": decisions}

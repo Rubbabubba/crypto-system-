@@ -1,77 +1,66 @@
-# strategies/c5.py — v1.9.4
-# Highest-high breakout with EMA/ATR context. Exit on failed breakout or close<EMA.
+# strategies/c5.py
+# ============================================================
+# Strategy: Trend Pullback Re-entry (Position-aware)
+# Version: 1.3.0  (2025-09-29)
+# ============================================================
+
 from __future__ import annotations
-from typing import Dict, Any, List
-import numpy as np
+import typing as T
 import pandas as pd
 
-NAME = "c5"
-VERSION = "1.9.4"
+STRAT_ID = "c5"
+STRAT_VERSION = "1.3.0"
 
-NEED_COLS = {"open","high","low","close","volume"}
+def _ema(s, n): return s.ewm(span=int(n), adjust=False).mean()
 
-def _ok_df(df: pd.DataFrame, need_len: int = 100) -> bool:
-    return (
-        isinstance(df, pd.DataFrame) and
-        NEED_COLS.issubset(df.columns) and
-        len(df) >= need_len and
-        not df.tail(2).isna().any().any()
-    )
+def _gate(symbol: str, desired: str, reason: str, params: dict) -> tuple[str, str]:
+    pos = (params or {}).get("positions", {}).get(symbol)
+    allow_add = bool((params or {}).get("allow_add", False))
+    allow_conf = bool((params or {}).get("allow_conflicts", False))
+    allow_shorts = bool((params or {}).get("allow_shorts", False))
+    held_action = (params or {}).get("held_action", "flat")
+    if not pos:
+        if desired == "sell" and not allow_shorts:
+            return "flat", "no_shorts"
+        return desired, reason
+    holder = pos.get("strategy")
+    side = pos.get("side", "long")
+    if side == "long":
+        if holder and holder != STRAT_ID and not allow_conf:
+            return (held_action if held_action in ("flat","note") else "flat", f"held_by_{holder}")
+        if holder == STRAT_ID:
+            return ("sell", reason) if desired == "sell" else (("buy", reason) if allow_add else ("flat","hold_in_pos"))
+        return (desired, reason) if allow_conf else ("flat", f"held_by_{holder or 'unknown'}")
+    return "flat", "unsupported_short_state"
 
-def _ema(s: pd.Series, n: int) -> pd.Series:
-    return s.ewm(span=int(n), adjust=False).mean()
+def _decide_one(df: pd.DataFrame, params: dict):
+    if df is None or df.empty or df.shape[0] < 210:
+        return "flat", "insufficient_bars"
+    c = df["close"]
+    ema20  = _ema(c, int(params.get("ema_fast", 20)))
+    ema50  = _ema(c, int(params.get("ema_mid", 50)))
+    ema200 = _ema(c, int(params.get("ema_slow", 200)))
 
-def _atr(df: pd.DataFrame, n: int) -> pd.Series:
-    h, l, c = df["high"], df["low"], df["close"]
-    prev_c = c.shift(1)
-    tr = pd.concat([(h-l), (h-prev_c).abs(), (l-prev_c).abs()], axis=1).max(axis=1)
-    return tr.rolling(int(n)).mean()
+    c1, c2  = c.iloc[-2], c.iloc[-1]
+    e201, e202 = ema20.iloc[-2], ema20.iloc[-1]
+    e502, e2002 = ema50.iloc[-1], ema200.iloc[-1]
 
-def _in_pos(positions: Dict[str, float], sym: str) -> bool:
-    try: return float(positions.get(sym, 0.0)) > 0.0
-    except Exception: return False
+    if e502 > e2002:
+        if (c1 < e201) and (c2 > e202):
+            return "buy", "uptrend_recross_ema20"
+    if e502 < e2002:
+        if (c1 > e201) and (c2 < e202):
+            return "sell", "downtrend_recross_ema20"
+    return "flat", "hold_in_pos"
 
-def run(df_map: Dict[str, pd.DataFrame], params: Dict[str, Any], positions: Dict[str, float]) -> List[Dict[str, Any]]:
-    breakout_len = int(params.get("breakout_len", 20))
-    ema_len      = int(params.get("ema_len", 20))
-    atr_len      = int(params.get("atr_len", 14))
-    k_fail       = float(params.get("k_fail", 0.0))  # percentage pullback tolerated after breakout (0..0.2)
-
-    out: List[Dict[str, Any]] = []
-
-    need_len = max(breakout_len + 5, ema_len + 5, atr_len + 5, 100)
-
-    for sym, df in df_map.items():
-        if not _ok_df(df, need_len=need_len):
-            out.append({"symbol": sym, "action": "flat", "reason": "insufficient_data"})
-            continue
-
-        df = df.sort_index()
-        c = df["close"]
-        ema = _ema(c, ema_len)
-        atr = _atr(df, atr_len)
-
-        # Prior highest high
-        hh_prev = df["high"].rolling(breakout_len).max().iloc[-2]
-        c_prev, c_now = float(c.iloc[-2]), float(c.iloc[-1])
-        ema_now = float(ema.iloc[-1])
-
-        have = _in_pos(positions, sym)
-
-        if have:
-            # Exit if failed breakout (price back below hh_prev by k_fail fraction) or close below EMA
-            fail_line = hh_prev * (1 - abs(k_fail))
-            if (k_fail > 0 and c_now < fail_line) or (c_now < ema_now):
-                reason = "failed_breakout" if (k_fail > 0 and c_now < fail_line) else "ema_break"
-                out.append({"symbol": sym, "action": "sell", "reason": reason})
-                continue
-            out.append({"symbol": sym, "action": "flat", "reason": "hold_in_pos"})
-            continue
-
-        # Entry: breakout + above EMA
-        if (c_prev <= hh_prev) and (c_now > hh_prev) and (c_now > ema_now):
-            out.append({"symbol": sym, "action": "buy", "reason": "hh_breakout"})
-        else:
-            out.append({"symbol": sym, "action": "flat", "reason": "no_signal"})
-
-    return out
+def run(df_map: T.Dict[str, pd.DataFrame], params: dict) -> dict:
+    decisions = []
+    p = params or {}
+    for sym, df in (df_map or {}).items():
+        try:
+            desired, reason = _decide_one(df, p)
+            action, gated_reason = _gate(sym, desired, reason, p)
+        except Exception as e:
+            action, gated_reason = "flat", f"error:{e}"
+        decisions.append({"symbol": sym, "action": action, "reason": gated_reason})
+    return {"strategy": STRAT_ID, "version": STRAT_VERSION, "decisions": decisions}

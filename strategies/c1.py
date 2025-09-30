@@ -1,96 +1,99 @@
-# strategies/c1.py — v1.9.4
-# VWAP + EMA slope pullback/confirmation. Stateless exits on EMA cross-down.
+# strategies/c1.py
+# ============================================================
+# Strategy: EMA Trend + VWAP Filter (Position-aware)
+# Version: 1.4.0  (2025-09-29)
+# ------------------------------------------------------------
+# Logic:
+#   • BUY when fast EMA > slow EMA AND close > rolling VWAP.
+#   • SELL when fast EMA < slow EMA AND close < rolling VWAP.
+# Position awareness (via params["positions"]):
+#   • Flat: allow BUY; SELL only if allow_shorts.
+#   • Long owned by c1: allow SELL exit; BUY only if allow_add.
+#   • Long owned by another strategy: suppress unless allow_conflicts.
+# ============================================================
+
 from __future__ import annotations
-from typing import Dict, Any, List
-import numpy as np
+import typing as T
 import pandas as pd
 
-NAME = "c1"
-VERSION = "1.9.4"
-
-# ---------- helpers ----------
-NEED_COLS = {"open","high","low","close","volume"}
-
-def _ok_df(df: pd.DataFrame, need_len: int = 60) -> bool:
-    return (
-        isinstance(df, pd.DataFrame) and
-        NEED_COLS.issubset(df.columns) and
-        len(df) >= need_len and
-        not df.tail(2).isna().any().any()
-    )
+STRAT_ID = "c1"
+STRAT_VERSION = "1.4.0"
 
 def _ema(s: pd.Series, n: int) -> pd.Series:
     return s.ewm(span=int(n), adjust=False).mean()
 
-def _vwap(df: pd.DataFrame) -> pd.Series:
+def _rolling_vwap(df: pd.DataFrame, win: int) -> pd.Series:
     tp = (df["high"] + df["low"] + df["close"]) / 3.0
-    vol = df["volume"].replace(0, np.nan)
-    vwap = (tp * vol).cumsum() / vol.cumsum()
-    return vwap.ffill().fillna(df["close"])
+    pv = tp * df["volume"]
+    v = df["volume"].rolling(win, min_periods=1).sum()
+    out = (pv.rolling(win, min_periods=1).sum()) / v
+    return out.ffill().bfill()
 
-def _zscore(series: pd.Series, window: int) -> pd.Series:
-    r = series.rolling(window)
-    m = r.mean()
-    sd = r.std(ddof=0)
-    return (series - m) / sd.replace(0, np.nan)
+def _gate(symbol: str, desired: str, reason: str, params: dict) -> tuple[str, str]:
+    # desired: "buy" | "sell" as produced by the raw signal
+    pos = (params or {}).get("positions", {}).get(symbol)
+    allow_add = bool((params or {}).get("allow_add", False))
+    allow_conf = bool((params or {}).get("allow_conflicts", False))
+    allow_shorts = bool((params or {}).get("allow_shorts", False))
+    held_action = (params or {}).get("held_action", "flat")
 
-def _cross_dn(x_prev, x_now, y_prev, y_now) -> bool:
-    return (x_prev > y_prev) and (x_now <= y_now)
+    if not pos:
+        if desired == "sell" and not allow_shorts:
+            return "flat", "no_shorts"
+        return desired, reason
 
-def _in_pos(positions: Dict[str, float], sym: str) -> bool:
-    try: return float(positions.get(sym, 0.0)) > 0.0
-    except Exception: return False
+    holder = pos.get("strategy")
+    side = pos.get("side", "long")
 
-# ---------- main ----------
-def run(df_map: Dict[str, pd.DataFrame], params: Dict[str, Any], positions: Dict[str, float]) -> List[Dict[str, Any]]:
-    ema_len         = int(params.get("ema_len", 20))
-    ema_slope_min   = float(params.get("ema_slope_min", 0.0))
-    vwap_sigma      = float(params.get("vwap_sigma", 1.0))
-    band_lookback   = int(params.get("band_lookback", 10))
-
-    out: List[Dict[str, Any]] = []
-
-    for sym, df in df_map.items():
-        if not _ok_df(df, need_len=max(ema_len, 60)):
-            out.append({"symbol": sym, "action": "flat", "reason": "insufficient_data"})
-            continue
-
-        df = df.sort_index()
-        ema = _ema(df["close"], ema_len)
-        ema_slope = ema - ema.shift(1)
-        vwap = _vwap(df)
-        dev = df["close"] - vwap
-        z = _zscore(dev, max(20, ema_len))
-        lower_touch = z <= -abs(vwap_sigma)
-
-        idx_last = len(df) - 1
-        start = max(0, idx_last - band_lookback)
-        touched_recent = bool(lower_touch.iloc[start:idx_last+1].any())
-
-        c_prev, c_now = df["close"].iloc[-2], df["close"].iloc[-1]
-        vw_prev, vw_now = vwap.iloc[-2], vwap.iloc[-1]
-        ema_prev, ema_now = ema.iloc[-2], ema.iloc[-1]
-        slope_now = float(ema_slope.iloc[-1])
-
-        crossed_up = (c_prev < vw_prev) and (c_now > vw_now)
-        ema_slope_ok = (slope_now >= ema_slope_min)
-        trend_ok = (c_now > vw_now) and ema_slope_ok and touched_recent
-
-        have = _in_pos(positions, sym)
-
-        # Exits first
-        if have:
-            if _cross_dn(c_prev, c_now, ema_prev, ema_now):
-                out.append({"symbol": sym, "action": "sell", "reason": "ema_cross_down"})
-                continue
-            out.append({"symbol": sym, "action": "flat", "reason": "hold_in_pos"})
-            continue
-
-        # Entries
-        if (crossed_up and ema_slope_ok) or trend_ok:
-            reason = "entry_reversion" if (crossed_up and ema_slope_ok) else "entry_trend"
-            out.append({"symbol": sym, "action": "buy", "reason": reason})
+    # Only long support by default
+    if side == "long":
+        if holder and holder != STRAT_ID and not allow_conf:
+            return (held_action if held_action in ("flat", "note") else "flat",
+                    f"held_by_{holder}")
+        if holder == STRAT_ID:
+            # We own it
+            if desired == "sell":
+                return "sell", reason
+            # desired == buy
+            return ("buy", reason) if allow_add else ("flat", "hold_in_pos")
         else:
-            out.append({"symbol": sym, "action": "flat", "reason": "no_signal"})
+            # Held by another or unknown owner
+            if desired == "sell":
+                # If we don't own it, don't force exit by default
+                return ("sell", reason) if allow_conf else ("flat", f"held_by_{holder or 'unknown'}")
+            else:
+                return ("buy", reason) if allow_conf else ("flat", f"held_by_{holder or 'unknown'}")
 
-    return out
+    # If side == "short" and you want support, add logic here. Default: do nothing.
+    return "flat", "unsupported_short_state"
+
+def _decide_one(df: pd.DataFrame, params: dict) -> tuple[str, str]:
+    if df is None or df.empty or df.shape[0] < 50:
+        return "flat", "no_data"
+    fast = int(params.get("ema_fast", 12))
+    slow = int(params.get("ema_slow", 26))
+    vwin = int(params.get("vwap_win", 50))
+
+    c = df["close"]
+    ema_f = _ema(c, fast)
+    ema_s = _ema(c, slow)
+    vwap = _rolling_vwap(df, vwin)
+
+    cl = c.iloc[-1]
+    if ema_f.iloc[-1] > ema_s.iloc[-1] and cl > vwap.iloc[-1]:
+        return "buy", "trend_up_and_above_vwap"
+    if ema_f.iloc[-1] < ema_s.iloc[-1] and cl < vwap.iloc[-1]:
+        return "sell", "trend_down_and_below_vwap"
+    return "flat", "hold_in_pos"
+
+def run(df_map: T.Dict[str, pd.DataFrame], params: dict) -> dict:
+    decisions = []
+    p = params or {}
+    for sym, df in (df_map or {}).items():
+        try:
+            desired, reason = _decide_one(df, p)
+            action, gated_reason = _gate(sym, desired, reason, p)
+        except Exception as e:
+            action, gated_reason = "flat", f"error:{e}"
+        decisions.append({"symbol": sym, "action": action, "reason": gated_reason})
+    return {"strategy": STRAT_ID, "version": STRAT_VERSION, "decisions": decisions}

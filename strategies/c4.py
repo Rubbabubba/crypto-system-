@@ -1,87 +1,71 @@
-# strategies/c4.py — v1.9.4
-# Volume “bubble” breakout. Entry on break above bubble high with volume context; exit on failed breakout or ATR stop.
+# strategies/c4.py
+# ============================================================
+# Strategy: Failed Breakout Reversal (Position-aware)
+# Version: 1.3.0  (2025-09-29)
+# ============================================================
+
 from __future__ import annotations
-from typing import Dict, Any, List
-import numpy as np
+import typing as T
 import pandas as pd
 
-NAME = "c4"
-VERSION = "1.9.4"
+STRAT_ID = "c4"
+STRAT_VERSION = "1.3.0"
 
-NEED_COLS = {"open","high","low","close","volume"}
+def _don(df: pd.DataFrame, n: int):
+    hh = df["high"].rolling(n, min_periods=n).max()
+    ll = df["low"].rolling(n, min_periods=n).min()
+    return hh, ll
 
-def _ok_df(df: pd.DataFrame, need_len: int = 120) -> bool:
-    return (
-        isinstance(df, pd.DataFrame) and
-        NEED_COLS.issubset(df.columns) and
-        len(df) >= need_len and
-        not df.tail(2).isna().any().any()
-    )
+def _gate(symbol: str, desired: str, reason: str, params: dict) -> tuple[str, str]:
+    pos = (params or {}).get("positions", {}).get(symbol)
+    allow_add = bool((params or {}).get("allow_add", False))
+    allow_conf = bool((params or {}).get("allow_conflicts", False))
+    allow_shorts = bool((params or {}).get("allow_shorts", False))
+    held_action = (params or {}).get("held_action", "flat")
+    if not pos:
+        if desired == "sell" and not allow_shorts:
+            return "flat", "no_shorts"
+        return desired, reason
+    holder = pos.get("strategy")
+    side = pos.get("side", "long")
+    if side == "long":
+        if holder and holder != STRAT_ID and not allow_conf:
+            return (held_action if held_action in ("flat","note") else "flat", f"held_by_{holder}")
+        if holder == STRAT_ID:
+            return ("sell", reason) if desired == "sell" else (("buy", reason) if allow_add else ("flat","hold_in_pos"))
+        return (desired, reason) if allow_conf else ("flat", f"held_by_{holder or 'unknown'}")
+    return "flat", "unsupported_short_state"
 
-def _atr(df: pd.DataFrame, n: int) -> pd.Series:
-    h, l, c = df["high"], df["low"], df["close"]
-    prev_c = c.shift(1)
-    tr = pd.concat([(h-l), (h-prev_c).abs(), (l-prev_c).abs()], axis=1).max(axis=1)
-    return tr.rolling(int(n)).mean()
+def _decide_one(df: pd.DataFrame, params: dict):
+    if df is None or df.empty:
+        return "flat", "no_data"
+    n = int(params.get("don_n", 20))
+    if df.shape[0] < n + 2:
+        return "flat", "insufficient_bars"
+    hh, ll = _don(df, n)
+    c = df["close"]
+    c1, c2 = c.iloc[-2], c.iloc[-1]
+    hh1, hh2 = hh.iloc[-2], hh.iloc[-1]
+    ll1, ll2 = ll.iloc[-2], ll.iloc[-1]
 
-def _in_pos(positions: Dict[str, float], sym: str) -> bool:
-    try: return float(positions.get(sym, 0.0)) > 0.0
-    except Exception: return False
+    # Failed breakout up (reversal down -> SELL)
+    if (c1 > hh1) and (c2 <= hh2):
+        return "sell", "failed_breakout"
 
-def run(df_map: Dict[str, pd.DataFrame], params: Dict[str, Any], positions: Dict[str, float]) -> List[Dict[str, Any]]:
-    bars_per_bubble = int(params.get("bars_per_bubble", 60))
-    min_total_vol   = float(params.get("min_total_vol", 0.0))
-    min_delta_frac  = float(params.get("min_delta_frac", 0.30))  # bubble range vs ATR(atr_len)
-    atr_len         = int(params.get("atr_len", 14))
-    atr_mult_stop   = float(params.get("atr_mult_stop", 1.0))
+    # Failed breakdown down (reversal up -> BUY)
+    if (c1 < ll1) and (c2 >= ll2):
+        return "buy", "failed_breakdown"
 
-    out: List[Dict[str, Any]] = []
-    need_len = max(bars_per_bubble + 5, atr_len + 5, 120)
+    return "flat", "hold_in_pos"
 
-    for sym, df in df_map.items():
-        if not _ok_df(df, need_len=need_len):
-            out.append({"symbol": sym, "action": "flat", "reason": "insufficient_data"})
-            continue
-
-        df = df.sort_index()
-        c = df["close"]
-        hwin = df["high"].rolling(bars_per_bubble)
-        lwin = df["low"].rolling(bars_per_bubble)
-        vwin = df["volume"].rolling(bars_per_bubble)
-
-        bubble_high = hwin.max()
-        bubble_low  = lwin.min()
-        bubble_vol  = vwin.sum()
-
-        atr = _atr(df, atr_len)
-
-        bh = float(bubble_high.iloc[-2])  # prior bar bubble high
-        bl = float(bubble_low.iloc[-2])
-        bv = float(bubble_vol.iloc[-2])
-        atr_now = float(atr.iloc[-1])
-
-        c_prev, c_now = float(c.iloc[-2]), float(c.iloc[-1])
-
-        have = _in_pos(positions, sym)
-
-        # Bubble must be "meaningful" vs ATR
-        bubble_range = max(1e-9, bh - bl)
-        meaningful = (atr_now > 0) and ((bubble_range / atr_now) >= min_delta_frac)
-
-        if have:
-            # Exit if failed breakout: close back below prior bubble high; or ATR stop from bubble low
-            stop_line = bl - atr_mult_stop * atr_now
-            if (c_now < bh) or (atr_mult_stop > 0 and c_now < stop_line):
-                reason = "failed_breakout" if (c_now < bh) else "atr_stop"
-                out.append({"symbol": sym, "action": "sell", "reason": reason})
-                continue
-            out.append({"symbol": sym, "action": "flat", "reason": "hold_in_pos"})
-            continue
-
-        # Entry: break above bubble high + volume context + meaningful bubble
-        if meaningful and (bv >= min_total_vol) and (c_prev <= bh) and (c_now > bh):
-            out.append({"symbol": sym, "action": "buy", "reason": "bubble_breakout"})
-        else:
-            out.append({"symbol": sym, "action": "flat", "reason": "no_signal"})
-
-    return out
+def run(df_map: T.Dict[str, pd.DataFrame], params: dict) -> dict:
+    decisions = []
+    p = params or {}
+    for sym, df in (df_map or {}).items():
+        try:
+            desired, reason = _decide_one(df, p)
+            action, gated_reason = _gate(sym, desired, reason, p)
+        except Exception as e:
+            action, gated_reason = "flat", f"error:{e}"
+        decisions.append({"symbol": sym, "action": action, "reason": gated_reason})
+    return {"strategy": STRAT_ID, "version": STRAT_VERSION, "decisions": decisions}
