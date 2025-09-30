@@ -1,5 +1,5 @@
 # app.py — Crypto Trading System "everything" app
-# Version: 1.9.2 (2025-09-30)
+# Version: 1.10.0 (2025-09-30)
 #
 # What’s in this file
 # - Full Flask app with HTML dashboard embedded (mobile-friendly)
@@ -38,6 +38,9 @@ import threading
 import datetime as dt
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
+from services.market_crypto import MarketCrypto
+import broker as br
+
 
 import requests
 from flask import Flask, request, jsonify, Response
@@ -98,42 +101,28 @@ def now_utc_iso() -> str:
 # --------------------------------------------
 # Candles (data) helper
 # --------------------------------------------
+
 def fetch_crypto_bars(symbol: str, timeframe: str, limit: int=600) -> List[Dict[str,Any]]:
     """
-    Returns a list of bars with keys: t,o,h,l,c,v
-    timeframe: e.g. "1Min","5Min","1H","1D"
+    Returns a list of bars with keys: t,o,h,l,c,v using MarketCrypto (Alpaca v1beta3).
+    timeframe: e.g. "1Min","5Min","1Hour","1Day"
     """
-    # Attempt Alpaca Market Data v2 crypto bars
-    # Docs pattern: GET /v1beta3/crypto/us/bars
-    # Fallback: empty if creds missing or request fails
-    hdr = alpaca_headers()
-    if not hdr:
-        return []
-
-    # Normalize: BTC/USD -> BTCUSD
-    sym = symbol.replace("/","")
-    url = f"{ALPACA_DATA_HOST}/v1beta3/crypto/us/bars"
-    params = {
-        "symbols": sym,
-        "timeframe": timeframe,
-        "limit": limit,
-        "feed": "us"
-    }
     try:
-        r = requests.get(url, headers=hdr, params=params, timeout=20)
-        if r.status_code != 200:
+        market = MarketCrypto.from_env()
+        data = market.candles([symbol], timeframe=timeframe, limit=limit)
+        df = data.get(symbol)
+        if df is None or len(df.index) == 0:
             return []
-        js = r.json()
-        data = js.get("bars",{}).get(sym,[])
+        # Convert DataFrame rows to list of dicts matching prior shape
         out = []
-        for b in data:
+        for _, row in df.iterrows():
             out.append({
-                "t": b.get("t"),
-                "o": b.get("o"),
-                "h": b.get("h"),
-                "l": b.get("l"),
-                "c": b.get("c"),
-                "v": b.get("v"),
+                "t": str(row.get("ts")),
+                "o": float(row.get("open") or 0),
+                "h": float(row.get("high") or 0),
+                "l": float(row.get("low") or 0),
+                "c": float(row.get("close") or 0),
+                "v": float(row.get("volume") or 0),
             })
         return out
     except Exception:
@@ -163,35 +152,21 @@ STRAT_MODULES = {
 def alpaca_ok() -> bool:
     return bool(ALPACA_KEY_ID and ALPACA_SECRET_KEY and ALPACA_TRADE_HOST.startswith("http"))
 
+
 def get_positions() -> List[Dict[str,Any]]:
-    if not alpaca_ok():
-        return []
     try:
-        url = f"{ALPACA_TRADE_HOST}/v2/positions"
-        r = requests.get(url, headers=alpaca_headers(), timeout=20)
-        if r.status_code != 200:
-            return []
-        return r.json()
+        return br.list_positions()
     except Exception:
         return []
 
+
+
 def get_recent_orders(status: str="all", limit: int=200) -> List[Dict[str,Any]]:
-    if not alpaca_ok():
-        return []
     try:
-        url = f"{ALPACA_TRADE_HOST}/v2/orders"
-        params = {
-            "status": status, # open, closed, all
-            "limit": limit,
-            "direction": "desc",
-            "nested": "true"
-        }
-        r = requests.get(url, headers=alpaca_headers(), params=params, timeout=20)
-        if r.status_code != 200:
-            return []
-        return r.json()
+        return br.list_orders(status=status, limit=limit)
     except Exception:
         return []
+
 
 def get_fill_activities(after_iso: Optional[str]=None) -> List[Dict[str,Any]]:
     """Realized P&L approximated via FILL activities."""
@@ -209,16 +184,50 @@ def get_fill_activities(after_iso: Optional[str]=None) -> List[Dict[str,Any]]:
     except Exception:
         return []
 
+
 def compute_pnl_summary(days: int=14) -> Dict[str,Any]:
-    # Realized from fills in window; unrealized from positions snapshot
+    """
+    Realized P&L from FILL activities (average-cost method); Unrealized from current positions.
+    """
     since = (dt.datetime.utcnow() - dt.timedelta(days=days)).replace(tzinfo=dt.timezone.utc).isoformat()
     fills = get_fill_activities(since)
+    # Normalize fills and sort ascending by time
+    def _ts(f):
+        for k in ("transaction_time","timestamp","processed_at","order_submitted_at","date"):
+            if f.get(k):
+                return f[k]
+        return ""
+    fills = sorted(fills, key=_ts)
+
     realized = 0.0
-    # Approximation: sum of (side-adjusted signed quantity * price) across matched pairs is hard;
-    # as a lightweight estimate, we compute running position per symbol and infer realized deltas.
-    # If you store realized P&L elsewhere, wire it here instead.
-    # For now, we set realized=0 and focus on unrealized from positions for the dashboard; keep scaffolding.
-    # If fills exist and you want a rough delta: skip (to avoid misleading).
+    # Track running position and avg cost per symbol
+    pos: Dict[str, Dict[str,float]] = {}  # {sym: {"qty": q, "avg": avg}}
+    for f in fills:
+        try:
+            sym = f.get("symbol") or f.get("asset_symbol") or ""
+            side = (f.get("side") or f.get("order_side") or "").lower()
+            px = float(f.get("price") or f.get("price_per_share") or f.get("p") or 0)
+            qty = float(f.get("qty") or f.get("quantity") or f.get("q") or 0)
+            if not sym or qty <= 0 or px <= 0:
+                continue
+            # For crypto, Alpaca activities usually use trading symbol (BTCUSD). For consistency, keep as-is.
+            s = sym
+            entry = pos.get(s, {"qty": 0.0, "avg": 0.0})
+            if side in ("buy","buying_power_decrease"):
+                # new weighted average cost
+                new_qty = entry["qty"] + qty
+                entry["avg"] = (entry["avg"] * entry["qty"] + px * qty) / new_qty if new_qty > 0 else entry["avg"]
+                entry["qty"] = new_qty
+                pos[s] = entry
+            elif side in ("sell","selling_power_increase"):
+                sell_qty = min(qty, entry["qty"]) if entry["qty"] > 0 else qty
+                realized += (px - entry["avg"]) * sell_qty
+                entry["qty"] = max(0.0, entry["qty"] - sell_qty)
+                pos[s] = entry
+        except Exception:
+            continue
+
+    # Unrealized from positions snapshot
     positions = get_positions()
     unreal = 0.0
     for p in positions:
@@ -226,7 +235,7 @@ def compute_pnl_summary(days: int=14) -> Dict[str,Any]:
             mv = float(p.get("market_value","0") or 0)
             cb = float(p.get("cost_basis","0") or 0)
             unreal += mv - cb
-        except:
+        except Exception:
             pass
     return {
         "window_days": days,
@@ -235,6 +244,7 @@ def compute_pnl_summary(days: int=14) -> Dict[str,Any]:
         "total": realized + unreal,
         "as_of": now_utc_iso(),
     }
+
 
 def attribute_by_strategy(days: int=30) -> Dict[str,Any]:
     """Group recent orders by client_order_id prefix c1..c6 to approximate strat attribution."""
