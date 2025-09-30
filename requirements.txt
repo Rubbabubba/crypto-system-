@@ -1,29 +1,8 @@
-# ===== requirements.txt =====
-# Version: 1.9.2-req.2
-# Compatible with Python 3.11/3.12 on Render. Prefers wheels-only installs.
-
-# Web
-Flask==3.0.3
-Flask-Cors==4.0.1
+flask==3.0.3
+werkzeug==3.1.3
 gunicorn==21.2.0
 
-# HTTP + env
-requests==2.32.3
-httpx==0.27.0
-python-dotenv==1.0.1
-
-# Data/TA (wheel-friendly pins)
+pandas==2.2.2
 numpy==1.26.4
-pandas==2.1.4
-pandas-ta==0.3.14b0
-
-# Scheduling / time
-APScheduler==3.10.4
 python-dateutil==2.9.0.post0
-pytz==2024.1
-
-# Utils
-tenacity==8.5.0
-cachetools==5.3.3
-orjson==3.10.7   # If this fails on your image, delete this line and redeploy.
-# ===== end =====
+requests==2.32.3
