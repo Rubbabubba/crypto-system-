@@ -1,8 +1,25 @@
-flask==3.0.3
-werkzeug==3.1.3
-gunicorn==21.2.0
+# ===== requirements.txt =====
+# Version: 1.9.2-req.1  (aligned with app/strategy v1.9.2 series)
+
+Flask==3.0.3
+Flask-Cors==4.0.1
+
+gunicorn==22.0.0
+
+requests==2.32.3
+python-dotenv==1.0.1
 
 pandas==2.2.2
-numpy==1.26.4
+numpy==2.0.1
+pandas-ta==0.3.14b0
+
+APScheduler==3.10.4
+
 python-dateutil==2.9.0.post0
-requests==2.32.3
+pytz==2024.1
+
+tenacity==8.5.0
+cachetools==5.3.3
+orjson==3.10.7
+httpx==0.27.0
+# ===== end =====
