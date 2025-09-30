@@ -1,68 +1,117 @@
 # strategies/c2.py
-# ============================================================
-# Strategy: Bollinger Mean Reversion (Position-aware)
-# Version: 1.3.0  (2025-09-29)
-# ============================================================
-
+# Version: 1.3.0 (2025-09-30)
 from __future__ import annotations
-import typing as T
-import pandas as pd
+import os, time
+from typing import Any, Dict, List
+import requests, math
 
-STRAT_ID = "c2"
-STRAT_VERSION = "1.3.0"
+STRATEGY_NAME = "c2"
+STRATEGY_VERSION = "1.3.0"
 
-def _bollinger(c: pd.Series, n: int, k: float):
-    m = c.rolling(n, min_periods=n).mean()
-    s = c.rolling(n, min_periods=n).std(ddof=0)
-    return m, m + k * s, m - k * s
+ALPACA_TRADE_HOST = os.getenv("ALPACA_TRADE_HOST", "https://paper-api.alpaca.markets")
+ALPACA_DATA_HOST  = os.getenv("ALPACA_DATA_HOST",  "https://data.alpaca.markets")
+ALPACA_KEY_ID     = os.getenv("ALPACA_KEY_ID", "")
+ALPACA_SECRET_KEY = os.getenv("ALPACA_SECRET_KEY", "")
 
-def _gate(symbol: str, desired: str, reason: str, params: dict) -> tuple[str, str]:
-    pos = (params or {}).get("positions", {}).get(symbol)
-    allow_add = bool((params or {}).get("allow_add", False))
-    allow_conf = bool((params or {}).get("allow_conflicts", False))
-    allow_shorts = bool((params or {}).get("allow_shorts", False))
-    held_action = (params or {}).get("held_action", "flat")
-    if not pos:
-        if desired == "sell" and not allow_shorts:
-            return "flat", "no_shorts"
-        return desired, reason
-    holder = pos.get("strategy")
-    side = pos.get("side", "long")
-    if side == "long":
-        if holder and holder != STRAT_ID and not allow_conf:
-            return (held_action if held_action in ("flat", "note") else "flat", f"held_by_{holder}")
-        if holder == STRAT_ID:
-            return ("sell", reason) if desired == "sell" else (("buy", reason) if allow_add else ("flat","hold_in_pos"))
-        # unknown/other
-        return (desired, reason) if allow_conf else ("flat", f"held_by_{holder or 'unknown'}")
-    return "flat", "unsupported_short_state"
+def _hdr():
+    if not (ALPACA_KEY_ID and ALPACA_SECRET_KEY): return {}
+    return {"APCA-API-KEY-ID": ALPACA_KEY_ID, "APCA-API-SECRET-KEY": ALPACA_SECRET_KEY, "Accept":"application/json","Content-Type":"application/json"}
 
-def _decide_one(df: pd.DataFrame, params: dict):
-    if df is None or df.empty:
-        return "flat", "no_data"
-    n = int(params.get("bb_n", 20))
-    k = float(params.get("bb_k", 2.0))
-    if df.shape[0] < n + 2:
-        return "flat", "insufficient_bars"
-    c = df["close"]
-    mid, ub, lb = _bollinger(c, n, k)
-    cl1, cl2 = c.iloc[-2], c.iloc[-1]
-    ub1, ub2 = ub.iloc[-2], ub.iloc[-1]
-    lb1, lb2 = lb.iloc[-2], lb.iloc[-1]
-    if cl1 >= lb1 and cl2 < lb2:
-        return "buy", "pierce_below_lower_bb"
-    if cl1 <= ub1 and cl2 > ub2:
-        return "sell", "pierce_above_upper_bb"
-    return "flat", "hold_in_pos"
+def _sym(s:str)->str: return s.replace("/","")
 
-def run(df_map: T.Dict[str, pd.DataFrame], params: dict) -> dict:
-    decisions = []
-    p = params or {}
-    for sym, df in (df_map or {}).items():
-        try:
-            desired, reason = _decide_one(df, p)
-            action, gated_reason = _gate(sym, desired, reason, p)
-        except Exception as e:
-            action, gated_reason = "flat", f"error:{e}"
-        decisions.append({"symbol": sym, "action": action, "reason": gated_reason})
-    return {"strategy": STRAT_ID, "version": STRAT_VERSION, "decisions": decisions}
+def _bars(symbol: str, timeframe: str, limit: int) -> List[Dict[str,Any]]:
+    if not _hdr(): return []
+    url = f"{ALPACA_DATA_HOST}/v1beta3/crypto/us/bars"
+    params = {"symbols": _sym(symbol), "timeframe": timeframe, "limit": limit, "feed":"us"}
+    try:
+        r = requests.get(url, headers=_hdr(), params=params, timeout=20)
+        if r.status_code != 200: return []
+        return r.json().get("bars",{}).get(_sym(symbol),[])
+    except Exception:
+        return []
+
+def _positions() -> List[Dict[str,Any]]:
+    if not _hdr(): return []
+    try:
+        r = requests.get(f"{ALPACA_TRADE_HOST}/v2/positions", headers=_hdr(), timeout=20)
+        return r.json() if r.status_code == 200 else []
+    except Exception:
+        return []
+
+def _has_long(symbol: str):
+    sym = _sym(symbol)
+    for p in _positions():
+        if (p.get("symbol") or p.get("asset_symbol")) == sym and p.get("side","long")=="long":
+            return p
+    return None
+
+def _place(symbol: str, side: str, notional: float, client_id: str) -> Dict[str,Any]:
+    if not _hdr(): return {"error":"no_alpaca_creds"}
+    payload = {"symbol": _sym(symbol),"side":side,"type":"market","time_in_force":"ioc","notional":str(notional),"client_order_id":client_id}
+    try:
+        r = requests.post(f"{ALPACA_TRADE_HOST}/v2/orders", headers=_hdr(), json=payload, timeout=20)
+        return r.json() if r.status_code in (200,201) else {"error": f"order_http_{r.status_code}", "details": r.text}
+    except Exception as e:
+        return {"error":"order_exc","details":str(e)}
+
+def _rsi(closes: List[float], n: int=14) -> List[float]:
+    if len(closes) < n+1: return []
+    gains, losses = 0.0, 0.0
+    out=[]
+    for i in range(1,n+1):
+        d = closes[i]-closes[i-1]
+        gains += max(0,d); losses += max(0,-d)
+    avg_g, avg_l = gains/n, losses/n
+    rs = (avg_g / avg_l) if avg_l>0 else 1e9
+    out.append(100 - (100/(1+rs)))
+    for i in range(n+1,len(closes)):
+        d = closes[i]-closes[i-1]
+        g, l = max(0,d), max(0,-d)
+        avg_g = (avg_g*(n-1)+g)/n
+        avg_l = (avg_l*(n-1)+l)/n
+        rs = (avg_g/avg_l) if avg_l>0 else 1e9
+        out.append(100 - (100/(1+rs)))
+    return out
+
+def _vwap(bars):
+    cum_pv=cum_v=0.0
+    out=[]
+    for b in bars:
+        h,l,c,v = float(b["h"]),float(b["l"]),float(b["c"]),float(b["v"])
+        tp=(h+l+c)/3.0
+        cum_pv+=tp*v; cum_v+=v
+        out.append(cum_pv/max(1e-9,cum_v))
+    return out
+
+def _decide(symbol: str, bars: List[Dict[str,Any]]) -> Dict[str,str]:
+    if len(bars) < 80:
+        return {"symbol": symbol, "action":"flat", "reason":"insufficient_bars"}
+    closes=[float(b["c"]) for b in bars]
+    rsi=_rsi(closes,14)
+    if not rsi: return {"symbol":symbol,"action":"flat","reason":"no_rsi"}
+    r=rsi[-1]
+    v=_vwap(bars)[-1]
+    c=closes[-1]
+    have_long = _has_long(symbol) is not None
+    if r < 27:  # oversold
+        return {"symbol":symbol,"action":"buy","reason":"rsi_oversold"}
+    if have_long and (r > 60 or c >= v*1.01):
+        return {"symbol":symbol,"action":"sell","reason":"mean_revert_exit_vwap"}
+    return {"symbol":symbol,"action":"flat","reason":"hold_in_pos" if have_long else "no_signal"}
+
+def run_scan(symbols, timeframe, limit, notional, dry, extra):
+    results, placed = [], []
+    epoch=int(time.time())
+    for s in symbols:
+        dec=_decide(s, _bars(s,timeframe,limit))
+        results.append(dec)
+        if dry or dec["action"]=="flat": continue
+        if dec["action"]=="sell" and not _has_long(s): continue
+        coid=f"{STRATEGY_NAME}-{epoch}-{_sym(s).lower()}"
+        res=_place(s, dec["action"], notional, coid)
+        if "error" not in res:
+            placed.append({"symbol":s,"side":dec["action"],"notional":notional,
+                           "status":res.get("status","accepted"),
+                           "client_order_id":res.get("client_order_id",coid),
+                           "filled_avg_price":res.get("filled_avg_price"),"id":res.get("id")})
+    return {"strategy":STRATEGY_NAME,"version":STRATEGY_VERSION,"results":results,"placed":placed}

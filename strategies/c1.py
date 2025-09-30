@@ -1,99 +1,139 @@
 # strategies/c1.py
-# ============================================================
-# Strategy: EMA Trend + VWAP Filter (Position-aware)
-# Version: 1.4.0  (2025-09-29)
-# ------------------------------------------------------------
-# Logic:
-#   • BUY when fast EMA > slow EMA AND close > rolling VWAP.
-#   • SELL when fast EMA < slow EMA AND close < rolling VWAP.
-# Position awareness (via params["positions"]):
-#   • Flat: allow BUY; SELL only if allow_shorts.
-#   • Long owned by c1: allow SELL exit; BUY only if allow_add.
-#   • Long owned by another strategy: suppress unless allow_conflicts.
-# ============================================================
-
+# Version: 1.4.0 (2025-09-30)
 from __future__ import annotations
-import typing as T
-import pandas as pd
+import os, time, math, datetime as dt
+from typing import Any, Dict, List
+import requests
 
-STRAT_ID = "c1"
-STRAT_VERSION = "1.4.0"
+STRATEGY_NAME = "c1"
+STRATEGY_VERSION = "1.4.0"
 
-def _ema(s: pd.Series, n: int) -> pd.Series:
-    return s.ewm(span=int(n), adjust=False).mean()
+# ---------- Broker & Data helpers ----------
+ALPACA_TRADE_HOST = os.getenv("ALPACA_TRADE_HOST", "https://paper-api.alpaca.markets")
+ALPACA_DATA_HOST  = os.getenv("ALPACA_DATA_HOST",  "https://data.alpaca.markets")
+ALPACA_KEY_ID     = os.getenv("ALPACA_KEY_ID", "")
+ALPACA_SECRET_KEY = os.getenv("ALPACA_SECRET_KEY", "")
 
-def _rolling_vwap(df: pd.DataFrame, win: int) -> pd.Series:
-    tp = (df["high"] + df["low"] + df["close"]) / 3.0
-    pv = tp * df["volume"]
-    v = df["volume"].rolling(win, min_periods=1).sum()
-    out = (pv.rolling(win, min_periods=1).sum()) / v
-    return out.ffill().bfill()
+def _hdr():
+    if not (ALPACA_KEY_ID and ALPACA_SECRET_KEY):
+        return {}
+    return {
+        "APCA-API-KEY-ID": ALPACA_KEY_ID,
+        "APCA-API-SECRET-KEY": ALPACA_SECRET_KEY,
+        "Accept": "application/json",
+        "Content-Type": "application/json",
+    }
 
-def _gate(symbol: str, desired: str, reason: str, params: dict) -> tuple[str, str]:
-    # desired: "buy" | "sell" as produced by the raw signal
-    pos = (params or {}).get("positions", {}).get(symbol)
-    allow_add = bool((params or {}).get("allow_add", False))
-    allow_conf = bool((params or {}).get("allow_conflicts", False))
-    allow_shorts = bool((params or {}).get("allow_shorts", False))
-    held_action = (params or {}).get("held_action", "flat")
+def _sym(s: str) -> str:
+    return s.replace("/","")
 
-    if not pos:
-        if desired == "sell" and not allow_shorts:
-            return "flat", "no_shorts"
-        return desired, reason
+def _bars(symbol: str, timeframe: str, limit: int) -> List[Dict[str,Any]]:
+    if not _hdr(): return []
+    url = f"{ALPACA_DATA_HOST}/v1beta3/crypto/us/bars"
+    params = {"symbols": _sym(symbol), "timeframe": timeframe, "limit": limit, "feed":"us"}
+    try:
+        r = requests.get(url, headers=_hdr(), params=params, timeout=20)
+        if r.status_code != 200: return []
+        return r.json().get("bars",{}).get(_sym(symbol),[])
+    except Exception:
+        return []
 
-    holder = pos.get("strategy")
-    side = pos.get("side", "long")
+def _positions() -> List[Dict[str,Any]]:
+    if not _hdr(): return []
+    try:
+        r = requests.get(f"{ALPACA_TRADE_HOST}/v2/positions", headers=_hdr(), timeout=20)
+        return r.json() if r.status_code == 200 else []
+    except Exception:
+        return []
 
-    # Only long support by default
-    if side == "long":
-        if holder and holder != STRAT_ID and not allow_conf:
-            return (held_action if held_action in ("flat", "note") else "flat",
-                    f"held_by_{holder}")
-        if holder == STRAT_ID:
-            # We own it
-            if desired == "sell":
-                return "sell", reason
-            # desired == buy
-            return ("buy", reason) if allow_add else ("flat", "hold_in_pos")
-        else:
-            # Held by another or unknown owner
-            if desired == "sell":
-                # If we don't own it, don't force exit by default
-                return ("sell", reason) if allow_conf else ("flat", f"held_by_{holder or 'unknown'}")
-            else:
-                return ("buy", reason) if allow_conf else ("flat", f"held_by_{holder or 'unknown'}")
+def _has_long(symbol: str) -> Dict[str,Any] | None:
+    sym = _sym(symbol)
+    for p in _positions():
+        psym = p.get("symbol") or p.get("asset_symbol")
+        if psym == sym and (p.get("side","long").lower() == "long"):
+            return p
+    return None
 
-    # If side == "short" and you want support, add logic here. Default: do nothing.
-    return "flat", "unsupported_short_state"
+def _place(symbol: str, side: str, notional: float, client_id: str) -> Dict[str,Any]:
+    if not _hdr(): return {"error":"no_alpaca_creds"}
+    payload = {
+        "symbol": _sym(symbol),
+        "side": side,
+        "type": "market",
+        "time_in_force": "ioc",
+        "notional": str(notional),
+        "client_order_id": client_id
+    }
+    try:
+        r = requests.post(f"{ALPACA_TRADE_HOST}/v2/orders", headers=_hdr(), json=payload, timeout=20)
+        ok = r.status_code in (200,201)
+        return r.json() if ok else {"error": f"order_http_{r.status_code}", "details": r.text}
+    except Exception as e:
+        return {"error":"order_exc","details":str(e)}
 
-def _decide_one(df: pd.DataFrame, params: dict) -> tuple[str, str]:
-    if df is None or df.empty or df.shape[0] < 50:
-        return "flat", "no_data"
-    fast = int(params.get("ema_fast", 12))
-    slow = int(params.get("ema_slow", 26))
-    vwin = int(params.get("vwap_win", 50))
+# ---------- Indicators ----------
+def _ema(vals: List[float], n: int) -> List[float]:
+    if not vals or n<=0: return []
+    k = 2/(n+1)
+    out = []
+    ema = None
+    for v in vals:
+        ema = v if ema is None else (v*k + ema*(1-k))
+        out.append(ema)
+    return out
 
-    c = df["close"]
-    ema_f = _ema(c, fast)
-    ema_s = _ema(c, slow)
-    vwap = _rolling_vwap(df, vwin)
+def _vwap(bars: List[Dict[str,Any]]) -> List[float]:
+    cum_pv = 0.0
+    cum_v  = 0.0
+    out=[]
+    for b in bars:
+        h,l,c,v = float(b["h"]), float(b["l"]), float(b["c"]), float(b["v"])
+        tp = (h+l+c)/3.0
+        cum_pv += tp*v
+        cum_v  += v
+        out.append(cum_pv/max(1e-9,cum_v))
+    return out
 
-    cl = c.iloc[-1]
-    if ema_f.iloc[-1] > ema_s.iloc[-1] and cl > vwap.iloc[-1]:
-        return "buy", "trend_up_and_above_vwap"
-    if ema_f.iloc[-1] < ema_s.iloc[-1] and cl < vwap.iloc[-1]:
-        return "sell", "trend_down_and_below_vwap"
-    return "flat", "hold_in_pos"
+# ---------- Logic ----------
+def _decide(symbol: str, bars: List[Dict[str,Any]]) -> Dict[str,str]:
+    # need enough bars
+    if len(bars) < 60:
+        return {"symbol": symbol, "action":"flat", "reason":"insufficient_bars"}
+    closes = [float(b["c"]) for b in bars]
+    vwap = _vwap(bars)
+    ema = _ema(closes, 50)
 
-def run(df_map: T.Dict[str, pd.DataFrame], params: dict) -> dict:
-    decisions = []
-    p = params or {}
-    for sym, df in (df_map or {}).items():
-        try:
-            desired, reason = _decide_one(df, p)
-            action, gated_reason = _gate(sym, desired, reason, p)
-        except Exception as e:
-            action, gated_reason = "flat", f"error:{e}"
-        decisions.append({"symbol": sym, "action": action, "reason": gated_reason})
-    return {"strategy": STRAT_ID, "version": STRAT_VERSION, "decisions": decisions}
+    c = closes[-1]
+    v = vwap[-1]
+    e = ema[-1]
+
+    have_long = _has_long(symbol) is not None
+    # Trend filter: only long if price above EMA50
+    if c > e and c < v * 0.997:         # pullback to/below VWAP in uptrend
+        return {"symbol": symbol, "action":"buy", "reason":"vwap_pullback_uptrend"}
+    if have_long and c < e and c < v:   # lose trend & under VWAP -> exit
+        return {"symbol": symbol, "action":"sell", "reason":"trend_break_under_vwap"}
+    return {"symbol": symbol, "action":"flat", "reason":"hold_in_pos" if have_long else "no_signal"}
+
+# ---------- Public API ----------
+def run_scan(symbols: List[str], timeframe: str, limit: int, notional: float, dry: bool, extra: Dict[str,Any]):
+    results, placed = [], []
+    epoch = int(time.time())
+    for s in symbols:
+        bars = _bars(s, timeframe, limit)
+        decision = _decide(s, bars)
+        results.append(decision)
+        if dry or decision["action"] in ("flat",):
+            continue
+        # prevent sells if flat
+        if decision["action"] == "sell" and not _has_long(s):
+            continue
+        coid = f"{STRATEGY_NAME}-{epoch}-{_sym(s).lower()}"
+        ordres = _place(s, decision["action"], notional, coid)
+        if "error" not in ordres:
+            placed.append({
+                "symbol": s, "side": decision["action"], "notional": notional,
+                "status": ordres.get("status","accepted"), "client_order_id": ordres.get("client_order_id", coid),
+                "filled_avg_price": ordres.get("filled_avg_price"), "id": ordres.get("id")
+            })
+    return {"strategy": STRATEGY_NAME, "version": STRATEGY_VERSION, "results": results, "placed": placed}
