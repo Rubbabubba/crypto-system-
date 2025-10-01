@@ -619,3 +619,9 @@ def scan(
         "placed": placed,
         "params": {"strategy": strategy, "timeframe": timeframe, "limit": limit, "symbols": syms}
     }
+
+if __name__ == "__main__":
+    import os
+    import uvicorn
+    # Render provides PORT in the environment
+    uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", "8000")))
