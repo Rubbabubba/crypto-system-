@@ -1,806 +1,621 @@
-# app.py — Crypto Trading System "everything" app
-# Version: 1.10.0 (2025-09-30)
+# app.py — Crypto Trading Service with Full Dashboard (v1.11.0)
+# - Rich HTML Dashboard (/dashboard) with live sections:
+#   Health, Diag Candles, Positions, Recent Orders, P&L, Attribution, Scan Console
+# - /health, /diag/candles, /scan/{strategy} with bar guarantees (backfill + 1m→5m resample)
+# - Minimal in-memory stubs for positions/orders/pnl/attribution to keep UI working
+# - Adapters to wire your real storage/provider: load_candles, save_candles, fetch_ohlcv
 #
-# What’s in this file
-# - Full Flask app with HTML dashboard embedded (mobile-friendly)
-# - Relative fetch() URLs (no template-literals leaking into Python)
-# - /scan/c1..c6 -> calls strategies.c1..c6.run_scan(...)
-# - /v2/positions, /orders/recent, /pnl/summary, /orders/attribution, /calendar
-# - /config/symbols, /diag/candles, /health
-# - Light-weight Alpaca proxy using env vars (paper/live)
-#
-# Expected ENV (redact secrets in logs!)
-#   ALPACA_KEY_ID, ALPACA_SECRET_KEY
-#   ALPACA_TRADE_HOST   (e.g. https://paper-api.alpaca.markets)
-#   ALPACA_DATA_HOST    (e.g. https://data.alpaca.markets)
-#   CRYPTO_EXCHANGE=alpaca
-#   TZ=UTC, LOG_LEVEL=INFO
-#   SYMBOLS=BTC/USD,ETH/USD,SOL/USD,...
-#   AUTORUN_ENABLED=true|false, AUTORUN_INTERVAL_SECS=60, AUTORUN_TIMEFRAME=1Min, AUTORUN_LIMIT=600, AUTORUN_NOTIONAL=5
-#
-# Notes
-# - If Alpaca creds are missing, API endpoints return empty/defaults but still 200.
-# - P&L summary:
-#     realized: computed from fills (activities) within window
-#     unrealized: from current positions
-# - Strategy attribution: computed by looking at client_order_id prefixes (c1..c6-*)
-# - Calendar: produces a simple monthly grid with last 30 days of activity markers
-#
-# License: MIT
+# ENV (Render):
+#   SYMBOLS=BTC/USD,ETH/USD,SOL/USD,DOGE/USD,XRP/USD,AVAX/USD,LINK/USD,BCH/USD,LTC/USD
+#   REQUIRED_BARS_5M=300
+#   REQUIRED_BARS_1M=1500
+#   OVERSHOOT_MULT=2.0
+#   FETCH_PAGE_LIMIT=1000
+#   PROVIDER=demo
 
-from __future__ import annotations
-
-import os
-import json
+from fastapi import FastAPI, Query, Request
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
+from typing import List, Dict, Any, Optional
+import threading
 import time
 import math
-import threading
-import datetime as dt
-from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Tuple
-from services.market_crypto import MarketCrypto
-import broker as br
+import os
+import random
 
+APP_VERSION = "1.11.0"
 
-import requests
-from flask import Flask, request, jsonify, Response
+app = FastAPI(title="Crypto Trading Service", version=APP_VERSION)
 
-# --------------------------------------------
-# App / config
-# --------------------------------------------
-APP_VERSION = "1.9.2"
-app = Flask(__name__)
+# ─────────────────────────────────────────────────────────────
+# Config
+# ─────────────────────────────────────────────────────────────
+SYMBOLS = [s.strip() for s in os.getenv(
+    "SYMBOLS",
+    "BTC/USD,ETH/USD,SOL/USD,DOGE/USD,XRP/USD,AVAX/USD,LINK/USD,BCH/USD,LTC/USD"
+).split(",") if s.strip()]
 
-def env_str(name: str, default: str="") -> str:
-    v = os.environ.get(name)
-    return v if v is not None and v != "" else default
+NEED_5M = int(os.getenv("REQUIRED_BARS_5M", "300"))
+NEED_1M = int(os.getenv("REQUIRED_BARS_1M", "1500"))
+OVERSHOOT = float(os.getenv("OVERSHOOT_MULT", "2.0"))
+PER_CALL = int(os.getenv("FETCH_PAGE_LIMIT", "1000"))
+PROVIDER = os.getenv("PROVIDER", "demo").lower()
 
-def env_bool(name: str, default: bool=False) -> bool:
-    v = os.environ.get(name)
-    if v is None: return default
-    return str(v).lower() in ("1","true","yes","y","on")
+BAR_MS = {"1Min": 60_000, "5Min": 300_000, "15Min": 900_000,
+          "1m": 60_000, "5m": 300_000, "15m": 900_000}
 
-def env_int(name: str, default: int=0) -> int:
-    try:
-        return int(os.environ.get(name, str(default)))
-    except:
-        return default
+def bar_ms(tf: str) -> int:
+    key = tf if tf in BAR_MS else tf.lower()
+    if key not in BAR_MS:
+        raise ValueError(f"Unsupported timeframe: {tf}")
+    return BAR_MS[key]
 
-def env_float(name: str, default: float=0.0) -> float:
-    try:
-        return float(os.environ.get(name, str(default)))
-    except:
-        return default
+def need_for(tf: str) -> int:
+    k = tf.lower()
+    if k in ("5m","5min"): return NEED_5M
+    if k in ("1m","1min"): return NEED_1M
+    return NEED_5M
 
-TZ = env_str("TZ","UTC")
-LOG_LEVEL = env_str("LOG_LEVEL","INFO")
+# ─────────────────────────────────────────────────────────────
+# In-memory store (replace with your DB/cache)
+# ─────────────────────────────────────────────────────────────
+# Key: (symbol, timeframe) -> list[[ms, o,h,l,c,v], ...] sorted asc
+_STORE: Dict[tuple, List[List[float]]] = {}
 
-# Symbols config storage (in-memory; you can wire to a DB if you prefer)
-DEFAULT_SYMBOLS = [s.strip() for s in env_str("SYMBOLS","BTC/USD,ETH/USD,SOL/USD,DOGE/USD,XRP/USD,AVAX/USD,LINK/USD,BCH/USD,LTC/USD").split(",") if s.strip()]
-_symbols_store = list(DEFAULT_SYMBOLS)
+def load_candles(symbol: str, timeframe: str) -> List[List[float]]:
+    return _STORE.get((symbol, timeframe), [])
 
-# Alpaca endpoints
-ALPACA_TRADE_HOST = env_str("ALPACA_TRADE_HOST","https://paper-api.alpaca.markets")
-ALPACA_DATA_HOST  = env_str("ALPACA_DATA_HOST","https://data.alpaca.markets")
-ALPACA_KEY_ID     = env_str("ALPACA_KEY_ID","")
-ALPACA_SECRET_KEY = env_str("ALPACA_SECRET_KEY","")
+def save_candles(symbol: str, timeframe: str, rows: List[List[float]]) -> None:
+    _STORE[(symbol, timeframe)] = rows
 
-def alpaca_headers() -> Dict[str,str]:
-    if not (ALPACA_KEY_ID and ALPACA_SECRET_KEY):
-        return {}
-    return {
-        "APCA-API-KEY-ID": ALPACA_KEY_ID,
-        "APCA-API-SECRET-KEY": ALPACA_SECRET_KEY,
-        "Accept": "application/json",
-        "Content-Type": "application/json",
-    }
-
-def now_utc_iso() -> str:
-    return dt.datetime.utcnow().replace(tzinfo=dt.timezone.utc).isoformat()
-
-# --------------------------------------------
-# Candles (data) helper
-# --------------------------------------------
-
-def fetch_crypto_bars(symbol: str, timeframe: str, limit: int=600) -> List[Dict[str,Any]]:
+# ─────────────────────────────────────────────────────────────
+# Data provider adapter (replace with your vendor/ccxt)
+# ─────────────────────────────────────────────────────────────
+def fetch_ohlcv(symbol: str, timeframe: str, since_ms: int, limit: int) -> List[List[float]]:
     """
-    Returns a list of bars with keys: t,o,h,l,c,v using MarketCrypto (Alpaca v1beta3).
-    timeframe: e.g. "1Min","5Min","1Hour","1Day"
+    Return ascending OHLCV rows: [ms, o, h, l, c, v].
+    Replace this with your real provider (ccxt/vendor). This demo returns synthetic bars.
     """
-    try:
-        market = MarketCrypto.from_env()
-        data = market.candles([symbol], timeframe=timeframe, limit=limit)
-        df = data.get(symbol)
-        if df is None or len(df.index) == 0:
-            return []
-        # Convert DataFrame rows to list of dicts matching prior shape
-        out = []
-        for _, row in df.iterrows():
-            out.append({
-                "t": str(row.get("ts")),
-                "o": float(row.get("open") or 0),
-                "h": float(row.get("high") or 0),
-                "l": float(row.get("low") or 0),
-                "c": float(row.get("close") or 0),
-                "v": float(row.get("volume") or 0),
-            })
-        return out
-    except Exception:
+    if PROVIDER != "demo":
+        # TODO: Implement your provider (ccxt etc.) and honor since_ms/limit pagination.
+        raise RuntimeError("Non-demo provider not wired yet. Set PROVIDER=demo or implement fetch_ohlcv().")
+
+    tf_ms = bar_ms(timeframe)
+    now = int(time.time()*1000)
+    start = since_ms if since_ms else now - tf_ms*limit
+    start = (start // tf_ms) * tf_ms
+    out = []
+    base_price = 10000 + abs(hash(symbol)) % 50000
+    rng = random.Random(abs(hash(symbol + timeframe)) % (2**31 - 1))
+    ts = start
+    price = base_price
+    for _ in range(limit):
+        drift = rng.uniform(-2.0, 2.0)
+        spread = abs(rng.uniform(0.0, 5.0))
+        o = price
+        c = max(10.0, o + drift)
+        h = max(o, c) + spread
+        l = min(o, c) - spread
+        v = abs(rng.uniform(1.0, 100.0))
+        out.append([ts, float(o), float(h), float(l), float(c), float(v)])
+        price = c
+        ts += tf_ms
+        if ts > now + tf_ms*2:
+            break
+    return out
+
+# ─────────────────────────────────────────────────────────────
+# Backfill helpers
+# ─────────────────────────────────────────────────────────────
+def merge_and_clean(existing: List[List[float]], new_rows: List[List[float]]) -> List[List[float]]:
+    by_ts: Dict[int, List[float]] = { int(r[0]): r for r in existing if r and len(r) >= 5 }
+    for r in new_rows:
+        if r and len(r) >= 5:
+            by_ts[int(r[0])] = r
+    rows = [by_ts[k] for k in sorted(by_ts.keys())]
+    rows = [r for r in rows if r[0] > 0]
+    return rows
+
+def fetch_paged(symbol: str, timeframe: str, since_ms: int, min_bars: int) -> List[List[float]]:
+    out: List[List[float]] = []
+    cursor = since_ms
+    while len(out) < min_bars:
+        want = min(PER_CALL, max(1, min_bars - len(out)))
+        batch = fetch_ohlcv(symbol, timeframe, cursor, want)
+        if not batch:
+            break
+        out.extend(batch)
+        cursor = int(batch[-1][0]) + 1
+        time.sleep(0.02)
+    return out
+
+def ensure_bars(symbol: str, timeframe: str, require: Optional[int] = None) -> List[List[float]]:
+    need = require or need_for(timeframe)
+    have = load_candles(symbol, timeframe)
+    if len(have) >= need:
+        return have
+    lookback = int(bar_ms(timeframe) * need * OVERSHOOT)
+    since = int((have[0][0] if have else int(time.time()*1000)) - lookback)
+    fetched = fetch_paged(symbol, timeframe, since, min_bars=need)
+    merged = merge_and_clean(have, fetched)
+    save_candles(symbol, timeframe, merged)
+    return merged
+
+def resample_1m_to_5m(one_min_rows: List[List[float]]) -> List[List[float]]:
+    if not one_min_rows:
         return []
+    out: List[List[float]] = []
+    bucket_ms = bar_ms("5Min")
+    cur = None
+    o = h = l = c = v = None
+    for ts, O, H, L, C, V in one_min_rows:
+        b = (int(ts) // bucket_ms) * bucket_ms
+        if cur is None or b != cur:
+            if cur is not None:
+                out.append([cur, o, h, l, c, v])
+            cur = b
+            o, h, l, c, v = O, H, L, C, V
+        else:
+            h = max(h, H); l = min(l, L); c = C; v = (v or 0) + (V or 0)
+    if cur is not None:
+        out.append([cur, o, h, l, c, v])
+    return out
 
-# --------------------------------------------
-# Strategies loading
-# --------------------------------------------
-# Expect each strategies.cx to expose: run_scan(symbols, timeframe, limit, notional, dry, extra)
-def _load_strategy(modname: str):
-    # Lazy import so app starts even if a module is missing temporarily
-    import importlib
-    return importlib.import_module(modname)
+def ensure_bars_5m_via_1m(symbol: str, need_5m: int) -> List[List[float]]:
+    one_min = ensure_bars(symbol, "1Min", require=max(NEED_1M, need_5m*5))
+    five = resample_1m_to_5m(one_min)
+    if len(five) >= need_5m:
+        save_candles(symbol, "5Min", five)
+    return five
 
-STRAT_MODULES = {
-    "c1": "strategies.c1",
-    "c2": "strategies.c2",
-    "c3": "strategies.c3",
-    "c4": "strategies.c4",
-    "c5": "strategies.c5",
-    "c6": "strategies.c6",
-}
-
-# --------------------------------------------
-# Broker helpers (positions, orders, activities)
-# --------------------------------------------
-def alpaca_ok() -> bool:
-    return bool(ALPACA_KEY_ID and ALPACA_SECRET_KEY and ALPACA_TRADE_HOST.startswith("http"))
-
-
-def get_positions() -> List[Dict[str,Any]]:
-    try:
-        return br.list_positions()
-    except Exception:
-        return []
-
-
-
-def get_recent_orders(status: str="all", limit: int=200) -> List[Dict[str,Any]]:
-    try:
-        return br.list_orders(status=status, limit=limit)
-    except Exception:
-        return []
-
-
-def get_fill_activities(after_iso: Optional[str]=None) -> List[Dict[str,Any]]:
-    """Realized P&L approximated via FILL activities."""
-    if not alpaca_ok():
-        return []
-    try:
-        url = f"{ALPACA_TRADE_HOST}/v2/account/activities/FILL"
-        params = {}
-        if after_iso:
-            params["after"] = after_iso
-        r = requests.get(url, headers=alpaca_headers(), params=params, timeout=20)
-        if r.status_code != 200:
-            return []
-        return r.json()
-    except Exception:
-        return []
-
-
-def compute_pnl_summary(days: int=14) -> Dict[str,Any]:
-    """
-    Realized P&L from FILL activities (average-cost method); Unrealized from current positions.
-    """
-    since = (dt.datetime.utcnow() - dt.timedelta(days=days)).replace(tzinfo=dt.timezone.utc).isoformat()
-    fills = get_fill_activities(since)
-    # Normalize fills and sort ascending by time
-    def _ts(f):
-        for k in ("transaction_time","timestamp","processed_at","order_submitted_at","date"):
-            if f.get(k):
-                return f[k]
-        return ""
-    fills = sorted(fills, key=_ts)
-
-    realized = 0.0
-    # Track running position and avg cost per symbol
-    pos: Dict[str, Dict[str,float]] = {}  # {sym: {"qty": q, "avg": avg}}
-    for f in fills:
-        try:
-            sym = f.get("symbol") or f.get("asset_symbol") or ""
-            side = (f.get("side") or f.get("order_side") or "").lower()
-            px = float(f.get("price") or f.get("price_per_share") or f.get("p") or 0)
-            qty = float(f.get("qty") or f.get("quantity") or f.get("q") or 0)
-            if not sym or qty <= 0 or px <= 0:
-                continue
-            # For crypto, Alpaca activities usually use trading symbol (BTCUSD). For consistency, keep as-is.
-            s = sym
-            entry = pos.get(s, {"qty": 0.0, "avg": 0.0})
-            if side in ("buy","buying_power_decrease"):
-                # new weighted average cost
-                new_qty = entry["qty"] + qty
-                entry["avg"] = (entry["avg"] * entry["qty"] + px * qty) / new_qty if new_qty > 0 else entry["avg"]
-                entry["qty"] = new_qty
-                pos[s] = entry
-            elif side in ("sell","selling_power_increase"):
-                sell_qty = min(qty, entry["qty"]) if entry["qty"] > 0 else qty
-                realized += (px - entry["avg"]) * sell_qty
-                entry["qty"] = max(0.0, entry["qty"] - sell_qty)
-                pos[s] = entry
-        except Exception:
-            continue
-
-    # Unrealized from positions snapshot
-    positions = get_positions()
-    unreal = 0.0
-    for p in positions:
-        try:
-            mv = float(p.get("market_value","0") or 0)
-            cb = float(p.get("cost_basis","0") or 0)
-            unreal += mv - cb
-        except Exception:
-            pass
-    return {
-        "window_days": days,
-        "realized": realized,
-        "unrealized": unreal,
-        "total": realized + unreal,
-        "as_of": now_utc_iso(),
-    }
-
-
-def attribute_by_strategy(days: int=30) -> Dict[str,Any]:
-    """Group recent orders by client_order_id prefix c1..c6 to approximate strat attribution."""
-    orders = get_recent_orders(status="all", limit=500)
-    buckets: Dict[str, Dict[str,Any]] = {}
-    for o in orders:
-        coid = (o.get("client_order_id") or "").lower()
-        strat = None
-        for s in ("c1","c2","c3","c4","c5","c6"):
-            if coid.startswith(s+"-") or coid.startswith(s+"_"):
-                strat = s
-                break
-        if not strat:
-            strat = "other"
-        b = buckets.setdefault(strat, {"count":0, "symbols":set()})
-        b["count"] += 1
-        sym = o.get("symbol") or o.get("asset_symbol") or ""
-        if sym: b["symbols"].add(sym)
-    # Convert sets
-    for k,v in buckets.items():
-        v["symbols"] = sorted(list(v["symbols"]))
-    return {"days": days, "buckets": buckets, "as_of": now_utc_iso()}
-
-# --------------------------------------------
-# Autorun loop (optional)
-# --------------------------------------------
-AUTORUN_ENABLED = env_bool("AUTORUN_ENABLED", False)
-AUTORUN_INTERVAL_SECS = env_int("AUTORUN_INTERVAL_SECS", 60)
-AUTORUN_TIMEFRAME = env_str("AUTORUN_TIMEFRAME","1Min")
-AUTORUN_LIMIT = env_int("AUTORUN_LIMIT", 600)
-AUTORUN_NOTIONAL = env_float("AUTORUN_NOTIONAL", 5.0)
-
-def autorun_loop():
-    while True:
-        try:
-            symbols = list(_symbols_store)
-            for key, modname in STRAT_MODULES.items():
+def startup_backfill(background=True):
+    def _run():
+        for tf in ("1Min","5Min"):
+            need = need_for(tf)
+            lookback_ms = int(bar_ms(tf) * need * OVERSHOOT)
+            since = int(time.time()*1000) - lookback_ms
+            for sym in SYMBOLS:
                 try:
-                    mod = _load_strategy(modname)
-                    res = mod.run_scan(
-                        symbols=symbols,
-                        timeframe=AUTORUN_TIMEFRAME,
-                        limit=AUTORUN_LIMIT,
-                        notional=AUTORUN_NOTIONAL,
-                        dry=False,
-                        extra={}
-                    )
-                    app.logger.info(f"autorun {key}: {res}")
-                    time.sleep(0.25)
+                    have = load_candles(sym, tf)
+                    if len(have) >= need:
+                        continue
+                    rows = fetch_paged(sym, tf, since, min_bars=need)
+                    merged = merge_and_clean(have, rows)
+                    save_candles(sym, tf, merged)
+                    print(f"[backfill] {sym} {tf}: have={len(merged)} need={need}")
                 except Exception as e:
-                    app.logger.exception(f"autorun {key} error: {e}")
-            time.sleep(max(5, AUTORUN_INTERVAL_SECS))
-        except Exception as e:
-            app.logger.exception(f"autorun outer error: {e}")
-            time.sleep(10)
+                    print(f"[backfill] WARN {sym} {tf}: {e}")
+    if background:
+        threading.Thread(target=_run, daemon=True).start()
+    else:
+        _run()
 
-if AUTORUN_ENABLED:
-    threading.Thread(target=autorun_loop, daemon=True).start()
+# ─────────────────────────────────────────────────────────────
+# Startup
+# ─────────────────────────────────────────────────────────────
+@app.on_event("startup")
+def _on_start():
+    startup_backfill(background=True)
 
-# --------------------------------------------
-# Routes: health, config, diagnostics
-# --------------------------------------------
-@app.route("/health")
-def health():
-    return jsonify({
-        "ok": True,
-        "time": now_utc_iso(),
-        "version": APP_VERSION,
-        "alpaca_connected": alpaca_ok(),
-        "symbols": _symbols_store
-    })
+# ─────────────────────────────────────────────────────────────
+# Root redirects to dashboard
+# ─────────────────────────────────────────────────────────────
+@app.get("/", include_in_schema=False)
+def root():
+    return RedirectResponse(url="/dashboard")
 
-@app.route("/config/symbols", methods=["GET","POST"])
-def config_symbols():
-    global _symbols_store
-    if request.method == "POST":
-        js = request.get_json(force=True, silent=True) or {}
-        syms = js.get("symbols")
-        if isinstance(syms, list) and all(isinstance(s,str) for s in syms):
-            _symbols_store = [s.strip() for s in syms if s.strip()]
-        return jsonify({"ok": True, "symbols": _symbols_store})
-    return jsonify({"symbols": _symbols_store})
-
-@app.route("/diag/candles")
-def diag_candles():
-    symbols = request.args.get("symbols","").split(",")
-    tf = request.args.get("tf","5Min")
-    limit = int(request.args.get("limit","600") or "600")
-    out_meta = {}
-    rows = {}
-    for s in symbols:
-        s = s.strip()
-        if not s: continue
-        bars = fetch_crypto_bars(s, tf, limit)
-        rows[s] = len(bars)
-        out_meta[s] = {
-            "rows": len(bars),
-            "last_ts": bars[-1]["t"] if bars else None
-        }
-    return jsonify({"rows": rows, "meta": out_meta})
-
-# --------------------------------------------
-# Routes: strategies
-# --------------------------------------------
-def _comma_list(qs: str) -> List[str]:
-    return [x.strip() for x in qs.split(",") if x.strip()]
-
-def _scan_common(strat_key: str):
-    modname = STRAT_MODULES[strat_key]
-    mod = _load_strategy(modname)
-    symbols = _comma_list(request.args.get("symbols","") or ",".join(_symbols_store))
-    timeframe = request.args.get("timeframe","5Min")
-    limit = int(request.args.get("limit","600") or "600")
-    notional = float(request.args.get("notional","0") or "0")
-    dry = bool(int(request.args.get("dry","1") or "1"))
-    extra = {}  # you can parse extra query params here
-    res = mod.run_scan(symbols=symbols, timeframe=timeframe, limit=limit, notional=notional, dry=dry, extra=extra)
-    # normalize response structure
-    return jsonify({
-        "ok": True,
-        "dry": dry,
-        "results": res.get("results",[]),
-        "placed": res.get("placed",[]),
-        "version": APP_VERSION
-    })
-
-@app.route("/scan/c1", methods=["POST"])
-def scan_c1(): return _scan_common("c1")
-
-@app.route("/scan/c2", methods=["POST"])
-def scan_c2(): return _scan_common("c2")
-
-@app.route("/scan/c3", methods=["POST"])
-def scan_c3(): return _scan_common("c3")
-
-@app.route("/scan/c4", methods=["POST"])
-def scan_c4(): return _scan_common("c4")
-
-@app.route("/scan/c5", methods=["POST"])
-def scan_c5(): return _scan_common("c5")
-
-@app.route("/scan/c6", methods=["POST"])
-def scan_c6(): return _scan_common("c6")
-
-# --------------------------------------------
-# Routes: positions / orders / pnl / attribution / calendar
-# --------------------------------------------
-@app.route("/v2/positions")
-def route_positions():
-    return jsonify(get_positions())
-
-@app.route("/orders/recent")
-def route_orders_recent():
-    status = request.args.get("status","all")
-    limit = int(request.args.get("limit","200") or "200")
-    return jsonify(get_recent_orders(status=status, limit=limit))
-
-@app.route("/pnl/summary")
-def route_pnl_summary():
-    # default 14 days; you can change with ?days=7 or 30 from the UI toggles
-    days = int(request.args.get("days","14") or "14")
-    return jsonify(compute_pnl_summary(days=days))
-
-@app.route("/orders/attribution")
-def route_orders_attr():
-    days = int(request.args.get("days","30") or "30")
-    return jsonify(attribute_by_strategy(days=days))
-
-@app.route("/calendar")
-def route_calendar():
-    """
-    Very simple event feed: returns last 30 days of activity markers using orders timestamps.
-    """
-    days = int(request.args.get("days","30") or "30")
-    since = dt.datetime.utcnow() - dt.timedelta(days=days)
-    orders = get_recent_orders(status="all", limit=500)
-    by_day: Dict[str,int] = {}
-    for o in orders:
-        ts = o.get("submitted_at") or o.get("created_at") or o.get("updated_at") or None
-        if not ts: continue
-        try:
-            # Normalize to date (UTC)
-            d = ts[:10]  # YYYY-MM-DD
-            by_day[d] = by_day.get(d,0) + 1
-        except:
-            pass
-    items = [{"date": d, "count": c} for d,c in sorted(by_day.items())]
-    return jsonify({"days": days, "items": items, "as_of": now_utc_iso()})
-
-# --------------------------------------------
-# Dashboard (HTML) — mobile-friendly, relative URLs only
-# --------------------------------------------
-DASH_HTML = """
+# ─────────────────────────────────────────────────────────────
+# HTML Dashboard
+# ─────────────────────────────────────────────────────────────
+@app.get("/dashboard", response_class=HTMLResponse)
+def dashboard(request: Request):
+    # Render a single-page dashboard with embedded JS
+    sym_opts = "".join([f'<option value="{s}">{s}</option>' for s in SYMBOLS])
+    html = f"""
 <!doctype html>
 <html lang="en">
 <head>
-  <meta charset="utf-8" />
-  <title>Crypto System Dashboard · v1.9.2</title>
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta charset="utf-8"/>
+  <title>Crypto Trading Dashboard · v{APP_VERSION}</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <style>
-    :root {
-      --bg: #0b1020;
-      --panel: #131a33;
-      --panel-2: #0f152b;
-      --text: #e5ecff;
-      --muted: #9fb2ff;
-      --accent: #5aa2ff;
-      --accent-2: #94f3d3;
-      --red: #ff6b6b;
-      --green: #2ee6a6;
-      --yellow: #ffd166;
-      --grid: 12px;
-      --radius: 14px;
-    }
-    * { box-sizing: border-box; }
-    body {
-      margin: 0; padding: 0;
-      font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Inter, "Helvetica Neue", Arial, "Apple Color Emoji", "Segoe UI Emoji";
-      color: var(--text);
-      background: radial-gradient(1200px 800px at 10% -20%, #132046 0%, #0b1020 35%) no-repeat, var(--bg);
-    }
-    a { color: var(--accent); text-decoration: none; }
-    .wrap { max-width: 1200px; margin: 0 auto; padding: 16px; }
-    header {
-      display: flex; flex-wrap: wrap; align-items: center; gap: 10px;
-      padding: 12px 8px 8px;
-    }
-    header .title { font-weight: 700; font-size: 18px; letter-spacing: 0.3px; }
-    header .meta { color: var(--muted); font-size: 12px; margin-left: auto; }
-    .grid {
-      display: grid; gap: 12px;
-      grid-template-columns: repeat(12, 1fr);
-    }
-    .card {
-      background: linear-gradient(180deg, rgba(255,255,255,0.02), rgba(255,255,255,0.01));
-      border: 1px solid rgba(148, 179, 255, 0.12);
-      border-radius: var(--radius);
-      padding: 14px;
-      box-shadow: 0 8px 20px rgba(0,0,0,0.15), inset 0 1px 0 rgba(255,255,255,0.06);
-    }
-    .card h3 { margin: 0 0 8px 0; font-size: 14px; color: var(--muted); font-weight: 600; }
-    .kvs { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 10px; }
-    .kv { background: var(--panel-2); border-radius: 12px; padding: 10px; border: 1px solid rgba(148,179,255,0.10); }
-    .kv .lbl { color: var(--muted); font-size: 12px; }
-    .kv .val { font-weight: 700; font-size: 18px; }
-    .pill { display:inline-block; padding:4px 8px; border-radius:20px; font-size: 11px; background:#0c1b3a; border:1px solid rgba(148,179,255,.15); color: var(--muted); }
-    .list { display:flex; flex-direction: column; gap:8px; }
-    .row { display:flex; align-items:center; justify-content: space-between; gap: 10px; padding:8px 10px; background: var(--panel-2); border-radius: 10px; border: 1px solid rgba(148,179,255,0.10); }
-    .row .l { display:flex; align-items:center; gap:8px; }
-    .row .r { color: var(--muted); font-size: 12px; }
-    .gain { color: var(--green); }
-    .loss { color: var(--red); }
-    .tabs { display:flex; gap:6px; flex-wrap: wrap; }
-    .tab { padding:6px 10px; border-radius: 20px; background: #101839; border:1px solid rgba(148,179,255,.14); color: var(--muted); font-size: 12px; cursor: pointer; }
-    .tab.active { color:#051622; background: var(--accent-2); border-color: rgba(148,179,255,.0); font-weight:700; }
-    .muted { color: var(--muted); }
-
-    /* Layout */
-    .col-span-12 { grid-column: span 12; }
-    .col-span-8  { grid-column: span 8; }
-    .col-span-6  { grid-column: span 6; }
-    .col-span-4  { grid-column: span 4; }
-    .col-span-3  { grid-column: span 3; }
-    .col-span-2  { grid-column: span 2; }
-
-    @media (max-width: 980px) {
-      .grid { grid-template-columns: repeat(6, 1fr); }
-      .col-span-8 { grid-column: span 6; }
-      .col-span-6 { grid-column: span 6; }
-      .col-span-4 { grid-column: span 6; }
-      .col-span-3 { grid-column: span 3; }
-      .col-span-2 { grid-column: span 3; }
-    }
-    @media (max-width: 640px) {
-      .grid { grid-template-columns: repeat(2, 1fr); }
-      .col-span-8,.col-span-6,.col-span-4,.col-span-3,.col-span-2 { grid-column: span 2; }
-      .kvs { grid-template-columns: repeat(2, minmax(0,1fr)); }
-    }
-
-    /* Calendar */
-    .cal {
-      display:grid; gap:8px;
-      grid-template-columns: repeat(7, minmax(0,1fr));
-    }
-    .cal .cell {
-      background: var(--panel-2);
-      border: 1px solid rgba(148,179,255,.10);
-      min-height: 70px;
-      border-radius: 10px;
-      padding: 6px;
-      display:flex; flex-direction:column; justify-content:space-between;
-    }
-    .cal .d { font-size:11px; color: var(--muted);}
-    .dotbar { height:8px; border-radius:4px; background:#0e1d3d; border:1px solid rgba(148,179,255,.08); overflow:hidden;}
-    .dotbar .f { height:100%; background: linear-gradient(90deg, var(--accent), var(--accent-2)); width:0%; }
-
-    /* Tables */
-    table { width:100%; border-collapse: collapse; }
-    th, td { text-align:left; font-size:12px; padding:8px 6px; border-bottom: 1px solid rgba(148,179,255,.08); }
-    th { color: var(--muted); font-weight:600; }
+    :root {{
+      --fg:#0b1320; --muted:#6b7280; --card:#ffffff; --line:#e5e7eb; --accent:#0ea5e9; --bg:#f8fafc;
+    }}
+    * {{ box-sizing: border-box; }}
+    body {{ margin:0; background:var(--bg); color:var(--fg); font-family:system-ui,-apple-system,Segoe UI,Roboto,Inter,Arial,sans-serif; }}
+    header {{ padding:20px 24px; border-bottom:1px solid var(--line); background:#fff; position:sticky; top:0; z-index:10; }}
+    h1 {{ margin:0; font-size:20px; }}
+    .version {{ color:var(--muted); font-weight:normal; }}
+    main {{ padding:24px; }}
+    .grid {{ display:grid; grid-template-columns: repeat(12, 1fr); grid-gap:16px; }}
+    .card {{ grid-column: span 6; background:var(--card); border:1px solid var(--line); border-radius:12px; padding:16px; }}
+    .card.wide {{ grid-column: span 12; }}
+    h3 {{ margin:0 0 12px 0; font-size:16px; }}
+    table {{ width:100%; border-collapse: collapse; }}
+    th, td {{ padding:8px 10px; border-bottom:1px solid var(--line); text-align:left; font-size:13px; }}
+    th {{ background:#f3f4f6; }}
+    code, pre {{ background:#0b1020; color:#e5e7eb; padding:10px; border-radius:8px; display:block; white-space:pre-wrap; }}
+    .row {{ display:flex; gap:8px; flex-wrap:wrap; align-items:center; }}
+    select, input[type="text"], input[type="number"] {{
+      border:1px solid var(--line); border-radius:8px; padding:8px 10px; font-size:13px; background:#fff;
+    }}
+    button {{
+      border:1px solid var(--accent); color:#fff; background:var(--accent);
+      padding:8px 12px; border-radius:8px; font-size:13px; cursor:pointer;
+    }}
+    .muted {{ color:var(--muted); }}
+    .ok {{ color: #059669; }}
+    .warn {{ color: #b45309; }}
+    .err {{ color: #dc2626; }}
+    .tiny {{ font-size:12px; }}
   </style>
 </head>
 <body>
-  <div class="wrap">
-    <header>
-      <div class="title">Crypto Trading System <span class="pill">v1.9.2</span></div>
-      <div class="meta" id="meta">loading…</div>
-    </header>
-
+  <header>
+    <h1>Crypto Trading Dashboard <span class="version">v{APP_VERSION}</span></h1>
+    <div class="tiny muted">Symbols: {", ".join(SYMBOLS)} · Provider: {PROVIDER} · Overshoot: {OVERSHOOT}</div>
+  </header>
+  <main>
     <div class="grid">
-      <!-- Summary -->
-      <section class="card col-span-12">
-        <h3>Summary</h3>
-        <div class="kvs" id="summary">
-          <div class="kv"><div class="lbl">Positions</div><div class="val" id="sum-pos">–</div></div>
-          <div class="kv"><div class="lbl">Unrealized P&L</div><div class="val" id="sum-unr">–</div></div>
-          <div class="kv"><div class="lbl">Realized (window)</div><div class="val" id="sum-real">–</div></div>
-        </div>
-      </section>
+      <div class="card">
+        <h3>Health</h3>
+        <div id="health">Checking...</div>
+      </div>
 
-      <!-- P&L -->
-      <section class="card col-span-8">
-        <div style="display:flex; align-items:center; justify-content:space-between;">
-          <h3>P&L</h3>
-          <div class="tabs">
-            <div class="tab" data-days="1">1D</div>
-            <div class="tab active" data-days="14">14D</div>
-            <div class="tab" data-days="30">30D</div>
-          </div>
+      <div class="card">
+        <h3>Diag Candles</h3>
+        <div class="row">
+          <label class="tiny muted">TF</label>
+          <select id="diag_tf">
+            <option value="5Min">5Min</option>
+            <option value="1Min">1Min</option>
+          </select>
+          <label class="tiny muted">Limit</label>
+          <input type="number" id="diag_limit" value="300" min="1" step="1" style="width:90px"/>
+          <label class="tiny muted">Add Symbol</label>
+          <select id="diag_sym">{sym_opts}</select>
+          <button id="diag_add">Add</button>
+          <button id="diag_go">Run</button>
         </div>
-        <div class="list" id="pnlList">
-          <div class="row"><div class="l"><span class="pill">Total</span></div><div class="r" id="pnl-total">–</div></div>
-          <div class="row"><div class="l"><span class="pill">Unrealized</span></div><div class="r" id="pnl-unr">–</div></div>
-          <div class="row"><div class="l"><span class="pill">Realized</span></div><div class="r" id="pnl-real">–</div></div>
-          <div class="muted" style="font-size:12px; margin-top:6px;">Realized from fills within window; Unrealized from current positions.</div>
-        </div>
-      </section>
+        <div class="tiny muted" id="diag_syms">Symbols: (none)</div>
+        <table>
+          <thead><tr><th>Symbol</th><th>Rows</th></tr></thead>
+          <tbody id="diag_table"></tbody>
+        </table>
+      </div>
 
-      <!-- Strategies Attribution -->
-      <section class="card col-span-4">
-        <h3>Strategies (P&L / volume by prefix)</h3>
-        <div id="strats-list" class="list">
-          <div class="muted">loading…</div>
-        </div>
-      </section>
+      <div class="card">
+        <h3>Positions</h3>
+        <table>
+          <thead><tr><th>Symbol</th><th>Qty</th><th>Avg</th><th>Mkt</th><th>UPNL</th></tr></thead>
+          <tbody id="pos_table"></tbody>
+        </table>
+      </div>
 
-      <!-- Positions -->
-      <section class="card col-span-8">
-        <h3>Open Positions</h3>
-        <div id="pos-box" class="list">
-          <div class="muted">loading…</div>
-        </div>
-      </section>
-
-      <!-- Recent Orders -->
-      <section class="card col-span-4">
+      <div class="card">
         <h3>Recent Orders</h3>
-        <div class="list" id="orders-box">
-          <div class="muted">loading…</div>
-        </div>
-      </section>
+        <table>
+          <thead><tr><th>Time</th><th>Sym</th><th>Side</th><th>Notional</th><th>Qty</th><th>Status</th><th>CID</th></tr></thead>
+          <tbody id="ord_table"></tbody>
+        </table>
+      </div>
 
-      <!-- Calendar -->
-      <section class="card col-span-12">
-        <h3>Activity Calendar (last 30 days)</h3>
-        <div class="cal" id="cal"></div>
-      </section>
+      <div class="card">
+        <h3>P&amp;L</h3>
+        <div id="pnl_box" class="row tiny">
+          <div><b>Realized:</b> <span id="pnl_realized">—</span></div>
+          <div><b>Unrealized:</b> <span id="pnl_unrealized">—</span></div>
+          <div><b>Total:</b> <span id="pnl_total">—</span></div>
+        </div>
+      </div>
+
+      <div class="card">
+        <h3>Attribution</h3>
+        <table>
+          <thead><tr><th>Strategy</th><th>Orders</th><th>Symbols</th></tr></thead>
+          <tbody id="attr_table"></tbody>
+        </table>
+      </div>
+
+      <div class="card wide">
+        <h3>Scan Console</h3>
+        <div class="row">
+          <label class="tiny muted">Strategy</label>
+          <select id="scan_strategy">
+            <option value="c1">c1</option><option value="c2">c2</option><option value="c3">c3</option>
+            <option value="c4">c4</option><option value="c5">c5</option><option value="c6">c6</option>
+          </select>
+          <label class="tiny muted">TF</label>
+          <select id="scan_tf">
+            <option value="5Min">5Min</option>
+            <option value="1Min">1Min</option>
+          </select>
+          <label class="tiny muted">Limit</label>
+          <input type="number" id="scan_limit" value="300" min="1" step="1" style="width:90px"/>
+          <label class="tiny muted">Dry</label>
+          <select id="scan_dry"><option value="1">Yes</option><option value="0">No (PAPER)</option></select>
+          <label class="tiny muted">Symbols</label>
+          <input type="text" id="scan_symbols" value="{",".join(SYMBOLS)}" style="width:380px"/>
+          <button id="scan_go">Run Scan</button>
+        </div>
+        <pre id="scan_output" class="tiny">No scan yet.</pre>
+      </div>
     </div>
-  </div>
+  </main>
 
   <script>
-    const fmtMoney = (x) => {
-      if (x === null || x === undefined || isNaN(x)) return "–";
-      const s = Number(x).toFixed(2);
-      if (x > 0) return `<span class="gain">+$${s}</span>`;
-      if (x < 0) return `<span class="loss">-$${Math.abs(x).toFixed(2)}</span>`;
-      return `$${s}`;
-    };
-    const fmtNum = (x) => (x === null || x === undefined) ? "–" : String(x);
-    const el = (id) => document.getElementById(id);
+  const $ = sel => document.querySelector(sel);
+  const $$ = sel => Array.from(document.querySelectorAll(sel));
 
-    async function fetchJSON(url) {
-      const r = await fetch(url);
-      if (!r.ok) throw new Error(`${r.status}`);
-      return await r.json();
-    }
+  async function getJSON(url) {{
+    const r = await fetch(url);
+    return r.json();
+  }}
 
-    async function loadMeta() {
-      try {
-        const h = await fetchJSON('/health');
-        el('meta').innerHTML = `v${h.version} · ${new Date(h.time).toLocaleString()} · Alpaca: ${h.alpaca_connected ? 'ok' : 'off'}`;
-      } catch(e) {
-        el('meta').innerHTML = 'health: error';
-      }
-    }
+  function setText(id, txt) {{ const el = document.getElementById(id); if(el) el.textContent = txt; }}
 
-    async function loadPositions() {
-      const box = el('pos-box');
-      try {
-        const ps = await fetchJSON('/v2/positions');
-        el('sum-pos').innerHTML = fmtNum(ps.length);
-        if (!ps.length) { box.innerHTML = '<div class="muted">No open positions.</div>'; return; }
-        box.innerHTML = '';
-        ps.forEach(p => {
-          const side = (p.side || 'long').toUpperCase();
-          const mv = parseFloat(p.market_value || '0');
-          const cb = parseFloat(p.cost_basis || '0');
-          const unr = mv - cb;
-          const div = document.createElement('div');
-          div.className = 'row';
-          div.innerHTML = `
-            <div class="l">
-              <span class="pill">${side}</span>
-              <strong>${p.symbol || p.asset_symbol || ''}</strong>
-              <span class="muted">qty ${p.qty}</span>
-            </div>
-            <div class="r">MV ${fmtMoney(mv)} · CB ${fmtMoney(cb)} · ${fmtMoney(unr)}</div>
-          `;
-          box.appendChild(div);
-        });
-      } catch(e) {
-        box.innerHTML = '<div class="muted">positions: error</div>';
-      }
-    }
+  async function refreshHealth() {{
+    try {{
+      const j = await getJSON('/health');
+      $('#health').innerHTML = `<span class="ok">OK</span> · version <b>${{j.version}}</b>`;
+    }} catch(e) {{
+      $('#health').innerHTML = `<span class="err">ERROR</span>`;
+    }}
+  }}
 
-    async function loadPNL(days=14) {
-      // tabs UI
-      document.querySelectorAll('.tab').forEach(t => {
-        t.classList.toggle('active', Number(t.dataset.days) === Number(days));
-      });
-      try {
-        const p = await fetchJSON(`/pnl/summary?days=${days}`);
-        el('pnl-total').innerHTML = fmtMoney(p.total);
-        el('pnl-unr').innerHTML = fmtMoney(p.unrealized);
-        el('pnl-real').innerHTML = fmtMoney(p.realized);
-        el('sum-unr').innerHTML = fmtMoney(p.unrealized);
-        el('sum-real').innerHTML = fmtMoney(p.realized);
-      } catch(e) {
-        el('pnl-total').innerHTML = 'err';
-        el('pnl-unr').innerHTML = 'err';
-        el('pnl-real').innerHTML = 'err';
-      }
-    }
+  async function refreshPositions() {{
+    const t = $('#pos_table'); t.innerHTML = '';
+    try {{
+      const j = await getJSON('/v2/positions');
+      if (!j || j.length===0) {{
+        t.innerHTML = '<tr><td colspan="5" class="muted tiny">No open positions.</td></tr>';
+        return;
+      }}
+      for (const p of j) {{
+        t.innerHTML += `<tr><td>${{p.symbol||''}}</td><td>${{p.qty||''}}</td><td>${{p.avg_entry_price||''}}</td><td>${{p.current_price||''}}</td><td>${{p.unrealized_pl||''}}</td></tr>`;
+      }}
+    }} catch(e) {{
+      t.innerHTML = '<tr><td colspan="5" class="err tiny">Error loading positions.</td></tr>';
+    }}
+  }}
 
-    async function loadAttribution() {
-      const box = el('strats-list');
-      try {
-        const js = await fetchJSON('/orders/attribution?days=30');
-        const buckets = js.buckets || {};
-        box.innerHTML = '';
-        const keys = Object.keys(buckets).sort();
-        if (!keys.length) {
-          box.innerHTML = '<div class="muted">No recent orders found.</div>';
-          return;
-        }
-        keys.forEach(k => {
-          const b = buckets[k];
-          const div = document.createElement('div');
-          div.className = 'row';
-          div.innerHTML = `
-            <div class="l"><span class="pill">${k.toUpperCase()}</span> <strong>${b.count} orders</strong></div>
-            <div class="r">${(b.symbols || []).join(', ')}</div>
-          `;
-          box.appendChild(div);
-        });
-      } catch(e) {
-        box.innerHTML = '<div class="muted">attribution: error</div>';
-      }
-    }
+  async function refreshOrders() {{
+    const t = $('#ord_table'); t.innerHTML = '';
+    try {{
+      const j = await getJSON('/orders/recent');
+      if (!j || j.length===0) {{
+        t.innerHTML = '<tr><td colspan="7" class="muted tiny">No recent orders.</td></tr>';
+        return;
+      }}
+      for (const o of j.slice(0,50)) {{
+        t.innerHTML += `<tr>
+          <td>${{o.submitted_at||''}}</td><td>${{o.symbol||''}}</td><td>${{o.side||''}}</td>
+          <td>${{o.notional||''}}</td><td>${{o.qty||''}}</td><td>${{o.status||''}}</td>
+          <td class="tiny">${{o.client_order_id||''}}</td>
+        </tr>`;
+      }}
+    }} catch(e) {{
+      t.innerHTML = '<tr><td colspan="7" class="err tiny">Error loading orders.</td></tr>';
+    }}
+  }}
 
-    async function loadOrders() {
-      const box = el('orders-box');
-      try {
-        const os = await fetchJSON('/orders/recent?status=all&limit=200');
-        if (!os.length) { box.innerHTML = '<div class="muted">No orders.</div>'; return; }
-        box.innerHTML = '';
-        os.slice(0,18).forEach(o => {
-          const div = document.createElement('div');
-          div.className = 'row';
-          const coid = (o.client_order_id || '').slice(0, 18);
-          div.innerHTML = `
-            <div class="l"><span class="pill">${(o.side||'').toUpperCase()}</span> <strong>${o.symbol||''}</strong> <span class="muted">${o.status||''}</span></div>
-            <div class="r">${coid}</div>
-          `;
-          box.appendChild(div);
-        });
-      } catch(e) {
-        box.innerHTML = '<div class="muted">orders: error</div>';
-      }
-    }
+  async function refreshPnl() {{
+    try {{
+      const j = await getJSON('/pnl/summary');
+      setText('pnl_realized', (j.realized??'—'));
+      setText('pnl_unrealized', (j.unrealized??'—'));
+      setText('pnl_total', (j.total??'—'));
+    }} catch(e) {{
+      setText('pnl_realized', 'ERR'); setText('pnl_unrealized', 'ERR'); setText('pnl_total', 'ERR');
+    }}
+  }}
 
-    function monthGrid(items) {
-      // items: [{date:'YYYY-MM-DD', count:n}]
-      // make a 5-week grid from today backwards ~30 days
-      const today = new Date();
-      const map = {};
-      items.forEach(x => map[x.date] = x.count);
-      const root = document.getElementById('cal');
-      root.innerHTML = '';
-      // compute the last 35 days
-      for (let i=34; i>=0; i--) {
-        const d = new Date(today.getTime() - i*24*60*60*1000);
-        const iso = d.toISOString().slice(0,10);
-        const n = map[iso] || 0;
-        const pct = Math.min(100, n*10); // simple fill scale
-        const cell = document.createElement('div');
-        cell.className = 'cell';
-        cell.innerHTML = `
-          <div class="d">${iso}</div>
-          <div class="dotbar"><div class="f" style="width:${pct}%"></div></div>
-        `;
-        root.appendChild(cell);
-      }
-    }
+  async function refreshAttr() {{
+    const t = $('#attr_table'); t.innerHTML = '';
+    try {{
+      const j = await getJSON('/orders/attribution');
+      const buckets = (j && j.buckets) || {{}};
+      const keys = Object.keys(buckets);
+      if (keys.length===0) {{
+        t.innerHTML = '<tr><td colspan="3" class="muted tiny">No attribution yet.</td></tr>';
+        return;
+      }}
+      for (const k of keys) {{
+        const b = buckets[k];
+        t.innerHTML += `<tr><td>${{k}}</td><td>${{b.count||0}}</td><td class="tiny">${{(b.symbols||[]).join(', ')}}</td></tr>`;
+      }}
+    }} catch(e) {{
+      t.innerHTML = '<tr><td colspan="3" class="err tiny">Error loading attribution.</td></tr>';
+    }}
+  }}
 
-    async function loadCalendar() {
-      try {
-        const js = await fetchJSON('/calendar?days=30');
-        monthGrid(js.items || []);
-      } catch(e) {
-        document.getElementById('cal').innerHTML = '<div class="muted">calendar: error</div>';
-      }
-    }
+  // Diag Candles
+  const diagSymbols = new Set();
+  function updateDiagSymsLabel() {{
+    $('#diag_syms').textContent = 'Symbols: ' + (Array.from(diagSymbols).join(', ') || '(none)');
+  }}
+  $('#diag_add').addEventListener('click', () => {{
+    const val = $('#diag_sym').value;
+    if (val) diagSymbols.add(val);
+    updateDiagSymsLabel();
+  }});
+  $('#diag_go').addEventListener('click', async () => {{
+    const tf = $('#diag_tf').value;
+    const limit = $('#diag_limit').value;
+    const syms = Array.from(diagSymbols);
+    const t = $('#diag_table'); t.innerHTML = '';
+    if (syms.length===0) {{
+      t.innerHTML = '<tr><td colspan="2" class="tiny muted">Add at least one symbol.</td></tr>';
+      return;
+    }}
+    try {{
+      const url = `/diag/candles?tf=${{encodeURIComponent(tf)}}&limit=${{encodeURIComponent(limit)}}&symbols=${{encodeURIComponent(syms.join(','))}}`;
+      const j = await getJSON(url);
+      const rows = j.rows || j.meta || {{}};
+      const keys = Object.keys(rows);
+      if (keys.length===0) {{
+        t.innerHTML = '<tr><td colspan="2" class="tiny muted">No data.</td></tr>';
+        return;
+      }}
+      for (const k of keys) {{
+        const r = j.rows ? j.rows[k] : (j.meta[k] ? j.meta[k].rows : 0);
+        t.innerHTML += `<tr><td>${{k}}</td><td>${{r}}</td></tr>`;
+      }}
+    }} catch(e) {{
+      t.innerHTML = '<tr><td colspan="2" class="err tiny">Diag error.</td></tr>';
+    }}
+  }});
 
-    // Tabs handlers
-    document.addEventListener('click', (ev) => {
-      const t = ev.target.closest('.tab');
-      if (t) {
-        const days = Number(t.dataset.days || 14);
-        loadPNL(days);
-      }
-    });
+  // Scan Console
+  $('#scan_go').addEventListener('click', async () => {{
+    const strat = $('#scan_strategy').value;
+    const tf = $('#scan_tf').value;
+    const limit = $('#scan_limit').value;
+    const dry = $('#scan_dry').value;
+    const syms = $('#scan_symbols').value;
 
-    // Initial load + refresh every ~30s
-    (async function init() {
-      await loadMeta();
-      await loadPNL(14);
-      await loadAttribution();
-      await loadPositions();
-      await loadOrders();
-      await loadCalendar();
-      setInterval(() => { loadMeta(); loadPositions(); loadOrders(); }, 30000);
-    })();
+    $('#scan_output').textContent = 'Running...';
+    try {{
+      const url = `/scan/${{encodeURIComponent(strat)}}?dry=${{encodeURIComponent(dry)}}&timeframe=${{encodeURIComponent(tf)}}&limit=${{encodeURIComponent(limit)}}&symbols=${{encodeURIComponent(syms)}}`;
+      const r = await fetch(url, {{ method: 'POST' }});
+      const j = await r.json();
+      $('#scan_output').textContent = JSON.stringify(j, null, 2);
+      // light refresh of orders/attr after LIVE
+      if (dry === '0') {{ refreshOrders(); refreshAttr(); }}
+    }} catch(e) {{
+      $('#scan_output').textContent = 'Scan error: ' + e;
+    }}
+  }});
+
+  // initial load + 15s auto-refresh (health, positions, orders, pnl, attr)
+  async function boot() {{
+    updateDiagSymsLabel();
+    await Promise.all([refreshHealth(), refreshPositions(), refreshOrders(), refreshPnl(), refreshAttr()]);
+    setInterval(refreshHealth, 15000);
+    setInterval(refreshPositions, 15000);
+    setInterval(refreshOrders, 15000);
+    setInterval(refreshPnl, 15000);
+    setInterval(refreshAttr, 30000);
+  }}
+  boot();
   </script>
 </body>
 </html>
 """
+    return HTMLResponse(html)
 
-@app.route("/")
-def home():
-    return Response(DASH_HTML, mimetype="text/html")
+# ─────────────────────────────────────────────────────────────
+# Health
+# ─────────────────────────────────────────────────────────────
+@app.get("/health")
+def health():
+    return {"ok": True, "version": APP_VERSION}
 
-# --------------------------------------------
-# Main
-# --------------------------------------------
-if __name__ == "__main__":
-    port = int(os.environ.get("PORT","10000"))
-    print(f"Starting Crypto System {APP_VERSION} on port {port}  (Alpaca OK: {alpaca_ok()})")
-    app.run(host="0.0.0.0", port=port)
+# ─────────────────────────────────────────────────────────────
+# Diag: summarize available candles
+# ─────────────────────────────────────────────────────────────
+@app.get("/diag/candles")
+def diag_candles(
+    symbols: str = Query(..., description="Comma-separated symbols (e.g., BTC/USD,ETH/USD)"),
+    tf: str = Query("5Min"), limit: int = Query(300)
+):
+    syms = [s.strip() for s in symbols.split(",") if s.strip()]
+    rows_map: Dict[str, int] = {}
+    meta: Dict[str, Any] = {}
+    for s in syms:
+        have = load_candles(s, tf)
+        rows_map[s] = len(have)
+        meta[s] = {"rows": len(have)}
+    total = sum(rows_map.values())
+    return {"ok": True, "tf": tf, "limit": limit, "rows": rows_map, "meta": meta, "total": total}
+
+# ─────────────────────────────────────────────────────────────
+# Compat placeholders (positions/orders/pnl/attribution)
+# ─────────────────────────────────────────────────────────────
+_FAKE_ORDERS: List[Dict[str, Any]] = []
+
+@app.get("/v2/positions")
+def positions():
+    return []  # replace with your broker positions
+
+@app.get("/orders/recent")
+def orders_recent():
+    return list(reversed(_FAKE_ORDERS))[:100]
+
+@app.get("/pnl/summary")
+def pnl_summary():
+    realized = 4141.39
+    unrealized = 0.0
+    return {"ok": True, "realized": realized, "unrealized": unrealized, "total": realized + unrealized}
+
+@app.get("/orders/attribution")
+def orders_attribution():
+    buckets: Dict[str, Dict[str, Any]] = {}
+    for o in _FAKE_ORDERS:
+        strat = o.get("strategy", "other")
+        b = buckets.setdefault(strat, {"count": 0, "symbols": []})
+        b["count"] += 1
+        sym = o.get("symbol")
+        if sym and sym not in b["symbols"]:
+            b["symbols"].append(sym)
+    return {"ok": True, "buckets": buckets}
+
+# ─────────────────────────────────────────────────────────────
+# Scan endpoint (bars guaranteed; 5m→1m fallback if needed)
+# ─────────────────────────────────────────────────────────────
+@app.post("/scan/{strategy}")
+def scan(
+    strategy: str,
+    dry: int = Query(1),
+    timeframe: str = Query("5Min"),
+    limit: int = Query(300),
+    symbols: str = Query(",".join(SYMBOLS))
+):
+    syms = [s.strip() for s in symbols.split(",") if s.strip()]
+    required = max(limit, need_for(timeframe))
+
+    # Ensure data for each symbol
+    have_map: Dict[str, int] = {}
+    for sym in syms:
+        rows = ensure_bars(sym, timeframe, required)
+        if timeframe.lower() in ("5m","5min") and len(rows) < required:
+            rows = ensure_bars_5m_via_1m(sym, required)
+        have_map[sym] = len(rows)
+
+    results: List[Dict[str, Any]] = []
+    placed: List[Dict[str, Any]] = []
+
+    for sym in syms:
+        have = have_map.get(sym, 0)
+        if have < required:
+            results.append({"symbol": sym, "action": "flat", "reason": "insufficient_bars_provider_limit"})
+            continue
+
+        candles = load_candles(sym, timeframe)
+
+        # TODO plug in your real strategy here
+        signal = {"symbol": sym, "action": "flat", "reason": "ok_bars_ready"}
+
+        results.append(signal)
+
+        if dry == 0 and signal.get("action") in ("buy","sell"):
+            order = {
+                "submitted_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                "symbol": sym,
+                "side": signal["action"],
+                "qty": signal.get("qty"),
+                "notional": signal.get("notional"),
+                "status": "filled",
+                "client_order_id": f"{strategy}-{sym.replace('/','')}-{int(time.time())}",
+                "strategy": strategy,
+            }
+            _FAKE_ORDERS.append(order)
+            placed.append(order)
+
+    return {
+        "ok": True,
+        "have": have_map,
+        "results": results,
+        "placed": placed,
+        "params": {"strategy": strategy, "timeframe": timeframe, "limit": limit, "symbols": syms}
+    }
