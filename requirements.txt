@@ -6,3 +6,8 @@ pandas==2.2.2
 numpy==1.26.4
 python-dateutil==2.9.0.post0
 requests==2.32.3
+fastapi
+uvicorn[standard]
+# ccxt or your data vendor’s SDK (only if you implement fetch_ohlcv here)
+# pandas (ONLY if you switch to the pandas resampler version)
+
