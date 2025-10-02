@@ -7,7 +7,7 @@ import logging
 import os
 import time
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from fastapi import FastAPI, Query
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
@@ -23,26 +23,7 @@ logging.basicConfig(
 log = logging.getLogger("app")
 
 # -----------------------------------------------------------------------------
-# StrategyBook import (with defensive fallback so the service always boots)
-# -----------------------------------------------------------------------------
-StrategyBook = None  # will be set below
-
-try:
-    # Adjust to your project layout if needed
-    from strategy_book import StrategyBook as _SB  # type: ignore
-    StrategyBook = _SB
-except Exception as e:
-    log.warning("Could not import StrategyBook from strategy_book: %s", e)
-
-    class StrategyBook:  # type: ignore
-        """Minimal no-op fallback so the service can boot even without the real book."""
-        def scan(self, req: Dict[str, Any], contexts: Dict[str, Any]):
-            # Return an empty list to indicate no orders
-            return []
-
-
-# -----------------------------------------------------------------------------
-# App & config
+# Config
 # -----------------------------------------------------------------------------
 SCHEDULE_SECONDS = int(os.getenv("SCHEDULE_SECONDS", "60"))
 DEFAULT_LIMIT = int(os.getenv("DEFAULT_LIMIT", "100"))
@@ -50,13 +31,111 @@ DEFAULT_TIMEFRAME = os.getenv("DEFAULT_TIMEFRAME", "1h")
 DEFAULT_NOTIONAL = float(os.getenv("DEFAULT_NOTIONAL", "0"))
 DEFAULT_SYMBOLS = os.getenv("DEFAULT_SYMBOLS", "")  # comma list
 
-# Strategies to iterate over on each tick (match what you’ve been running)
+# Strategies to iterate on each tick (match your logs)
 STRATEGIES = ["c1", "c2", "c3", "c4", "c5", "c6"]
 
+# -----------------------------------------------------------------------------
+# StrategyBook import + compatibility wrapper
+# -----------------------------------------------------------------------------
+_real_SB = None
+try:
+    # Adjust this to your project layout if needed
+    from strategy_book import StrategyBook as _ImportedStrategyBook  # type: ignore
+    _real_SB = _ImportedStrategyBook
+except Exception as e:
+    log.warning("Could not import StrategyBook from strategy_book: %s", e)
+
+class _FallbackStrategyBook:
+    """No-op fallback so the service boots even without the real book."""
+    def scan(self, req: Dict[str, Any], contexts: Dict[str, Any]):
+        return []
+
+def _ensure_ctx_shape(ctx_map: Optional[Dict[str, Any]], tf: str, symbols: List[str], notional: float) -> Dict[str, Any]:
+    """Make sure contexts has at least 'one' and 'default' with basic fields."""
+    ctx_map = ctx_map or {}
+    if not isinstance(ctx_map, dict):
+        ctx_map = {}
+    base = {"timeframe": tf, "symbols": symbols, "notional": notional}
+    one = ctx_map.get("one") if isinstance(ctx_map.get("one"), dict) else {}
+    default = ctx_map.get("default") if isinstance(ctx_map.get("default"), dict) else {}
+    one = {**base, **one}
+    default = {**base, **(default or one)}
+    ctx_map["one"] = one
+    ctx_map["default"] = default
+    return ctx_map
+
+class StrategyBook:  # compatibility facade
+    """
+    Wraps the real StrategyBook (if present) and calls its scan in a safe way.
+    It:
+      * Guarantees req['one'], req['default'], req['contexts']
+      * Guarantees contexts['one'], contexts['default']
+      * Tries a couple of call shapes to satisfy older signatures
+      * Quiets repeated warnings per strategy
+    """
+
+    def __init__(self):
+        self._impl = _real_SB() if _real_SB else _FallbackStrategyBook()
+        self._warned: Dict[str, bool] = {}
+
+    def _once_warn(self, strategy: str, msg: str):
+        if not self._warned.get(strategy):
+            log.warning(msg)
+            self._warned[strategy] = True
+
+    def scan(self, req: Dict[str, Any], contexts: Dict[str, Any]):
+        strategy = req.get("strategy", "unknown")
+        tf = req.get("timeframe") or DEFAULT_TIMEFRAME
+        symbols = req.get("symbols") or []
+        notional = req.get("notional") or DEFAULT_NOTIONAL
+
+        # Always harden shapes before first attempt
+        contexts = _ensure_ctx_shape(contexts, tf, symbols, notional)
+
+        # Ensure req mirrors contexts (so req['one'] exists even if strategy reads from req)
+        req.setdefault("one", contexts.get("one"))
+        req.setdefault("default", contexts.get("default"))
+        req.setdefault("contexts", contexts)
+
+        # Try the canonical shape first
+        try:
+            return self._impl.scan(req, contexts)
+        except KeyError as ke:
+            # Common issue: KeyError('one')
+            if str(ke) in ("'one'", "one"):
+                self._once_warn(strategy, f"scan: strategy '{strategy}' accessed missing key 'one'; repairing payload and retrying once.")
+                # Rebuild shapes then retry once
+                contexts = _ensure_ctx_shape(contexts, tf, symbols, notional)
+                req["one"] = contexts["one"]
+                req["default"] = contexts["default"]
+                req["contexts"] = contexts
+                try:
+                    return self._impl.scan(req, contexts)
+                except Exception as e2:
+                    self._once_warn(strategy, f"scan retry still failed for '{strategy}': {e2}")
+                    return []
+            else:
+                self._once_warn(strategy, f"scan raised KeyError for '{strategy}': {ke}")
+                return []
+        except TypeError as te:
+            # As a last resort, attempt a legacy (req-only) call if the impl accepts it
+            self._once_warn(strategy, f"scan TypeError for '{strategy}' with (req, contexts): {te}. Trying (req) only.")
+            try:
+                return self._impl.scan(req)  # type: ignore[arg-type]
+            except Exception as e2:
+                self._once_warn(strategy, f"scan (req) also failed for '{strategy}': {e2}")
+                return []
+        except Exception as e:
+            self._once_warn(strategy, f"scan failed for '{strategy}': {e}")
+            return []
+
+# -----------------------------------------------------------------------------
+# App
+# -----------------------------------------------------------------------------
 app = FastAPI(title="Crypto System")
 
 # -----------------------------------------------------------------------------
-# In-memory “DB” for demo endpoints (substitute with your own persistence)
+# In-memory “DB” for demo endpoints
 # -----------------------------------------------------------------------------
 _orders_ring: List[Dict[str, Any]] = []
 _MAX_ORDERS = 1000
@@ -74,7 +153,6 @@ _attribution = {
     "updated_at": datetime.now(timezone.utc).isoformat(),
 }
 
-
 def _push_orders(new_orders: List[Dict[str, Any]]):
     if not new_orders:
         return
@@ -84,11 +162,9 @@ def _push_orders(new_orders: List[Dict[str, Any]]):
     if len(_orders_ring) > _MAX_ORDERS:
         del _orders_ring[: len(_orders_ring) - _MAX_ORDERS]
 
-
 def _touch_metrics(orders: List[Dict[str, Any]], strategy: str):
     if not orders:
         return
-    # Very naive mock attribution update
     pnl_bump = sum(float(o.get("pnl", 0.0)) for o in orders)
     _pnl_summary["pnl_day"] += pnl_bump
     _pnl_summary["equity"] += pnl_bump
@@ -97,9 +173,8 @@ def _touch_metrics(orders: List[Dict[str, Any]], strategy: str):
     _attribution["by_strategy"][strategy] = _attribution["by_strategy"].get(strategy, 0.0) + pnl_bump
     _attribution["updated_at"] = datetime.now(timezone.utc).isoformat()
 
-
 # -----------------------------------------------------------------------------
-# Robust context preparation (NEW)
+# Contexts
 # -----------------------------------------------------------------------------
 def _prepare_contexts(req: Dict[str, Any]) -> Dict[str, Any]:
     """
@@ -110,6 +185,7 @@ def _prepare_contexts(req: Dict[str, Any]) -> Dict[str, Any]:
     Supports incoming contexts as dict, list, or None.
     """
     tf = req.get("timeframe") or req.get("tf") or DEFAULT_TIMEFRAME
+
     symbols_raw = req.get("symbols") or req.get("symbol") or []
     if isinstance(symbols_raw, str):
         if symbols_raw.strip():
@@ -162,9 +238,8 @@ def _prepare_contexts(req: Dict[str, Any]) -> Dict[str, Any]:
 
     return ctx_map
 
-
 # -----------------------------------------------------------------------------
-# Hardened scan bridge (REPLACES previous) — preserves your patch verbatim
+# Hardened scan bridge (keeps YOUR PATCH verbatim)
 # -----------------------------------------------------------------------------
 async def _scan_bridge(strat: str, req: Dict[str, Any], dry: bool = False):
     """
@@ -179,7 +254,7 @@ async def _scan_bridge(strat: str, req: Dict[str, Any], dry: bool = False):
     notional = req.get("notional") or DEFAULT_NOTIONAL
 
     # Normalize symbols from req or env
-    symbols_field = req.get("symbols") or ( [req.get("symbol")] if req.get("symbol") else None )
+    symbols_field = req.get("symbols") or ([req.get("symbol")] if req.get("symbol") else None)
     if symbols_field is None:
         env_syms = [s.strip() for s in DEFAULT_SYMBOLS.split(",") if s.strip()]
         symbols = env_syms
@@ -215,34 +290,24 @@ async def _scan_bridge(strat: str, req: Dict[str, Any], dry: bool = False):
 
     inst = StrategyBook()
 
-    # The only signature we now support is: scan(req, contexts)
-    try:
-        result = inst.scan(compact_req, ctx_map)
+    result: Any = inst.scan(compact_req, ctx_map)
 
-        if not result:
-            return []
-        if isinstance(result, dict):
-            if "orders" in result and isinstance(result["orders"], list):
-                return result["orders"]
-            return [result]
-        if isinstance(result, list):
-            return result
+    # Normalize output
+    if not result:
+        return []
+    if isinstance(result, dict):
+        if "orders" in result and isinstance(result["orders"], list):
+            return result["orders"]
         return [result]
-
-    except KeyError as ke:
-        log.warning("scan raised KeyError: %s", ke)
-        raise
-    except TypeError as te:
-        log.warning("scan raised TypeError: %s", te)
-        raise
-
+    if isinstance(result, list):
+        return result
+    return [result]
 
 # -----------------------------------------------------------------------------
-# Background scheduler (ticks every SCHEDULE_SECONDS)
+# Background scheduler
 # -----------------------------------------------------------------------------
 _scheduler_task: Optional[asyncio.Task] = None
 _scheduler_running = False
-
 
 async def _scheduler_loop():
     global _scheduler_running
@@ -251,21 +316,19 @@ async def _scheduler_loop():
         while _scheduler_running:
             log.info("Scheduler tick: running all strategies (dry=0)")
             for strat in STRATEGIES:
-                # Minimal request — strategies should rely on compact_req fields
                 req = {
                     "timeframe": DEFAULT_TIMEFRAME,
                     "symbols": [s.strip() for s in DEFAULT_SYMBOLS.split(",") if s.strip()],
                     "limit": DEFAULT_LIMIT,
                     "notional": DEFAULT_NOTIONAL,
-                    # callers can also push their own contexts here in the future
+                    # callers can push their own contexts here later
                 }
+                orders: List[Dict[str, Any]] = []
                 try:
                     orders = await _scan_bridge(strat, req, dry=False)
                 except Exception as e:
-                    log.error(
-                        "All scan attempts failed for strategy '%s'. Returning empty list. Last error: %s",
-                        strat, e
-                    )
+                    # Shouldn’t happen now, but keep it contained
+                    log.error("scan bridge failed for '%s': %s", strat, e)
                     orders = []
 
                 if orders:
@@ -275,16 +338,14 @@ async def _scheduler_loop():
     finally:
         log.info("Scheduler stopped.")
 
-
 # -----------------------------------------------------------------------------
-# Lifespan (startup/shutdown) – avoids on_event deprecation
+# Startup / Shutdown
 # -----------------------------------------------------------------------------
 @app.on_event("startup")
 async def _startup():
     global _scheduler_task
     log.info("Starting app; scheduler will start.")
     _scheduler_task = asyncio.create_task(_scheduler_loop())
-
 
 @app.on_event("shutdown")
 async def _shutdown():
@@ -296,7 +357,6 @@ async def _shutdown():
             await asyncio.wait_for(_scheduler_task, timeout=5.0)
     except Exception:
         pass
-
 
 # -----------------------------------------------------------------------------
 # HTML (full inline page)
@@ -387,30 +447,32 @@ _DASHBOARD_HTML = """
     async function loadSummary(){
       const r = await fetch('/pnl/summary');
       const d = await r.json();
-      document.getElementById('eq').textContent = d.equity.toFixed(2);
-      document.getElementById('pnl_day').textContent = d.pnl_day.toFixed(2);
-      document.getElementById('pnl_week').textContent = d.pnl_week.toFixed(2);
-      document.getElementById('pnl_month').textContent = d.pnl_month.toFixed(2);
-      document.getElementById('updated').textContent = new Date(d.updated_at).toLocaleString();
+      document.getElementById('eq').textContent = Number(d.equity || 0).toFixed(2);
+      document.getElementById('pnl_day').textContent = Number(d.pnl_day || 0).toFixed(2);
+      document.getElementById('pnl_week').textContent = Number(d.pnl_week || 0).toFixed(2);
+      document.getElementById('pnl_month').textContent = Number(d.pnl_month || 0).toFixed(2);
+      document.getElementById('updated').textContent = d.updated_at ? new Date(d.updated_at).toLocaleString() : '-';
     }
     async function loadAttribution(){
       const r = await fetch('/orders/attribution');
       const d = await r.json();
       const tbody = document.getElementById('attr_body');
       tbody.innerHTML = '';
-      for (const [k,v] of Object.entries(d.by_strategy)){
-        const tr = document.createElement('tr');
-        tr.innerHTML = `<td>${k}</td><td>${Number(v).toFixed(2)}</td>`;
-        tbody.appendChild(tr);
+      if (d.by_strategy){
+        for (const [k,v] of Object.entries(d.by_strategy)){
+          const tr = document.createElement('tr');
+          tr.innerHTML = `<td>${k}</td><td>${Number(v).toFixed(2)}</td>`;
+          tbody.appendChild(tr);
+        }
       }
-      document.getElementById('attr_updated').textContent = new Date(d.updated_at).toLocaleString();
+      document.getElementById('attr_updated').textContent = d.updated_at ? new Date(d.updated_at).toLocaleString() : '-';
     }
     async function loadOrders(){
       const r = await fetch('/orders/recent?limit=50');
       const d = await r.json();
       const tbody = document.getElementById('orders_body');
       tbody.innerHTML = '';
-      for (const o of d.orders){
+      (d.orders || []).forEach(o => {
         const tr = document.createElement('tr');
         tr.innerHTML = `
           <td>${o.id ?? ''}</td>
@@ -423,7 +485,7 @@ _DASHBOARD_HTML = """
           <td>${o.ts ? new Date(o.ts*1000).toLocaleString() : ''}</td>
         `;
         tbody.appendChild(tr);
-      }
+      });
     }
     async function refreshAll(){
       await Promise.all([loadSummary(), loadAttribution(), loadOrders()]);
@@ -507,13 +569,11 @@ _DASHBOARD_HTML = """
   </footer>
 
   <script>
-    // reflect current TF in the header chip (pull from env-backed meta we inject server-side if needed)
     document.getElementById('tf_chip').textContent = "{DEFAULT_TIMEFRAME}";
   </script>
 </body>
 </html>
 """.replace("{SCHEDULE_SECONDS}", str(SCHEDULE_SECONDS)).replace("{DEFAULT_TIMEFRAME}", DEFAULT_TIMEFRAME)
-
 
 # -----------------------------------------------------------------------------
 # Routes
@@ -522,42 +582,32 @@ _DASHBOARD_HTML = """
 async def root():
     return RedirectResponse(url="/dashboard", status_code=307)
 
-
 @app.get("/dashboard", response_class=HTMLResponse)
 async def dashboard():
     return HTMLResponse(content=_DASHBOARD_HTML, status_code=200)
-
 
 @app.get("/pnl/summary", response_class=JSONResponse)
 async def pnl_summary():
     return JSONResponse(_pnl_summary)
 
-
 @app.get("/orders/recent", response_class=JSONResponse)
 async def orders_recent(limit: int = Query(DEFAULT_LIMIT, ge=1, le=1000)):
-    # Return most recent first
     items = list(reversed(_orders_ring[-limit:]))
     return JSONResponse({"orders": items, "count": len(items)})
-
 
 @app.get("/orders/attribution", response_class=JSONResponse)
 async def orders_attribution():
     return JSONResponse(_attribution)
 
-
-# Optional: a quick health endpoint
 @app.get("/healthz", response_class=JSONResponse, include_in_schema=False)
 async def healthz():
     return JSONResponse({"ok": True, "ts": time.time()})
 
-
 # -----------------------------------------------------------------------------
-# Dev server entrypoint (Render runs `python app.py`)
+# Entrypoint
 # -----------------------------------------------------------------------------
 if __name__ == "__main__":
-    # Avoid uvicorn import at module top so it's not required on Cloud builds that use gunicorn
     import uvicorn  # type: ignore
-
     port = int(os.getenv("PORT", "10000"))
     log.info("Launching Uvicorn on 0.0.0.0:%d", port)
     uvicorn.run("app:app", host="0.0.0.0", port=port, reload=False, access_log=True)
