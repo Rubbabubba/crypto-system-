@@ -1,37 +1,33 @@
-# app.py  (v3.6.0)
-# A single-file FastAPI app with:
-# - Flexible StrategyBook.scan adapter
-# - Internal scheduler (option B)
-# - Dashboard HTML (P&L total, by strategy, calendar heatmap)
-# - Compatibility endpoints: /scan/{c1..c6}, /scan/all, /orders/*, /pnl/summary, /v2/positions, /health, /dashboard
+# app.py  (v3.7.0)
+# Single-file FastAPI service with:
+# - Robust StrategyBook scan adapter (kwargs-only; no typed model)
+# - Internal scheduler (Option B) via FastAPI lifespan
+# - Full dashboard HTML (Total P&L, By-Strategy P&L, Calendar Heatmap, Recent Orders)
+# - Endpoints: /scan/{c1..c6}, /scan/all, /orders/recent, /orders/attribution, /pnl/summary,
+#              /v2/positions, /health, /dashboard
 #
-# Env vars you can set on Render:
-#   AUTO_SCAN_ENABLED=1           -> enable internal scheduler (default: 0)
-#   AUTO_SCAN_EVERY=60            -> seconds between automatic full scans (default: 60)
+# Env (Render):
+#   AUTO_SCAN_ENABLED=1
+#   AUTO_SCAN_EVERY=60
 #   DEFAULT_TIMEFRAME=5Min
 #   DEFAULT_LIMIT=360
 #   DEFAULT_NOTIONAL=25
 #   DEFAULT_SYMBOLS=BTC/USD,ETH/USD,SOL/USD,DOGE/USD,XRP/USD,AVAX/USD,LINK/USD,BCH/USD,LTC/USD,ADA/USD,TON/USD,TRX/USD,APT/USD,ARB/USD,SUI/USD,OP/USD,MATIC/USD,NEAR/USD,ATOM/USD
 #   PORT (Render provides automatically)
-#
-# Notes:
-# - This app *does not* depend on httpx. Requests out to exchanges/brokers should be done in your StrategyBook code.
-# - The StrategyBook adapter below tries multiple calling conventions and avoids passing 'dry' into typed models.
 
 import os
 import json
-import time
 import asyncio
 import logging
-import traceback
-from datetime import datetime, timezone, date
-from typing import Any, Dict, List, Optional, Union
+from datetime import datetime, timezone
+from typing import Any, Dict, List, Optional
 
-from fastapi import FastAPI, Request, Query
+from fastapi import FastAPI, Query
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, PlainTextResponse
 from fastapi.middleware.cors import CORSMiddleware
+from contextlib import asynccontextmanager
 
-APP_VERSION = "3.6.0"
+APP_VERSION = "3.7.0"
 
 # -----------------------------------------------------------------------------
 # Logging
@@ -43,33 +39,29 @@ logging.basicConfig(
 log = logging.getLogger("app")
 
 # -----------------------------------------------------------------------------
-# Optional: import your StrategyBook implementation
+# StrategyBook loader (optional)
 # -----------------------------------------------------------------------------
 _strategy_book = None
-ScanRequest = None  # optional typed request model
 
 def _try_import_strategy_book():
-    global _strategy_book, ScanRequest
+    global _strategy_book
     candidates = [
-        # ("module", "class_name", "scan_request_class_name")
-        ("strategy_book", "StrategyBook", "ScanRequest"),
-        ("strategies", "StrategyBook", "ScanRequest"),
-        ("app_strategy", "StrategyBook", "ScanRequest"),
+        ("strategies", "StrategyBook"),
+        ("strategy_book", "StrategyBook"),
+        ("app_strategy", "StrategyBook"),
     ]
-    for mod, cls, scan_req in candidates:
+    for mod, cls in candidates:
         try:
-            m = __import__(mod, fromlist=[cls, scan_req])
-            _strategy_book = getattr(m, cls, None)
-            ScanRequest = getattr(m, scan_req, None)
-            if callable(_strategy_book):
-                # If it's a class, instantiate a singleton
-                _strategy_book = _strategy_book()
-            if _strategy_book is not None:
-                log.info("Loaded StrategyBook from %s.%s", mod, cls)
-                return
+            m = __import__(mod, fromlist=[cls])
+            sb = getattr(m, cls, None)
+            if sb is None:
+                continue
+            _strategy_book = sb() if callable(sb) else sb
+            log.info("Loaded StrategyBook from %s.%s", mod, cls)
+            return
         except Exception:
             continue
-    log.warning("StrategyBook not found; scans will return 'flat' unless your code provides it.")
+    log.warning("StrategyBook not found; scans will return 'flat'.")
 
 _try_import_strategy_book()
 
@@ -79,7 +71,6 @@ _try_import_strategy_book()
 DEFAULT_TIMEFRAME = os.getenv("DEFAULT_TIMEFRAME", "5Min")
 DEFAULT_LIMIT = int(os.getenv("DEFAULT_LIMIT", "360"))
 DEFAULT_NOTIONAL = float(os.getenv("DEFAULT_NOTIONAL", "25"))
-
 DEFAULT_SYMBOLS_RAW = os.getenv(
     "DEFAULT_SYMBOLS",
     "BTC/USD,ETH/USD,SOL/USD,DOGE/USD,XRP/USD,AVAX/USD,LINK/USD,BCH/USD,LTC/USD,ADA/USD,TON/USD,TRX/USD,APT/USD,ARB/USD,SUI/USD,OP/USD,MATIC/USD,NEAR/USD,ATOM/USD",
@@ -87,10 +78,8 @@ DEFAULT_SYMBOLS_RAW = os.getenv(
 
 def _parse_symbols(sym_param: Optional[str]) -> List[str]:
     raw = (sym_param or DEFAULT_SYMBOLS_RAW).strip()
-    # Convert URL-encoded slashes back
     raw = raw.replace("%2F", "/")
-    parts = [s.strip() for s in raw.split(",") if s.strip()]
-    return parts
+    return [s.strip() for s in raw.split(",") if s.strip()]
 
 def _utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
@@ -101,7 +90,7 @@ async def _maybe_await(x):
     return x
 
 # -----------------------------------------------------------------------------
-# StrategyBook scan bridge (flexible signature adapter)
+# Scan adapter (kwargs-only; no typed model; no dict/json positional calls)
 # -----------------------------------------------------------------------------
 def _mk_scan_payload(
     timeframe: str,
@@ -111,7 +100,6 @@ def _mk_scan_payload(
     topk: Optional[int] = None,
     min_score: Optional[float] = None,
 ) -> Dict[str, Any]:
-    """Canonical dict for scanning (no framework-specific fields)."""
     return {
         "timeframe": str(timeframe),
         "limit": int(limit),
@@ -121,103 +109,76 @@ def _mk_scan_payload(
         "min_score": min_score,
     }
 
-def _variants_for_scan(strat: str, base: Dict[str, Any], dry: int) -> List[Dict[str, Any]]:
-    """Produce multiple payload shapes commonly seen in adapters."""
-    execute = bool(dry == 0)
-    live = execute  # alias
-
-    clean = {k: v for k, v in base.items() if v is not None}
-
-    # kwargs with execute/live
-    kw = dict(clean); kw.update({"execute": execute, "live": live})
-    # kwargs with named strat
-    kw_named = dict(kw); kw_named["strat"] = strat
-    # dict + strategy
-    dict_with_strategy = dict(kw); dict_with_strategy["strategy"] = strat
-    # minimal variants
-    kw_min = dict(clean)
-    dict_with_strategy_min = dict(clean); dict_with_strategy_min["strategy"] = strat
-
-    return [
-        {"call": ("kwargs2",), "kwargs": {"strat": strat, **kw}},                 # scan(strat=?, timeframe=..., ...)
-        {"call": ("args1_kwargs", strat), "kwargs": kw},                          # scan(strat, timeframe=..., ...)
-        {"call": ("args1_dict1", strat), "args": (clean,)},                       # scan(strat, { ... })
-        {"call": ("args1_dict1_json", strat), "args": (json.dumps(clean),)},      # scan(strat, "{...json...}")
-        {"call": ("args0_dict_strategy",), "args": (dict_with_strategy,)},        # scan({strategy:..., ...})
-        {"call": ("args0_json_strategy",), "args": (json.dumps(dict_with_strategy),)},  # scan("{...}")
-        {"call": ("kwargs2_named",), "kwargs": kw_named},                         # scan(strat=..., timeframe=..., ...)
-        {"call": ("kwargs_min",), "kwargs": {"strat": strat, **kw_min}},
-        {"call": ("args0_dict_strategy_min",), "args": (dict_with_strategy_min,)},
-    ]
-
-async def _scan_bridge(strat: str, req_dict: Dict[str, Any], dry: int = 1) -> Any:
-    """Try multiple StrategyBook.scan(...) signatures safely."""
+async def _scan_bridge(strat: str, req: Dict[str, Any], dry: int = 1) -> Any:
+    """
+    Try common kwargs calling styles only — avoids dict/json positional variants
+    that caused 'string indices must be integers' in some StrategyBook impls.
+    We DO NOT pass 'dry' anywhere; we derive execute/live from it when present.
+    """
     if _strategy_book is None:
         raise RuntimeError("StrategyBook not available")
 
-    # 0) Try ScanRequest (if available), *without* passing 'dry'
-    if ScanRequest is not None:
-        try:
-            sr_payload = {k: v for k, v in req_dict.items() if k in {"timeframe","limit","symbols","notional","topk","min_score"}}
-            model = ScanRequest(**sr_payload)  # type: ignore
-            return await _maybe_await(_strategy_book.scan(strat, model))  # type: ignore
-        except TypeError as te:
-            log.warning("scan(strat, ScanRequest) failed: %s", te)
-        except Exception:
-            log.exception("scan(strat, ScanRequest) crashed")
+    clean = {k: v for k, v in req.items() if v is not None}
+    execute = bool(dry == 0)
+    live = execute
 
-    variants = _variants_for_scan(strat, req_dict, dry)
+    variants = [
+        # scan(strat=..., timeframe=..., ..., execute=..., live=...)
+        {"kwargs": {"strat": strat, **clean, "execute": execute, "live": live}},
+        # scan(strategy=..., timeframe=..., ...)
+        {"kwargs": {"strategy": strat, **clean, "execute": execute, "live": live}},
+        # scan(strat, timeframe=..., ...)
+        {"args": (strat,), "kwargs": {**clean, "execute": execute, "live": live}},
+        # scan(strategy=..., timeframe=..., ...) without execute/live
+        {"kwargs": {"strategy": strat, **clean}},
+        # scan(strat=..., timeframe=..., ...) without execute/live
+        {"kwargs": {"strat": strat, **clean}},
+        # scan(strat, timeframe=..., ...) without execute/live
+        {"args": (strat,), "kwargs": {**clean}},
+    ]
 
-    for v in variants:
+    last_error = None
+    for i, v in enumerate(variants, 1):
         try:
-            call = v["call"][0]
-            if call in ("kwargs2", "kwargs2_named", "kwargs_min"):
+            if "args" in v:
+                return await _maybe_await(_strategy_book.scan(*v["args"], **v["kwargs"]))  # type: ignore
+            else:
                 return await _maybe_await(_strategy_book.scan(**v["kwargs"]))  # type: ignore
-            if call == "args1_kwargs":
-                arg1 = v["call"][1]
-                return await _maybe_await(_strategy_book.scan(arg1, **v["kwargs"]))  # type: ignore
-            if call in ("args1_dict1", "args1_dict1_json"):
-                arg1 = v["call"][1]
-                return await _maybe_await(_strategy_book.scan(arg1, *v["args"]))  # type: ignore
-            if call in ("args0_dict_strategy", "args0_json_strategy", "args0_dict_strategy_min"):
-                return await _maybe_await(_strategy_book.scan(*v["args"]))  # type: ignore
         except TypeError as te:
-            log.warning("scan variant %s failed: %s", v["call"], te)
-        except Exception:
-            log.exception("scan variant %s crashed", v["call"])
-
-    raise TypeError("No compatible StrategyBook.scan signature (exhausted variants)")
+            log.warning("scan kwargs-variant #%d failed: %s", i, te)
+            last_error = te
+        except Exception as ex:
+            log.exception("scan kwargs-variant #%d crashed", i)
+            last_error = ex
+    raise TypeError(f"No compatible StrategyBook.scan signature (kwargs-only). Last error: {last_error}")
 
 # -----------------------------------------------------------------------------
-# In-memory order log & PnL (for the dashboard)
+# In-memory orders & PnL
 # -----------------------------------------------------------------------------
-# If your StrategyBook already persists orders elsewhere, you can adapt the
-# /orders/recent handler to read from there. For now, we keep an in-memory list.
 _order_log: List[Dict[str, Any]] = []
-_positions: Dict[str, Any] = {}  # simple shape
+_positions: Dict[str, Any] = {}
 
 def _append_orders_from_scan(strat: str, scan_result: Any):
-    """
-    Try to extract 'orders' from a scan result and push into the in-memory log.
-    Expected order fields (best-effort): ts, strat, symbol, side, qty, price, pnl
-    """
     try:
         if not scan_result:
             return
+        orders = []
         if isinstance(scan_result, dict):
-            orders = []
-            if "orders" in scan_result and isinstance(scan_result["orders"], list):
+            if isinstance(scan_result.get("orders"), list):
                 orders = scan_result["orders"]
-            elif "result" in scan_result and isinstance(scan_result["result"], dict) and isinstance(scan_result["result"].get("orders"), list):
+            elif isinstance(scan_result.get("result"), dict) and isinstance(scan_result["result"].get("orders"), list):
                 orders = scan_result["result"]["orders"]
-            for od in orders:
-                od_copy = dict(od)
-                od_copy.setdefault("ts", _utc_now_iso())
-                od_copy.setdefault("strat", strat)
-                od_copy.setdefault("pnl", 0.0)
-                _order_log.append(od_copy)
+
+        for od in orders:
+            if not isinstance(od, dict):
+                continue
+            rec = dict(od)
+            rec.setdefault("ts", _utc_now_iso())
+            rec.setdefault("strat", strat)
+            rec.setdefault("pnl", 0.0)
+            _order_log.append(rec)
     except Exception:
-        log.exception("Failed to harvest orders from scan result for %s", strat)
+        log.exception("Failed to harvest orders from scan result (%s)", strat)
 
 def _pnl_summary() -> Dict[str, Any]:
     total = 0.0
@@ -228,33 +189,85 @@ def _pnl_summary() -> Dict[str, Any]:
         total += pnl
         s = str(od.get("strat", "unknown"))
         by_strat[s] = by_strat.get(s, 0.0) + pnl
-        # Day key
+
+        ts = od.get("ts")
         try:
-            ts = od.get("ts")
-            d = datetime.fromisoformat(ts.replace("Z", "+00:00")) if isinstance(ts, str) else datetime.now(timezone.utc)
+            d = datetime.fromisoformat(str(ts).replace("Z", "+00:00"))
         except Exception:
             d = datetime.now(timezone.utc)
         key = d.strftime("%Y-%m-%d")
         by_day[key] = by_day.get(key, 0.0) + pnl
 
-    # Calendar range (last 90 days)
+    # last 90 days
+    days = []
     today = datetime.now(timezone.utc).date()
-    days = [(today.fromordinal(today.toordinal() - i)).isoformat() for i in range(0, 90)]
-    days.reverse()
-    cal = [{"date": d, "pnl": round(by_day.get(d, 0.0), 2)} for d in days]
+    for i in range(89, -1, -1):
+        days.append((today.fromordinal(today.toordinal() - i)).isoformat())
+
+    calendar = [{"date": d, "pnl": round(by_day.get(d, 0.0), 2)} for d in days]
 
     return {
         "version": APP_VERSION,
         "total_pnl": round(total, 2),
         "by_strategy": {k: round(v, 2) for k, v in by_strat.items()},
-        "calendar": cal,
+        "calendar": calendar,
         "orders_count": len(_order_log),
     }
 
 # -----------------------------------------------------------------------------
-# FastAPI app & middleware
+# FastAPI app + CORS
 # -----------------------------------------------------------------------------
-app = FastAPI(title="Crypto System", version=APP_VERSION)
+STRATEGY_LIST = ["c1", "c2", "c3", "c4", "c5", "c6"]
+
+# Internal scheduler (Option B)
+_scheduler_task: Optional[asyncio.Task] = None
+
+async def _scheduler_loop():
+    every = max(10, int(os.getenv("AUTO_SCAN_EVERY", "60")))
+    while True:
+        try:
+            if int(os.getenv("AUTO_SCAN_ENABLED", "0")) == 1:
+                log.info("Scheduler tick: running all strategies (dry=0)")
+                syms = _parse_symbols(None)
+                for s in STRATEGY_LIST:
+                    try:
+                        await _run_one_scan(
+                            strat=s,
+                            dry=0,
+                            timeframe=DEFAULT_TIMEFRAME,
+                            limit=DEFAULT_LIMIT,
+                            symbols=syms,
+                            notional=DEFAULT_NOTIONAL,
+                            topk=None,
+                            min_score=None,
+                        )
+                    except Exception:
+                        log.exception("Scheduled scan failed for %s", s)
+                    await asyncio.sleep(1.0)
+            await asyncio.sleep(every)
+        except Exception:
+            log.exception("Scheduler loop crashed; retrying in %ss", every)
+            await asyncio.sleep(every)
+
+@asynccontextmanager
+async def lifespan(app_: FastAPI):
+    global _scheduler_task
+    if int(os.getenv("AUTO_SCAN_ENABLED", "0")) == 1:
+        _scheduler_task = asyncio.create_task(_scheduler_loop())
+        log.info("Auto scheduler enabled (every %ss)", int(os.getenv("AUTO_SCAN_EVERY", "60")))
+    else:
+        log.info("Auto scheduler disabled")
+    try:
+        yield
+    finally:
+        if _scheduler_task:
+            log.info("Shutting down app; scheduler will stop.")
+            _scheduler_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await _scheduler_task
+
+import contextlib
+app = FastAPI(title="Crypto System", version=APP_VERSION, lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -264,10 +277,8 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-STRATEGY_LIST = ["c1", "c2", "c3", "c4", "c5", "c6"]
-
 # -----------------------------------------------------------------------------
-# HTML dashboard
+# Dashboard HTML (plain string; no f-strings / no Template)
 # -----------------------------------------------------------------------------
 _DASHBOARD_HTML = """
 <!doctype html>
@@ -449,11 +460,7 @@ setInterval(loadAll, 10000);
 """
 
 def _dashboard_html() -> str:
-    return (
-        _DASHBOARD_HTML
-        .replace("__VERSION__", APP_VERSION)
-        .replace("__YEAR__", str(datetime.now().year))
-    )
+    return _DASHBOARD_HTML.replace("__VERSION__", APP_VERSION).replace("__YEAR__", str(datetime.now().year))
 
 # -----------------------------------------------------------------------------
 # Routes
@@ -463,7 +470,7 @@ async def root():
     return RedirectResponse("/dashboard")
 
 @app.get("/dashboard", response_class=HTMLResponse)
-async def dashboard():
+def dashboard():
     return HTMLResponse(_dashboard_html())
 
 @app.get("/health")
@@ -492,22 +499,21 @@ async def positions():
 async def pnl_summary():
     return JSONResponse(_pnl_summary())
 
-# --- SCAN endpoints -----------------------------------------------------------
-async def _run_one_scan(strat: str, dry: int, timeframe: str, limit: int,
-                        symbols: List[str], notional: Optional[float],
-                        topk: Optional[int], min_score: Optional[float]) -> Dict[str, Any]:
-    req = _mk_scan_payload(
-        timeframe=timeframe,
-        limit=limit,
-        symbols=symbols,
-        notional=notional,
-        topk=topk,
-        min_score=min_score,
-    )
+# --- SCAN helpers -------------------------------------------------------------
+async def _run_one_scan(
+    strat: str,
+    dry: int,
+    timeframe: str,
+    limit: int,
+    symbols: List[str],
+    notional: Optional[float],
+    topk: Optional[int],
+    min_score: Optional[float],
+) -> Dict[str, Any]:
+    req = _mk_scan_payload(timeframe, limit, symbols, notional, topk, min_score)
     if _strategy_book is None:
         log.warning("No strategy adapter handled %s; returning flat", strat)
         return {"status": "ok", "strat": strat, "result": {"orders": []}, "ts": _utc_now_iso()}
-
     try:
         res = await _scan_bridge(strat, req, dry=dry)
         _append_orders_from_scan(strat, res)
@@ -544,49 +550,11 @@ async def scan_all(
     out = []
     for s in STRATEGY_LIST:
         out.append(await _run_one_scan(s, dry, timeframe, limit, syms, notional, topk, min_score))
-        await asyncio.sleep(1.0)  # small gap
+        await asyncio.sleep(1.0)
     return JSONResponse(out)
 
 # -----------------------------------------------------------------------------
-# Internal scheduler (Option B)
-# -----------------------------------------------------------------------------
-async def _scheduler_loop():
-    every = max(10, int(os.getenv("AUTO_SCAN_EVERY", "60")))
-    while True:
-        try:
-            if int(os.getenv("AUTO_SCAN_ENABLED", "0")) == 1:
-                log.info("Scheduler tick: running all strategies (dry=0)")
-                # run through all strategies sequentially with defaults
-                syms = _parse_symbols(None)
-                for s in STRATEGY_LIST:
-                    # dry=0 to execute live if your StrategyBook honors it via execute/live flags
-                    await _run_one_scan(
-                        strat=s,
-                        dry=0,
-                        timeframe=DEFAULT_TIMEFRAME,
-                        limit=DEFAULT_LIMIT,
-                        symbols=syms,
-                        notional=DEFAULT_NOTIONAL,
-                        topk=None,
-                        min_score=None,
-                    )
-                    await asyncio.sleep(1.0)
-            await asyncio.sleep(every)
-        except Exception:
-            log.exception("Scheduler loop crashed; recovering in %ss", every)
-            await asyncio.sleep(every)
-
-@app.on_event("startup")
-async def on_startup():
-    # kick off scheduler if enabled
-    if int(os.getenv("AUTO_SCAN_ENABLED", "0")) == 1:
-        asyncio.create_task(_scheduler_loop())
-        log.info("Auto scheduler enabled (every %ss)", int(os.getenv("AUTO_SCAN_EVERY", "60")))
-    else:
-        log.info("Auto scheduler disabled")
-
-# -----------------------------------------------------------------------------
-# Run
+# Uvicorn entrypoint
 # -----------------------------------------------------------------------------
 if __name__ == "__main__":
     import uvicorn
