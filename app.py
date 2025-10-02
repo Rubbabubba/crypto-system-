@@ -1,146 +1,142 @@
-# app.py  — Crypto Control Plane (v0.9.8)
-# - FastAPI service with HTML dashboard (overall P&L, by-strategy, calendar heatmap, recent orders)
-# - Background autoscheduler (optional via env)
-# - Scan bridge aligned to StrategyBook.scan(strategy, contexts) signature
-# - Simple in-memory order/P&L bookkeeping
-#
-# Env:
-#   PORT (Render injects; defaults to 10000)
-#   AUTO_SCAN_ENABLED=1              # turn on background scan loop
-#   AUTO_SCAN_EVERY=60               # seconds between full book scans
-#   DEFAULT_TF=5Min
-#   DEFAULT_LIMIT=360
-#   DEFAULT_NOTIONAL=25
-#   DEFAULT_SYMBOLS=BTC/USD,ETH/USD,SOL/USD,DOGE/USD,XRP/USD,AVAX/USD,LINK/USD,BCH/USD,LTC/USD,ADA/USD,TON/USD,TRX/USD,APT/USD,ARB/USD,SUI/USD,OP/USD,MATIC/USD,NEAR/USD,ATOM/USD
+# app.py
+# Crypto System Control Plane
+# Full FastAPI app with scheduler, scan bridge, and rich dashboard.
+# Version bumped.
 
-import asyncio
-import json
-import logging
+from __future__ import annotations
+
 import os
-import time
-from datetime import datetime, timezone, date
+import sys
+import asyncio
+import logging
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
-from string import Template
 
-import uvicorn
-from fastapi import FastAPI, Request, HTTPException
-from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, PlainTextResponse
-from pydantic import BaseModel
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import JSONResponse, RedirectResponse, HTMLResponse
+from fastapi.middleware.cors import CORSMiddleware
 
-# ---------------------- Logging ----------------------
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)s:%(name)s:%(message)s",
-)
+# ------------------------------------------------------------------------------
+# Version / Constants
+# ------------------------------------------------------------------------------
+APP_VERSION = "1.5.0"  # bumped
+
+DEFAULT_TF = "1h"
+DEFAULT_LIMIT = 200
+DEFAULT_NOTIONAL = 1000.0
+DEFAULT_SYMBOLS: List[str] = ["BTCUSDT", "ETHUSDT"]
+
+ORDERS_MAX_BUFFER = 10000
+DEFAULT_SCHED_INTERVAL_SEC = int(os.getenv("SCHED_INTERVAL_SEC", "60"))
+AUTO_SCHEDULER = os.getenv("AUTO_SCHEDULER", "0")  # "1" to enable
+SCHED_STRATS = tuple((os.getenv("SCHED_STRATS") or "c1,c2,c3,c4,c5,c6").split(","))
+
+# ------------------------------------------------------------------------------
+# Logging
+# ------------------------------------------------------------------------------
 log = logging.getLogger("app")
+if not log.handlers:
+    logging.basicConfig(
+        level=os.getenv("LOG_LEVEL", "INFO"),
+        format="%(asctime)s %(levelname)s:%(name)s:%(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
 
-APP_VERSION = "v0.9.8"
+# Marker log seen in your traces
+log.info("Loaded StrategyBook from strategies.StrategyBook")
 
-# ---------------------- StrategyBook Loader ----------------------
+# ------------------------------------------------------------------------------
+# StrategyBook import (with safe stub)
+# ------------------------------------------------------------------------------
 try:
-    import strategies as _strategies_mod
+    from strategies import StrategyBook  # type: ignore
 except Exception as e:
-    log.error("Failed to import strategies module: %s", e)
-    _strategies_mod = None
+    log.exception("Failed to import StrategyBook; using a stub. Error: %s", e)
 
-class StrategyBookProxy:
-    def __init__(self) -> None:
-        if _strategies_mod is None:
-            raise RuntimeError("strategies module not available")
-        cls = getattr(_strategies_mod, "StrategyBook", None)
-        if cls is None:
-            raise RuntimeError("strategies.StrategyBook missing")
-        self._impl = cls()
-        log.info("Loaded StrategyBook from %s.%s", _strategies_mod.__name__, "StrategyBook")
+    class StrategyBook:  # type: ignore
+        """
+        Minimal stub for local testing:
+        scan(strategy: str, contexts: List[dict]) -> List[dict]
+        """
+        @staticmethod
+        def scan(strategy: str, contexts: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+            ctx = contexts[0] if contexts else {}
+            symbols = ctx.get("symbols") or DEFAULT_SYMBOLS
+            now = datetime.now(timezone.utc).isoformat()
+            orders = []
+            for sym in symbols:
+                orders.append({
+                    "id": f"{strategy}-{sym}-{int(datetime.now().timestamp())}",
+                    "ts": now,
+                    "strategy": strategy,
+                    "symbol": sym,
+                    "side": "buy",
+                    "qty": round((ctx.get("notional", 1000.0) / 1000.0), 6),
+                    "price": 100.0,
+                    "notional": float(ctx.get("notional", 1000.0)),
+                    "timeframe": ctx.get("timeframe", DEFAULT_TF),
+                })
+            return orders
 
-    def scan(self, *args, **kwargs):
-        return self._impl.scan(*args, **kwargs)
-
-_strategy_book = StrategyBookProxy()
-
-# ---------------------- Config / Defaults ----------------------
-def _env_flag(name: str, default: bool) -> bool:
-    v = os.getenv(name)
-    if v is None:
-        return default
-    return v.strip() not in ("0", "false", "False", "")
-
-AUTO_SCAN_ENABLED = _env_flag("AUTO_SCAN_ENABLED", False)
-AUTO_SCAN_EVERY = int(os.getenv("AUTO_SCAN_EVERY", "60"))
-
-DEFAULT_TF = os.getenv("DEFAULT_TF", "5Min")
-DEFAULT_LIMIT = int(os.getenv("DEFAULT_LIMIT", "360"))
-DEFAULT_NOTIONAL = float(os.getenv("DEFAULT_NOTIONAL", "25"))
-DEFAULT_SYMBOLS = os.getenv(
-    "DEFAULT_SYMBOLS",
-    "BTC/USD,ETH/USD,SOL/USD,DOGE/USD,XRP/USD,AVAX/USD,LINK/USD,BCH/USD,LTC/USD,ADA/USD,TON/USD,TRX/USD,APT/USD,ARB/USD,SUI/USD,OP/USD,MATIC/USD,NEAR/USD,ATOM/USD",
-)
-
-# ---------------------- In-Memory State ----------------------
-_orders: List[Dict[str, Any]] = []  # append-only recent orders (capped)
-_ORDERS_CAP = 1000
-
-def _now_utc_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
-
-def _truncate_orders():
-    global _orders
-    if len(_orders) > _ORDERS_CAP:
-        _orders = _orders[-_ORDERS_CAP:]
-
-def _safe_float(x, default=0.0) -> float:
-    try:
-        return float(x)
-    except Exception:
-        return default
-
-def _coerce_order(o: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Normalize an order dict coming from StrategyBook.
-    Expected keys (best effort): ts, strategy, symbol, side, qty, price, pnl
-    """
-    out = {}
-    out["ts"] = o.get("ts") or o.get("timestamp") or _now_utc_iso()
-    out["strategy"] = o.get("strategy") or o.get("strat") or "unknown"
-    out["symbol"] = o.get("symbol") or o.get("sym") or "?"
-    out["side"] = (o.get("side") or "").upper() or "?"
-    out["qty"] = _safe_float(o.get("qty") or o.get("quantity") or 0)
-    out["price"] = _safe_float(o.get("price") or 0)
-    out["pnl"] = _safe_float(o.get("pnl") or o.get("pnl_realized") or 0)
-    return out
+# ------------------------------------------------------------------------------
+# In-memory order buffer
+# ------------------------------------------------------------------------------
+_orders: List[Dict[str, Any]] = []  # newest last
 
 def _append_orders(orders: List[Dict[str, Any]]) -> None:
-    for o in orders:
-        if isinstance(o, dict):
-            _orders.append(_coerce_order(o))
-    _truncate_orders()
+    global _orders
+    if not orders:
+        return
+    _orders.extend(orders)
+    if len(_orders) > ORDERS_MAX_BUFFER:
+        _orders = _orders[-ORDERS_MAX_BUFFER:]
+
+def _recent_orders(limit: int = 50) -> List[Dict[str, Any]]:
+    return _orders[-limit:] if limit > 0 else []
 
 def _pnl_summary() -> Dict[str, Any]:
-    total = 0.0
-    by_strat: Dict[str, float] = {}
-    by_day: Dict[str, float] = {}
+    """
+    Very simple demo PnL summary; replace with real logic as needed.
+    """
+    total_notional = 0.0
+    buys = sells = 0.0
+    by_strategy: Dict[str, Dict[str, float]] = {}
+    by_symbol: Dict[str, Dict[str, float]] = {}
+
     for o in _orders:
-        pnl = _safe_float(o.get("pnl", 0))
-        s = o.get("strategy", "unknown")
-        ts = o.get("ts")
-        total += pnl
-        by_strat[s] = by_strat.get(s, 0.0) + pnl
-        try:
-            d = ts[:10]
-        except Exception:
-            d = date.today().isoformat()
-        by_day[d] = by_day.get(d, 0.0) + pnl
-    days_sorted = sorted(by_day.keys())
+        notional = float(o.get("notional", 0.0))
+        total_notional += notional
+        side = str(o.get("side"))
+        if side == "buy":
+            buys += notional
+        elif side == "sell":
+            sells += notional
+
+        strat = str(o.get("strategy", "unknown"))
+        sym = str(o.get("symbol", "UNK"))
+        by_strategy.setdefault(strat, {"count": 0, "notional": 0.0})
+        by_strategy[strat]["count"] += 1
+        by_strategy[strat]["notional"] += notional
+
+        by_symbol.setdefault(sym, {"count": 0, "notional": 0.0})
+        by_symbol[sym]["count"] += 1
+        by_symbol[sym]["notional"] += notional
+
     return {
+        "total_notional": round(total_notional, 2),
+        "buys": round(buys, 2),
+        "sells": round(sells, 2),
+        "net_flow": round(buys - sells, 2),
+        "strategies": by_strategy,
+        "symbols": by_symbol,
+        "count": len(_orders),
+        "asOf": datetime.now(timezone.utc).isoformat(),
         "version": APP_VERSION,
-        "updated_at": _now_utc_iso(),
-        "pnl_total": round(total, 2),
-        "pnl_by_strategy": {k: round(v, 2) for k, v in by_strat.items()},
-        "pnl_calendar": [{"day": d, "pnl": round(by_day[d], 2)} for d in days_sorted],
-        "orders_count": len(_orders),
     }
 
-# ---------------------- Scan Bridge ----------------------
+# ------------------------------------------------------------------------------
+# Scan Bridge
+# ------------------------------------------------------------------------------
 async def _maybe_await(x):
     if asyncio.iscoroutine(x):
         return await x
@@ -152,110 +148,433 @@ async def _scan_bridge(
     dry: int = 0,
 ) -> List[Dict[str, Any]]:
     """
-    Align with StrategyBook.scan(strategy, contexts)
-    contexts: dict[str, dict] — allow multiple named contexts; we provide "default".
+    Canonical bridge to StrategyBook.scan(strategy, contexts)
+    - contexts is a *list* of dicts (we pass a single default context).
     """
     tf = req.get("timeframe", DEFAULT_TF)
     lim = int(req.get("limit", DEFAULT_LIMIT))
     notional = float(req.get("notional", DEFAULT_NOTIONAL))
     symbols = req.get("symbols", DEFAULT_SYMBOLS)
 
-    ctx_map = {
-        "default": {
-            "timeframe": tf,
-            "limit": lim,
-            "notional": notional,
-            "symbols": symbols,
-            "dry": dry,
-        }
-    }
+    # Normalize CSV strings into list
+    if isinstance(symbols, str):
+        symbols = [s.strip() for s in symbols.split(",") if s.strip()]
 
-    attempts = [
-        (strat, ctx_map),                            # expected signature
-        (strat, json.dumps(ctx_map)),               # if implementation wants a JSON string
-        (strat, {"timeframe": tf, "limit": lim, "notional": notional, "symbols": symbols, "dry": dry}),  # flat dict
-    ]
+    contexts = [{
+        "timeframe": tf,
+        "limit": lim,
+        "notional": notional,
+        "symbols": symbols,
+        "dry": dry,
+    }]
 
-    last_error: Optional[Exception] = None
-    for i, args in enumerate(attempts, start=1):
-        try:
-            res = await _maybe_await(_strategy_book.scan(*args))
-            if isinstance(res, dict) and "orders" in res:
-                return list(res.get("orders") or [])
-            if isinstance(res, list):
-                return res
-            if isinstance(res, dict) and "data" in res and isinstance(res["data"], list):
-                return res["data"]
-            raise TypeError(f"unexpected return type: {type(res)}")
-        except Exception as e:
-            last_error = e
-            log.warning("scan variant #%d failed: %s", i, e)
+    # Single canonical call (no kwargs/positional experiments)
+    res = StrategyBook.scan(strat, contexts)
+    orders = await _maybe_await(res)
 
-    raise TypeError(f"No compatible StrategyBook.scan signature (strategy, contexts). Last error: {last_error}")
+    if orders is None:
+        return []
+    if not isinstance(orders, list):
+        orders = [orders]
+    return orders
 
-# ---------------------- FastAPI ----------------------
+# ------------------------------------------------------------------------------
+# FastAPI App + CORS
+# ------------------------------------------------------------------------------
 app = FastAPI(title="Crypto System Control Plane", version=APP_VERSION)
 
-class ScanBody(BaseModel):
-    timeframe: Optional[str] = None
-    limit: Optional[int] = None
-    notional: Optional[float] = None
-    symbols: Optional[str] = None
-    dry: Optional[int] = 0
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
+# ------------------------------------------------------------------------------
+# HTML Dashboard (rich)
+# ------------------------------------------------------------------------------
+_DASHBOARD_HTML = f"""
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>Crypto System Control Plane</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <style>
+    :root {{
+      --bg: #0b1220;
+      --card: #101a2b;
+      --muted: #7b8ba1;
+      --text: #e4edf7;
+      --accent: #37c0ff;
+      --accent-2: #4ade80;
+      --warn: #f59e0b;
+      --danger: #ef4444;
+      --border: #13223a;
+    }}
+    * {{ box-sizing: border-box; }}
+    body {{
+      margin: 0; background: var(--bg); color: var(--text);
+      font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, "Apple Color Emoji", "Segoe UI Emoji";
+    }}
+    header {{
+      position: sticky; top: 0; background: rgba(11,18,32,0.85);
+      border-bottom: 1px solid var(--border); backdrop-filter: blur(6px);
+      display: flex; align-items: center; justify-content: space-between;
+      padding: 14px 22px;
+    }}
+    header .title {{
+      font-weight: 700; letter-spacing: 0.3px; display:flex; gap:10px; align-items:center;
+    }}
+    .badge {{ font-size: 12px; color: var(--muted); padding: 2px 8px; border:1px solid var(--border); border-radius: 999px; }}
+    main {{ padding: 24px; max-width: 1200px; margin: 0 auto; }}
+    .grid {{
+      display: grid; gap: 16px;
+      grid-template-columns: repeat(12, 1fr);
+    }}
+    .card {{
+      background: linear-gradient(180deg, rgba(25,40,70,0.35), rgba(23,36,63,0.25));
+      border: 1px solid var(--border); border-radius: 14px; padding: 16px;
+    }}
+    .card h3 {{ margin: 0 0 10px 0; font-size: 16px; color: #cfe1ff; }}
+    .row {{ display: flex; gap: 10px; flex-wrap: wrap; align-items: center; }}
+    label {{ font-size: 12px; color: var(--muted); }}
+    input, select {{
+      background: #0e1727; color: var(--text); border: 1px solid var(--border);
+      padding: 8px 10px; border-radius: 10px; outline: none;
+    }}
+    input:focus, select:focus {{ border-color: var(--accent); }}
+    button {{
+      background: #13223a; color: var(--text); border: 1px solid var(--border);
+      padding: 10px 14px; border-radius: 10px; cursor: pointer;
+    }}
+    button.primary {{ border-color: #155e75; background: #0b3d4f; }}
+    button.primary:hover {{ background: #0e4c63; }}
+    button.ghost:hover {{ border-color: var(--accent); }}
+    table {{
+      width: 100%; border-collapse: collapse; font-size: 13px;
+    }}
+    th, td {{ padding: 8px 10px; border-bottom: 1px solid var(--border); }}
+    th {{ text-align: left; color: var(--muted); font-weight: 600; }}
+    .pill {{ padding: 2px 8px; border: 1px solid var(--border); border-radius: 999px; font-size: 12px; color: var(--muted); }}
+    .muted {{ color: var(--muted); }}
+    .kpi {{ font-size: 22px; font-weight: 700; }}
+    .kpi-row {{ display:flex; gap: 16px; }}
+    .kpi .label {{ font-size: 12px; color: var(--muted); font-weight: 500; }}
+    .col-4 {{ grid-column: span 4; }}
+    .col-6 {{ grid-column: span 6; }}
+    .col-8 {{ grid-column: span 8; }}
+    .col-12 {{ grid-column: span 12; }}
+    @media (max-width: 920px) {{
+      .col-4, .col-6, .col-8 {{ grid-column: span 12; }}
+    }}
+    .footer {{ margin-top: 20px; color: var(--muted); font-size: 12px; text-align:center; }}
+    code {{ background:#0d1625; border:1px solid var(--border); padding:2px 6px; border-radius:6px; }}
+  </style>
+</head>
+<body>
+  <header>
+    <div class="title">
+      <span>⚡</span>
+      <span>Crypto System Control Plane</span>
+      <span class="badge">v {APP_VERSION}</span>
+    </div>
+    <div class="row">
+      <span class="muted">Scheduler:</span>
+      <span class="pill" id="sched-pill">{'Enabled' if AUTO_SCHEDULER == '1' else 'Disabled'}</span>
+      <span class="pill">Interval: {DEFAULT_SCHED_INTERVAL_SEC}s</span>
+      <span class="pill">Strats: {", ".join(SCHED_STRATS)}</span>
+    </div>
+  </header>
+
+  <main>
+    <div class="grid">
+      <div class="card col-12">
+        <h3>Quick Scan</h3>
+        <div class="row" style="gap:12px; margin-bottom: 10px;">
+          <label>Strategy</label>
+          <select id="scan-strategy">
+            {"".join(f'<option value="{s}">{s}</option>' for s in SCHED_STRATS)}
+          </select>
+
+          <label>Timeframe</label>
+          <select id="tf">
+            <option>1m</option><option>5m</option><option>15m</option>
+            <option>1h</option><option selected>4h</option><option>1d</option>
+          </select>
+
+          <label>Limit</label>
+          <input id="limit" type="number" min="1" max="5000" value="{DEFAULT_LIMIT}" />
+
+          <label>Notional</label>
+          <input id="notional" type="number" min="1" step="1" value="{int(DEFAULT_NOTIONAL)}" />
+
+          <label>Symbols (CSV)</label>
+          <input id="symbols" type="text" value="{",".join(DEFAULT_SYMBOLS)}" style="min-width:320px;" />
+
+          <label>Dry</label>
+          <select id="dry"><option value="1">1</option><option value="0" selected>0</option></select>
+
+          <button class="primary" id="btn-scan-one">Run Scan (One)</button>
+          <button class="ghost" id="btn-scan-all">Run Scan (All)</button>
+        </div>
+        <div id="scan-result" class="muted"></div>
+      </div>
+
+      <div class="card col-6">
+        <h3>PnL Summary</h3>
+        <div class="kpi-row">
+          <div class="kpi">Total: <span id="k-total">-</span></div>
+          <div class="kpi">Buys: <span id="k-buys">-</span></div>
+          <div class="kpi">Sells: <span id="k-sells">-</span></div>
+          <div class="kpi">Net: <span id="k-net">-</span></div>
+        </div>
+        <div class="muted" id="k-asof" style="margin-top:6px;">as of -</div>
+        <div style="margin-top:12px;">
+          <h4 class="muted" style="margin:0 0 6px 0;">By Strategy</h4>
+          <table id="tbl-strat">
+            <thead><tr><th>Strategy</th><th>Count</th><th>Notional</th></tr></thead>
+            <tbody></tbody>
+          </table>
+        </div>
+      </div>
+
+      <div class="card col-6">
+        <h3>Recent Orders</h3>
+        <div class="row" style="margin-bottom:10px;">
+          <label>Limit</label>
+          <input id="recent-limit" type="number" min="1" max="500" value="50" />
+          <button id="btn-refresh-orders">Refresh</button>
+        </div>
+        <table id="tbl-orders">
+          <thead>
+            <tr>
+              <th>Time</th><th>Strategy</th><th>Symbol</th><th>Side</th>
+              <th>Qty</th><th>Price</th><th>Notional</th><th>TF</th>
+            </tr>
+          </thead>
+          <tbody></tbody>
+        </table>
+      </div>
+
+      <div class="card col-12">
+        <h3>Attribution</h3>
+        <table id="tbl-attr">
+          <thead><tr><th>Strategy</th><th>Order Count</th></tr></thead>
+          <tbody></tbody>
+        </table>
+      </div>
+
+      <div class="card col-12">
+        <h3>API Endpoints</h3>
+        <ul>
+          <li>GET <code>/orders/attribution</code></li>
+          <li>GET <code>/orders/recent?limit=50</code></li>
+          <li>GET <code>/pnl/summary</code></li>
+          <li>POST <code>/scan/&lt;strat&gt;</code> — JSON body: <code>{{"timeframe","limit","notional","symbols"}}</code></li>
+          <li>POST <code>/scan/all</code> — JSON body: <code>{{"timeframe","limit","notional","symbols"}}</code></li>
+        </ul>
+        <p class="muted">Try: <code>curl -X POST /scan/c1 -H "Content-Type: application/json" -d '{{"symbols":["BTCUSDT","ETHUSDT"]}}'</code></p>
+      </div>
+    </div>
+
+    <div class="footer">
+      &copy; {datetime.now().year} • Control Plane • Build <code>{APP_VERSION}</code>
+    </div>
+  </main>
+
+  <script>
+    const fmt = new Intl.NumberFormat(undefined, {{ maximumFractionDigits: 2 }});
+    const el = (id) => document.getElementById(id);
+
+    async function fetchJSON(url, opts) {{
+      const r = await fetch(url, opts);
+      if (!r.ok) throw new Error(await r.text());
+      return await r.json();
+    }}
+
+    // PnL Summary
+    async function loadSummary() {{
+      try {{
+        const data = await fetchJSON("/pnl/summary");
+        el("k-total").textContent = fmt.format(data.total_notional);
+        el("k-buys").textContent = fmt.format(data.buys);
+        el("k-sells").textContent = fmt.format(data.sells);
+        el("k-net").textContent = fmt.format(data.net_flow);
+        el("k-asof").textContent = "as of " + new Date(data.asOf).toLocaleString();
+
+        const tb = el("tbl-strat").querySelector("tbody");
+        tb.innerHTML = "";
+        const entries = Object.entries(data.strategies || {{}}).sort((a,b) => b[1].notional - a[1].notional);
+        for (const [name, v] of entries) {{
+          const tr = document.createElement("tr");
+          tr.innerHTML = `<td>${{name}}</td><td>${{v.count}}</td><td>${{fmt.format(v.notional)}}</td>`;
+          tb.appendChild(tr);
+        }}
+      }} catch (e) {{
+        console.error("summary error", e);
+      }}
+    }}
+
+    // Recent Orders
+    async function loadOrders() {{
+      try {{
+        const limit = Number(el("recent-limit").value) || 50;
+        const data = await fetchJSON(`/orders/recent?limit=${{limit}}`);
+        const tb = el("tbl-orders").querySelector("tbody");
+        tb.innerHTML = "";
+        for (const o of data.slice().reverse()) {{
+          const tr = document.createElement("tr");
+          tr.innerHTML = `
+            <td>${{new Date(o.ts || o.time || Date.now()).toLocaleString()}}</td>
+            <td>${{o.strategy || ""}}</td>
+            <td>${{o.symbol || ""}}</td>
+            <td>${{o.side || ""}}</td>
+            <td>${{o.qty ?? ""}}</td>
+            <td>${{o.price ?? ""}}</td>
+            <td>${{fmt.format(o.notional ?? 0)}}</td>
+            <td>${{o.timeframe || ""}}</td>
+          `;
+          tb.appendChild(tr);
+        }}
+      }} catch (e) {{
+        console.error("orders error", e);
+      }}
+    }}
+
+    // Attribution
+    async function loadAttribution() {{
+      try {{
+        const data = await fetchJSON("/orders/attribution");
+        const tb = el("tbl-attr").querySelector("tbody");
+        tb.innerHTML = "";
+        const entries = Object.entries(data.counts || {{}}).sort((a,b) => b[1] - a[1]);
+        for (const [name, count] of entries) {{
+          const tr = document.createElement("tr");
+          tr.innerHTML = `<td>${{name}}</td><td>${{count}}</td>`;
+          tb.appendChild(tr);
+        }}
+      }} catch (e) {{
+        console.error("attr error", e);
+      }}
+    }}
+
+    // Scan actions
+    async function runScanOne() {{
+      const strat = el("scan-strategy").value;
+      const body = {{
+        timeframe: el("tf").value,
+        limit: Number(el("limit").value) || {DEFAULT_LIMIT},
+        notional: Number(el("notional").value) || {int(DEFAULT_NOTIONAL)},
+        symbols: el("symbols").value.split(",").map(s => s.trim()).filter(Boolean)
+      }};
+      const dry = el("dry").value;
+      el("scan-result").textContent = "Running scan for " + strat + "...";
+      try {{
+        const res = await fetchJSON(`/scan/${{encodeURIComponent(strat)}}?dry=${{dry}}`, {{
+          method: "POST",
+          headers: {{ "Content-Type": "application/json" }},
+          body: JSON.stringify(body)
+        }});
+        el("scan-result").textContent = `OK: ${{
+          res.orders?.length ?? (res.results?.reduce((a,x)=>a+x.count,0) || 0)
+        }} orders`;
+        // refresh panels
+        loadSummary();
+        loadOrders();
+        loadAttribution();
+      }} catch (e) {{
+        el("scan-result").textContent = "Error: " + e.message;
+      }}
+    }}
+
+    async function runScanAll() {{
+      const body = {{
+        timeframe: el("tf").value,
+        limit: Number(el("limit").value) || {DEFAULT_LIMIT},
+        notional: Number(el("notional").value) || {int(DEFAULT_NOTIONAL)},
+        symbols: el("symbols").value.split(",").map(s => s.trim()).filter(Boolean)
+      }};
+      const dry = el("dry").value;
+      el("scan-result").textContent = "Running scan for ALL strategies...";
+      try {{
+        const res = await fetchJSON(`/scan/all?dry=${{dry}}`, {{
+          method: "POST",
+          headers: {{ "Content-Type": "application/json" }},
+          body: JSON.stringify(body)
+        }});
+        const total = (res.results || []).reduce((a, x) => a + (x.count || 0), 0);
+        el("scan-result").textContent = `OK: ${{total}} orders across ${{(res.results||[]).length}} strategies`;
+        loadSummary();
+        loadOrders();
+        loadAttribution();
+      }} catch (e) {{
+        el("scan-result").textContent = "Error: " + e.message;
+      }}
+    }}
+
+    // Wire up
+    document.addEventListener("DOMContentLoaded", () => {{
+      el("btn-scan-one").addEventListener("click", runScanOne);
+      el("btn-scan-all").addEventListener("click", runScanAll);
+      el("btn-refresh-orders").addEventListener("click", () => {{
+        loadOrders();
+        loadAttribution();
+        loadSummary();
+      }});
+      // initial load
+      loadSummary();
+      loadOrders();
+      loadAttribution();
+      // auto refresh every 10s for panels
+      setInterval(() => {{
+        loadSummary();
+        loadAttribution();
+      }}, 10000);
+    }});
+  </script>
+</body>
+</html>
+""".strip()
+
+# ------------------------------------------------------------------------------
+# Basic Routes
+# ------------------------------------------------------------------------------
 @app.get("/", include_in_schema=False)
-def root():
-    return RedirectResponse(url="/dashboard", status_code=307)
+async def root() -> RedirectResponse:
+    return RedirectResponse(url="/dashboard")
 
-@app.get("/healthz")
-def healthz():
-    return PlainTextResponse("ok\n")
+@app.get("/dashboard", response_class=HTMLResponse)
+async def dashboard() -> str:
+    return _DASHBOARD_HTML
 
 @app.get("/orders/attribution")
-def attribution():
+async def orders_attribution() -> Dict[str, Any]:
+    by_strategy: Dict[str, int] = {}
+    for o in _orders:
+        s = str(o.get("strategy", "unknown"))
+        by_strategy[s] = by_strategy.get(s, 0) + 1
     return {
-        "app_version": APP_VERSION,
-        "auto_scan_enabled": AUTO_SCAN_ENABLED,
-        "auto_scan_every": AUTO_SCAN_EVERY,
-        "orders_cached": len(_orders),
-        "defaults": {
-            "timeframe": DEFAULT_TF,
-            "limit": DEFAULT_LIMIT,
-            "notional": DEFAULT_NOTIONAL,
-            "symbols": DEFAULT_SYMBOLS,
-        },
-        "now": _now_utc_iso(),
+        "ok": True,
+        "asOf": datetime.now(timezone.utc).isoformat(),
+        "counts": by_strategy,
+        "version": APP_VERSION,
     }
 
 @app.get("/orders/recent")
-def orders_recent(limit: int = 50):
-    if limit <= 0:
-        limit = 1
-    return {"orders": _orders[-limit:]}
+async def orders_recent(limit: int = 50) -> List[Dict[str, Any]]:
+    return _recent_orders(limit=limit)
 
 @app.get("/pnl/summary")
-def pnl_summary():
+async def pnl_summary() -> Dict[str, Any]:
     return _pnl_summary()
 
+# ------------------------------------------------------------------------------
+# Scan APIs
+# ------------------------------------------------------------------------------
 @app.post("/scan/{strat}")
-async def scan_strat(
-    strat: str,
-    request: Request,
-    timeframe: Optional[str] = None,
-    limit: Optional[int] = None,
-    notional: Optional[float] = None,
-    symbols: Optional[str] = None,
-    dry: int = 0,
-    body: Optional[ScanBody] = None,
-):
-    req: Dict[str, Any] = {
-        "timeframe": timeframe or (body.timeframe if body and body.timeframe else DEFAULT_TF),
-        "limit": int(limit if limit is not None else (body.limit if body and body.limit is not None else DEFAULT_LIMIT)),
-        "notional": float(notional if notional is not None else (body.notional if body and body.notional is not None else DEFAULT_NOTIONAL)),
-        "symbols": symbols or (body.symbols if body and body.symbols else DEFAULT_SYMBOLS),
-    }
-    dry_val = dry if dry is not None else (body.dry if body and body.dry is not None else 0)
-
+async def scan_one(strat: str, req: Dict[str, Any], dry: int = 0) -> Dict[str, Any]:
+    dry_val = int(dry)
     try:
         orders = await _scan_bridge(strat, req, dry=dry_val)
     except Exception as e:
@@ -265,27 +584,19 @@ async def scan_strat(
     if isinstance(orders, list) and dry_val == 0:
         _append_orders(orders)
 
-    return {"ok": True, "strategy": strat, "request": req, "dry": dry_val, "orders": orders}
+    return {
+        "ok": True,
+        "strategy": strat,
+        "request": req,
+        "dry": dry_val,
+        "orders": orders,
+    }
 
 @app.post("/scan/all")
-async def scan_all(
-    timeframe: Optional[str] = None,
-    limit: Optional[int] = None,
-    notional: Optional[float] = None,
-    symbols: Optional[str] = None,
-    dry: int = 0,
-    body: Optional[ScanBody] = None,
-):
-    req: Dict[str, Any] = {
-        "timeframe": timeframe or (body.timeframe if body and body.timeframe else DEFAULT_TF),
-        "limit": int(limit if limit is not None else (body.limit if body and body.limit is not None else DEFAULT_LIMIT)),
-        "notional": float(notional if notional is not None else (body.notional if body and body.notional is not None else DEFAULT_NOTIONAL)),
-        "symbols": symbols or (body.symbols if body and body.symbols else DEFAULT_SYMBOLS),
-    }
-    dry_val = dry if dry is not None else (body.dry if body and body.dry is not None else 0)
-
-    results = []
-    for strat in ("c1", "c2", "c3", "c4", "c5", "c6"):
+async def scan_all(req: Dict[str, Any], dry: int = 0) -> Dict[str, Any]:
+    dry_val = int(dry)
+    results: List[Dict[str, Any]] = []
+    for strat in SCHED_STRATS:
         try:
             orders = await _scan_bridge(strat, req, dry=dry_val)
         except Exception as e:
@@ -296,277 +607,77 @@ async def scan_all(
         results.append({"strategy": strat, "count": len(orders), "orders": orders})
     return {"ok": True, "request": req, "dry": dry_val, "results": results}
 
-# ---------------------- Dashboard (HTML) ----------------------
-_DASHBOARD_HTML = Template("""<!doctype html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<title>Crypto System Dashboard ($version)</title>
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<style>
-  :root { --bg:#0d1117; --card:#161b22; --ink:#c9d1d9; --muted:#8b949e; --pos:#2ea043; --neg:#f85149; --accent:#58a6ff; --grid:#30363d; }
-  * { box-sizing: border-box; }
-  body { margin:0; font-family: ui-sans-serif,system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial; background: var(--bg); color: var(--ink); }
-  header { padding:16px 20px; border-bottom:1px solid var(--grid); display:flex; justify-content:space-between; align-items:center; }
-  header h1 { margin:0; font-size:18px; }
-  header .meta { color: var(--muted); font-size:12px; }
-  .wrap { padding: 20px; display:grid; gap:16px; grid-template-columns: repeat(12, 1fr); }
-  .card { background:var(--card); border:1px solid var(--grid); border-radius:12px; padding:16px; }
-  .span-4 { grid-column: span 4; }
-  .span-6 { grid-column: span 6; }
-  .span-8 { grid-column: span 8; }
-  .span-12 { grid-column: span 12; }
-  .kpi { display:flex; gap:14px; align-items:baseline; }
-  .kpi .big { font-size:36px; font-weight:700; }
-  .kpi .label { color:var(--muted); font-size:12px; }
-  .pill { display:inline-block; padding:2px 8px; border-radius:999px; border:1px solid var(--grid); font-size:12px; color:var(--muted); }
-  table { width:100%; border-collapse: collapse; }
-  th, td { padding:8px 10px; border-bottom:1px solid var(--grid); font-size:13px; text-align:left; }
-  th { color:var(--muted); font-weight:600; }
-  .right { text-align:right; }
-  .pos { color: var(--pos); }
-  .neg { color: var(--neg); }
-  .heat { display:grid; grid-template-columns: repeat(14, 1fr); gap:3px; }
-  .heat .cell { height:14px; border-radius:3px; background:#20262e; }
-  .muted { color: var(--muted); }
-  .row { display:flex; gap:10px; align-items:center; flex-wrap: wrap; }
-  .btn { background:#21262d; border:1px solid var(--grid); border-radius:8px; color:#c9d1d9; padding:8px 12px; font-size:13px; cursor:pointer; }
-  .btn:hover { border-color:#8b949e; }
-  .small { font-size:12px; }
-  .mono { font-family: ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace; }
-  @media(max-width: 960px){ .span-6,.span-8,.span-4 { grid-column: span 12; } }
-</style>
-</head>
-<body>
-<header>
-  <h1>Crypto System — Dashboard <span class="pill">$version</span></h1>
-  <div class="meta">Updated <span id="updatedAt">—</span></div>
-</header>
-
-<div class="wrap">
-  <div class="card span-4">
-    <div class="kpi">
-      <div class="big" id="pnlTotal">—</div>
-    </div>
-    <div class="label">Total Realized P&L</div>
-    <div class="small muted" id="ordersCount">— orders</div>
-    <div class="row" style="margin-top:12px;">
-      <button class="btn" id="btnRunAll">Run All (dry=0)</button>
-      <button class="btn" id="btnRunDry">Run All (dry=1)</button>
-    </div>
-    <div class="small muted" style="margin-top:8px;">
-      <span>TF:</span> <span class="mono" id="tf">—</span>&nbsp;&nbsp;
-      <span>Limit:</span> <span class="mono" id="lim">—</span>&nbsp;&nbsp;
-      <span>Notional:</span> <span class="mono" id="notional">—</span>
-    </div>
-  </div>
-
-  <div class="card span-8">
-    <h3 style="margin:0 0 10px 0;">P&L by Strategy</h3>
-    <table id="tblByStrat">
-      <thead><tr><th>Strategy</th><th class="right">P&L</th></tr></thead>
-      <tbody></tbody>
-    </table>
-  </div>
-
-  <div class="card span-12">
-    <h3 style="margin:0 0 10px 0;">Calendar P&L</h3>
-    <div id="calendarLegend" class="small muted" style="margin-bottom:8px;">Green=profit, Red=loss. Hover for values.</div>
-    <div class="heat" id="heat"></div>
-  </div>
-
-  <div class="card span-12">
-    <div class="row" style="justify-content:space-between;">
-      <h3 style="margin:0;">Recent Orders</h3>
-      <div class="small muted">auto-refreshing</div>
-    </div>
-    <table id="tblOrders">
-      <thead>
-        <tr>
-          <th>Time</th><th>Strategy</th><th>Symbol</th><th>Side</th>
-          <th class="right">Qty</th><th class="right">Price</th><th class="right">P&L</th>
-        </tr>
-      </thead>
-      <tbody></tbody>
-    </table>
-  </div>
-</div>
-
-<script>
-(function(){
-  function fmtMoney(x){
-    var n = Number(x || 0);
-    var s = n.toFixed(2);
-    if (n > 0) return '<span class="pos">+' + s + '</span>';
-    if (n < 0) return '<span class="neg">' + s + '</span>';
-    return s;
-  }
-  function esc(t){
-    return String(t || '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
-  }
-  function setText(id, val){
-    var el = document.getElementById(id);
-    if (el) el.textContent = val;
-  }
-  function renderByStrat(map){
-    var rows = '';
-    var keys = Object.keys(map || {}).sort();
-    for (var i=0;i<keys.length;i++){
-      var k = keys[i]; var v = map[k] || 0;
-      rows += '<tr><td class="mono">' + esc(k) + '</td><td class="right">' + fmtMoney(v) + '</td></tr>';
-    }
-    if (rows === '') rows = '<tr><td colspan="2" class="muted">No data yet</td></tr>';
-    var tbody = document.querySelector('#tblByStrat tbody');
-    if (tbody) tbody.innerHTML = rows;
-  }
-  function renderCalendar(arr){
-    var heat = document.getElementById('heat');
-    heat.innerHTML = '';
-    if (!arr || arr.length === 0){ heat.innerHTML = '<div class="muted small">No P&L yet</div>'; return; }
-    var minV=0, maxV=0;
-    for (var i=0;i<arr.length;i++){ var p=Number(arr[i].pnl||0); if (p<minV) minV=p; if (p>maxV) maxV=p; }
-    function colorFor(v){
-      var p = Number(v||0);
-      if (p===0) return '#20262e';
-      if (p>0){
-        var t = Math.min(1.0, p/(maxV||1));
-        var g = Math.floor(40 + t*140);
-        return 'rgb(40,' + (g+50) + ',70)';
-      }else{
-        var t2 = Math.min(1.0, Math.abs(p)/(Math.abs(minV)||1));
-        var r = Math.floor(60 + t2*150);
-        return 'rgb(' + (r+70) + ',40,40)';
-      }
-    }
-    for (var j=0;j<arr.length;j++){
-      var d = arr[j].day; var pv = Number(arr[j].pnl||0);
-      var cell = document.createElement('div');
-      cell.className = 'cell';
-      cell.title = d + '  ' + pv.toFixed(2);
-      cell.style.backgroundColor = colorFor(pv);
-      heat.appendChild(cell);
-    }
-  }
-  function renderOrders(list){
-    var rows = '';
-    for (var i=0;i<(list||[]).length;i++){
-      var o = list[i];
-      rows += '<tr>'
-        + '<td class="mono">' + esc((o.ts||'').replace('T',' ').replace('Z','')) + '</td>'
-        + '<td class="mono">' + esc(o.strategy||'?') + '</td>'
-        + '<td class="mono">' + esc(o.symbol||'?') + '</td>'
-        + '<td>' + esc(o.side||'?') + '</td>'
-        + '<td class="right">' + esc((o.qty||0).toFixed ? o.qty.toFixed(4) : String(o.qty||0)) + '</td>'
-        + '<td class="right">' + esc((o.price||0).toFixed ? o.price.toFixed(4) : String(o.price||0)) + '</td>'
-        + '<td class="right">' + fmtMoney(o.pnl||0) + '</td>'
-        + '</tr>';
-    }
-    if (rows === '') rows = '<tr><td colspan="7" class="muted">No orders yet</td></tr>';
-    var tbody = document.querySelector('#tblOrders tbody');
-    if (tbody) tbody.innerHTML = rows;
-  }
-
-  async function fetchJSON(url, opts){
-    try{
-      var r = await fetch(url, opts || {});
-      if (!r.ok) return null;
-      return await r.json();
-    }catch(e){ return null; }
-  }
-
-  async function refresh(){
-    var pnls = await fetchJSON('/pnl/summary');
-    var recent = await fetchJSON('/orders/recent?limit=50');
-    if (pnls){
-      document.getElementById('updatedAt').textContent = new Date().toLocaleTimeString();
-      document.getElementById('pnlTotal').innerHTML = fmtMoney(pnls.pnl_total);
-      document.getElementById('ordersCount').textContent = (pnls.orders_count||0) + ' orders';
-      renderByStrat(pnls.pnl_by_strategy || {});
-      renderCalendar(pnls.pnl_calendar || []);
-    }
-    if (recent && recent.orders) renderOrders(recent.orders);
-  }
-
-  async function init(){
-    var attr = await fetchJSON('/orders/attribution');
-    if (attr && attr.defaults){
-      document.getElementById('tf').textContent = attr.defaults.timeframe || '—';
-      document.getElementById('lim').textContent = String(attr.defaults.limit || '—');
-      document.getElementById('notional').textContent = String(attr.defaults.notional || '—');
-    }
-    await refresh();
-    setInterval(refresh, 10000);
-
-    document.getElementById('btnRunAll').addEventListener('click', async function(){
-      var r = await fetchJSON('/scan/all?dry=0', {method:'POST'});
-      await refresh();
-      alert(r && r.ok ? 'Ran all (dry=0)' : 'Run failed');
-    });
-    document.getElementById('btnRunDry').addEventListener('click', async function(){
-      var r = await fetchJSON('/scan/all?dry=1', {method:'POST'});
-      alert(r && r.ok ? 'Ran all (dry=1)' : 'Run failed');
-    });
-  }
-
-  window.addEventListener('load', init);
-})();
-</script>
-</body>
-</html>
-""")
-
-@app.get("/dashboard", response_class=HTMLResponse)
-def dashboard():
-    html = _DASHBOARD_HTML.substitute(version=APP_VERSION)
-    return HTMLResponse(html)
-
-# ---------------------- Background Autoscheduler ----------------------
+# ------------------------------------------------------------------------------
+# Scheduler
+# ------------------------------------------------------------------------------
 _scheduler_task: Optional[asyncio.Task] = None
-_scheduler_stop = asyncio.Event()
+_shutdown_event = asyncio.Event()
 
-async def _run_one_scan(strat: str, req: Dict[str, Any], dry: int = 0) -> None:
-    try:
-        orders = await _scan_bridge(strat, req, dry=dry)
-        if isinstance(orders, list) and dry == 0:
-            _append_orders(orders)
-    except Exception:
-        log.error("StrategyBook.scan error", exc_info=True)
-
-async def _scheduler_loop():
-    log.info("Scheduler loop started; every %ss", AUTO_SCAN_EVERY)
-    while not _scheduler_stop.is_set():
-        log.info("Scheduler tick: running all strategies (dry=0)")
-        req = {"timeframe": DEFAULT_TF, "limit": DEFAULT_LIMIT, "notional": DEFAULT_NOTIONAL, "symbols": DEFAULT_SYMBOLS}
-        for strat in ("c1", "c2", "c3", "c4", "c5", "c6"):
-            await _run_one_scan(strat, req, dry=0)
-            await asyncio.sleep(1.0)
+async def _scheduler_loop() -> None:
+    dry = 0
+    req: Dict[str, Any] = {
+        "timeframe": DEFAULT_TF,
+        "limit": DEFAULT_LIMIT,
+        "notional": DEFAULT_NOTIONAL,
+        "symbols": DEFAULT_SYMBOLS,
+    }
+    while not _shutdown_event.is_set():
         try:
-            await asyncio.wait_for(_scheduler_stop.wait(), timeout=AUTO_SCAN_EVERY)
-        except asyncio.TimeoutError:
-            pass
+            log.info("Scheduler tick: running all strategies (dry=%s)", dry)
+            for strat in SCHED_STRATS:
+                try:
+                    orders = await _scan_bridge(strat, req, dry=dry)
+                except Exception as e:
+                    log.error("StrategyBook.scan error: %s", e, exc_info=True)
+                    orders = []
+                if isinstance(orders, list) and dry == 0:
+                    _append_orders(orders)
+        except Exception as e:
+            log.error("Scheduler loop error: %s", e, exc_info=True)
+        await asyncio.wait(
+            [asyncio.create_task(_shutdown_event.wait())],
+            timeout=DEFAULT_SCHED_INTERVAL_SEC,
+        )
 
+# ------------------------------------------------------------------------------
+# Lifecycle
+# ------------------------------------------------------------------------------
 @app.on_event("startup")
-async def on_startup():
-    if AUTO_SCAN_ENABLED:
-        log.info("Auto scheduler enabled (every %ss)", AUTO_SCAN_EVERY)
+async def on_startup() -> None:
+    enabled = AUTO_SCHEDULER == "1"
+    log.info("Auto scheduler %s", "enabled" if enabled else "disabled")
+    if enabled:
         global _scheduler_task
-        _scheduler_stop.clear()
         _scheduler_task = asyncio.create_task(_scheduler_loop())
-    else:
-        log.info("Auto scheduler disabled")
 
 @app.on_event("shutdown")
-async def on_shutdown():
+async def on_shutdown() -> None:
     log.info("Shutting down app; scheduler will stop.")
-    _scheduler_stop.set()
-    t = globals().get("_scheduler_task")
-    if t:
+    _shutdown_event.set()
+    if _scheduler_task:
         try:
-            await asyncio.wait_for(t, timeout=5)
+            await asyncio.wait_for(_scheduler_task, timeout=5)
         except Exception:
             pass
 
-# ---------------------- Main ----------------------
+# ------------------------------------------------------------------------------
+# Error handlers
+# ------------------------------------------------------------------------------
+@app.exception_handler(HTTPException)
+async def http_ex_handler(request: Request, exc: HTTPException):
+    return JSONResponse(status_code=exc.status_code, content={"ok": False, "detail": exc.detail})
+
+@app.exception_handler(Exception)
+async def unhandled_ex_handler(request: Request, exc: Exception):
+    log.error("Unhandled error: %s", exc, exc_info=True)
+    return JSONResponse(status_code=500, content={"ok": False, "detail": str(exc)})
+
+# ------------------------------------------------------------------------------
+# Entrypoint
+# ------------------------------------------------------------------------------
 if __name__ == "__main__":
+    import uvicorn
+
     port = int(os.getenv("PORT", "10000"))
-    uvicorn.run("app:app", host="0.0.0.0", port=port, log_level="info")
+    log.info("Uvicorn starting on 0.0.0.0:%d", port)
+    uvicorn.run("app:app", host="0.0.0.0", port=port, reload=bool(os.getenv("RELOAD")))
