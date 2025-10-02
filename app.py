@@ -1,587 +1,650 @@
-# app.py
+# app.py  —  v3.5.0
+# - Restores full dashboard (P&L totals, P&L by strategy, calendar P&L, positions, recent orders)
+# - Built-in scheduler (Option B) using env controls
+# - FIX: StrategyBook.scan called with positional args (no 'strat=' keyword)
+# - No httpx dependency; uses stdlib + installed pkgs
+
 import os
 import json
 import time
-import asyncio
+import threading
+import traceback
 import logging
-from datetime import datetime, timezone
-from typing import List, Optional, Dict, Any, Tuple
+from datetime import datetime, timedelta, timezone
+from typing import Any, Dict, List, Optional
 
-import httpx
-from fastapi import FastAPI, Query, Body, Request
-from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
+from fastapi import FastAPI, Request, Response, Query
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, PlainTextResponse
 from pydantic import BaseModel
 
+# ===== Logging =====
 logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("app")
+log = logging.getLogger("app")
 
-app = FastAPI(title="Crypto Trading System")
+# ===== Strategies package (your code) =====
+# We assume these exist per your project. The only fix we enforce is: use positional call .scan(strat, req)
+try:
+    from strategies import StrategyBook, ScanRequest, ScanResult  # type: ignore
+except Exception as e:
+    # If import bombs in a dev shell, make a light fallback to keep app bootable.
+    log.error("Failed importing strategies: %s", e)
+    StrategyBook = None  # type: ignore
 
-# -----------------------------
-# Configuration / Defaults
-# -----------------------------
-DEFAULT_UNIVERSE: List[str] = [
-    "BTC/USD","ETH/USD","SOL/USD","DOGE/USD","XRP/USD","ADA/USD",
-    "AVAX/USD","LINK/USD","TON/USD","TRX/USD","BCH/USD","LTC/USD",
-    "APT/USD","ARB/USD","SUI/USD","OP/USD","MATIC/USD","NEAR/USD","ATOM/USD"
-]
-STRATS_ALL: List[str] = ["c1","c2","c3","c4","c5","c6"]
+    class ScanRequest(BaseModel):  # minimal shim for local dev
+        timeframe: str
+        limit: int
+        dry: int = 1
+        symbols: List[str]
+        notional: Optional[float] = None
+        topk: Optional[int] = None
+        min_score: Optional[float] = None
 
-# Built-in background scheduler (Option B)
-SCHED_ENABLED = os.getenv("SCHED_ENABLED", "0") == "1"
-SCHED_INTERVAL_SEC = int(os.getenv("SCHED_INTERVAL_SEC", "300"))
+    class ScanResult(BaseModel):  # minimal shim
+        symbol: str
+        action: str
+        reason: str
+        side: Optional[str] = None
+        qty: Optional[float] = None
+        notional: Optional[float] = None
+        status: Optional[str] = None
 
-# Alpaca
-ALPACA_KEY = os.getenv("ALPACA_API_KEY_ID", "")
-ALPACA_SECRET = os.getenv("ALPACA_API_SECRET_KEY", "")
-ALPACA_PAPER = os.getenv("ALPACA_PAPER", "1") == "1"
-ALPACA_BASE = "https://paper-api.alpaca.markets" if ALPACA_PAPER else "https://api.alpaca.markets"
-ALPACA_DATA = "https://data.alpaca.markets"
-TRADING_ENABLED = os.getenv("TRADING_ENABLED", "1") == "1"  # master toggle
+# ===== App =====
+app = FastAPI(title="Crypto System", version="3.5.0")
 
-# App Meta
-APP_VERSION = os.getenv("APP_VERSION", "2025.10.01")
-STARTED_AT = datetime.now(timezone.utc).isoformat()
-
-# In-memory order log (so /orders/recent keeps working even if you don’t have a DB)
-ORDER_LOG: List[Dict[str, Any]] = []  # appended when we "place" orders from scans
-ORDER_LOG_MAX = 2000
-
-# -----------------------------
-# Strategies Adapter
-# -----------------------------
-"""
-We try to call into your existing strategies package WITHOUT enforcing a specific API.
-This adapter will check (in order):
-
-1) strategies.run_scan(...)
-2) strategies.StrategyBook().scan(...)
-3) strategies.<strat>.scan(...)
-
-Your current dashboard logs show /scan is returning 200 with fields like topk & min_score,
-so this should be compatible as long as one of the above exists.
-"""
-
-_StrategyCache: Dict[str, Any] = {}
-_strategy_run_fn = None
+# ===== Global StrategyBook =====
 _strategy_book = None
-
-def _import_strategies():
-    global _strategy_run_fn, _strategy_book
-    if _strategy_run_fn or _strategy_book:
-        return
+if StrategyBook is not None:
     try:
-        import strategies  # type: ignore
+        _strategy_book = StrategyBook()
+        log.info("StrategyBook initialized")
     except Exception as e:
-        logger.warning("strategies import failed: %s", e)
-        return
+        log.exception("Failed to init StrategyBook: %s", e)
 
-    # 1) Prefer run_scan function if present
-    if hasattr(strategies, "run_scan") and callable(getattr(strategies, "run_scan")):
-        _strategy_run_fn = getattr(strategies, "run_scan")
-        logger.info("Using strategies.run_scan adapter")
-        return
+# ===== Env / Defaults =====
+ENABLE_SCHEDULER = os.getenv("ENABLE_SCHEDULER", "0") == "1"
+SCHEDULER_INTERVAL_SEC = int(os.getenv("SCHEDULER_INTERVAL_SEC", "60"))
+STRATEGY_LIST = [s.strip() for s in os.getenv("STRATEGY_LIST", "c1,c2,c3,c4,c5,c6").split(",") if s.strip()]
 
-    # 2) Try StrategyBook
-    try:
-        SB = getattr(strategies, "StrategyBook", None)
-        if SB:
-            _strategy_book = SB()
-            logger.info("Using strategies.StrategyBook().scan adapter")
-            return
-    except Exception as e:
-        logger.warning("StrategyBook init failed: %s", e)
+DEFAULT_TIMEFRAME = os.getenv("DEFAULT_TIMEFRAME", "5Min")
+DEFAULT_LIMIT = int(os.getenv("DEFAULT_LIMIT", "360"))
+DEFAULT_NOTIONAL = float(os.getenv("DEFAULT_NOTIONAL", "25"))
+DEFAULT_SYMBOLS = [s.strip() for s in os.getenv("DEFAULT_SYMBOLS", "BTC/USD,ETH/USD").split(",") if s.strip()]
 
-def _get_module_for_strat(strat: str):
-    """Load strategies.<strat> lazily if needed."""
-    if strat in _StrategyCache:
-        return _StrategyCache[strat]
-    try:
-        import importlib
-        mod = importlib.import_module(f"strategies.{strat}")
-        _StrategyCache[strat] = mod
-        return mod
-    except Exception as e:
-        logger.warning("No module strategies.%s (%s)", strat, e)
-        return None
+# ===== Helpers =====
 
-async def run_scan_adapter(
-    strat: str,
-    timeframe: str,
-    limit: int,
-    notional: float,
-    symbols: List[str],
-    dry: bool,
-    topk: int = 2,
-    min_score: float = 0.10
-) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
-    """
-    Returns (placed_orders, meta_info)
-    placed_orders: list of dicts for any orders we actually attempted
-    meta_info: arbitrary metadata (scores, candidate signals, etc.)
-    """
-    _import_strategies()
+def _iso_now() -> str:
+    return datetime.now(timezone.utc).isoformat()
 
-    # 1) strategies.run_scan
-    if _strategy_run_fn:
-        try:
-            res = await _maybe_await(_strategy_run_fn(
-                strat=strat,
-                timeframe=timeframe,
-                limit=limit,
-                notional=notional,
-                symbols=symbols,
-                dry=dry,
-                topk=topk,
-                min_score=min_score
-            ))
-            # Expect a dict or tuple
-            if isinstance(res, tuple) and len(res) == 2:
-                return res[0], res[1]  # (placed, meta)
-            if isinstance(res, dict):
-                return res.get("placed", []), res
-        except Exception as e:
-            logger.exception("strategies.run_scan error: %s", e)
-
-    # 2) StrategyBook().scan
-    if _strategy_book and hasattr(_strategy_book, "scan"):
-        try:
-            res = await _maybe_await(_strategy_book.scan(
-                strat=strat,
-                timeframe=timeframe,
-                limit=limit,
-                notional=notional,
-                symbols=symbols,
-                dry=dry,
-                topk=topk,
-                min_score=min_score
-            ))
-            if isinstance(res, tuple) and len(res) == 2:
-                return res[0], res[1]
-            if isinstance(res, dict):
-                return res.get("placed", []), res
-        except Exception as e:
-            logger.exception("StrategyBook.scan error: %s", e)
-
-    # 3) strategies.<strat>.scan
-    mod = _get_module_for_strat(strat)
-    if mod and hasattr(mod, "scan") and callable(getattr(mod, "scan")):
-        try:
-            res = await _maybe_await(mod.scan(
-                timeframe=timeframe,
-                limit=limit,
-                notional=notional,
-                symbols=symbols,
-                dry=dry,
-                topk=topk,
-                min_score=min_score
-            ))
-            if isinstance(res, tuple) and len(res) == 2:
-                return res[0], res[1]
-            if isinstance(res, dict):
-                return res.get("placed", []), res
-        except Exception as e:
-            logger.exception("%s.scan error: %s", strat, e)
-
-    # Fallback: no strategy available
-    logger.warning("No strategy adapter handled %s; returning flat", strat)
-    return [], {"reason": "no_strategy_adapter"}
-
-async def _maybe_await(x):
-    if asyncio.iscoroutine(x):
-        return await x
+def _maybe_await(x):
+    if hasattr(x, "__await__"):
+        # It's an awaitable
+        import asyncio
+        return asyncio.get_event_loop().run_until_complete(x)  # used only in sync contexts
     return x
 
-# -----------------------------
-# Alpaca Helpers (safe no-ops)
-# -----------------------------
-def alpaca_headers() -> Dict[str, str]:
-    return {
-        "APCA-API-KEY-ID": ALPACA_KEY,
-        "APCA-API-SECRET-KEY": ALPACA_SECRET,
-        "Content-Type": "application/json",
-    }
+def _mk_scan_request(
+    timeframe: str,
+    limit: int,
+    dry: int,
+    symbols: List[str],
+    notional: Optional[float] = None,
+    topk: Optional[int] = None,
+    min_score: Optional[float] = None,
+):
+    # If the project's ScanRequest is a BaseModel/dataclass, construct it directly.
+    try:
+        return ScanRequest(
+            timeframe=timeframe,
+            limit=limit,
+            dry=dry,
+            symbols=symbols,
+            notional=notional,
+            topk=topk,
+            min_score=min_score,
+        )
+    except Exception:
+        # Fallback to dict if scans accept plain kwargs in your StrategyBook
+        return {
+            "timeframe": timeframe,
+            "limit": limit,
+            "dry": dry,
+            "symbols": symbols,
+            "notional": notional,
+            "topk": topk,
+            "min_score": min_score,
+        }
 
-async def alpaca_positions() -> List[Dict[str, Any]]:
-    if not (ALPACA_KEY and ALPACA_SECRET):
-        return []
-    url = f"{ALPACA_BASE}/v2/positions"
-    async with httpx.AsyncClient(timeout=15) as client:
-        r = await client.get(url, headers=alpaca_headers())
-    if r.status_code == 200:
-        return r.json()
+def _safe_call_orders_recent(limit: int, status: str) -> List[Dict[str, Any]]:
+    """
+    Try to fetch recent orders via StrategyBook if it exposes broker access.
+    Fallback: empty list.
+    """
+    try:
+        if hasattr(_strategy_book, "orders_recent"):
+            return _strategy_book.orders_recent(limit=limit, status=status)  # type: ignore
+        if hasattr(_strategy_book, "broker") and hasattr(_strategy_book.broker, "orders_recent"):
+            return _strategy_book.broker.orders_recent(limit=limit, status=status)  # type: ignore
+    except Exception:
+        log.exception("orders_recent failed")
     return []
 
-def _append_order_log(row: Dict[str, Any]):
-    ORDER_LOG.append(row)
-    if len(ORDER_LOG) > ORDER_LOG_MAX:
-        del ORDER_LOG[: len(ORDER_LOG) - ORDER_LOG_MAX]
+def _safe_call_positions() -> List[Dict[str, Any]]:
+    try:
+        if hasattr(_strategy_book, "positions"):
+            return _strategy_book.positions()  # type: ignore
+        if hasattr(_strategy_book, "broker") and hasattr(_strategy_book.broker, "positions"):
+            return _strategy_book.broker.positions()  # type: ignore
+    except Exception:
+        log.exception("positions failed")
+    return []
 
-# -----------------------------
-# API Models
-# -----------------------------
-class ScanResponse(BaseModel):
-    strat: str
-    placed: int
-    placed_sample: List[Dict[str, Any]]
-    meta: Dict[str, Any]
-    dry: bool
+def _safe_call_pnl_summary() -> Dict[str, Any]:
+    """
+    Expect shape:
+      {
+        "asof": ISO,
+        "total": {"realized": float, "unrealized": float},
+        "by_strategy": {"c1": {"realized":..,"unrealized":..}, ...},
+        "calendar": [{"date":"YYYY-MM-DD","realized": float}, ... up to ~30-60]
+      }
+    Fallback returns zeros so dashboard renders.
+    """
+    try:
+        if hasattr(_strategy_book, "pnl_summary"):
+            return _strategy_book.pnl_summary()  # type: ignore
+        if hasattr(_strategy_book, "analytics") and hasattr(_strategy_book.analytics, "pnl_summary"):
+            return _strategy_book.analytics.pnl_summary()  # type: ignore
+    except Exception:
+        log.exception("pnl_summary failed")
 
-# -----------------------------
-# Routes
-# -----------------------------
+    # default placeholder
+    today = datetime.now().date()
+    cal = [{"date": (today - timedelta(days=i)).isoformat(), "realized": 0.0} for i in range(0, 14)][::-1]
+    return {
+        "asof": _iso_now(),
+        "total": {"realized": 0.0, "unrealized": 0.0},
+        "by_strategy": {s: {"realized": 0.0, "unrealized": 0.0} for s in STRATEGY_LIST},
+        "calendar": cal,
+    }
+
+def _safe_call_universe() -> Dict[str, Any]:
+    return {
+        "core": ["BTC/USD","ETH/USD","SOL/USD","DOGE/USD","XRP/USD","AVAX/USD","LINK/USD","BCH/USD","LTC/USD"],
+        "alts": ["ADA/USD","TON/USD","TRX/USD","APT/USD","ARB/USD","SUI/USD","OP/USD","MATIC/USD","NEAR/USD","ATOM/USD"]
+    }
+
+# ===== Scheduler (Option B) =====
+
+_stop_flag = False
+
+def _scheduler_loop():
+    """
+    Simple staggered loop that runs all strategies live using default params.
+    Respects ENABLE_SCHEDULER & SCHEDULER_INTERVAL_SEC.
+    """
+    global _stop_flag
+    if _strategy_book is None:
+        log.warning("Scheduler: StrategyBook is not available; exiting scheduler thread.")
+        return
+
+    while not _stop_flag and ENABLE_SCHEDULER:
+        try:
+            log.info("Scheduler tick: running all strategies (dry=0)")
+            # Build one request object to reuse
+            req = _mk_scan_request(
+                timeframe=DEFAULT_TIMEFRAME,
+                limit=DEFAULT_LIMIT,
+                dry=0,
+                symbols=DEFAULT_SYMBOLS,
+                notional=DEFAULT_NOTIONAL,
+                topk=None,
+                min_score=None,
+            )
+            for s in STRATEGY_LIST:
+                try:
+                    # *** IMPORTANT FIX: call with positional args (no 'strat=' keyword) ***
+                    res = _strategy_book.scan(s, req)  # may be sync or async
+                    res = _maybe_await(res)
+                except TypeError as te:
+                    log.error("StrategyBook.scan error: %s", te)
+                    log.warning("No strategy adapter handled %s; returning flat", s)
+                except Exception:
+                    log.exception("Error scanning %s", s)
+                time.sleep(1.0)  # tiny stagger
+        except Exception:
+            log.exception("Scheduler loop crashed once; continuing.")
+        # Sleep main cadence
+        for _ in range(SCHEDULER_INTERVAL_SEC):
+            if _stop_flag:
+                break
+            time.sleep(1)
+
+# Start scheduler thread if enabled
+if ENABLE_SCHEDULER:
+    t = threading.Thread(target=_scheduler_loop, name="scheduler", daemon=True)
+    t.start()
+    log.info("Scheduler thread started (interval=%ss)", SCHEDULER_INTERVAL_SEC)
+
+# ===== Routes =====
+
 @app.get("/", include_in_schema=False)
-def root_redirect():
-    return RedirectResponse(url="/dashboard", status_code=307)
-
-@app.get("/dashboard", response_class=HTMLResponse)
-def dashboard():
-    return HTMLResponse(DASHBOARD_HTML)
+def root():
+    return RedirectResponse(url="/dashboard")
 
 @app.get("/health")
 def health():
-    return {
-        "ok": True,
-        "version": APP_VERSION,
-        "started_at": STARTED_AT,
-        "scheduler": {"enabled": SCHED_ENABLED, "interval_sec": SCHED_INTERVAL_SEC},
-        "alpaca_paper": ALPACA_PAPER,
-        "trading_enabled": TRADING_ENABLED,
-    }
+    return {"status": "ok", "time": _iso_now(), "scheduler": ENABLE_SCHEDULER}
 
-@app.get("/universe")
-def universe():
-    return {"universe": DEFAULT_UNIVERSE, "count": len(DEFAULT_UNIVERSE)}
-
-@app.get("/v2/positions")
-async def positions():
-    # Mirror the path your frontend expects
-    return JSONResponse(await alpaca_positions())
-
-@app.get("/orders/attribution")
-def orders_attr():
-    # Keep whatever shape your UI expects; we expose a compact snapshot
-    return {
-        "source": "app-order-log",
-        "count": len(ORDER_LOG),
-        "last": ORDER_LOG[-10:],
-    }
-
-@app.get("/orders/recent")
-def orders_recent(status: str = "all", limit: int = 200):
-    # Simple, local recorder. If you already store orders elsewhere, you can replace this.
-    lim = max(1, min(limit, 1000))
-    return {"orders": ORDER_LOG[-lim:]}
-
-@app.get("/pnl/summary")
-def pnl_summary():
-    # Placeholder; extend to read from your storage if you track realized/unrealized PnL.
-    # We at least return 200 OK so your UI stays happy.
-    return {"realized": 0.0, "unrealized": 0.0, "since": STARTED_AT}
-
-@app.post("/scan/{strat}", response_model=ScanResponse)
-async def scan_endpoint(
-    strat: str,
-    timeframe: str = Query("5Min"),
-    limit: int = Query(360, ge=50, le=10_000),
-    dry: int = Query(1, ge=0, le=1),
-    symbols: Optional[str] = Query(None),
-    notional: float = Query(25, gt=0),
-    topk: int = Query(2, ge=1, le=50),
-    min_score: float = Query(0.10, ge=0.0, le=1.0),
-):
-    if strat not in STRATS_ALL:
-        return JSONResponse(
-            status_code=400,
-            content={"error": f"Unknown strategy '{strat}'", "allowed": STRATS_ALL},
-        )
-    syms = symbols.split(",") if symbols else list(DEFAULT_UNIVERSE)
-
-    placed, meta = await run_scan_adapter(
-        strat=strat,
-        timeframe=timeframe,
-        limit=limit,
-        notional=notional,
-        symbols=syms,
-        dry=bool(dry),
-        topk=topk,
-        min_score=min_score,
-    )
-
-    # Record orders locally (so /orders/recent shows something)
-    utcnow = datetime.now(timezone.utc).isoformat()
-    for p in placed or []:
-        _append_order_log({
-            "ts": utcnow,
-            "strat": strat,
-            "symbol": p.get("symbol"),
-            "side": p.get("side"),
-            "qty": p.get("qty"),
-            "notional": p.get("notional"),
-            "status": p.get("status", "submitted"),
-            "dry": bool(dry),
-            "meta": {"timeframe": timeframe, "limit": limit},
-        })
-
-    sample = (placed or [])[:10]
-    return {
-        "strat": strat,
-        "placed": len(placed or []),
-        "placed_sample": sample,
-        "meta": meta or {},
-        "dry": bool(dry),
-    }
-
-# -----------------------------
-# (Optional) /cron/runall is handy even with Option B
-# -----------------------------
-@app.post("/cron/runall")
-async def cron_run_all(
-    dry: int = Query(0, ge=0, le=1),
-    timeframe: str = Query("5Min"),
-    limit: int = Query(360, ge=100, le=5000),
-    notional: float = Query(25, gt=0),
-    symbols: Optional[str] = Query(None),
-    topk: int = Query(2, ge=1, le=10),
-    min_score: float = Query(0.10, ge=0.0, le=1.0)
-):
-    syms = symbols.split(",") if symbols else list(DEFAULT_UNIVERSE)
-    results = []
-    for s in STRATS_ALL:
-        try:
-            placed, meta = await run_scan_adapter(
-                strat=s,
-                timeframe=timeframe,
-                limit=limit,
-                notional=notional,
-                symbols=syms,
-                dry=bool(dry),
-                topk=topk,
-                min_score=min_score
-            )
-            results.append({"strat": s, "placed": len(placed or []), "meta": meta})
-            await asyncio.sleep(1.0)
-        except Exception as e:
-            logger.exception("runall error for %s", s)
-            results.append({"strat": s, "error": str(e)})
-            await asyncio.sleep(0.5)
-    return {"ok": True, "results": results}
-
-# -----------------------------
-# Background Scheduler (Option B)
-# -----------------------------
-_bg_task: asyncio.Task | None = None
-async def scheduler_loop():
-    interval = max(30, SCHED_INTERVAL_SEC)  # sanity floor
-    while True:
-        try:
-            logger.info("Scheduler tick: running all strategies (dry=0)")
-            await cron_run_all(
-                dry=0,
-                timeframe="5Min",
-                limit=360,
-                notional=25,
-                symbols=None,
-                topk=2,
-                min_score=0.10
-            )
-        except Exception:
-            logger.exception("scheduler_loop error")
-        await asyncio.sleep(interval)
-
-@app.on_event("startup")
-async def _startup():
-    # Small delay to let server finish booting
-    await asyncio.sleep(1.0)
-    if SCHED_ENABLED:
-        global _bg_task
-        _bg_task = asyncio.create_task(scheduler_loop())
-        logger.info("Background scheduler started (interval=%ss)", SCHED_INTERVAL_SEC)
-    else:
-        logger.info("Background scheduler disabled (SCHED_ENABLED != 1)")
-
-@app.on_event("shutdown")
-async def _shutdown():
-    global _bg_task
-    if _bg_task:
-        _bg_task.cancel()
-        _bg_task = None
-
-# -----------------------------
-# Inline HTML (dashboard)
-# -----------------------------
-DASHBOARD_HTML = """
-<!doctype html>
+@app.get("/dashboard", response_class=HTMLResponse)
+def dashboard():
+    # Full inline HTML + JS. Uses same endpoints you already hit in the UI logs.
+    html = f"""<!doctype html>
 <html lang="en">
 <head>
   <meta charset="utf-8"/>
-  <title>Crypto Trading System</title>
-  <meta name="viewport" content="width=device-width,initial-scale=1"/>
+  <title>Crypto System – Dashboard (v{app.version})</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <style>
-    :root { color-scheme: light dark; }
-    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; margin: 24px; }
-    h1 { margin: 0 0 12px; font-size: 22px; }
-    .row { display: flex; flex-wrap: wrap; gap: 12px; align-items: center; margin-bottom: 12px; }
-    label { font-size: 14px; color: #666; margin-right: 6px; }
-    input, select { padding: 6px 8px; font-size: 14px; }
-    button { padding: 8px 12px; font-size: 14px; cursor: pointer; }
-    .card { border: 1px solid #ddd; padding: 12px; border-radius: 8px; margin-top: 16px; }
-    code { background: rgba(0,0,0,0.06); padding: 2px 4px; border-radius: 4px; }
-    table { border-collapse: collapse; width: 100%; }
-    th, td { padding: 8px; border-bottom: 1px solid #eee; text-align: left; }
-    .muted { color: #888; }
-    .ok { color: #0a7; }
-    .bad { color: #d33; }
+    :root {{
+      --bg:#0b0e12; --panel:#12161c; --muted:#9aa4ad; --text:#e7edf3; --accent:#24a0ed; --pos:#19c37d; --neg:#ff4d4f;
+      --grid:#1c222b;
+    }}
+    * {{ box-sizing:border-box; }}
+    body {{
+      margin:0; font-family: system-ui, -apple-system, Segoe UI, Roboto, Ubuntu, Cantarell, Noto Sans, Helvetica, Arial, "Apple Color Emoji","Segoe UI Emoji";
+      background: var(--bg); color: var(--text);
+    }}
+    header {{
+      padding:16px 20px; display:flex; align-items:center; gap:16px; border-bottom:1px solid #1b2027; position:sticky; top:0; background:rgba(11,14,18,.9); backdrop-filter: blur(6px);
+    }}
+    h1 {{ font-size:18px; margin:0; font-weight:600; letter-spacing:.3px; }}
+    .badge {{ font-size:12px; color:#fff; background:#2b3340; padding:4px 8px; border-radius:999px; }}
+    .tag {{ font-size:12px; color:#cfd6dd; background:#1a212b; padding:4px 8px; border-radius:6px; border:1px solid #2a323d; }}
+    main {{ padding:20px; max-width:1200px; margin:0 auto; }}
+    .grid {{ display:grid; grid-template-columns: repeat(12, 1fr); gap:16px; }}
+    .card {{ grid-column: span 12; background:var(--panel); border:1px solid #1b2027; border-radius:14px; padding:16px; }}
+    @media (min-width: 900px) {{
+      .span4 {{ grid-column: span 4; }}
+      .span6 {{ grid-column: span 6; }}
+      .span8 {{ grid-column: span 8; }}
+      .span12 {{ grid-column: span 12; }}
+      .span3 {{ grid-column: span 3; }}
+    }}
+    .kpis {{ display:flex; gap:16px; flex-wrap:wrap; }}
+    .kpi {{ background:#0f141a; border:1px solid #1b2027; border-radius:12px; padding:12px 14px; min-width:180px; }}
+    .kpi h3 {{ font-size:12px; margin:0; color:var(--muted); font-weight:500; }}
+    .kpi .v {{ font-size:22px; margin-top:6px; font-weight:700; }}
+    .green {{ color: var(--pos); }}
+    .red {{ color: var(--neg); }}
+    table {{ width:100%; border-collapse: collapse; }}
+    th, td {{ text-align:left; padding:8px; border-bottom:1px solid #1b2027; font-size:14px; }}
+    th {{ color:#c2cbd3; font-weight:600; }}
+    .controls {{ display:flex; gap:10px; flex-wrap:wrap; }}
+    input, select, button {{
+      background:#0f141a; color:#e7edf3; border:1px solid #273140; border-radius:10px; padding:8px 10px; font-size:14px;
+    }}
+    button.primary {{ background:var(--accent); color:#00121f; border-color: transparent; font-weight:700; }}
+    .calendar {{
+      display:grid; grid-template-columns: repeat(14, 1fr); gap:6px;
+    }}
+    .cell {{
+      height:36px; border-radius:6px; background:#0f141a; display:flex; align-items:center; justify-content:center; font-size:12px; border:1px solid #1b2027;
+    }}
+    .pos {{ background: rgba(25,195,125,.1); border-color: rgba(25,195,125,.3); }}
+    .neg {{ background: rgba(255,77,79,.12); border-color: rgba(255,77,79,.35); }}
+    .muted {{ color: var(--muted); }}
+    .mono {{ font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace; }}
+    .small {{ font-size:12px; }}
   </style>
 </head>
 <body>
-  <h1>Crypto Trading System</h1>
-  <div class="row">
-    <span class="muted">Version: <code id="ver">...</code></span>
-    <span class="muted">Scheduler: <code id="sched">...</code></span>
-    <span class="muted">Alpaca: <code id="alp">...</code></span>
-  </div>
+  <header>
+    <h1>Crypto Trading System <span class="badge">v{app.version}</span></h1>
+    <span id="sched" class="tag">Scheduler: …</span>
+    <span id="asof" class="tag">as of —</span>
+  </header>
 
-  <div class="card">
-    <div class="row">
-      <label>Timeframe</label>
-      <select id="tf">
-        <option>1Min</option>
-        <option selected>5Min</option>
-        <option>15Min</option>
-      </select>
+  <main>
+    <div class="grid">
+      <section class="card span12">
+        <div class="kpis">
+          <div class="kpi">
+            <h3>Total Realized P&L</h3>
+            <div id="kpi-realized" class="v">—</div>
+          </div>
+          <div class="kpi">
+            <h3>Total Unrealized P&L</h3>
+            <div id="kpi-unrealized" class="v">—</div>
+          </div>
+          <div class="kpi">
+            <h3>Open Positions</h3>
+            <div id="kpi-positions" class="v">—</div>
+          </div>
+          <div class="kpi">
+            <h3>Recent Orders (24h)</h3>
+            <div id="kpi-orders" class="v">—</div>
+          </div>
+        </div>
+      </section>
 
-      <label>Limit</label>
-      <input id="lim" type="number" value="360" min="50" max="10000" style="width:100px"/>
+      <section class="card span8">
+        <h3>P&L by Strategy</h3>
+        <table id="tbl-strat">
+          <thead>
+            <tr><th>Strategy</th><th class="mono">Realized</th><th class="mono">Unrealized</th></tr>
+          </thead>
+          <tbody></tbody>
+        </table>
+      </section>
 
-      <label>Notional</label>
-      <input id="notional" type="number" value="25" min="1" step="1" style="width:100px"/>
+      <section class="card span4">
+        <h3>Calendar P&L (Realized)</h3>
+        <div id="cal" class="calendar"></div>
+        <div class="small muted" id="cal-hint" style="margin-top:6px;"></div>
+      </section>
 
-      <label>Dry</label>
-      <select id="dry">
-        <option value="1">Yes</option>
-        <option value="0" selected>No</option>
-      </select>
+      <section class="card span6">
+        <h3>Open Positions</h3>
+        <table id="tbl-pos">
+          <thead>
+            <tr><th>Symbol</th><th>Side</th><th class="mono">Qty</th><th class="mono">Avg</th><th class="mono">Unrealized</th></tr>
+          </thead>
+          <tbody></tbody>
+        </table>
+      </section>
 
-      <label>TopK</label>
-      <input id="topk" type="number" value="2" min="1" max="50" style="width:80px"/>
+      <section class="card span6">
+        <h3>Recent Orders</h3>
+        <table id="tbl-orders">
+          <thead>
+            <tr><th>Time</th><th>Symbol</th><th>Side</th><th class="mono">Qty</th><th>Status</th><th>Strategy</th></tr>
+          </thead>
+          <tbody></tbody>
+        </table>
+      </section>
 
-      <label>Min Score</label>
-      <input id="minscore" type="number" value="0.10" min="0" max="1" step="0.01" style="width:100px"/>
-
-      <button onclick="runAll()">Run All</button>
+      <section class="card span12">
+        <h3>Manual Scan (optional)</h3>
+        <div class="controls" style="margin-bottom:10px;">
+          <label>Timeframe <input id="tf" value="{DEFAULT_TIMEFRAME}"/></label>
+          <label>Limit <input id="lim" type="number" value="{DEFAULT_LIMIT}"/></label>
+          <label>Notional <input id="notional" type="number" value="{DEFAULT_NOTIONAL}"/></label>
+          <label>Symbols <input id="syms" size="80" value="{",".join(DEFAULT_SYMBOLS)}"/></label>
+          <label>Dry?
+            <select id="dry">
+              <option value="1">1 (no orders)</option>
+              <option value="0">0 (live)</option>
+            </select>
+          </label>
+          <button class="primary" onclick="scanAll()">Run All</button>
+        </div>
+        <div class="controls">
+          {"".join([f'<button onclick="scanOne(\\'{s}\\')">{s}</button>' for s in STRATEGY_LIST])}
+        </div>
+        <pre id="scan-log" class="mono small" style="margin-top:12px; background:#0f141a; border:1px solid #1b2027; padding:10px; border-radius:8px; max-height:220px; overflow:auto;"></pre>
+      </section>
     </div>
-    <div class="row">
-      <label>Symbols (CSV)</label>
-      <input id="symbols" type="text" style="flex:1"
-        placeholder="Leave blank to use default universe"/>
-    </div>
-    <div id="status" class="muted"></div>
-    <div id="results"></div>
-  </div>
+  </main>
 
-  <div class="card">
-    <h3>Recent Orders</h3>
-    <div id="orders"></div>
-  </div>
+<script>
+const fmt = (x) => {{
+  if (x === null || x === undefined) return "—";
+  const s = Number(x);
+  if (!isFinite(s)) return "—";
+  const str = s.toFixed(2);
+  return (s > 0 ? '<span class="green">+'+str+'</span>' : (s < 0 ? '<span class="red">'+str+'</span>' : str));
+}};
 
-  <script>
-    async function loadHealth() {
-      const r = await fetch('/health'); const j = await r.json();
-      document.getElementById('ver').textContent = j.version || 'n/a';
-      const sch = j.scheduler?.enabled ? 'enabled @ '+j.scheduler.interval_sec+'s' : 'disabled';
-      document.getElementById('sched').textContent = sch;
-      const alp = (j.alpaca_paper===true?'paper':'live') + ', trading='+(j.trading_enabled?'on':'off');
-      document.getElementById('alp').textContent = alp;
-    }
+async function loadAll(){{
+  try {{
+    const health = await (await fetch('/health')).json();
+    document.getElementById('sched').textContent = 'Scheduler: ' + (health.scheduler ? 'ON' : 'OFF');
+  }} catch(e) {{}}
 
-    async function runAll() {
-      const tf = document.getElementById('tf').value;
-      const lim = document.getElementById('lim').value;
-      const notional = document.getElementById('notional').value;
-      const dry = document.getElementById('dry').value;
-      const topk = document.getElementById('topk').value;
-      const minscore = document.getElementById('minscore').value;
-      const syms = document.getElementById('symbols').value.trim();
+  try {{
+    const pnl = await (await fetch('/pnl/summary')).json();
+    document.getElementById('asof').textContent = 'as of ' + (pnl.asof || '');
+    const realized = pnl.total?.realized ?? 0;
+    const unreal = pnl.total?.unrealized ?? 0;
+    document.getElementById('kpi-realized').innerHTML = fmt(realized);
+    document.getElementById('kpi-unrealized').innerHTML = fmt(unreal);
 
-      const params = new URLSearchParams({
-        timeframe: tf, limit: lim, dry: dry, notional: notional,
-        topk: topk, min_score: minscore
-      });
-      if (syms) { params.set('symbols', syms); }
+    // Strategy table
+    const tbody = document.querySelector('#tbl-strat tbody');
+    tbody.innerHTML = '';
+    const bys = pnl.by_strategy || {{}};
+    Object.keys(bys).sort().forEach(k => {{
+      const r = bys[k]?.realized ?? 0;
+      const u = bys[k]?.unrealized ?? 0;
+      const tr = document.createElement('tr');
+      tr.innerHTML = `<td>${{k}}</td><td class="mono">${{fmt(r)}}</td><td class="mono">${{fmt(u)}}</td>`;
+      tbody.appendChild(tr);
+    }});
 
-      setStatus('Running scans...');
-      const out = [];
-      for (const s of ["c1","c2","c3","c4","c5","c6"]) {
-        const url = `/scan/${encodeURIComponent(s)}?`+params.toString();
-        const r = await fetch(url, {method:'POST'});
-        const j = await r.json();
-        out.push(j);
-      }
-      renderResults(out);
-      setStatus('Done.');
-      refreshOrders();
-    }
+    // Calendar
+    const calDiv = document.getElementById('cal');
+    calDiv.innerHTML = '';
+    const cal = pnl.calendar || [];
+    cal.forEach(d => {{
+      const v = Number(d.realized || 0);
+      const cls = v > 0 ? 'cell pos' : (v < 0 ? 'cell neg' : 'cell');
+      const el = document.createElement('div');
+      el.className = cls;
+      el.title = `${{d.date}}  realized: ${{v.toFixed(2)}}`;
+      el.textContent = (v>0?'+':'') + v.toFixed(0);
+      calDiv.appendChild(el);
+    }});
+    document.getElementById('cal-hint').textContent = 'Last ' + cal.length + ' trading days';
 
-    function setStatus(msg) {
-      document.getElementById('status').textContent = msg;
-    }
+  }} catch(e) {{
+    console.error(e);
+  }}
 
-    function renderResults(items) {
-      const el = document.getElementById('results');
-      if (!Array.isArray(items) || items.length === 0) {
-        el.innerHTML = '<div class="muted">No results.</div>'; return;
-      }
-      let html = '<table><thead><tr><th>Strat</th><th>Placed</th><th>Sample</th><th>Meta keys</th><th>Dry</th></tr></thead><tbody>';
-      for (const it of items) {
-        const keys = it.meta ? Object.keys(it.meta).slice(0,5).join(', ') : '';
-        const sample = (it.placed_sample||[]).slice(0,3).map(p => (p.symbol||'?')+' '+(p.side||'?')+' x'+(p.qty||p.notional||'?')).join(' | ');
-        html += `<tr>
-          <td><code>${it.strat}</code></td>
-          <td class="${it.placed>0?'ok':'muted'}">${it.placed}</td>
-          <td>${sample||'<span class="muted">-</span>'}</td>
-          <td class="muted">${keys||'-'}</td>
-          <td>${it.dry ? 'Yes' : 'No'}</td>
-        </tr>`;
-      }
-      html += '</tbody></table>';
-      el.innerHTML = html;
-    }
+  try {{
+    const pos = await (await fetch('/v2/positions')).json();
+    document.getElementById('kpi-positions').innerHTML = (pos.length || 0);
+    const tbody = document.querySelector('#tbl-pos tbody');
+    tbody.innerHTML = '';
+    pos.forEach(p => {{
+      const tr = document.createElement('tr');
+      tr.innerHTML = `<td>${{p.symbol||'-'}}</td><td>${{p.side||'-'}}</td><td class="mono">${{p.qty||'-'}}</td><td class="mono">${{p.avg_price||'-'}}</td><td class="mono">${{fmt(p.unrealized_pl||0)}}</td>`;
+      tbody.appendChild(tr);
+    }});
+  }} catch(e) {{}}
 
-    async function refreshOrders() {
-      const r = await fetch('/orders/recent?status=all&limit=200');
-      const j = await r.json();
-      const el = document.getElementById('orders');
-      const rows = j.orders || [];
-      if (!rows.length) { el.innerHTML = '<div class="muted">No orders yet.</div>'; return; }
-      let html = '<table><thead><tr><th>Time (UTC)</th><th>Strat</th><th>Symbol</th><th>Side</th><th>Qty/Notional</th><th>Status</th><th>Dry</th></tr></thead><tbody>';
-      for (const o of rows.slice(-50).reverse()) {
-        html += `<tr>
-          <td>${o.ts || ''}</td>
-          <td><code>${o.strat||''}</code></td>
-          <td>${o.symbol||''}</td>
-          <td>${o.side||''}</td>
-          <td>${o.qty ?? o.notional ?? ''}</td>
-          <td>${o.status||''}</td>
-          <td>${o.dry ? 'Yes' : 'No'}</td>
-        </tr>`;
-      }
-      html += '</tbody></table>';
-      el.innerHTML = html;
-    }
+  try {{
+    const ords = await (await fetch('/orders/recent?status=all&limit=200')).json();
+    document.getElementById('kpi-orders').innerHTML = (ords.length || 0);
+    const tbody = document.querySelector('#tbl-orders tbody');
+    tbody.innerHTML = '';
+    ords.slice(0,200).forEach(o => {{
+      const tr = document.createElement('tr');
+      const ts = o.submitted_at || o.created_at || o.time || '';
+      tr.innerHTML = `<td>${{ts}}</td><td>${{o.symbol||'-'}}</td><td>${{o.side||'-'}}</td><td class="mono">${{o.qty||o.notional||'-'}}</td><td>${{o.status||'-'}}</td><td>${{o.strategy||o.tag||'-'}}</td>`;
+      tbody.appendChild(tr);
+    }});
+  }} catch(e) {{
+    console.error(e);
+  }}
+}}
 
-    loadHealth();
-    refreshOrders();
-    setInterval(refreshOrders, 10000);
-  </script>
+async function scanOne(strat){{
+  const tf = document.getElementById('tf').value;
+  const lim = document.getElementById('lim').value;
+  const notional = document.getElementById('notional').value;
+  const syms = document.getElementById('syms').value;
+  const dry = document.getElementById('dry').value;
+  const url = `/scan/${{strat}}?dry=${{dry}}&timeframe=${{encodeURIComponent(tf)}}&limit=${{lim}}&notional=${{notional}}&symbols=${{encodeURIComponent(syms)}}`;
+  const t0 = Date.now();
+  const r = await fetch(url, {{method:'POST'}});
+  const txt = await r.text();
+  const ms = Date.now()-t0;
+  const logEl = document.getElementById('scan-log');
+  logEl.textContent = `[${{new Date().toISOString()}}] POST ${{
+    url
+  }}  ${{
+    r.status
+  }} (${{
+    ms
+  }}ms)\\n${{
+    txt
+  }}\\n\\n` + logEl.textContent;
+  loadAll();
+}}
+
+async function scanAll(){{
+  const tf = document.getElementById('tf').value;
+  const lim = document.getElementById('lim').value;
+  const notional = document.getElementById('notional').value;
+  const syms = document.getElementById('syms').value;
+  const dry = document.getElementById('dry').value;
+  const url = `/scan/all?dry=${{dry}}&timeframe=${{encodeURIComponent(tf)}}&limit=${{lim}}&notional=${{notional}}&symbols=${{encodeURIComponent(syms)}}`;
+  const t0 = Date.now();
+  const r = await fetch(url, {{method:'POST'}});
+  const txt = await r.text();
+  const ms = Date.now()-t0;
+  const logEl = document.getElementById('scan-log');
+  logEl.textContent = `[${{new Date().toISOString()}}] POST ${{
+    url
+  }}  ${{
+    r.status
+  }} (${{
+    ms
+  }}ms)\\n${{
+    txt
+  }}\\n\\n` + logEl.textContent;
+  loadAll();
+}}
+
+loadAll();
+setInterval(loadAll, 60000);
+</script>
+
 </body>
-</html>
-"""
+</html>"""
+    return HTMLResponse(html)
 
-# -----------------------------
-# Local dev entrypoint
-# -----------------------------
+# ======= API: Universe =======
+@app.get("/universe")
+def universe():
+    return JSONResponse(_safe_call_universe())
+
+# ======= API: Orders / Positions / P&L =======
+@app.get("/orders/recent")
+def orders_recent(limit: int = Query(100, ge=1, le=500), status: str = Query("all")):
+    data = _safe_call_orders_recent(limit=limit, status=status)
+    return JSONResponse(data)
+
+@app.get("/v2/positions")
+def positions():
+    data = _safe_call_positions()
+    return JSONResponse(data)
+
+@app.get("/pnl/summary")
+def pnl_summary():
+    data = _safe_call_pnl_summary()
+    return JSONResponse(data)
+
+@app.get("/orders/attribution")
+def orders_attr():
+    """
+    Lightweight endpoint dashboard pings.
+    If your backend exposes richer attribution, you can return it here.
+    """
+    return JSONResponse({"ok": True, "time": _iso_now(), "v": app.version})
+
+# ======= API: Scanning =======
+@app.post("/scan/{strat}")
+def scan_strat(
+    strat: str,
+    dry: int = Query(1),
+    timeframe: str = Query(DEFAULT_TIMEFRAME),
+    limit: int = Query(DEFAULT_LIMIT, ge=1, le=5000),
+    notional: float = Query(DEFAULT_NOTIONAL),
+    symbols: str = Query(",".join(DEFAULT_SYMBOLS)),
+    topk: Optional[int] = Query(None, ge=1, le=25),
+    min_score: Optional[float] = Query(None),
+):
+    if _strategy_book is None:
+        return JSONResponse({"error": "StrategyBook not available"}, status_code=500)
+
+    syms = [s.strip() for s in symbols.split(",") if s.strip()]
+    req = _mk_scan_request(
+        timeframe=timeframe,
+        limit=limit,
+        dry=dry,
+        symbols=syms,
+        notional=notional,
+        topk=topk,
+        min_score=min_score,
+    )
+    try:
+        # *** IMPORTANT FIX: call with positional args ***
+        res = _strategy_book.scan(strat, req)
+        res = _maybe_await(res)
+        # Ensure serializable
+        if isinstance(res, list):
+            payload = [r.dict() if hasattr(r, "dict") else r for r in res]
+        else:
+            payload = res.dict() if hasattr(res, "dict") else res
+        return JSONResponse({"ok": True, "results": payload})
+    except TypeError as te:
+        log.error("StrategyBook.scan TypeError: %s", te)
+        return JSONResponse({"ok": False, "error": str(te), "note": "Use positional args only"}, status_code=500)
+    except Exception as e:
+        log.exception("scan failed: %s", e)
+        return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
+
+@app.post("/scan/all")
+def scan_all(
+    dry: int = Query(1),
+    timeframe: str = Query(DEFAULT_TIMEFRAME),
+    limit: int = Query(DEFAULT_LIMIT, ge=1, le=5000),
+    notional: float = Query(DEFAULT_NOTIONAL),
+    symbols: str = Query(",".join(DEFAULT_SYMBOLS)),
+    topk: Optional[int] = Query(None, ge=1, le=25),
+    min_score: Optional[float] = Query(None),
+):
+    if _strategy_book is None:
+        return JSONResponse({"error": "StrategyBook not available"}, status_code=500)
+
+    syms = [s.strip() for s in symbols.split(",") if s.strip()]
+    req = _mk_scan_request(
+        timeframe=timeframe,
+        limit=limit,
+        dry=dry,
+        symbols=syms,
+        notional=notional,
+        topk=topk,
+        min_score=min_score,
+    )
+    out = []
+    for strat in STRATEGY_LIST:
+        try:
+            # *** positional args ***
+            res = _strategy_book.scan(strat, req)
+            res = _maybe_await(res)
+            if isinstance(res, list):
+                payload = [r.dict() if hasattr(r, "dict") else r for r in res]
+            else:
+                payload = res.dict() if hasattr(res, "dict") else res
+            out.append({"strat": strat, "results": payload})
+        except Exception as e:
+            log.exception("scan_all %s failed", strat)
+            out.append({"strat": strat, "error": str(e)})
+        time.sleep(0.5)  # small stagger
+    return JSONResponse({"ok": True, "runs": out})
+
+# ===== Graceful shutdown =====
+@app.on_event("shutdown")
+def _shutdown():
+    global _stop_flag
+    _stop_flag = True
+    log.info("Shutting down app; scheduler will stop.")
+
+# ===== Local dev =====
 if __name__ == "__main__":
+    # For local testing: uvicorn app:app --reload
     import uvicorn
     port = int(os.getenv("PORT", "10000"))
-    uvicorn.run("app:app", host="0.0.0.0", port=port, reload=False)
+    uvicorn.run(app, host="0.0.0.0", port=port)
