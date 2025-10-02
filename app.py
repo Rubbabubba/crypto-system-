@@ -1,9 +1,9 @@
-# app.py  —  v3.5.1
-# - Restored full dashboard (Total P&L, P&L by strategy, calendar P&L, positions, recent orders)
-# - Built-in scheduler (Option B) with env controls
-# - FIX: StrategyBook.scan called with positional args
-# - FIX: no backslashes inside f-string expressions (precomputed buttons_html)
-# - No httpx dependency; stdlib + installed pkgs only
+# app.py  —  v3.5.2
+# - Keeps full dashboard: Total P&L, P&L by strategy, calendar P&L, positions, recent orders
+# - Built-in scheduler (Option B) driven by env vars
+# - Robust scan bridge: always build dict; try dict → JSON string → ScanRequest model
+# - Avoids f-string backslash pitfalls by precomputing HTML fragments
+# - No external http client dependency
 
 import os
 import json
@@ -15,7 +15,6 @@ from typing import Any, Dict, List, Optional
 
 from fastapi import FastAPI, Query
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
-
 from pydantic import BaseModel
 
 # ===== Logging =====
@@ -48,7 +47,7 @@ except Exception as e:
         status: Optional[str] = None
 
 # ===== App =====
-app = FastAPI(title="Crypto System", version="3.5.1")
+app = FastAPI(title="Crypto System", version="3.5.2")
 
 # ===== Global StrategyBook =====
 _strategy_book = None
@@ -79,7 +78,7 @@ def _maybe_await(x):
         return asyncio.get_event_loop().run_until_complete(x)
     return x
 
-def _mk_scan_request(
+def _mk_scan_dict(
     timeframe: str,
     limit: int,
     dry: int,
@@ -87,27 +86,17 @@ def _mk_scan_request(
     notional: Optional[float] = None,
     topk: Optional[int] = None,
     min_score: Optional[float] = None,
-):
-    try:
-        return ScanRequest(
-            timeframe=timeframe,
-            limit=limit,
-            dry=dry,
-            symbols=symbols,
-            notional=notional,
-            topk=topk,
-            min_score=min_score,
-        )
-    except Exception:
-        return {
-            "timeframe": timeframe,
-            "limit": limit,
-            "dry": dry,
-            "symbols": symbols,
-            "notional": notional,
-            "topk": topk,
-            "min_score": min_score,
-        }
+) -> Dict[str, Any]:
+    # Always return a plain dict so the strategy layer can subscript safely
+    return {
+        "timeframe": timeframe,
+        "limit": int(limit),
+        "dry": int(dry),
+        "symbols": symbols,
+        "notional": notional,
+        "topk": topk,
+        "min_score": min_score,
+    }
 
 def _safe_call_orders_recent(limit: int, status: str) -> List[Dict[str, Any]]:
     try:
@@ -138,6 +127,7 @@ def _safe_call_pnl_summary() -> Dict[str, Any]:
     except Exception:
         log.exception("pnl_summary failed")
 
+    # Fallback empty but shaped data
     today = datetime.now().date()
     cal = [{"date": (today - timedelta(days=i)).isoformat(), "realized": 0.0} for i in range(0, 14)][::-1]
     return {
@@ -153,6 +143,46 @@ def _safe_call_universe() -> Dict[str, Any]:
         "alts": ["ADA/USD","TON/USD","TRX/USD","APT/USD","ARB/USD","SUI/USD","OP/USD","MATIC/USD","NEAR/USD","ATOM/USD"]
     }
 
+# ---------- Robust bridge to StrategyBook.scan ----------
+def _scan_bridge(strat: str, req_dict: Dict[str, Any]):
+    """
+    Try common calling conventions so we don't depend on the exact StrategyBook signature:
+      1) scan(strat, dict)
+      2) scan(strat, json.dumps(dict))
+      3) scan(strat, ScanRequest(**dict))  (if that class exists)
+    Returns whatever the underlying scan returns.
+    """
+    if _strategy_book is None:
+        raise RuntimeError("StrategyBook not available")
+
+    # 1) dict
+    try:
+        return _maybe_await(_strategy_book.scan(strat, req_dict))  # type: ignore
+    except TypeError as te1:
+        log.warning("scan(strat, dict) failed: %s", te1)
+    except Exception:
+        log.exception("scan(strat, dict) crashed")
+
+    # 2) JSON string
+    try:
+        return _maybe_await(_strategy_book.scan(strat, json.dumps(req_dict)))  # type: ignore
+    except TypeError as te2:
+        log.warning("scan(strat, json) failed: %s", te2)
+    except Exception:
+        log.exception("scan(strat, json) crashed")
+
+    # 3) ScanRequest model (if available)
+    try:
+        if ScanRequest is not None:
+            model = ScanRequest(**req_dict)  # type: ignore
+            return _maybe_await(_strategy_book.scan(strat, model))  # type: ignore
+    except TypeError as te3:
+        log.warning("scan(strat, ScanRequest) failed: %s", te3)
+    except Exception:
+        log.exception("scan(strat, ScanRequest) crashed")
+
+    raise TypeError("No compatible StrategyBook.scan signature (tried dict, json, ScanRequest)")
+
 # ===== Scheduler (Option B) =====
 _stop_flag = False
 
@@ -164,7 +194,7 @@ def _scheduler_loop():
     while not _stop_flag and ENABLE_SCHEDULER:
         try:
             log.info("Scheduler tick: running all strategies (dry=0)")
-            req = _mk_scan_request(
+            req = _mk_scan_dict(
                 timeframe=DEFAULT_TIMEFRAME,
                 limit=DEFAULT_LIMIT,
                 dry=0,
@@ -175,13 +205,10 @@ def _scheduler_loop():
             )
             for s in STRATEGY_LIST:
                 try:
-                    res = _strategy_book.scan(s, req)  # positional args
-                    _maybe_await(res)
-                except TypeError as te:
-                    log.error("StrategyBook.scan error: %s", te)
+                    _scan_bridge(s, req)
+                except Exception as e:
+                    log.error("StrategyBook.scan error: %s", e)
                     log.warning("No strategy adapter handled %s; returning flat", s)
-                except Exception:
-                    log.exception("Error scanning %s", s)
                 time.sleep(1.0)
         except Exception:
             log.exception("Scheduler loop crashed once; continuing.")
@@ -206,7 +233,7 @@ def health():
 
 @app.get("/dashboard", response_class=HTMLResponse)
 def dashboard():
-    # Precompute buttons HTML to avoid backslashes inside f-string expressions
+    # Precompute buttons to keep the f-string clean
     buttons_html = "".join([f"<button onclick=\"scanOne('{s}')\">{s}</button>" for s in STRATEGY_LIST])
 
     html = f"""<!doctype html>
@@ -352,21 +379,21 @@ def dashboard():
   </main>
 
 <script>
-const fmt = (x) => {{
+const fmt = (x) => {
   if (x === null || x === undefined) return "—";
   const s = Number(x);
   if (!isFinite(s)) return "—";
   const str = s.toFixed(2);
   return (s > 0 ? '<span class="green">+'+str+'</span>' : (s < 0 ? '<span class="red">'+str+'</span>' : str));
-}};
+};
 
-async function loadAll(){{
-  try {{
+async function loadAll(){
+  try {
     const health = await (await fetch('/health')).json();
     document.getElementById('sched').textContent = 'Scheduler: ' + (health.scheduler ? 'ON' : 'OFF');
-  }} catch(e) {{}}
+  } catch(e) {}
 
-  try {{
+  try {
     const pnl = await (await fetch('/pnl/summary')).json();
     document.getElementById('asof').textContent = 'as of ' + (pnl.asof || '');
     const realized = pnl.total?.realized ?? 0;
@@ -377,93 +404,93 @@ async function loadAll(){{
     // Strategy table
     const tbody = document.querySelector('#tbl-strat tbody');
     tbody.innerHTML = '';
-    const bys = pnl.by_strategy || {{}};
-    Object.keys(bys).sort().forEach(k => {{
+    const bys = pnl.by_strategy || {};
+    Object.keys(bys).sort().forEach(k => {
       const r = bys[k]?.realized ?? 0;
       const u = bys[k]?.unrealized ?? 0;
       const tr = document.createElement('tr');
-      tr.innerHTML = `<td>${{k}}</td><td class="mono">${{fmt(r)}}</td><td class="mono">${{fmt(u)}}</td>`;
+      tr.innerHTML = `<td>${k}</td><td class="mono">${fmt(r)}</td><td class="mono">${fmt(u)}</td>`;
       tbody.appendChild(tr);
-    }});
+    });
 
     // Calendar
     const calDiv = document.getElementById('cal');
     calDiv.innerHTML = '';
     const cal = pnl.calendar || [];
-    cal.forEach(d => {{
+    cal.forEach(d => {
       const v = Number(d.realized || 0);
       const cls = v > 0 ? 'cell pos' : (v < 0 ? 'cell neg' : 'cell');
       const el = document.createElement('div');
       el.className = cls;
-      el.title = `${{d.date}}  realized: ${{v.toFixed(2)}}`;
+      el.title = `${d.date}  realized: ${v.toFixed(2)}`;
       el.textContent = (v>0?'+':'') + v.toFixed(0);
       calDiv.appendChild(el);
-    }});
+    });
     document.getElementById('cal-hint').textContent = 'Last ' + cal.length + ' trading days';
 
-  }} catch(e) {{
+  } catch(e) {
     console.error(e);
-  }}
+  }
 
-  try {{
+  try {
     const pos = await (await fetch('/v2/positions')).json();
     document.getElementById('kpi-positions').innerHTML = (pos.length || 0);
     const tbody = document.querySelector('#tbl-pos tbody');
     tbody.innerHTML = '';
-    pos.forEach(p => {{
+    pos.forEach(p => {
       const tr = document.createElement('tr');
-      tr.innerHTML = `<td>${{p.symbol||'-'}}</td><td>${{p.side||'-'}}</td><td class="mono">${{p.qty||'-'}}</td><td class="mono">${{p.avg_price||'-'}}</td><td class="mono">${{fmt(p.unrealized_pl||0)}}</td>`;
+      tr.innerHTML = `<td>${p.symbol||'-'}</td><td>${p.side||'-'}</td><td class="mono">${p.qty||'-'}</td><td class="mono">${p.avg_price||'-'}</td><td class="mono">${fmt(p.unrealized_pl||0)}</td>`;
       tbody.appendChild(tr);
-    }});
-  }} catch(e) {{}}
+    });
+  } catch(e) {}
 
-  try {{
+  try {
     const ords = await (await fetch('/orders/recent?status=all&limit=200')).json();
     document.getElementById('kpi-orders').innerHTML = (ords.length || 0);
     const tbody = document.querySelector('#tbl-orders tbody');
     tbody.innerHTML = '';
-    ords.slice(0,200).forEach(o => {{
+    ords.slice(0,200).forEach(o => {
       const tr = document.createElement('tr');
       const ts = o.submitted_at || o.created_at || o.time || '';
-      tr.innerHTML = `<td>${{ts}}</td><td>${{o.symbol||'-'}}</td><td>${{o.side||'-'}}</td><td class="mono">${{o.qty||o.notional||'-'}}</td><td>${{o.status||'-'}}</td><td>${{o.strategy||o.tag||'-'}}</td>`;
+      tr.innerHTML = `<td>${ts}</td><td>${o.symbol||'-'}</td><td>${o.side||'-'}</td><td class="mono">${o.qty||o.notional||'-'}</td><td>${o.status||'-'}</td><td>${o.strategy||o.tag||'-'}</td>`;
       tbody.appendChild(tr);
-    }});
-  }} catch(e) {{
+    });
+  } catch(e) {
     console.error(e);
-  }}
-}}
+  }
+}
 
-async function scanOne(strat){{
+async function scanOne(strat){
   const tf = document.getElementById('tf').value;
   const lim = document.getElementById('lim').value;
   const notional = document.getElementById('notional').value;
   const syms = document.getElementById('syms').value;
   const dry = document.getElementById('dry').value;
-  const url = `/scan/${{strat}}?dry=${{dry}}&timeframe=${{encodeURIComponent(tf)}}&limit=${{lim}}&notional=${{notional}}&symbols=${{encodeURIComponent(syms)}}`;
+  const url = `/scan/${strat}?dry=${dry}&timeframe=${encodeURIComponent(tf)}&limit=${lim}&notional=${notional}&symbols=${encodeURIComponent(syms)}`;
   const t0 = Date.now();
-  const r = await fetch(url, {{method:'POST'}});
+  const r = await fetch(url, {method:'POST'});
   const txt = await r.text();
   const ms = Date.now()-t0;
   const logEl = document.getElementById('scan-log');
-  logEl.textContent = `[${{new Date().toISOString()}}] POST ${{url}}  ${{r.status}} (${{ms}}ms)\\n${{txt}}\\n\\n` + logEl.textContent;
+  logEl.textContent = `[${new Date().toISOString()}] POST ${url}  ${r.status} (${ms}ms)\n${txt}\n\n` + logEl.textContent;
   loadAll();
-}}
+}
 
-async function scanAll(){{
+async function scanAll(){
   const tf = document.getElementById('tf').value;
   const lim = document.getElementById('lim').value;
   const notional = document.getElementById('notional').value;
   const syms = document.getElementById('syms').value;
   const dry = document.getElementById('dry').value;
-  const url = `/scan/all?dry=${{dry}}&timeframe=${{encodeURIComponent(tf)}}&limit=${{lim}}&notional=${{notional}}&symbols=${{encodeURIComponent(syms)}}`;
+  const url = `/scan/all?dry=${dry}&timeframe=${encodeURIComponent(tf)}&limit=${lim}&notional=${notional}&symbols=${encodeURIComponent(syms)}`;
   const t0 = Date.now();
-  const r = await fetch(url, {{method:'POST'}});
+  const r = await fetch(url, {method:'POST'});
   const txt = await r.text();
   const ms = Date.now()-t0;
   const logEl = document.getElementById('scan-log');
-  logEl.textContent = `[${{new Date().toISOString()}}] POST ${{url}}  ${{r.status}} (${{ms}}ms)\\n${{txt}}\\n\\n` + logEl.textContent;
+  logEl.textContent = `[${new Date().toISOString()}] POST ${url}  ${r.status} (${ms}ms)\n${txt}\n\n` + logEl.textContent;
   loadAll();
-}}
+}
 
 loadAll();
 setInterval(loadAll, 60000);
@@ -514,7 +541,7 @@ def scan_strat(
         return JSONResponse({"error": "StrategyBook not available"}, status_code=500)
 
     syms = [s.strip() for s in symbols.split(",") if s.strip()]
-    req = _mk_scan_request(
+    req = _mk_scan_dict(
         timeframe=timeframe,
         limit=limit,
         dry=dry,
@@ -524,18 +551,14 @@ def scan_strat(
         min_score=min_score,
     )
     try:
-        res = _strategy_book.scan(strat, req)  # positional args
-        res = _maybe_await(res)
+        res = _scan_bridge(strat, req)
         if isinstance(res, list):
             payload = [r.dict() if hasattr(r, "dict") else r for r in res]
         else:
             payload = res.dict() if hasattr(res, "dict") else res
         return JSONResponse({"ok": True, "results": payload})
-    except TypeError as te:
-        log.error("StrategyBook.scan TypeError: %s", te)
-        return JSONResponse({"ok": False, "error": str(te), "note": "Use positional args only"}, status_code=500)
     except Exception as e:
-        log.exception("scan failed: %s", e)
+        log.error("scan_strat failed: %s", e)
         return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
 
 @app.post("/scan/all")
@@ -552,7 +575,7 @@ def scan_all(
         return JSONResponse({"error": "StrategyBook not available"}, status_code=500)
 
     syms = [s.strip() for s in symbols.split(",") if s.strip()]
-    req = _mk_scan_request(
+    req = _mk_scan_dict(
         timeframe=timeframe,
         limit=limit,
         dry=dry,
@@ -564,15 +587,14 @@ def scan_all(
     out = []
     for strat in STRATEGY_LIST:
         try:
-            res = _strategy_book.scan(strat, req)  # positional args
-            res = _maybe_await(res)
+            res = _scan_bridge(strat, req)
             if isinstance(res, list):
                 payload = [r.dict() if hasattr(r, "dict") else r for r in res]
             else:
                 payload = res.dict() if hasattr(res, "dict") else res
             out.append({"strat": strat, "results": payload})
         except Exception as e:
-            log.exception("scan_all %s failed", strat)
+            log.error("scan_all %s failed: %s", strat, e)
             out.append({"strat": strat, "error": str(e)})
         time.sleep(0.5)
     return JSONResponse({"ok": True, "runs": out})
