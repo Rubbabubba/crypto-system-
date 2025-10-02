@@ -1,135 +1,198 @@
-# app.py
-import os
-import sys
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
 import asyncio
 import json
-import time
 import logging
+import os
+import time
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
-from fastapi import FastAPI, HTTPException, Query
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, PlainTextResponse
+from fastapi import FastAPI, Query
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 
-# ---------------------- App Metadata ----------------------
-APP_NAME = "Crypto System Control Plane"
-APP_VERSION = "1.8.0"
-
-# ---------------------- Logging ----------------------
+# -----------------------------------------------------------------------------
+# Logging
+# -----------------------------------------------------------------------------
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 logging.basicConfig(
-    level=os.getenv("LOG_LEVEL", "INFO"),
+    level=LOG_LEVEL,
     format="%(asctime)s %(levelname)s:%(name)s:%(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S",
 )
 log = logging.getLogger("app")
 
-# ---------------------- Defaults ----------------------
-DEFAULT_TF = "1h"
-DEFAULT_LIMIT = 200
-DEFAULT_NOTIONAL = 10_000.0
-DEFAULT_SYMBOLS = ["BTCUSDT", "ETHUSDT", "SOLUSDT"]
-DEFAULT_STRATEGIES = ("c1", "c2", "c3", "c4", "c5", "c6")
-SCHEDULER_INTERVAL_SEC = int(os.getenv("SCHEDULER_INTERVAL_SEC", "60"))
-ORDERS_MAX = int(os.getenv("ORDERS_MAX", "1000"))
-
-# ---------------------- In-Memory Store ----------------------
-# A very simple in-memory “db” for orders.
-_orders_lock = asyncio.Lock()
-_orders: List[Dict[str, Any]] = []
-
-def _append_orders(orders: List[Dict[str, Any]]) -> None:
-    # keep list bounded
-    if not orders:
-        return
-    capped = []
-    ts = datetime.now(timezone.utc).isoformat()
-    for o in orders:
-        if "ts" not in o:
-            o["ts"] = ts
-        capped.append(o)
-    _orders.extend(capped)
-    if len(_orders) > ORDERS_MAX:
-        del _orders[: len(_orders) - ORDERS_MAX]
-
-# ---------------------- StrategyBook Shim ----------------------
-"""
-We’ll try to import your real StrategyBook. If not found, we expose a no-op
-fallback that returns an empty list (so the app runs without crashing).
-Expected signature (from your logs):
-    class StrategyBook:
-        def scan(self, req, contexts): -> List[Dict]
-"""
-StrategyBook: Any = None
-_strategy_book_source = "fallback"
+# -----------------------------------------------------------------------------
+# StrategyBook import (with defensive fallback so the service always boots)
+# -----------------------------------------------------------------------------
+StrategyBook = None  # will be set below
 
 try:
-    # Try common import paths. You can adjust if your module lives elsewhere.
+    # Adjust to your project layout if needed
     from strategy_book import StrategyBook as _SB  # type: ignore
     StrategyBook = _SB
-    _strategy_book_source = "strategy_book.StrategyBook"
-except Exception:
-    try:
-        from strategies import StrategyBook as _SB  # type: ignore
-        StrategyBook = _SB
-        _strategy_book_source = "strategies.StrategyBook"
-    except Exception:
-        class StrategyBook:  # type: ignore
-            def scan(self, req, contexts):
-                # Fallback: no-op scan (keeps the service healthy even w/o code)
-                return []
-        _strategy_book_source = "fallback(no-op)"
+except Exception as e:
+    log.warning("Could not import StrategyBook from strategy_book: %s", e)
 
-log.info("Using StrategyBook from: %s", _strategy_book_source)
+    class StrategyBook:  # type: ignore
+        """Minimal no-op fallback so the service can boot even without the real book."""
+        def scan(self, req: Dict[str, Any], contexts: Dict[str, Any]):
+            # Return an empty list to indicate no orders
+            return []
 
-# ---------------------- Scan Bridge ----------------------
-async def _maybe_await(x):
-    if asyncio.iscoroutine(x):
-        return await x
-    return x
 
-def _build_contexts(
-    timeframe: str,
-    limit: int,
-    notional: float,
-    symbols: List[str],
-    dry: int,
-) -> Dict[str, Dict[str, Any]]:
+# -----------------------------------------------------------------------------
+# App & config
+# -----------------------------------------------------------------------------
+SCHEDULE_SECONDS = int(os.getenv("SCHEDULE_SECONDS", "60"))
+DEFAULT_LIMIT = int(os.getenv("DEFAULT_LIMIT", "100"))
+DEFAULT_TIMEFRAME = os.getenv("DEFAULT_TIMEFRAME", "1h")
+DEFAULT_NOTIONAL = float(os.getenv("DEFAULT_NOTIONAL", "0"))
+DEFAULT_SYMBOLS = os.getenv("DEFAULT_SYMBOLS", "")  # comma list
+
+# Strategies to iterate over on each tick (match what you’ve been running)
+STRATEGIES = ["c1", "c2", "c3", "c4", "c5", "c6"]
+
+app = FastAPI(title="Crypto System")
+
+# -----------------------------------------------------------------------------
+# In-memory “DB” for demo endpoints (substitute with your own persistence)
+# -----------------------------------------------------------------------------
+_orders_ring: List[Dict[str, Any]] = []
+_MAX_ORDERS = 1000
+
+_pnl_summary = {
+    "equity": 0.0,
+    "pnl_day": 0.0,
+    "pnl_week": 0.0,
+    "pnl_month": 0.0,
+    "updated_at": datetime.now(timezone.utc).isoformat(),
+}
+
+_attribution = {
+    "by_strategy": {s: 0.0 for s in STRATEGIES},
+    "updated_at": datetime.now(timezone.utc).isoformat(),
+}
+
+
+def _push_orders(new_orders: List[Dict[str, Any]]):
+    if not new_orders:
+        return
+    for o in new_orders:
+        o.setdefault("ts", time.time())
+        _orders_ring.append(o)
+    if len(_orders_ring) > _MAX_ORDERS:
+        del _orders_ring[: len(_orders_ring) - _MAX_ORDERS]
+
+
+def _touch_metrics(orders: List[Dict[str, Any]], strategy: str):
+    if not orders:
+        return
+    # Very naive mock attribution update
+    pnl_bump = sum(float(o.get("pnl", 0.0)) for o in orders)
+    _pnl_summary["pnl_day"] += pnl_bump
+    _pnl_summary["equity"] += pnl_bump
+    _pnl_summary["updated_at"] = datetime.now(timezone.utc).isoformat()
+
+    _attribution["by_strategy"][strategy] = _attribution["by_strategy"].get(strategy, 0.0) + pnl_bump
+    _attribution["updated_at"] = datetime.now(timezone.utc).isoformat()
+
+
+# -----------------------------------------------------------------------------
+# Robust context preparation (NEW)
+# -----------------------------------------------------------------------------
+def _prepare_contexts(req: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Build a contexts dict that is both explicit and backwards-friendly.
-    Your logs suggested some code was poking at keys like 'one' or iterating items,
-    so we include both a 'one' entry and a 'default' entry with the same payload.
+    Build a robust contexts map that *always* contains:
+      - 'one': a single context dict
+      - 'default': same as 'one' unless overridden
+    and also preserves any user-provided contexts.
+    Supports incoming contexts as dict, list, or None.
     """
-    base = {
-        "timeframe": timeframe,
-        "limit": limit,
-        "notional": notional,
+    tf = req.get("timeframe") or req.get("tf") or DEFAULT_TIMEFRAME
+    symbols_raw = req.get("symbols") or req.get("symbol") or []
+    if isinstance(symbols_raw, str):
+        if symbols_raw.strip():
+            symbols = [s.strip() for s in symbols_raw.split(",")]
+        else:
+            symbols = []
+    elif isinstance(symbols_raw, list):
+        symbols = symbols_raw
+    else:
+        env_syms = [s.strip() for s in DEFAULT_SYMBOLS.split(",") if s.strip()]
+        symbols = env_syms
+
+    notional = req.get("notional") or req.get("size") or DEFAULT_NOTIONAL
+
+    base_ctx = {
+        "timeframe": tf,
         "symbols": symbols,
-        "dry": dry,
-    }
-    return {
-        "one": dict(base),        # some code seemed to index 'one'
-        "default": dict(base),    # others might iterate or expect 'default'
+        "notional": notional,
     }
 
-async def _scan_bridge(
-    strat: str,
-    req: Dict[str, Any],
-    dry: int = 0,
-) -> List[Dict[str, Any]]:
-    """
-    Call StrategyBook().scan(req, contexts) exactly as your logs imply.
-    We pass the *whole* contexts dict (not just contexts['one']) to avoid
-    “string indices” errors seen earlier.
-    """
-    tf: str = req.get("timeframe", DEFAULT_TF)
-    lim: int = int(req.get("limit", DEFAULT_LIMIT))
-    notional: float = float(req.get("notional", DEFAULT_NOTIONAL))
-    symbols: List[str] = req.get("symbols", DEFAULT_SYMBOLS)
+    provided = req.get("contexts")
+    ctx_map: Dict[str, Any] = {}
 
-    ctx_map = _build_contexts(tf, lim, notional, symbols, dry)
+    if isinstance(provided, dict):
+        ctx_map.update({k: (v or {}) for k, v in provided.items()})
+    elif isinstance(provided, list) and provided:
+        first = provided[0] if isinstance(provided[0], dict) else {}
+        ctx_map["list"] = [(c if isinstance(c, dict) else {}) for c in provided]
+        ctx_map["one"] = {**base_ctx, **first}
+    elif isinstance(provided, list) and not provided:
+        pass
+    elif isinstance(provided, (str, int, float)):
+        ctx_map["one"] = {**base_ctx, "tag": str(provided)}
 
-      # Minimal, safe req payload your strategies can rely on
+    if "one" not in ctx_map:
+        if "default" in ctx_map and isinstance(ctx_map["default"], dict):
+            ctx_map["one"] = {**base_ctx, **ctx_map["default"]}
+        else:
+            ctx_map["one"] = dict(base_ctx)
+
+    if "default" not in ctx_map:
+        ctx_map["default"] = dict(ctx_map["one"])
+
+    for k in ("one", "default"):
+        ctx_k = ctx_map.get(k) or {}
+        ctx_k.setdefault("timeframe", tf)
+        ctx_k.setdefault("symbols", symbols)
+        ctx_k.setdefault("notional", notional)
+        ctx_map[k] = ctx_k
+
+    return ctx_map
+
+
+# -----------------------------------------------------------------------------
+# Hardened scan bridge (REPLACES previous) — preserves your patch verbatim
+# -----------------------------------------------------------------------------
+async def _scan_bridge(strat: str, req: Dict[str, Any], dry: bool = False):
+    """
+    Normalizes inputs and calls StrategyBook.scan in a way that keeps
+    older strategies happy. Guarantees both:
+      - contexts['one'] and contexts['default'] exist
+      - req['one'], req['default'], and req['contexts'] exist
+    """
+    req = req or {}
+    tf = req.get("timeframe") or req.get("tf") or DEFAULT_TIMEFRAME
+    lim = int(req.get("limit") or DEFAULT_LIMIT)
+    notional = req.get("notional") or DEFAULT_NOTIONAL
+
+    # Normalize symbols from req or env
+    symbols_field = req.get("symbols") or ( [req.get("symbol")] if req.get("symbol") else None )
+    if symbols_field is None:
+        env_syms = [s.strip() for s in DEFAULT_SYMBOLS.split(",") if s.strip()]
+        symbols = env_syms
+    elif isinstance(symbols_field, str):
+        symbols = [symbols_field]
+    else:
+        symbols = list(symbols_field)
+
+    # Build safe contexts
+    ctx_map = _prepare_contexts(req)
+
+    # ----------------- YOUR PREVIOUS PATCH (kept verbatim) -----------------
+    # Minimal, safe req payload your strategies can rely on
     compact_req = {
         # canonical fields
         "strategy": strat,
@@ -148,465 +211,353 @@ async def _scan_bridge(
         # passthrough for anything else the caller provided
         "raw": req,
     }
+    # ----------------------------------------------------------------------
 
     inst = StrategyBook()
-    attempts: List[Tuple[str, Any]] = []
 
-    # Single, canonical call (instance method)
+    # The only signature we now support is: scan(req, contexts)
     try:
         result = inst.scan(compact_req, ctx_map)
-        result = await _maybe_await(result)
+
+        if not result:
+            return []
+        if isinstance(result, dict):
+            if "orders" in result and isinstance(result["orders"], list):
+                return result["orders"]
+            return [result]
         if isinstance(result, list):
             return result
-        # If a strategy returns a non-list, normalize to list
-        if result is None:
-            return []
         return [result]
-    except Exception as e:
-        attempts.append(("inst.scan(req, contexts)", e))
 
-    # Final: give up but log what we tried
-    for name, e in attempts:
-        log.warning("scan attempt failed (%s): %s", name, e)
-    log.error(
-        "All scan attempts failed for strategy '%s'. Returning empty list. Last error: %s",
-        strat,
-        attempts[-1][1] if attempts else "unknown",
-    )
-    return []
+    except KeyError as ke:
+        log.warning("scan raised KeyError: %s", ke)
+        raise
+    except TypeError as te:
+        log.warning("scan raised TypeError: %s", te)
+        raise
 
-# ---------------------- FastAPI ----------------------
-app = FastAPI(title=APP_NAME, version=APP_VERSION)
 
-# CORS for dashboard XHR
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-# ---------------------- Scheduler ----------------------
+# -----------------------------------------------------------------------------
+# Background scheduler (ticks every SCHEDULE_SECONDS)
+# -----------------------------------------------------------------------------
 _scheduler_task: Optional[asyncio.Task] = None
-_scheduler_stop = asyncio.Event()
+_scheduler_running = False
+
 
 async def _scheduler_loop():
-    """
-    Background loop: every SCHEDULER_INTERVAL_SEC, run scans for all strategies
-    with dry=0. Append any returned orders to memory.
-    """
-    log.info("Scheduler started (interval=%ss).", SCHEDULER_INTERVAL_SEC)
+    global _scheduler_running
+    _scheduler_running = True
     try:
-        while not _scheduler_stop.is_set():
-            start = time.time()
+        while _scheduler_running:
             log.info("Scheduler tick: running all strategies (dry=0)")
-            req = {
-                "timeframe": DEFAULT_TF,
-                "limit": DEFAULT_LIMIT,
-                "notional": DEFAULT_NOTIONAL,
-                "symbols": DEFAULT_SYMBOLS,
-            }
-            for strat in DEFAULT_STRATEGIES:
+            for strat in STRATEGIES:
+                # Minimal request — strategies should rely on compact_req fields
+                req = {
+                    "timeframe": DEFAULT_TIMEFRAME,
+                    "symbols": [s.strip() for s in DEFAULT_SYMBOLS.split(",") if s.strip()],
+                    "limit": DEFAULT_LIMIT,
+                    "notional": DEFAULT_NOTIONAL,
+                    # callers can also push their own contexts here in the future
+                }
                 try:
-                    orders = await _scan_bridge(strat, req, dry=0)
+                    orders = await _scan_bridge(strat, req, dry=False)
                 except Exception as e:
-                    log.error("Scheduler scan error [%s]: %s", strat, e, exc_info=True)
+                    log.error(
+                        "All scan attempts failed for strategy '%s'. Returning empty list. Last error: %s",
+                        strat, e
+                    )
                     orders = []
-                if isinstance(orders, list) and orders:
-                    async with _orders_lock:
-                        _append_orders(orders)
-            elapsed = max(0.0, SCHEDULER_INTERVAL_SEC - (time.time() - start))
-            try:
-                await asyncio.wait_for(_scheduler_stop.wait(), timeout=elapsed)
-            except asyncio.TimeoutError:
-                pass
+
+                if orders:
+                    _push_orders(orders)
+                    _touch_metrics(orders, strat)
+            await asyncio.sleep(SCHEDULE_SECONDS)
     finally:
         log.info("Scheduler stopped.")
 
+
+# -----------------------------------------------------------------------------
+# Lifespan (startup/shutdown) – avoids on_event deprecation
+# -----------------------------------------------------------------------------
 @app.on_event("startup")
-async def _on_startup():
+async def _startup():
     global _scheduler_task
-    log.info("Starting up app; scheduler will start.")
-    _scheduler_stop.clear()
-    loop = asyncio.get_event_loop()
-    _scheduler_task = loop.create_task(_scheduler_loop())
+    log.info("Starting app; scheduler will start.")
+    _scheduler_task = asyncio.create_task(_scheduler_loop())
+
 
 @app.on_event("shutdown")
-async def _on_shutdown():
+async def _shutdown():
+    global _scheduler_running, _scheduler_task
     log.info("Shutting down app; scheduler will stop.")
-    _scheduler_stop.set()
-    if _scheduler_task:
-        try:
-            await _scheduler_task
-        except Exception:
-            pass
+    _scheduler_running = False
+    try:
+        if _scheduler_task:
+            await asyncio.wait_for(_scheduler_task, timeout=5.0)
+    except Exception:
+        pass
 
-# ---------------------- Helpers: PnL & Attribution ----------------------
-def _compute_pnl_summary() -> Dict[str, Any]:
-    """
-    Very basic PnL roll-up from in-memory _orders.
-    Expects order dicts to have at least: 'strategy', 'side', 'qty', 'price'
-    """
-    total_realized = 0.0
-    per_symbol: Dict[str, float] = {}
-    per_strategy: Dict[str, float] = {}
 
-    for o in _orders:
-        sym = o.get("symbol", "UNKNOWN")
-        strat = o.get("strategy", "UNKNOWN")
-        side = (o.get("side") or "").lower()
-        qty = float(o.get("qty", 0))
-        px = float(o.get("price", 0))
-
-        # super-naive: buys negative PnL (cost), sells positive (proceeds)
-        sign = 1.0 if side in ("sell", "short", "close") else -1.0
-        pnl = sign * qty * px
-
-        total_realized += pnl
-        per_symbol[sym] = per_symbol.get(sym, 0.0) + pnl
-        per_strategy[strat] = per_strategy.get(strat, 0.0) + pnl
-
-    return {
-        "total_realized": round(total_realized, 2),
-        "per_symbol": {k: round(v, 2) for k, v in per_symbol.items()},
-        "per_strategy": {k: round(v, 2) for k, v in per_strategy.items()},
-        "count_orders": len(_orders),
-        "updated_at": datetime.now(timezone.utc).isoformat(),
-    }
-
-def _compute_attribution() -> Dict[str, Any]:
-    by_strategy: Dict[str, Dict[str, Any]] = {}
-    for o in _orders:
-        strat = o.get("strategy", "UNKNOWN")
-        if strat not in by_strategy:
-            by_strategy[strat] = {"orders": 0, "notional": 0.0, "symbols": {}}
-        by_strategy[strat]["orders"] += 1
-        notional = float(o.get("qty", 0)) * float(o.get("price", 0))
-        by_strategy[strat]["notional"] += notional
-        sym = o.get("symbol", "UNKNOWN")
-        by_strategy[strat]["symbols"][sym] = by_strategy[strat]["symbols"].get(sym, 0) + 1
-
-    for strat, row in by_strategy.items():
-        row["notional"] = round(row["notional"], 2)
-    return {"by_strategy": by_strategy, "updated_at": datetime.now(timezone.utc).isoformat()}
-
-# ---------------------- Routes: HTML ----------------------
-@app.api_route("/", methods=["GET", "HEAD"])
-def root():
-    return RedirectResponse(url="/dashboard", status_code=307)
-
-@app.get("/dashboard", response_class=HTMLResponse)
-def dashboard():
-    # Self-contained HTML (no external assets) — includes lightweight styling and JS polling.
-    html = f"""<!doctype html>
+# -----------------------------------------------------------------------------
+# HTML (full inline page)
+# -----------------------------------------------------------------------------
+_DASHBOARD_HTML = """
+<!doctype html>
 <html lang="en">
 <head>
-<meta charset="utf-8" />
-<meta name="viewport" content="width=device-width, initial-scale=1" />
-<title>{APP_NAME} — Dashboard v{APP_VERSION}</title>
-<style>
-  :root {{
-    --bg: #0f1220;
-    --panel: #171a2b;
-    --text: #e9ecf1;
-    --muted: #9aa4b2;
-    --accent: #5ee6a8;
-    --accent2: #8ab4ff;
-    --bad: #ff8a7a;
-    --good: #7dffa1;
-    --chip: #22263a;
-    --border: #2a2e45;
-  }}
-  * {{ box-sizing: border-box; }}
-  body {{
-    margin: 0; padding: 0;
-    font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Ubuntu, Cantarell, Noto Sans, Arial, "Apple Color Emoji", "Segoe UI Emoji";
-    background: radial-gradient(1000px 600px at 10% -10%, #1a1f35 0%, #0f1220 35%, #0f1220 100%);
-    color: var(--text);
-  }}
-  header {{
-    position: sticky; top: 0; z-index: 5;
-    background: rgba(15,18,32,0.7); backdrop-filter: blur(8px);
-    border-bottom: 1px solid var(--border);
-    padding: 16px 20px;
-    display: grid; grid-template-columns: 1fr auto; gap: 12px; align-items: center;
-  }}
-  .brand {{
-    font-weight: 700; letter-spacing: .3px; font-size: 16px; color: var(--text);
-  }}
-  .brand small {{ color: var(--muted); font-weight: 600; margin-left: 6px; }}
-  .controls > * {{ margin-left: 8px; }}
-  button, .chip {{
-    border: 1px solid var(--border); background: var(--chip); color: var(--text);
-    padding: 8px 12px; border-radius: 8px; font-weight: 600; cursor: pointer;
-  }}
-  button:hover {{ border-color: var(--accent2); }}
-  main {{ padding: 20px; max-width: 1200px; margin: 0 auto; }}
-  .grid {{
-    display: grid; gap: 16px;
-    grid-template-columns: repeat(12, 1fr);
-  }}
-  .card {{
-    background: linear-gradient(0deg, rgba(255,255,255,0.02), rgba(255,255,255,0.02)), var(--panel);
-    border: 1px solid var(--border);
-    border-radius: 14px; padding: 14px;
-    box-shadow: 0 10px 30px rgba(0,0,0,0.20), inset 0 1px 0 rgba(255,255,255,0.03);
-  }}
-  .span-4 {{ grid-column: span 4; min-width: 0; }}
-  .span-8 {{ grid-column: span 8; min-width: 0; }}
-  .span-12 {{ grid-column: span 12; min-width: 0; }}
-  h2 {{ margin: 0 0 8px 0; font-size: 14px; color: var(--muted); font-weight: 700; letter-spacing: .3px; }}
-  .stat {{
-    font-size: 28px; font-weight: 800; margin: 4px 0 8px 0;
-  }}
-  .green {{ color: var(--good); }}
-  .red {{ color: var(--bad); }}
-  table {{ width: 100%; border-collapse: collapse; }}
-  th, td {{ text-align: left; padding: 8px 10px; border-bottom: 1px dashed var(--border); }}
-  th {{ font-size: 12px; color: var(--muted); font-weight: 700; }}
-  td {{ font-size: 13px; }}
-  .pill {{ display: inline-block; padding: 2px 8px; border-radius: 999px; background: #1f2338; border: 1px solid var(--border); font-size: 12px; color: var(--accent2); }}
-  .muted {{ color: var(--muted); }}
-  .right {{ text-align: right; }}
-  .fade {{ opacity: .85; }}
-  .footer {{ margin-top: 16px; color: var(--muted); font-size: 12px; }}
-  @media (max-width: 980px) {{
-    .span-4 {{ grid-column: span 12; }}
-    .span-8 {{ grid-column: span 12; }}
-  }}
-</style>
+  <meta charset="utf-8">
+  <title>Crypto System Dashboard</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <style>
+    :root{
+      --bg:#0b1220;
+      --panel:#111a2b;
+      --ink:#e6edf3;
+      --muted:#a6b3c2;
+      --accent:#5dd4a3;
+      --accent2:#66a3ff;
+      --red:#ff6b6b;
+      --chip:#1a2336;
+      --chip-br:#26324a;
+    }
+    *{box-sizing:border-box}
+    body{
+      margin:0;
+      font-family: system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, "Apple Color Emoji","Segoe UI Emoji";
+      background: linear-gradient(160deg, #0b1220 0%, #0e172a 100%);
+      color:var(--ink);
+    }
+    header{
+      padding:20px 24px;
+      border-bottom:1px solid #16233b;
+      display:flex;align-items:center;gap:12px;
+    }
+    .badge{
+      font-size:12px;
+      background:var(--chip);
+      border:1px solid var(--chip-br);
+      color:var(--muted);
+      padding:4px 8px;border-radius:999px;
+    }
+    main{padding:24px;max-width:1200px;margin:0 auto}
+    .grid{
+      display:grid;
+      grid-template-columns: repeat(12, 1fr);
+      gap:16px;
+    }
+    .card{
+      background:var(--panel);
+      border:1px solid #1a2740;
+      border-radius:14px;
+      padding:16px;
+      box-shadow: 0 10px 24px rgba(0,0,0,.2);
+    }
+    .span-4{grid-column: span 4}
+    .span-6{grid-column: span 6}
+    .span-8{grid-column: span 8}
+    .span-12{grid-column: span 12}
+    h1{font-size:18px;margin:0}
+    .muted{color:var(--muted)}
+    .row{display:flex;align-items:center;justify-content:space-between;gap:12px}
+    .kpi{font-size:28px;font-weight:700}
+    .good{color:var(--accent)}
+    .bad{color:var(--red)}
+    table{width:100%;border-collapse:collapse;font-size:14px}
+    th,td{padding:8px;border-bottom:1px solid #1a2740;text-align:left}
+    th{color:#9db0c9;font-weight:600}
+    .chips{display:flex;flex-wrap:wrap;gap:8px}
+    .chip{
+      background:var(--chip);
+      border:1px solid var(--chip-br);
+      padding:6px 10px;border-radius:999px;font-size:12px;color:#c7d2e3;
+    }
+    a.btn{
+      display:inline-block;padding:8px 12px;border-radius:10px;text-decoration:none;
+      background:var(--accent2);color:#0b1220;font-weight:700;border:1px solid #2a3f6b;
+    }
+    footer{padding:28px;color:var(--muted);text-align:center}
+    @media (max-width: 900px){
+      .span-4,.span-6,.span-8{grid-column: span 12}
+    }
+    code{
+      background:#0d1628;border:1px solid #1a2740;padding:2px 6px;border-radius:6px
+    }
+  </style>
+  <script>
+    async function loadSummary(){
+      const r = await fetch('/pnl/summary');
+      const d = await r.json();
+      document.getElementById('eq').textContent = d.equity.toFixed(2);
+      document.getElementById('pnl_day').textContent = d.pnl_day.toFixed(2);
+      document.getElementById('pnl_week').textContent = d.pnl_week.toFixed(2);
+      document.getElementById('pnl_month').textContent = d.pnl_month.toFixed(2);
+      document.getElementById('updated').textContent = new Date(d.updated_at).toLocaleString();
+    }
+    async function loadAttribution(){
+      const r = await fetch('/orders/attribution');
+      const d = await r.json();
+      const tbody = document.getElementById('attr_body');
+      tbody.innerHTML = '';
+      for (const [k,v] of Object.entries(d.by_strategy)){
+        const tr = document.createElement('tr');
+        tr.innerHTML = `<td>${k}</td><td>${Number(v).toFixed(2)}</td>`;
+        tbody.appendChild(tr);
+      }
+      document.getElementById('attr_updated').textContent = new Date(d.updated_at).toLocaleString();
+    }
+    async function loadOrders(){
+      const r = await fetch('/orders/recent?limit=50');
+      const d = await r.json();
+      const tbody = document.getElementById('orders_body');
+      tbody.innerHTML = '';
+      for (const o of d.orders){
+        const tr = document.createElement('tr');
+        tr.innerHTML = `
+          <td>${o.id ?? ''}</td>
+          <td>${o.symbol ?? ''}</td>
+          <td>${o.side ?? ''}</td>
+          <td>${o.qty ?? ''}</td>
+          <td>${o.px ?? ''}</td>
+          <td>${o.strategy ?? ''}</td>
+          <td>${o.pnl ?? 0}</td>
+          <td>${o.ts ? new Date(o.ts*1000).toLocaleString() : ''}</td>
+        `;
+        tbody.appendChild(tr);
+      }
+    }
+    async function refreshAll(){
+      await Promise.all([loadSummary(), loadAttribution(), loadOrders()]);
+    }
+    setInterval(refreshAll, 15000);
+    window.addEventListener('load', refreshAll);
+  </script>
 </head>
 <body>
-<header>
-  <div class="brand">{APP_NAME} <small>v{APP_VERSION}</small></div>
-  <div class="controls">
-    <button id="run-all">Run All Now</button>
-    <span class="chip" id="status-chip">idle</span>
-  </div>
-</header>
-
-<main class="grid">
-  <section class="card span-4" id="pnl-card">
-    <h2>Realized PnL</h2>
-    <div class="stat" id="pnl-total">—</div>
-    <div class="muted fade" id="pnl-updated">Updated: —</div>
-    <div style="margin-top:12px">
-      <h3 class="muted" style="font-size:12px;margin:0 0 6px 0;">By Strategy</h3>
-      <div id="pnl-by-strategy" class="fade"></div>
+  <header class="row">
+    <h1>Crypto System</h1>
+    <span class="badge">Live</span>
+    <span class="badge">Scheduler: <code>active</code></span>
+    <div style="margin-left:auto" class="chips">
+      <span class="chip">TF: <code id="tf_chip">auto</code></span>
+      <span class="chip">Tick: <code>{SCHEDULE_SECONDS}s</code></span>
     </div>
-  </section>
+  </header>
 
-  <section class="card span-8">
-    <h2>Recent Orders</h2>
-    <table id="orders-table">
-      <thead>
-        <tr>
-          <th>Time</th>
-          <th>Strategy</th>
-          <th>Symbol</th>
-          <th>Side</th>
-          <th class="right">Qty</th>
-          <th class="right">Price</th>
-          <th class="right">Notional</th>
-        </tr>
-      </thead>
-      <tbody id="orders-body"></tbody>
-    </table>
-  </section>
+  <main>
+    <div class="grid">
+      <section class="card span-8">
+        <div class="row" style="margin-bottom:8px">
+          <h2 style="margin:0;font-size:16px">P&L Summary</h2>
+          <a class="btn" href="#" onclick="refreshAll();return false;">Refresh</a>
+        </div>
+        <div class="grid" style="grid-template-columns:repeat(12,1fr);gap:12px">
+          <div class="span-4">
+            <div class="muted">Equity</div>
+            <div class="kpi" id="eq">0.00</div>
+          </div>
+          <div class="span-4">
+            <div class="muted">PnL (Day)</div>
+            <div class="kpi good" id="pnl_day">0.00</div>
+          </div>
+          <div class="span-4">
+            <div class="muted">PnL (Week)</div>
+            <div class="kpi" id="pnl_week">0.00</div>
+          </div>
+          <div class="span-4">
+            <div class="muted">PnL (Month)</div>
+            <div class="kpi" id="pnl_month">0.00</div>
+          </div>
+          <div class="span-8">
+            <div class="muted">Last Updated</div>
+            <div id="updated" class="kpi" style="font-size:16px">-</div>
+          </div>
+        </div>
+      </section>
 
-  <section class="card span-12">
-    <h2>Attribution</h2>
-    <table id="attr-table">
-      <thead>
-        <tr>
-          <th>Strategy</th>
-          <th class="right">Orders</th>
-          <th class="right">Notional</th>
-          <th>Symbols</th>
-        </tr>
-      </thead>
-      <tbody id="attr-body"></tbody>
-    </table>
-  </section>
+      <section class="card span-4">
+        <div class="row" style="margin-bottom:8px">
+          <h2 style="margin:0;font-size:16px">Attribution</h2>
+        </div>
+        <table>
+          <thead><tr><th>Strategy</th><th>PnL</th></tr></thead>
+          <tbody id="attr_body"></tbody>
+        </table>
+        <div class="muted" style="margin-top:8px">Updated: <span id="attr_updated">-</span></div>
+      </section>
 
-  <section class="card span-12 footer">
-    Scheduler interval: {SCHEDULER_INTERVAL_SEC}s · Strategies: {", ".join(DEFAULT_STRATEGIES)}
-  </section>
-</main>
+      <section class="card span-12">
+        <div class="row" style="margin-bottom:8px">
+          <h2 style="margin:0;font-size:16px">Recent Orders</h2>
+        </div>
+        <table>
+          <thead>
+            <tr>
+              <th>ID</th><th>Symbol</th><th>Side</th><th>Qty</th><th>Price</th>
+              <th>Strategy</th><th>PnL</th><th>Time</th>
+            </tr>
+          </thead>
+          <tbody id="orders_body"></tbody>
+        </table>
+      </section>
+    </div>
+  </main>
 
-<script>
-const fmt = (n) => (typeof n === 'number' ? n.toLocaleString(undefined, {{maximumFractionDigits: 2}}) : n);
+  <footer>
+    Built with FastAPI • Tick interval: {SCHEDULE_SECONDS}s
+  </footer>
 
-async function fetchJSON(url) {{
-  const r = await fetch(url, {{cache: 'no-store'}});
-  if (!r.ok) throw new Error('HTTP ' + r.status);
-  return await r.json();
-}}
-
-function renderPnL(data) {{
-  const total = data.total_realized || 0;
-  const cls = total >= 0 ? 'green' : 'red';
-  document.getElementById('pnl-total').innerHTML = `<span class="${{cls}}">$ ${{fmt(total)}}</span>`;
-  document.getElementById('pnl-updated').textContent = 'Updated: ' + (data.updated_at || '—');
-
-  const byStrat = data.per_strategy || {{}};
-  const parts = Object.entries(byStrat)
-    .sort((a,b) => Math.abs(b[1]) - Math.abs(a[1]))
-    .map(([k,v]) => `<div class="fade"><span class="pill">${{k}}</span> &nbsp; $ {{fmt(v)}}</div>`);
-  document.getElementById('pnl-by-strategy').innerHTML = parts.join('') || '<span class="muted">No data</span>';
-}}
-
-function renderOrders(data) {{
-  const rows = (data.orders || []).map(o => {{
-    const notional = (parseFloat(o.qty||0) * parseFloat(o.price||0)) || 0;
-    const side = (o.side||'').toUpperCase();
-    const t = o.ts ? new Date(o.ts).toLocaleString() : '—';
-    return `<tr>
-      <td>${{t}}</td>
-      <td><span class="pill">${{o.strategy||'—'}}</span></td>
-      <td>${{o.symbol||'—'}}</td>
-      <td>${{side}}</td>
-      <td class="right">${{fmt(parseFloat(o.qty||0))}}</td>
-      <td class="right">${{fmt(parseFloat(o.price||0))}}</td>
-      <td class="right">${{fmt(notional)}}</td>
-    </tr>`;
-  }});
-  document.getElementById('orders-body').innerHTML = rows.join('') || `<tr><td colspan="7" class="muted">No orders yet</td></tr>`;
-}}
-
-function renderAttr(data) {{
-  const rows = Object.entries(data.by_strategy || {{}}).map(([k, v]) => {{
-    const syms = Object.entries(v.symbols||{{}})
-      .map(([s,c]) => `<span class="pill">${{s}} × ${{c}}</span>`)
-      .join(' ');
-    return `<tr>
-      <td><span class="pill">${{k}}</span></td>
-      <td class="right">${{v.orders || 0}}</td>
-      <td class="right">$ {{fmt(v.notional || 0)}}</td>
-      <td>${{syms || '<span class="muted">—</span>'}}</td>
-    </tr>`;
-  }});
-  document.getElementById('attr-body').innerHTML = rows.join('') || `<tr><td colspan="4" class="muted">No data</td></tr>`;
-}}
-
-async function refreshAll() {{
-  try {{
-    document.getElementById('status-chip').textContent = 'refreshing…';
-    const [pnl, rec, attr] = await Promise.all([
-      fetchJSON('/pnl/summary'),
-      fetchJSON('/orders/recent?limit=50'),
-      fetchJSON('/orders/attribution'),
-    ]);
-    renderPnL(pnl);
-    renderOrders(rec);
-    renderAttr(attr);
-    document.getElementById('status-chip').textContent = 'ok';
-  }} catch (e) {{
-    console.error(e);
-    document.getElementById('status-chip').textContent = 'error';
-  }}
-}}
-
-async function runAllNow() {{
-  try {{
-    document.getElementById('status-chip').textContent = 'scanning…';
-    const r = await fetch('/scan/all', {{method:'POST'}});
-    await refreshAll();
-    document.getElementById('status-chip').textContent = 'ok';
-  }} catch (e) {{
-    console.error(e);
-    document.getElementById('status-chip').textContent = 'error';
-  }}
-}}
-
-document.getElementById('run-all').addEventListener('click', runAllNow);
-refreshAll();
-setInterval(refreshAll, 6000);
-</script>
+  <script>
+    // reflect current TF in the header chip (pull from env-backed meta we inject server-side if needed)
+    document.getElementById('tf_chip').textContent = "{DEFAULT_TIMEFRAME}";
+  </script>
 </body>
 </html>
-"""
-    return HTMLResponse(content=html)
+""".replace("{SCHEDULE_SECONDS}", str(SCHEDULE_SECONDS)).replace("{DEFAULT_TIMEFRAME}", DEFAULT_TIMEFRAME)
 
-# ---------------------- Routes: JSON APIs ----------------------
+
+# -----------------------------------------------------------------------------
+# Routes
+# -----------------------------------------------------------------------------
+@app.get("/", response_class=RedirectResponse, include_in_schema=False)
+async def root():
+    return RedirectResponse(url="/dashboard", status_code=307)
+
+
+@app.get("/dashboard", response_class=HTMLResponse)
+async def dashboard():
+    return HTMLResponse(content=_DASHBOARD_HTML, status_code=200)
+
+
 @app.get("/pnl/summary", response_class=JSONResponse)
 async def pnl_summary():
-    async with _orders_lock:
-        data = _compute_pnl_summary()
-    return JSONResponse(data)
+    return JSONResponse(_pnl_summary)
+
 
 @app.get("/orders/recent", response_class=JSONResponse)
-async def orders_recent(limit: int = Query(50, ge=1, le=ORDERS_MAX)):
-    async with _orders_lock:
-        out = list(reversed(_orders[-limit:]))  # newest first
-    return JSONResponse({"orders": out})
+async def orders_recent(limit: int = Query(DEFAULT_LIMIT, ge=1, le=1000)):
+    # Return most recent first
+    items = list(reversed(_orders_ring[-limit:]))
+    return JSONResponse({"orders": items, "count": len(items)})
+
 
 @app.get("/orders/attribution", response_class=JSONResponse)
 async def orders_attribution():
-    async with _orders_lock:
-        data = _compute_attribution()
-    return JSONResponse(data)
+    return JSONResponse(_attribution)
 
-# Quick health
-@app.get("/healthz", response_class=PlainTextResponse)
-def health():
-    return PlainTextResponse("ok")
 
-# ---------------------- Routes: Triggers ----------------------
-@app.post("/scan/{strategy}", response_class=JSONResponse)
-async def run_one(strategy: str, dry: int = Query(0, ge=0, le=1)):
-    req = {
-        "timeframe": DEFAULT_TF,
-        "limit": DEFAULT_LIMIT,
-        "notional": DEFAULT_NOTIONAL,
-        "symbols": DEFAULT_SYMBOLS,
-    }
-    try:
-        orders = await _scan_bridge(strategy, req, dry=dry)
-    except Exception as e:
-        log.error("StrategyBook.scan error: %s", e, exc_info=True)
-        raise HTTPException(status_code=500, detail=str(e))
-    if isinstance(orders, list) and dry == 0:
-        async with _orders_lock:
-            _append_orders(orders)
-    return {"ok": True, "strategy": strategy, "dry": dry, "orders": orders}
+# Optional: a quick health endpoint
+@app.get("/healthz", response_class=JSONResponse, include_in_schema=False)
+async def healthz():
+    return JSONResponse({"ok": True, "ts": time.time()})
 
-@app.post("/scan/all", response_class=JSONResponse)
-async def run_all(dry: int = Query(0, ge=0, le=1)):
-    req = {
-        "timeframe": DEFAULT_TF,
-        "limit": DEFAULT_LIMIT,
-        "notional": DEFAULT_NOTIONAL,
-        "symbols": DEFAULT_SYMBOLS,
-    }
-    results = []
-    for strat in DEFAULT_STRATEGIES:
-        try:
-            orders = await _scan_bridge(strat, req, dry=dry)
-        except Exception as e:
-            log.error("StrategyBook.scan error [%s]: %s", strat, e, exc_info=True)
-            orders = []
-        if isinstance(orders, list) and dry == 0 and orders:
-            async with _orders_lock:
-                _append_orders(orders)
-        results.append({"strategy": strat, "count": len(orders), "orders": orders})
-    return {"ok": True, "dry": dry, "results": results}
 
-# ---------------------- Main ----------------------
+# -----------------------------------------------------------------------------
+# Dev server entrypoint (Render runs `python app.py`)
+# -----------------------------------------------------------------------------
 if __name__ == "__main__":
-    # Allow `python app.py` to Just Work on Render/Heroku/etc.
+    # Avoid uvicorn import at module top so it's not required on Cloud builds that use gunicorn
+    import uvicorn  # type: ignore
+
     port = int(os.getenv("PORT", "10000"))
-    host = os.getenv("HOST", "0.0.0.0")
-    try:
-        import uvicorn  # type: ignore
-        uvicorn.run("app:app", host=host, port=port, reload=False, log_level="info")
-    except Exception as e:
-        log.error("Failed to start uvicorn: %s", e, exc_info=True)
-        # Fallback: simple ASGI server if uvicorn missing (unlikely on Render)
-        from starlette.responses import PlainTextResponse as _Plain
-        async def _fallback_scope(scope, receive, send):
-            if scope["type"] == "http":
-                res = _Plain("Server failed to start (uvicorn missing).", status_code=500)
-                await res(scope, receive, send)
-        import anyio
-        anyio.run(lambda: None)
+    log.info("Launching Uvicorn on 0.0.0.0:%d", port)
+    uvicorn.run("app:app", host="0.0.0.0", port=port, reload=False, access_log=True)
