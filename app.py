@@ -1,20 +1,21 @@
-# app.py  —  v3.5.0
-# - Restores full dashboard (P&L totals, P&L by strategy, calendar P&L, positions, recent orders)
-# - Built-in scheduler (Option B) using env controls
-# - FIX: StrategyBook.scan called with positional args (no 'strat=' keyword)
-# - No httpx dependency; uses stdlib + installed pkgs
+# app.py  —  v3.5.1
+# - Restored full dashboard (Total P&L, P&L by strategy, calendar P&L, positions, recent orders)
+# - Built-in scheduler (Option B) with env controls
+# - FIX: StrategyBook.scan called with positional args
+# - FIX: no backslashes inside f-string expressions (precomputed buttons_html)
+# - No httpx dependency; stdlib + installed pkgs only
 
 import os
 import json
 import time
 import threading
-import traceback
 import logging
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 
-from fastapi import FastAPI, Request, Response, Query
-from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, PlainTextResponse
+from fastapi import FastAPI, Query
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
+
 from pydantic import BaseModel
 
 # ===== Logging =====
@@ -22,15 +23,13 @@ logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("app")
 
 # ===== Strategies package (your code) =====
-# We assume these exist per your project. The only fix we enforce is: use positional call .scan(strat, req)
 try:
     from strategies import StrategyBook, ScanRequest, ScanResult  # type: ignore
 except Exception as e:
-    # If import bombs in a dev shell, make a light fallback to keep app bootable.
     log.error("Failed importing strategies: %s", e)
     StrategyBook = None  # type: ignore
 
-    class ScanRequest(BaseModel):  # minimal shim for local dev
+    class ScanRequest(BaseModel):  # minimal shim for boot
         timeframe: str
         limit: int
         dry: int = 1
@@ -49,7 +48,7 @@ except Exception as e:
         status: Optional[str] = None
 
 # ===== App =====
-app = FastAPI(title="Crypto System", version="3.5.0")
+app = FastAPI(title="Crypto System", version="3.5.1")
 
 # ===== Global StrategyBook =====
 _strategy_book = None
@@ -71,15 +70,13 @@ DEFAULT_NOTIONAL = float(os.getenv("DEFAULT_NOTIONAL", "25"))
 DEFAULT_SYMBOLS = [s.strip() for s in os.getenv("DEFAULT_SYMBOLS", "BTC/USD,ETH/USD").split(",") if s.strip()]
 
 # ===== Helpers =====
-
 def _iso_now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 def _maybe_await(x):
     if hasattr(x, "__await__"):
-        # It's an awaitable
         import asyncio
-        return asyncio.get_event_loop().run_until_complete(x)  # used only in sync contexts
+        return asyncio.get_event_loop().run_until_complete(x)
     return x
 
 def _mk_scan_request(
@@ -91,7 +88,6 @@ def _mk_scan_request(
     topk: Optional[int] = None,
     min_score: Optional[float] = None,
 ):
-    # If the project's ScanRequest is a BaseModel/dataclass, construct it directly.
     try:
         return ScanRequest(
             timeframe=timeframe,
@@ -103,7 +99,6 @@ def _mk_scan_request(
             min_score=min_score,
         )
     except Exception:
-        # Fallback to dict if scans accept plain kwargs in your StrategyBook
         return {
             "timeframe": timeframe,
             "limit": limit,
@@ -115,10 +110,6 @@ def _mk_scan_request(
         }
 
 def _safe_call_orders_recent(limit: int, status: str) -> List[Dict[str, Any]]:
-    """
-    Try to fetch recent orders via StrategyBook if it exposes broker access.
-    Fallback: empty list.
-    """
     try:
         if hasattr(_strategy_book, "orders_recent"):
             return _strategy_book.orders_recent(limit=limit, status=status)  # type: ignore
@@ -139,16 +130,6 @@ def _safe_call_positions() -> List[Dict[str, Any]]:
     return []
 
 def _safe_call_pnl_summary() -> Dict[str, Any]:
-    """
-    Expect shape:
-      {
-        "asof": ISO,
-        "total": {"realized": float, "unrealized": float},
-        "by_strategy": {"c1": {"realized":..,"unrealized":..}, ...},
-        "calendar": [{"date":"YYYY-MM-DD","realized": float}, ... up to ~30-60]
-      }
-    Fallback returns zeros so dashboard renders.
-    """
     try:
         if hasattr(_strategy_book, "pnl_summary"):
             return _strategy_book.pnl_summary()  # type: ignore
@@ -157,7 +138,6 @@ def _safe_call_pnl_summary() -> Dict[str, Any]:
     except Exception:
         log.exception("pnl_summary failed")
 
-    # default placeholder
     today = datetime.now().date()
     cal = [{"date": (today - timedelta(days=i)).isoformat(), "realized": 0.0} for i in range(0, 14)][::-1]
     return {
@@ -174,23 +154,16 @@ def _safe_call_universe() -> Dict[str, Any]:
     }
 
 # ===== Scheduler (Option B) =====
-
 _stop_flag = False
 
 def _scheduler_loop():
-    """
-    Simple staggered loop that runs all strategies live using default params.
-    Respects ENABLE_SCHEDULER & SCHEDULER_INTERVAL_SEC.
-    """
     global _stop_flag
     if _strategy_book is None:
         log.warning("Scheduler: StrategyBook is not available; exiting scheduler thread.")
         return
-
     while not _stop_flag and ENABLE_SCHEDULER:
         try:
             log.info("Scheduler tick: running all strategies (dry=0)")
-            # Build one request object to reuse
             req = _mk_scan_request(
                 timeframe=DEFAULT_TIMEFRAME,
                 limit=DEFAULT_LIMIT,
@@ -202,31 +175,27 @@ def _scheduler_loop():
             )
             for s in STRATEGY_LIST:
                 try:
-                    # *** IMPORTANT FIX: call with positional args (no 'strat=' keyword) ***
-                    res = _strategy_book.scan(s, req)  # may be sync or async
-                    res = _maybe_await(res)
+                    res = _strategy_book.scan(s, req)  # positional args
+                    _maybe_await(res)
                 except TypeError as te:
                     log.error("StrategyBook.scan error: %s", te)
                     log.warning("No strategy adapter handled %s; returning flat", s)
                 except Exception:
                     log.exception("Error scanning %s", s)
-                time.sleep(1.0)  # tiny stagger
+                time.sleep(1.0)
         except Exception:
             log.exception("Scheduler loop crashed once; continuing.")
-        # Sleep main cadence
         for _ in range(SCHEDULER_INTERVAL_SEC):
             if _stop_flag:
                 break
             time.sleep(1)
 
-# Start scheduler thread if enabled
 if ENABLE_SCHEDULER:
     t = threading.Thread(target=_scheduler_loop, name="scheduler", daemon=True)
     t.start()
     log.info("Scheduler thread started (interval=%ss)", SCHEDULER_INTERVAL_SEC)
 
 # ===== Routes =====
-
 @app.get("/", include_in_schema=False)
 def root():
     return RedirectResponse(url="/dashboard")
@@ -237,7 +206,9 @@ def health():
 
 @app.get("/dashboard", response_class=HTMLResponse)
 def dashboard():
-    # Full inline HTML + JS. Uses same endpoints you already hit in the UI logs.
+    # Precompute buttons HTML to avoid backslashes inside f-string expressions
+    buttons_html = "".join([f"<button onclick=\"scanOne('{s}')\">{s}</button>" for s in STRATEGY_LIST])
+
     html = f"""<!doctype html>
 <html lang="en">
 <head>
@@ -247,7 +218,6 @@ def dashboard():
   <style>
     :root {{
       --bg:#0b0e12; --panel:#12161c; --muted:#9aa4ad; --text:#e7edf3; --accent:#24a0ed; --pos:#19c37d; --neg:#ff4d4f;
-      --grid:#1c222b;
     }}
     * {{ box-sizing:border-box; }}
     body {{
@@ -272,7 +242,7 @@ def dashboard():
     }}
     .kpis {{ display:flex; gap:16px; flex-wrap:wrap; }}
     .kpi {{ background:#0f141a; border:1px solid #1b2027; border-radius:12px; padding:12px 14px; min-width:180px; }}
-    .kpi h3 {{ font-size:12px; margin:0; color:var(--muted); font-weight:500; }}
+    .kpi h3 {{ font-size:12px; margin:0; color:#9aa4ad; font-weight:500; }}
     .kpi .v {{ font-size:22px; margin-top:6px; font-weight:700; }}
     .green {{ color: var(--pos); }}
     .red {{ color: var(--neg); }}
@@ -284,17 +254,12 @@ def dashboard():
       background:#0f141a; color:#e7edf3; border:1px solid #273140; border-radius:10px; padding:8px 10px; font-size:14px;
     }}
     button.primary {{ background:var(--accent); color:#00121f; border-color: transparent; font-weight:700; }}
-    .calendar {{
-      display:grid; grid-template-columns: repeat(14, 1fr); gap:6px;
-    }}
-    .cell {{
-      height:36px; border-radius:6px; background:#0f141a; display:flex; align-items:center; justify-content:center; font-size:12px; border:1px solid #1b2027;
-    }}
+    .calendar {{ display:grid; grid-template-columns: repeat(14, 1fr); gap:6px; }}
+    .cell {{ height:36px; border-radius:6px; background:#0f141a; display:flex; align-items:center; justify-content:center; font-size:12px; border:1px solid #1b2027; }}
     .pos {{ background: rgba(25,195,125,.1); border-color: rgba(25,195,125,.3); }}
     .neg {{ background: rgba(255,77,79,.12); border-color: rgba(255,77,79,.35); }}
-    .muted {{ color: var(--muted); }}
-    .mono {{ font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace; }}
     .small {{ font-size:12px; }}
+    .mono {{ font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace; }}
   </style>
 </head>
 <body>
@@ -340,7 +305,7 @@ def dashboard():
       <section class="card span4">
         <h3>Calendar P&L (Realized)</h3>
         <div id="cal" class="calendar"></div>
-        <div class="small muted" id="cal-hint" style="margin-top:6px;"></div>
+        <div class="small" id="cal-hint" style="margin-top:6px; color:#9aa4ad;"></div>
       </section>
 
       <section class="card span6">
@@ -379,7 +344,7 @@ def dashboard():
           <button class="primary" onclick="scanAll()">Run All</button>
         </div>
         <div class="controls">
-          {"".join([f'<button onclick="scanOne(\\'{s}\\')">{s}</button>' for s in STRATEGY_LIST])}
+          {buttons_html}
         </div>
         <pre id="scan-log" class="mono small" style="margin-top:12px; background:#0f141a; border:1px solid #1b2027; padding:10px; border-radius:8px; max-height:220px; overflow:auto;"></pre>
       </section>
@@ -480,15 +445,7 @@ async function scanOne(strat){{
   const txt = await r.text();
   const ms = Date.now()-t0;
   const logEl = document.getElementById('scan-log');
-  logEl.textContent = `[${{new Date().toISOString()}}] POST ${{
-    url
-  }}  ${{
-    r.status
-  }} (${{
-    ms
-  }}ms)\\n${{
-    txt
-  }}\\n\\n` + logEl.textContent;
+  logEl.textContent = `[${{new Date().toISOString()}}] POST ${{url}}  ${{r.status}} (${{ms}}ms)\\n${{txt}}\\n\\n` + logEl.textContent;
   loadAll();
 }}
 
@@ -504,15 +461,7 @@ async function scanAll(){{
   const txt = await r.text();
   const ms = Date.now()-t0;
   const logEl = document.getElementById('scan-log');
-  logEl.textContent = `[${{new Date().toISOString()}}] POST ${{
-    url
-  }}  ${{
-    r.status
-  }} (${{
-    ms
-  }}ms)\\n${{
-    txt
-  }}\\n\\n` + logEl.textContent;
+  logEl.textContent = `[${{new Date().toISOString()}}] POST ${{url}}  ${{r.status}} (${{ms}}ms)\\n${{txt}}\\n\\n` + logEl.textContent;
   loadAll();
 }}
 
@@ -547,10 +496,6 @@ def pnl_summary():
 
 @app.get("/orders/attribution")
 def orders_attr():
-    """
-    Lightweight endpoint dashboard pings.
-    If your backend exposes richer attribution, you can return it here.
-    """
     return JSONResponse({"ok": True, "time": _iso_now(), "v": app.version})
 
 # ======= API: Scanning =======
@@ -579,10 +524,8 @@ def scan_strat(
         min_score=min_score,
     )
     try:
-        # *** IMPORTANT FIX: call with positional args ***
-        res = _strategy_book.scan(strat, req)
+        res = _strategy_book.scan(strat, req)  # positional args
         res = _maybe_await(res)
-        # Ensure serializable
         if isinstance(res, list):
             payload = [r.dict() if hasattr(r, "dict") else r for r in res]
         else:
@@ -621,8 +564,7 @@ def scan_all(
     out = []
     for strat in STRATEGY_LIST:
         try:
-            # *** positional args ***
-            res = _strategy_book.scan(strat, req)
+            res = _strategy_book.scan(strat, req)  # positional args
             res = _maybe_await(res)
             if isinstance(res, list):
                 payload = [r.dict() if hasattr(r, "dict") else r for r in res]
@@ -632,7 +574,7 @@ def scan_all(
         except Exception as e:
             log.exception("scan_all %s failed", strat)
             out.append({"strat": strat, "error": str(e)})
-        time.sleep(0.5)  # small stagger
+        time.sleep(0.5)
     return JSONResponse({"ok": True, "runs": out})
 
 # ===== Graceful shutdown =====
@@ -644,7 +586,6 @@ def _shutdown():
 
 # ===== Local dev =====
 if __name__ == "__main__":
-    # For local testing: uvicorn app:app --reload
     import uvicorn
     port = int(os.getenv("PORT", "10000"))
     uvicorn.run(app, host="0.0.0.0", port=port)
