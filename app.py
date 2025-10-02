@@ -129,15 +129,23 @@ async def _scan_bridge(
 
     ctx_map = _build_contexts(tf, lim, notional, symbols, dry)
 
-    # Minimal, safe req payload your strategies can rely on
+      # Minimal, safe req payload your strategies can rely on
     compact_req = {
+        # canonical fields
         "strategy": strat,
         "timeframe": tf,
         "limit": lim,
         "notional": notional,
         "symbols": symbols,
         "dry": dry,
-        # passthrough for anything else
+
+        # <-- NEW: mirror contexts into req so strategies that expect req['one']
+        # or req['default'] keep working. Also include req['contexts'].
+        "one": ctx_map.get("one"),
+        "default": ctx_map.get("default"),
+        "contexts": ctx_map,
+
+        # passthrough for anything else the caller provided
         "raw": req,
     }
 
