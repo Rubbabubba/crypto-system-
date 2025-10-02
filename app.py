@@ -9,13 +9,13 @@ import logging
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple, Union
 
-from fastapi import FastAPI, HTTPException, Query
-from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, PlainResponse
+from fastapi import FastAPI, HTTPException, Query, Response
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from pydantic import BaseModel
 
 # ---------------------- App metadata ----------------------
 APP_NAME = "Crypto System Control Plane"
-APP_VERSION = "1.7.0"  # << bumped
+APP_VERSION = "1.7.1"  # bumped
 
 # ---------------------- Logging ----------------------
 logging.basicConfig(
@@ -124,14 +124,12 @@ async def _scan_bridge(
 
     last_error: Optional[Exception] = None
 
-    # Try several safe calling patterns to be compatible with variations.
-    # 1) Class method or static method: StrategyBook.scan(strategy, contexts)
+    # 1) Class/staticmethod: StrategyBook.scan(strategy, contexts)
     try:
         res = StrategyBook.scan  # type: ignore[attr-defined]
         orders = await _maybe_await(res(strat, ctx_map))
         if isinstance(orders, list):
             return orders
-        # Some implementations return dict with "orders"
         if isinstance(orders, dict) and "orders" in orders:
             o = orders.get("orders")
             return o if isinstance(o, list) else []
@@ -139,7 +137,7 @@ async def _scan_bridge(
         last_error = e
         log.warning("scan variant #1 failed: %s", e)
 
-    # 2) Instance method on class
+    # 2) Instance method: StrategyBook().scan(strategy, contexts)
     try:
         sb = StrategyBook()  # type: ignore[call-arg]
         if hasattr(sb, "scan"):
@@ -153,9 +151,8 @@ async def _scan_bridge(
         last_error = e
         log.warning("scan variant #2 failed: %s", e)
 
-    # 3) Some older signatures might expect just the default context dict
+    # 3) Older signature expects the default context only (classmethod)
     try:
-        # class-level
         res = StrategyBook.scan  # type: ignore[attr-defined]
         orders = await _maybe_await(res(strat, ctx_map["default"]))
         if isinstance(orders, list):
@@ -167,7 +164,7 @@ async def _scan_bridge(
         last_error = e
         log.warning("scan variant #3 failed: %s", e)
 
-    # 4) Instance + default context
+    # 4) Older signature on instance
     try:
         sb = StrategyBook()  # type: ignore[call-arg]
         if hasattr(sb, "scan"):
@@ -181,7 +178,6 @@ async def _scan_bridge(
         last_error = e
         log.warning("scan variant #4 failed: %s", e)
 
-    # If we reached here, we couldn't find a compatible signature
     raise TypeError(
         f"No compatible StrategyBook.scan signature (strategy, contexts). Last error: {last_error}"
     )
@@ -192,7 +188,6 @@ async def _run_one_scan(strat: str, req: Dict[str, Any], dry: int) -> List[Dict[
         orders = await _scan_bridge(strat, req, dry=dry)
     except Exception as e:
         log.error("StrategyBook.scan error: %s", e, exc_info=True)
-        # Propagate to caller if not the scheduler
         raise
     return orders if isinstance(orders, list) else []
 
@@ -202,7 +197,7 @@ async def _scheduler_loop():
     Periodically scans all strategies and appends orders to in-memory store.
     Safe to run as a background task.
     """
-    req: Dict[str, Any] = {}  # scheduler uses defaults unless you set env
+    req: Dict[str, Any] = {}
     dry_val = int(os.environ.get("SCHEDULER_DRY", str(DEFAULT_DRY)))
 
     log.info("Scheduler tick: running all strategies (dry=%d)", dry_val)
@@ -220,18 +215,15 @@ async def _scheduler_loop():
 app = FastAPI(title=APP_NAME, version=APP_VERSION)
 
 
-# Lifespan-safe startup: keep deprecated decorator for compatibility,
-# but guard background scheduler when StrategyBook is missing.
+# Startup: keep decorator for compatibility; guard scheduler when StrategyBook is missing.
 @app.on_event("startup")
 async def _on_startup():
     log.info("Application startup complete.")
-    # If strategies are not available, do not start the scheduler
     if StrategyBook is None:
         log.warning("No StrategyBook available, skipping scheduler.")
         return
 
     async def runner():
-        # short delay to let the server finish binding
         await asyncio.sleep(2)
         while True:
             try:
@@ -256,21 +248,20 @@ class Order(BaseModel):
 
 
 # ---------------------- Routes ----------------------
-@app.head("/", response_class=PlainResponse)
+@app.head("/", include_in_schema=False)
 async def head_root():
     # Health checks (HEAD /) sometimes used by infra. Return 200 OK.
-    return PlainResponse(status_code=200)
+    return Response(status_code=200)
 
 
 @app.get("/", include_in_schema=False)
 async def root():
-    # Redirect to dashboard UI
     return RedirectResponse(url="/dashboard", status_code=307)
 
 
 @app.get("/dashboard", response_class=HTMLResponse)
 async def dashboard():
-    # Inline HTML dashboard. Keep everything self-contained.
+    # Inline HTML dashboard (complete)
     html = f"""<!doctype html>
 <html lang="en">
 <head>
@@ -288,9 +279,7 @@ async def dashboard():
   --bad: #ff5c5c;
   --chip: #1a2230;
 }}
-* {{
-  box-sizing: border-box;
-}}
+* {{ box-sizing: border-box; }}
 body {{
   margin: 0;
   padding: 0;
@@ -358,19 +347,9 @@ body {{
   border-radius: 10px;
   padding: 12px;
 }}
-.kpi .label {{
-  color: var(--muted);
-  font-size: 12px;
-}}
-.kpi .value {{
-  margin-top: 6px;
-  font-size: 20px;
-  font-weight: 700;
-}}
-.kpi .delta {{
-  margin-top: 4px;
-  font-size: 12px;
-}}
+.kpi .label {{ color: var(--muted); font-size: 12px; }}
+.kpi .value {{ margin-top: 6px; font-size: 20px; font-weight: 700; }}
+.kpi .delta {{ margin-top: 4px; font-size: 12px; }}
 .delta.pos {{ color: var(--good); }}
 .delta.neg {{ color: var(--bad); }}
 .table {{
@@ -384,16 +363,8 @@ body {{
   text-align: left;
   white-space: nowrap;
 }}
-.table th {{
-  color: var(--muted);
-  font-weight: 600;
-  font-size: 12px;
-}}
-.chips {{
-  display: flex;
-  gap: 8px;
-  flex-wrap: wrap;
-}}
+.table th {{ color: var(--muted); font-weight: 600; font-size: 12px; }}
+.chips {{ display: flex; gap: 8px; flex-wrap: wrap; }}
 .chip {{
   background: var(--chip);
   border: 1px solid #223046;
@@ -425,16 +396,10 @@ body {{
   border-radius: 10px;
   cursor: pointer;
 }}
-.btn:hover {{
-  background: #0f1520;
-}}
+.btn:hover {{ background: #0f1520; }}
 @media (max-width: 980px) {{
-  .grid {{
-    grid-template-columns: 1fr;
-  }}
-  .kpis {{
-    grid-template-columns: repeat(2, 1fr);
-  }}
+  .grid {{ grid-template-columns: 1fr; }}
+  .kpis {{ grid-template-columns: repeat(2, 1fr); }}
 }}
 </style>
 </head>
@@ -733,7 +698,7 @@ if __name__ == "__main__":
             host=host,
             port=port,
             reload=bool(int(os.environ.get("RELOAD", "0"))),
-            lifespan="on",  # keep lifespan enabled
+            lifespan="on",
         )
     except Exception as e:
         log.exception("Failed to start Uvicorn: %s", e)
