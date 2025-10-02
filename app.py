@@ -1,9 +1,8 @@
-# app.py  —  v3.5.2
-# - Keeps full dashboard: Total P&L, P&L by strategy, calendar P&L, positions, recent orders
-# - Built-in scheduler (Option B) driven by env vars
-# - Robust scan bridge: always build dict; try dict → JSON string → ScanRequest model
-# - Avoids f-string backslash pitfalls by precomputing HTML fragments
-# - No external http client dependency
+# app.py — v3.5.3
+# - Full dashboard: Total P&L, by-strategy P&L, calendar P&L, positions, recent orders
+# - Built-in scheduler (Option B) controlled by env vars
+# - Robust StrategyBook.scan bridge (dict → JSON → ScanRequest)
+# - Renders HTML with string.Template (no f-strings around JS/CSS)
 
 import os
 import json
@@ -16,6 +15,7 @@ from typing import Any, Dict, List, Optional
 from fastapi import FastAPI, Query
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from pydantic import BaseModel
+from string import Template
 
 # ===== Logging =====
 logging.basicConfig(level=logging.INFO)
@@ -28,7 +28,7 @@ except Exception as e:
     log.error("Failed importing strategies: %s", e)
     StrategyBook = None  # type: ignore
 
-    class ScanRequest(BaseModel):  # minimal shim for boot
+    class ScanRequest(BaseModel):  # minimal shim
         timeframe: str
         limit: int
         dry: int = 1
@@ -47,7 +47,7 @@ except Exception as e:
         status: Optional[str] = None
 
 # ===== App =====
-app = FastAPI(title="Crypto System", version="3.5.2")
+app = FastAPI(title="Crypto System", version="3.5.3")
 
 # ===== Global StrategyBook =====
 _strategy_book = None
@@ -87,7 +87,6 @@ def _mk_scan_dict(
     topk: Optional[int] = None,
     min_score: Optional[float] = None,
 ) -> Dict[str, Any]:
-    # Always return a plain dict so the strategy layer can subscript safely
     return {
         "timeframe": timeframe,
         "limit": int(limit),
@@ -127,7 +126,6 @@ def _safe_call_pnl_summary() -> Dict[str, Any]:
     except Exception:
         log.exception("pnl_summary failed")
 
-    # Fallback empty but shaped data
     today = datetime.now().date()
     cal = [{"date": (today - timedelta(days=i)).isoformat(), "realized": 0.0} for i in range(0, 14)][::-1]
     return {
@@ -145,13 +143,6 @@ def _safe_call_universe() -> Dict[str, Any]:
 
 # ---------- Robust bridge to StrategyBook.scan ----------
 def _scan_bridge(strat: str, req_dict: Dict[str, Any]):
-    """
-    Try common calling conventions so we don't depend on the exact StrategyBook signature:
-      1) scan(strat, dict)
-      2) scan(strat, json.dumps(dict))
-      3) scan(strat, ScanRequest(**dict))  (if that class exists)
-    Returns whatever the underlying scan returns.
-    """
     if _strategy_book is None:
         raise RuntimeError("StrategyBook not available")
 
@@ -231,67 +222,63 @@ def root():
 def health():
     return {"status": "ok", "time": _iso_now(), "scheduler": ENABLE_SCHEDULER}
 
-@app.get("/dashboard", response_class=HTMLResponse)
-def dashboard():
-    # Precompute buttons to keep the f-string clean
-    buttons_html = "".join([f"<button onclick=\"scanOne('{s}')\">{s}</button>" for s in STRATEGY_LIST])
-
-    html = f"""<!doctype html>
+# ---- Dashboard (rendered with string.Template, safe for JS/CSS) ----
+_DASHBOARD_TMPL = Template(r"""<!doctype html>
 <html lang="en">
 <head>
   <meta charset="utf-8"/>
-  <title>Crypto System – Dashboard (v{app.version})</title>
+  <title>Crypto System – Dashboard (v$version)</title>
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <style>
-    :root {{
+    :root {
       --bg:#0b0e12; --panel:#12161c; --muted:#9aa4ad; --text:#e7edf3; --accent:#24a0ed; --pos:#19c37d; --neg:#ff4d4f;
-    }}
-    * {{ box-sizing:border-box; }}
-    body {{
+    }
+    * { box-sizing:border-box; }
+    body {
       margin:0; font-family: system-ui, -apple-system, Segoe UI, Roboto, Ubuntu, Cantarell, Noto Sans, Helvetica, Arial, "Apple Color Emoji","Segoe UI Emoji";
       background: var(--bg); color: var(--text);
-    }}
-    header {{
+    }
+    header {
       padding:16px 20px; display:flex; align-items:center; gap:16px; border-bottom:1px solid #1b2027; position:sticky; top:0; background:rgba(11,14,18,.9); backdrop-filter: blur(6px);
-    }}
-    h1 {{ font-size:18px; margin:0; font-weight:600; letter-spacing:.3px; }}
-    .badge {{ font-size:12px; color:#fff; background:#2b3340; padding:4px 8px; border-radius:999px; }}
-    .tag {{ font-size:12px; color:#cfd6dd; background:#1a212b; padding:4px 8px; border-radius:6px; border:1px solid #2a323d; }}
-    main {{ padding:20px; max-width:1200px; margin:0 auto; }}
-    .grid {{ display:grid; grid-template-columns: repeat(12, 1fr); gap:16px; }}
-    .card {{ grid-column: span 12; background:var(--panel); border:1px solid #1b2027; border-radius:14px; padding:16px; }}
-    @media (min-width: 900px) {{
-      .span4 {{ grid-column: span 4; }}
-      .span6 {{ grid-column: span 6; }}
-      .span8 {{ grid-column: span 8; }}
-      .span12 {{ grid-column: span 12; }}
-      .span3 {{ grid-column: span 3; }}
-    }}
-    .kpis {{ display:flex; gap:16px; flex-wrap:wrap; }}
-    .kpi {{ background:#0f141a; border:1px solid #1b2027; border-radius:12px; padding:12px 14px; min-width:180px; }}
-    .kpi h3 {{ font-size:12px; margin:0; color:#9aa4ad; font-weight:500; }}
-    .kpi .v {{ font-size:22px; margin-top:6px; font-weight:700; }}
-    .green {{ color: var(--pos); }}
-    .red {{ color: var(--neg); }}
-    table {{ width:100%; border-collapse: collapse; }}
-    th, td {{ text-align:left; padding:8px; border-bottom:1px solid #1b2027; font-size:14px; }}
-    th {{ color:#c2cbd3; font-weight:600; }}
-    .controls {{ display:flex; gap:10px; flex-wrap:wrap; }}
-    input, select, button {{
+    }
+    h1 { font-size:18px; margin:0; font-weight:600; letter-spacing:.3px; }
+    .badge { font-size:12px; color:#fff; background:#2b3340; padding:4px 8px; border-radius:999px; }
+    .tag { font-size:12px; color:#cfd6dd; background:#1a212b; padding:4px 8px; border-radius:6px; border:1px solid #2a323d; }
+    main { padding:20px; max-width:1200px; margin:0 auto; }
+    .grid { display:grid; grid-template-columns: repeat(12, 1fr); gap:16px; }
+    .card { grid-column: span 12; background:var(--panel); border:1px solid #1b2027; border-radius:14px; padding:16px; }
+    @media (min-width: 900px) {
+      .span4 { grid-column: span 4; }
+      .span6 { grid-column: span 6; }
+      .span8 { grid-column: span 8; }
+      .span12 { grid-column: span 12; }
+      .span3 { grid-column: span 3; }
+    }
+    .kpis { display:flex; gap:16px; flex-wrap:wrap; }
+    .kpi { background:#0f141a; border:1px solid #1b2027; border-radius:12px; padding:12px 14px; min-width:180px; }
+    .kpi h3 { font-size:12px; margin:0; color:#9aa4ad; font-weight:500; }
+    .kpi .v { font-size:22px; margin-top:6px; font-weight:700; }
+    .green { color: var(--pos); }
+    .red { color: var(--neg); }
+    table { width:100%; border-collapse: collapse; }
+    th, td { text-align:left; padding:8px; border-bottom:1px solid #1b2027; font-size:14px; }
+    th { color:#c2cbd3; font-weight:600; }
+    .controls { display:flex; gap:10px; flex-wrap:wrap; }
+    input, select, button {
       background:#0f141a; color:#e7edf3; border:1px solid #273140; border-radius:10px; padding:8px 10px; font-size:14px;
-    }}
-    button.primary {{ background:var(--accent); color:#00121f; border-color: transparent; font-weight:700; }}
-    .calendar {{ display:grid; grid-template-columns: repeat(14, 1fr); gap:6px; }}
-    .cell {{ height:36px; border-radius:6px; background:#0f141a; display:flex; align-items:center; justify-content:center; font-size:12px; border:1px solid #1b2027; }}
-    .pos {{ background: rgba(25,195,125,.1); border-color: rgba(25,195,125,.3); }}
-    .neg {{ background: rgba(255,77,79,.12); border-color: rgba(255,77,79,.35); }}
-    .small {{ font-size:12px; }}
-    .mono {{ font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace; }}
+    }
+    button.primary { background:var(--accent); color:#00121f; border-color: transparent; font-weight:700; }
+    .calendar { display:grid; grid-template-columns: repeat(14, 1fr); gap:6px; }
+    .cell { height:36px; border-radius:6px; background:#0f141a; display:flex; align-items:center; justify-content:center; font-size:12px; border:1px solid #1b2027; }
+    .pos { background: rgba(25,195,125,.1); border-color: rgba(25,195,125,.3); }
+    .neg { background: rgba(255,77,79,.12); border-color: rgba(255,77,79,.35); }
+    .small { font-size:12px; }
+    .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace; }
   </style>
 </head>
 <body>
   <header>
-    <h1>Crypto Trading System <span class="badge">v{app.version}</span></h1>
+    <h1>Crypto Trading System <span class="badge">v$version</span></h1>
     <span id="sched" class="tag">Scheduler: …</span>
     <span id="asof" class="tag">as of —</span>
   </header>
@@ -358,10 +345,10 @@ def dashboard():
       <section class="card span12">
         <h3>Manual Scan (optional)</h3>
         <div class="controls" style="margin-bottom:10px;">
-          <label>Timeframe <input id="tf" value="{DEFAULT_TIMEFRAME}"/></label>
-          <label>Limit <input id="lim" type="number" value="{DEFAULT_LIMIT}"/></label>
-          <label>Notional <input id="notional" type="number" value="{DEFAULT_NOTIONAL}"/></label>
-          <label>Symbols <input id="syms" size="80" value="{",".join(DEFAULT_SYMBOLS)}"/></label>
+          <label>Timeframe <input id="tf" value="$default_timeframe"/></label>
+          <label>Limit <input id="lim" type="number" value="$default_limit"/></label>
+          <label>Notional <input id="notional" type="number" value="$default_notional"/></label>
+          <label>Symbols <input id="syms" size="80" value="$default_symbols"/></label>
           <label>Dry?
             <select id="dry">
               <option value="1">1 (no orders)</option>
@@ -371,7 +358,7 @@ def dashboard():
           <button class="primary" onclick="scanAll()">Run All</button>
         </div>
         <div class="controls">
-          {buttons_html}
+          $buttons_html
         </div>
         <pre id="scan-log" class="mono small" style="margin-top:12px; background:#0f141a; border:1px solid #1b2027; padding:10px; border-radius:8px; max-height:220px; overflow:auto;"></pre>
       </section>
@@ -401,7 +388,6 @@ async function loadAll(){
     document.getElementById('kpi-realized').innerHTML = fmt(realized);
     document.getElementById('kpi-unrealized').innerHTML = fmt(unreal);
 
-    // Strategy table
     const tbody = document.querySelector('#tbl-strat tbody');
     tbody.innerHTML = '';
     const bys = pnl.by_strategy || {};
@@ -413,7 +399,6 @@ async function loadAll(){
       tbody.appendChild(tr);
     });
 
-    // Calendar
     const calDiv = document.getElementById('cal');
     calDiv.innerHTML = '';
     const cal = pnl.calendar || [];
@@ -492,12 +477,28 @@ async function scanAll(){
   loadAll();
 }
 
+window.scanOne = scanOne;
+window.scanAll = scanAll;
+
 loadAll();
 setInterval(loadAll, 60000);
 </script>
 
 </body>
-</html>"""
+</html>
+""")
+
+@app.get("/dashboard", response_class=HTMLResponse)
+def dashboard():
+    buttons_html = "".join([f"<button onclick=\"scanOne('{s}')\">{s}</button>" for s in STRATEGY_LIST])
+    html = _DASHBOARD_TMPL.substitute(
+        version=app.version,
+        default_timeframe=DEFAULT_TIMEFRAME,
+        default_limit=str(DEFAULT_LIMIT),
+        default_notional=str(DEFAULT_NOTIONAL),
+        default_symbols=",".join(DEFAULT_SYMBOLS),
+        buttons_html=buttons_html,
+    )
     return HTMLResponse(html)
 
 # ======= API: Universe =======
