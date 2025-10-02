@@ -1,7 +1,7 @@
-# app.py  — Crypto Control Plane (v0.9.7)
+# app.py  — Crypto Control Plane (v0.9.8)
 # - FastAPI service with HTML dashboard (overall P&L, by-strategy, calendar heatmap, recent orders)
 # - Background autoscheduler (optional via env)
-# - Robust scan bridge that tries multiple StrategyBook.scan signatures using POSITIONAL args
+# - Scan bridge aligned to StrategyBook.scan(strategy, contexts) signature
 # - Simple in-memory order/P&L bookkeeping
 #
 # Env:
@@ -17,7 +17,6 @@ import asyncio
 import json
 import logging
 import os
-import sys
 import time
 from datetime import datetime, timezone, date
 from typing import Any, Dict, List, Optional
@@ -35,12 +34,9 @@ logging.basicConfig(
 )
 log = logging.getLogger("app")
 
-APP_VERSION = "v0.9.7"
+APP_VERSION = "v0.9.8"
 
 # ---------------------- StrategyBook Loader ----------------------
-# We expect a local module "strategies.py" with a class "StrategyBook"
-# that exposes a method "scan(...)". Signature varies across your versions,
-# so we call it via a resilient bridge that tries several positional layouts.
 try:
     import strategies as _strategies_mod
 except Exception as e:
@@ -58,7 +54,6 @@ class StrategyBookProxy:
         log.info("Loaded StrategyBook from %s.%s", _strategies_mod.__name__, "StrategyBook")
 
     def scan(self, *args, **kwargs):
-        # We never call this directly; use _scan_bridge below.
         return self._impl.scan(*args, **kwargs)
 
 _strategy_book = StrategyBookProxy()
@@ -82,7 +77,6 @@ DEFAULT_SYMBOLS = os.getenv(
 )
 
 # ---------------------- In-Memory State ----------------------
-# Very simple in-memory stores. Render dynos are ephemeral; this is for live dashboard only.
 _orders: List[Dict[str, Any]] = []  # append-only recent orders (capped)
 _ORDERS_CAP = 1000
 
@@ -112,13 +106,13 @@ def _coerce_order(o: Dict[str, Any]) -> Dict[str, Any]:
     out["side"] = (o.get("side") or "").upper() or "?"
     out["qty"] = _safe_float(o.get("qty") or o.get("quantity") or 0)
     out["price"] = _safe_float(o.get("price") or 0)
-    # P&L may be per-trade realized; fall back to 0
     out["pnl"] = _safe_float(o.get("pnl") or o.get("pnl_realized") or 0)
     return out
 
 def _append_orders(orders: List[Dict[str, Any]]) -> None:
     for o in orders:
-        _orders.append(_coerce_order(o))
+        if isinstance(o, dict):
+            _orders.append(_coerce_order(o))
     _truncate_orders()
 
 def _pnl_summary() -> Dict[str, Any]:
@@ -136,7 +130,6 @@ def _pnl_summary() -> Dict[str, Any]:
         except Exception:
             d = date.today().isoformat()
         by_day[d] = by_day.get(d, 0.0) + pnl
-    # sort day keys
     days_sorted = sorted(by_day.keys())
     return {
         "version": APP_VERSION,
@@ -148,19 +141,6 @@ def _pnl_summary() -> Dict[str, Any]:
     }
 
 # ---------------------- Scan Bridge ----------------------
-# Your StrategyBook.scan() has changed signatures across versions.
-# We will try multiple **POSITIONAL** variants only (no kwargs) to avoid "unexpected keyword" errors.
-#
-# We assemble the intent from query/body and then attempt these shapes:
-#   1) (strat, timeframe, limit, notional, symbols, dry)
-#   2) (strat, timeframe, limit, notional, symbols)
-#   3) (strat, {"timeframe":..., "limit":..., "notional":..., "symbols":..., "dry":...})
-#   4) (strat, [timeframe, limit, notional, symbols, dry])
-#   5) (strat, [timeframe, limit, notional, symbols])
-#   6) (strat, json.dumps({...}))
-#   7) (strat,)   # give the strategy name only
-#
-# Any successful call must return a list (orders) or a dict with "orders".
 async def _maybe_await(x):
     if asyncio.iscoroutine(x):
         return await x
@@ -171,19 +151,29 @@ async def _scan_bridge(
     req: Dict[str, Any],
     dry: int = 0,
 ) -> List[Dict[str, Any]]:
+    """
+    Align with StrategyBook.scan(strategy, contexts)
+    contexts: dict[str, dict] — allow multiple named contexts; we provide "default".
+    """
     tf = req.get("timeframe", DEFAULT_TF)
     lim = int(req.get("limit", DEFAULT_LIMIT))
     notional = float(req.get("notional", DEFAULT_NOTIONAL))
     symbols = req.get("symbols", DEFAULT_SYMBOLS)
 
+    ctx_map = {
+        "default": {
+            "timeframe": tf,
+            "limit": lim,
+            "notional": notional,
+            "symbols": symbols,
+            "dry": dry,
+        }
+    }
+
     attempts = [
-        (strat, tf, lim, notional, symbols, dry),
-        (strat, tf, lim, notional, symbols),
-        (strat, {"timeframe": tf, "limit": lim, "notional": notional, "symbols": symbols, "dry": dry}),
-        (strat, [tf, lim, notional, symbols, dry]),
-        (strat, [tf, lim, notional, symbols]),
-        (strat, json.dumps({"timeframe": tf, "limit": lim, "notional": notional, "symbols": symbols, "dry": dry})),
-        (strat,),
+        (strat, ctx_map),                            # expected signature
+        (strat, json.dumps(ctx_map)),               # if implementation wants a JSON string
+        (strat, {"timeframe": tf, "limit": lim, "notional": notional, "symbols": symbols, "dry": dry}),  # flat dict
     ]
 
     last_error: Optional[Exception] = None
@@ -194,21 +184,18 @@ async def _scan_bridge(
                 return list(res.get("orders") or [])
             if isinstance(res, list):
                 return res
-            # Some adapters return None or {"ok":...,"data":[...]}
             if isinstance(res, dict) and "data" in res and isinstance(res["data"], list):
                 return res["data"]
-            # If it's something else, continue
             raise TypeError(f"unexpected return type: {type(res)}")
         except Exception as e:
             last_error = e
-            log.warning("scan positional-variant #%d failed: %s", i, e)
+            log.warning("scan variant #%d failed: %s", i, e)
 
-    raise TypeError(f"No compatible StrategyBook.scan signature (positional variants). Last error: {last_error}")
+    raise TypeError(f"No compatible StrategyBook.scan signature (strategy, contexts). Last error: {last_error}")
 
 # ---------------------- FastAPI ----------------------
 app = FastAPI(title="Crypto System Control Plane", version=APP_VERSION)
 
-# ----------- Models for request bodies -----------
 class ScanBody(BaseModel):
     timeframe: Optional[str] = None
     limit: Optional[int] = None
@@ -216,7 +203,6 @@ class ScanBody(BaseModel):
     symbols: Optional[str] = None
     dry: Optional[int] = 0
 
-# ---------------------- Routes ----------------------
 @app.get("/", include_in_schema=False)
 def root():
     return RedirectResponse(url="/dashboard", status_code=307)
@@ -262,7 +248,6 @@ async def scan_strat(
     dry: int = 0,
     body: Optional[ScanBody] = None,
 ):
-    # Merge query > body > defaults
     req: Dict[str, Any] = {
         "timeframe": timeframe or (body.timeframe if body and body.timeframe else DEFAULT_TF),
         "limit": int(limit if limit is not None else (body.limit if body and body.limit is not None else DEFAULT_LIMIT)),
@@ -271,7 +256,6 @@ async def scan_strat(
     }
     dry_val = dry if dry is not None else (body.dry if body and body.dry is not None else 0)
 
-    # Run and harvest
     try:
         orders = await _scan_bridge(strat, req, dry=dry_val)
     except Exception as e:
@@ -424,26 +408,21 @@ _DASHBOARD_HTML = Template("""<!doctype html>
     var el = document.getElementById(id);
     if (el) el.textContent = val;
   }
-  function setHTML(id, val){
-    var el = document.getElementById(id);
-    if (el) el.innerHTML = val;
-  }
   function renderByStrat(map){
     var rows = '';
-    var keys = Object.keys(map).sort();
+    var keys = Object.keys(map || {}).sort();
     for (var i=0;i<keys.length;i++){
       var k = keys[i]; var v = map[k] || 0;
       rows += '<tr><td class="mono">' + esc(k) + '</td><td class="right">' + fmtMoney(v) + '</td></tr>';
     }
     if (rows === '') rows = '<tr><td colspan="2" class="muted">No data yet</td></tr>';
-    setHTML('tblByStrat').getElementsByTagName('tbody')[0].innerHTML = rows;
+    var tbody = document.querySelector('#tblByStrat tbody');
+    if (tbody) tbody.innerHTML = rows;
   }
   function renderCalendar(arr){
-    // arr is [{day: 'YYYY-MM-DD', pnl: n}, ...] sorted by day
     var heat = document.getElementById('heat');
     heat.innerHTML = '';
     if (!arr || arr.length === 0){ heat.innerHTML = '<div class="muted small">No P&L yet</div>'; return; }
-    // compute min/max for color scaling
     var minV=0, maxV=0;
     for (var i=0;i<arr.length;i++){ var p=Number(arr[i].pnl||0); if (p<minV) minV=p; if (p>maxV) maxV=p; }
     function colorFor(v){
@@ -451,7 +430,7 @@ _DASHBOARD_HTML = Template("""<!doctype html>
       if (p===0) return '#20262e';
       if (p>0){
         var t = Math.min(1.0, p/(maxV||1));
-        var g = Math.floor(40 + t*140); // dark->green
+        var g = Math.floor(40 + t*140);
         return 'rgb(40,' + (g+50) + ',70)';
       }else{
         var t2 = Math.min(1.0, Math.abs(p)/(Math.abs(minV)||1));
@@ -460,7 +439,7 @@ _DASHBOARD_HTML = Template("""<!doctype html>
       }
     }
     for (var j=0;j<arr.length;j++){
-      var d = arr[j].day; var pv = arr[j].pnl;
+      var d = arr[j].day; var pv = Number(arr[j].pnl||0);
       var cell = document.createElement('div');
       cell.className = 'cell';
       cell.title = d + '  ' + pv.toFixed(2);
@@ -470,7 +449,7 @@ _DASHBOARD_HTML = Template("""<!doctype html>
   }
   function renderOrders(list){
     var rows = '';
-    for (var i=0;i<list.length;i++){
+    for (var i=0;i<(list||[]).length;i++){
       var o = list[i];
       rows += '<tr>'
         + '<td class="mono">' + esc((o.ts||'').replace('T',' ').replace('Z','')) + '</td>'
@@ -483,7 +462,8 @@ _DASHBOARD_HTML = Template("""<!doctype html>
         + '</tr>';
     }
     if (rows === '') rows = '<tr><td colspan="7" class="muted">No orders yet</td></tr>';
-    document.getElementById('tblOrders').getElementsByTagName('tbody')[0].innerHTML = rows;
+    var tbody = document.querySelector('#tblOrders tbody');
+    if (tbody) tbody.innerHTML = rows;
   }
 
   async function fetchJSON(url, opts){
@@ -498,9 +478,9 @@ _DASHBOARD_HTML = Template("""<!doctype html>
     var pnls = await fetchJSON('/pnl/summary');
     var recent = await fetchJSON('/orders/recent?limit=50');
     if (pnls){
-      setText('updatedAt', new Date().toLocaleTimeString());
-      setHTML('pnlTotal', fmtMoney(pnls.pnl_total));
-      setText('ordersCount', (pnls.orders_count||0) + ' orders');
+      document.getElementById('updatedAt').textContent = new Date().toLocaleTimeString();
+      document.getElementById('pnlTotal').innerHTML = fmtMoney(pnls.pnl_total);
+      document.getElementById('ordersCount').textContent = (pnls.orders_count||0) + ' orders';
       renderByStrat(pnls.pnl_by_strategy || {});
       renderCalendar(pnls.pnl_calendar || []);
     }
@@ -508,12 +488,11 @@ _DASHBOARD_HTML = Template("""<!doctype html>
   }
 
   async function init(){
-    // surface defaults in UI
     var attr = await fetchJSON('/orders/attribution');
     if (attr && attr.defaults){
-      setText('tf', attr.defaults.timeframe || '—');
-      setText('lim', String(attr.defaults.limit || '—'));
-      setText('notional', String(attr.defaults.notional || '—'));
+      document.getElementById('tf').textContent = attr.defaults.timeframe || '—';
+      document.getElementById('lim').textContent = String(attr.defaults.limit || '—');
+      document.getElementById('notional').textContent = String(attr.defaults.notional || '—');
     }
     await refresh();
     setInterval(refresh, 10000);
@@ -550,7 +529,7 @@ async def _run_one_scan(strat: str, req: Dict[str, Any], dry: int = 0) -> None:
         orders = await _scan_bridge(strat, req, dry=dry)
         if isinstance(orders, list) and dry == 0:
             _append_orders(orders)
-    except Exception as e:
+    except Exception:
         log.error("StrategyBook.scan error", exc_info=True)
 
 async def _scheduler_loop():
@@ -558,7 +537,6 @@ async def _scheduler_loop():
     while not _scheduler_stop.is_set():
         log.info("Scheduler tick: running all strategies (dry=0)")
         req = {"timeframe": DEFAULT_TF, "limit": DEFAULT_LIMIT, "notional": DEFAULT_NOTIONAL, "symbols": DEFAULT_SYMBOLS}
-        # Run sequentially to avoid hammering API backends
         for strat in ("c1", "c2", "c3", "c4", "c5", "c6"):
             await _run_one_scan(strat, req, dry=0)
             await asyncio.sleep(1.0)
@@ -571,7 +549,6 @@ async def _scheduler_loop():
 async def on_startup():
     if AUTO_SCAN_ENABLED:
         log.info("Auto scheduler enabled (every %ss)", AUTO_SCAN_EVERY)
-        # Ensure only one loop
         global _scheduler_task
         _scheduler_stop.clear()
         _scheduler_task = asyncio.create_task(_scheduler_loop())
