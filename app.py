@@ -6,8 +6,9 @@ import sys
 import json
 import asyncio
 import logging
+import inspect
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Tuple, Union, AsyncGenerator, Generator
 
 from fastapi import FastAPI, HTTPException, Query, Response
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
@@ -15,7 +16,7 @@ from pydantic import BaseModel
 
 # ---------------------- App metadata ----------------------
 APP_NAME = "Crypto System Control Plane"
-APP_VERSION = "1.7.1"  # bumped
+APP_VERSION = "1.7.2"  # bumped
 
 # ---------------------- Logging ----------------------
 logging.basicConfig(
@@ -27,8 +28,7 @@ log = logging.getLogger("app")
 # ---------------------- Strategy imports (optional) ----------------------
 StrategyBook = None
 try:
-    # Your local module should define class StrategyBook with scan(strategy, contexts)
-    # or a staticmethod/classmethod scan(strategy, contexts)
+    # Should define StrategyBook with some .scan variant
     from strategies import StrategyBook as _SB  # type: ignore
     StrategyBook = _SB
     log.info("Loaded StrategyBook from strategies module.")
@@ -88,9 +88,52 @@ def _append_orders(orders: List[Dict[str, Any]]) -> None:
 
 # ---------------------- Scan Bridge ----------------------
 async def _maybe_await(x):
+    if inspect.isasyncgen(x):
+        # flatten async generator -> list
+        return [item async for item in x]  # type: ignore[misc]
     if asyncio.iscoroutine(x):
         return await x
+    if inspect.isgenerator(x):
+        return list(x)  # type: ignore[misc]
     return x
+
+
+def _normalize_orders(res: Any) -> List[Dict[str, Any]]:
+    """Coerce different return styles into List[Dict]."""
+    if res is None:
+        return []
+    # (orders, meta)
+    if isinstance(res, tuple) and res:
+        res = res[0]
+    # dict with 'orders'
+    if isinstance(res, dict):
+        if "orders" in res:
+            res = res["orders"]
+        else:
+            # single-order dict? wrap
+            return [res]
+    # list already
+    if isinstance(res, list):
+        # ensure dicts
+        return [x for x in res if isinstance(x, dict)]
+    return []
+
+
+def _contexts_for_all_shapes(tf: str, lim: int, notional: float, symbols: List[str], dry: int):
+    default_ctx = {
+        "timeframe": tf,
+        "limit": lim,
+        "notional": notional,
+        "symbols": symbols,
+        "dry": dry,
+    }
+    # different shapes some codebases expect
+    return {
+        "map": {"default": dict(default_ctx)},
+        "one": dict(default_ctx),
+        "list": [dict(default_ctx)],
+        "kwargs": dict(default_ctx),
+    }
 
 
 async def _scan_bridge(
@@ -99,96 +142,86 @@ async def _scan_bridge(
     dry: int = 0,
 ) -> List[Dict[str, Any]]:
     """
-    Align with StrategyBook.scan(strategy, contexts)
-    contexts: dict[str, dict] — allow multiple named contexts; we provide "default".
+    Universal adapter to whatever StrategyBook.scan expects.
+    Tries multiple signatures & context shapes. Never raises; returns [] on failure.
     """
     tf = req.get("timeframe", DEFAULT_TF)
     lim = int(req.get("limit", DEFAULT_LIMIT))
     notional = float(req.get("notional", DEFAULT_NOTIONAL))
     symbols = req.get("symbols", DEFAULT_SYMBOLS)
 
-    ctx_map = {
-        "default": {
-            "timeframe": tf,
-            "limit": lim,
-            "notional": notional,
-            "symbols": symbols,
-            "dry": dry,
-        }
-    }
+    ctx_variants = _contexts_for_all_shapes(tf, lim, notional, symbols, dry)
 
     if StrategyBook is None:
-        # No strategies available; return empty orders so the app stays live
         log.warning("StrategyBook missing; skipping scan for %s", strat)
         return []
 
+    attempts: List[Tuple[str, Any]] = []
+
+    # Collect call targets (classmethod/staticmethod vs instance)
+    callables: List[Tuple[str, Any]] = []
+    try:
+        callables.append(("class_scan", getattr(StrategyBook, "scan")))
+    except Exception as e:
+        log.debug("No class scan: %s", e)
+    try:
+        sb = StrategyBook()  # type: ignore[call-arg]
+        if hasattr(sb, "scan"):
+            callables.append(("inst_scan", getattr(sb, "scan")))
+    except Exception as e:
+        log.debug("No instance scan: %s", e)
+
+    # Build attempt matrix (ordered by most modern to most legacy)
+    for tag, fn in callables:
+        attempts.extend([
+            (f"{tag}(strategy, ctx_map)", (fn, (strat, ctx_variants["map"]), {})),
+            (f"{tag}(strategy, ctx_one)", (fn, (strat, ctx_variants["one"]), {})),
+            (f"{tag}(strategy, ctx_list)", (fn, (strat, ctx_variants["list"]), {})),
+            (f"{tag}(strategy, **kwargs)", (fn, (strat,), ctx_variants["kwargs"])),
+            (f"{tag}(ctx_map)", (fn, (ctx_variants["map"],), {})),
+            (f"{tag}(ctx_one)", (fn, (ctx_variants["one"],), {})),
+            (f"{tag}(ctx_list)", (fn, (ctx_variants["list"],), {})),
+            (f"{tag}(**kwargs)", (fn, (), ctx_variants["kwargs"])),
+            (f"{tag}(strategy)", (fn, (strat,), {})),
+            (f"{tag}()", (fn, (), {})),
+        ])
+
     last_error: Optional[Exception] = None
 
-    # 1) Class/staticmethod: StrategyBook.scan(strategy, contexts)
-    try:
-        res = StrategyBook.scan  # type: ignore[attr-defined]
-        orders = await _maybe_await(res(strat, ctx_map))
-        if isinstance(orders, list):
-            return orders
-        if isinstance(orders, dict) and "orders" in orders:
-            o = orders.get("orders")
-            return o if isinstance(o, list) else []
-    except Exception as e:
-        last_error = e
-        log.warning("scan variant #1 failed: %s", e)
+    for label, (fn, args, kwargs) in attempts:
+        try:
+            # If function has explicit signature, try to bind to avoid TypeErrors
+            try:
+                sig = inspect.signature(fn)  # type: ignore[arg-type]
+                # Try to bind; if fails, we'll still attempt the call (some callables are C funcs)
+                sig.bind_partial(*args, **kwargs)
+            except Exception:
+                pass
 
-    # 2) Instance method: StrategyBook().scan(strategy, contexts)
-    try:
-        sb = StrategyBook()  # type: ignore[call-arg]
-        if hasattr(sb, "scan"):
-            orders = await _maybe_await(sb.scan(strat, ctx_map))  # type: ignore[attr-defined]
+            raw = fn(*args, **kwargs)  # type: ignore[misc]
+            res = await _maybe_await(raw)
+            orders = _normalize_orders(res)
             if isinstance(orders, list):
                 return orders
-            if isinstance(orders, dict) and "orders" in orders:
-                o = orders.get("orders")
-                return o if isinstance(o, list) else []
-    except Exception as e:
-        last_error = e
-        log.warning("scan variant #2 failed: %s", e)
+        except Exception as e:
+            last_error = e
+            # Emit compact message to avoid spam but keep context for troubleshooting
+            msg = str(e)
+            # Trim very long messages
+            if len(msg) > 180:
+                msg = msg[:180] + "…"
+            log.warning("scan attempt failed (%s): %s", label, msg)
 
-    # 3) Older signature expects the default context only (classmethod)
-    try:
-        res = StrategyBook.scan  # type: ignore[attr-defined]
-        orders = await _maybe_await(res(strat, ctx_map["default"]))
-        if isinstance(orders, list):
-            return orders
-        if isinstance(orders, dict) and "orders" in orders:
-            o = orders.get("orders")
-            return o if isinstance(o, list) else []
-    except Exception as e:
-        last_error = e
-        log.warning("scan variant #3 failed: %s", e)
-
-    # 4) Older signature on instance
-    try:
-        sb = StrategyBook()  # type: ignore[call-arg]
-        if hasattr(sb, "scan"):
-            orders = await _maybe_await(sb.scan(strat, ctx_map["default"]))  # type: ignore[attr-defined]
-            if isinstance(orders, list):
-                return orders
-            if isinstance(orders, dict) and "orders" in orders:
-                o = orders.get("orders")
-                return o if isinstance(o, list) else []
-    except Exception as e:
-        last_error = e
-        log.warning("scan variant #4 failed: %s", e)
-
-    raise TypeError(
-        f"No compatible StrategyBook.scan signature (strategy, contexts). Last error: {last_error}"
+    log.error(
+        "All scan attempts failed for strategy '%s'. Returning empty list. Last error: %s",
+        strat,
+        last_error,
     )
+    return []
 
 
 async def _run_one_scan(strat: str, req: Dict[str, Any], dry: int) -> List[Dict[str, Any]]:
-    try:
-        orders = await _scan_bridge(strat, req, dry=dry)
-    except Exception as e:
-        log.error("StrategyBook.scan error: %s", e, exc_info=True)
-        raise
+    orders = await _scan_bridge(strat, req, dry=dry)
     return orders if isinstance(orders, list) else []
 
 
@@ -205,7 +238,8 @@ async def _scheduler_loop():
         try:
             orders = await _scan_bridge(strat, req, dry=dry_val)
         except Exception as e:
-            log.error("StrategyBook.scan error: %s", e, exc_info=True)
+            # _scan_bridge no longer raises, but keep guard just in case
+            log.error("StrategyBook.scan unexpected error: %s", e, exc_info=True)
             orders = []
         if isinstance(orders, list) and dry_val == 0:
             _append_orders(orders)
@@ -250,7 +284,7 @@ class Order(BaseModel):
 # ---------------------- Routes ----------------------
 @app.head("/", include_in_schema=False)
 async def head_root():
-    # Health checks (HEAD /) sometimes used by infra. Return 200 OK.
+    # Health checks (HEAD /). Return 200 OK.
     return Response(status_code=200)
 
 
