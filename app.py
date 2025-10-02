@@ -8,7 +8,7 @@ import asyncio
 import logging
 import inspect
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional, Tuple, Union, AsyncGenerator, Generator
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 from fastapi import FastAPI, HTTPException, Query, Response
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
@@ -16,7 +16,7 @@ from pydantic import BaseModel
 
 # ---------------------- App metadata ----------------------
 APP_NAME = "Crypto System Control Plane"
-APP_VERSION = "1.7.2"  # bumped
+APP_VERSION = "1.7.3"  # bumped
 
 # ---------------------- Logging ----------------------
 logging.basicConfig(
@@ -89,7 +89,6 @@ def _append_orders(orders: List[Dict[str, Any]]) -> None:
 # ---------------------- Scan Bridge ----------------------
 async def _maybe_await(x):
     if inspect.isasyncgen(x):
-        # flatten async generator -> list
         return [item async for item in x]  # type: ignore[misc]
     if asyncio.iscoroutine(x):
         return await x
@@ -102,37 +101,55 @@ def _normalize_orders(res: Any) -> List[Dict[str, Any]]:
     """Coerce different return styles into List[Dict]."""
     if res is None:
         return []
-    # (orders, meta)
     if isinstance(res, tuple) and res:
-        res = res[0]
-    # dict with 'orders'
+        res = res[0]  # (orders, meta)
     if isinstance(res, dict):
-        if "orders" in res:
+        if "orders" in res and isinstance(res["orders"], list):
             res = res["orders"]
         else:
-            # single-order dict? wrap
-            return [res]
-    # list already
+            return [res]  # single-order dict
     if isinstance(res, list):
-        # ensure dicts
         return [x for x in res if isinstance(x, dict)]
     return []
 
 
-def _contexts_for_all_shapes(tf: str, lim: int, notional: float, symbols: List[str], dry: int):
-    default_ctx = {
+def _build_req_and_contexts(base_req: Dict[str, Any], dry: int):
+    """Create a permissive 'req' and a few flavors of 'contexts' to satisfy different StrategyBooks."""
+    # permissive req (no exotic keys)
+    tf = base_req.get("timeframe", DEFAULT_TF)
+    lim = int(base_req.get("limit", DEFAULT_LIMIT))
+    notional = float(base_req.get("notional", DEFAULT_NOTIONAL))
+    symbols = base_req.get("symbols", DEFAULT_SYMBOLS)
+
+    # A compact 'req' that many codebases expect
+    req_compact = {
         "timeframe": tf,
         "limit": lim,
         "notional": notional,
         "symbols": symbols,
         "dry": dry,
     }
-    # different shapes some codebases expect
-    return {
-        "map": {"default": dict(default_ctx)},
-        "one": dict(default_ctx),
-        "list": [dict(default_ctx)],
-        "kwargs": dict(default_ctx),
+
+    # Some implementations index contexts['one'] (your logs show KeyError: 'one')
+    ctx = {
+        "timeframe": tf,
+        "limit": lim,
+        "notional": notional,
+        "symbols": symbols,
+        "dry": dry,
+    }
+
+    # Variants
+    ctx_map_one = {"one": dict(ctx)}
+    ctx_map_default = {"default": dict(ctx)}
+    ctx_map_both = {"one": dict(ctx), "default": dict(ctx)}
+    ctx_plain = dict(ctx)  # in case they expect a non-nested dict
+
+    return req_compact, {
+        "one": ctx_map_one,
+        "default": ctx_map_default,
+        "both": ctx_map_both,
+        "plain": ctx_plain,
     }
 
 
@@ -145,44 +162,51 @@ async def _scan_bridge(
     Universal adapter to whatever StrategyBook.scan expects.
     Tries multiple signatures & context shapes. Never raises; returns [] on failure.
     """
-    tf = req.get("timeframe", DEFAULT_TF)
-    lim = int(req.get("limit", DEFAULT_LIMIT))
-    notional = float(req.get("notional", DEFAULT_NOTIONAL))
-    symbols = req.get("symbols", DEFAULT_SYMBOLS)
-
-    ctx_variants = _contexts_for_all_shapes(tf, lim, notional, symbols, dry)
-
     if StrategyBook is None:
         log.warning("StrategyBook missing; skipping scan for %s", strat)
         return []
 
-    attempts: List[Tuple[str, Any]] = []
+    req_compact, ctxs = _build_req_and_contexts(req, dry)
 
-    # Collect call targets (classmethod/staticmethod vs instance)
+    # Collect callables (instance first, then class)
     callables: List[Tuple[str, Any]] = []
+    try:
+        inst = StrategyBook()  # type: ignore[call-arg]
+        if hasattr(inst, "scan"):
+            callables.append(("inst_scan", getattr(inst, "scan")))
+    except Exception as e:
+        log.debug("No instance StrategyBook(): %s", e)
     try:
         callables.append(("class_scan", getattr(StrategyBook, "scan")))
     except Exception as e:
-        log.debug("No class scan: %s", e)
-    try:
-        sb = StrategyBook()  # type: ignore[call-arg]
-        if hasattr(sb, "scan"):
-            callables.append(("inst_scan", getattr(sb, "scan")))
-    except Exception as e:
-        log.debug("No instance scan: %s", e)
+        log.debug("No class StrategyBook.scan: %s", e)
 
-    # Build attempt matrix (ordered by most modern to most legacy)
+    attempts: List[Tuple[str, Tuple[Any, tuple, dict]]] = []
+
+    # Based on your logs, the most promising shapes are:
+    #   scan(strategy, req, contexts)
+    #   scan(req, contexts)
+    #   scan(strategy, contexts)
+    # And 'contexts' wants a map with key 'one'
     for tag, fn in callables:
+        # Preferred: both keys available
         attempts.extend([
-            (f"{tag}(strategy, ctx_map)", (fn, (strat, ctx_variants["map"]), {})),
-            (f"{tag}(strategy, ctx_one)", (fn, (strat, ctx_variants["one"]), {})),
-            (f"{tag}(strategy, ctx_list)", (fn, (strat, ctx_variants["list"]), {})),
-            (f"{tag}(strategy, **kwargs)", (fn, (strat,), ctx_variants["kwargs"])),
-            (f"{tag}(ctx_map)", (fn, (ctx_variants["map"],), {})),
-            (f"{tag}(ctx_one)", (fn, (ctx_variants["one"],), {})),
-            (f"{tag}(ctx_list)", (fn, (ctx_variants["list"],), {})),
-            (f"{tag}(**kwargs)", (fn, (), ctx_variants["kwargs"])),
+            (f"{tag}(strategy, req, ctx_both)", (fn, (strat, req_compact, ctxs["both"]), {})),
+            (f"{tag}(strategy, req, ctx_one)", (fn, (strat, req_compact, ctxs["one"]), {})),
+            (f"{tag}(req, ctx_both)", (fn, (req_compact, ctxs["both"]), {})),
+            (f"{tag}(req, ctx_one)", (fn, (req_compact, ctxs["one"]), {})),
+            (f"{tag}(strategy, ctx_both)", (fn, (strat, ctxs["both"]), {})),
+            (f"{tag}(strategy, ctx_one)", (fn, (strat, ctxs["one"]), {})),
+            # Fallbacks for code that uses a plain dict for contexts, or wants default-only:
+            (f"{tag}(strategy, req, ctx_default)", (fn, (strat, req_compact, ctxs["default"]), {})),
+            (f"{tag}(req, ctx_default)", (fn, (req_compact, ctxs["default"]), {})),
+            (f"{tag}(strategy, ctx_default)", (fn, (strat, ctxs["default"]), {})),
+            (f"{tag}(strategy, req, ctx_plain)", (fn, (strat, req_compact, ctxs["plain"]), {})),
+            (f"{tag}(req, ctx_plain)", (fn, (req_compact, ctxs["plain"]), {})),
+            (f"{tag}(strategy, ctx_plain)", (fn, (strat, ctxs["plain"]), {})),
+            # Very old shapes:
             (f"{tag}(strategy)", (fn, (strat,), {})),
+            (f"{tag}(req)", (fn, (req_compact,), {})),
             (f"{tag}()", (fn, (), {})),
         ])
 
@@ -190,14 +214,7 @@ async def _scan_bridge(
 
     for label, (fn, args, kwargs) in attempts:
         try:
-            # If function has explicit signature, try to bind to avoid TypeErrors
-            try:
-                sig = inspect.signature(fn)  # type: ignore[arg-type]
-                # Try to bind; if fails, we'll still attempt the call (some callables are C funcs)
-                sig.bind_partial(*args, **kwargs)
-            except Exception:
-                pass
-
+            # Attempt to call; do not try kwargs with 'timeframe' etc (your logs show kwarg rejection)
             raw = fn(*args, **kwargs)  # type: ignore[misc]
             res = await _maybe_await(raw)
             orders = _normalize_orders(res)
@@ -205,9 +222,7 @@ async def _scan_bridge(
                 return orders
         except Exception as e:
             last_error = e
-            # Emit compact message to avoid spam but keep context for troubleshooting
             msg = str(e)
-            # Trim very long messages
             if len(msg) > 180:
                 msg = msg[:180] + "…"
             log.warning("scan attempt failed (%s): %s", label, msg)
@@ -238,7 +253,6 @@ async def _scheduler_loop():
         try:
             orders = await _scan_bridge(strat, req, dry=dry_val)
         except Exception as e:
-            # _scan_bridge no longer raises, but keep guard just in case
             log.error("StrategyBook.scan unexpected error: %s", e, exc_info=True)
             orders = []
         if isinstance(orders, list) and dry_val == 0:
@@ -249,7 +263,6 @@ async def _scheduler_loop():
 app = FastAPI(title=APP_NAME, version=APP_VERSION)
 
 
-# Startup: keep decorator for compatibility; guard scheduler when StrategyBook is missing.
 @app.on_event("startup")
 async def _on_startup():
     log.info("Application startup complete.")
@@ -726,7 +739,6 @@ if __name__ == "__main__":
     log.info("Starting %s v%s on %s:%d", APP_NAME, APP_VERSION, host, port)
     try:
         import uvicorn  # type: ignore
-
         uvicorn.run(
             "app:app",
             host=host,
