@@ -6,7 +6,257 @@ import json
 import time
 import math
 import threading
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta, timezone#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+import asyncio
+import json
+import logging
+import os
+import time
+from datetime import datetime, timezone, timedelta
+from typing import Any, Dict, List, Optional
+
+from fastapi import FastAPI, Query
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
+
+# -----------------------------------------------------------------------------
+# Logging
+# -----------------------------------------------------------------------------
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+logging.basicConfig(
+    level=LOG_LEVEL,
+    format="%(asctime)s %(levelname)s:%(name)s:%(message)s",
+)
+log = logging.getLogger("app")
+
+# -----------------------------------------------------------------------------
+# Config
+# -----------------------------------------------------------------------------
+SCHEDULE_SECONDS = int(os.getenv("SCHEDULE_SECONDS", "60"))
+DEFAULT_LIMIT = int(os.getenv("DEFAULT_LIMIT", "100"))
+DEFAULT_TIMEFRAME = os.getenv("DEFAULT_TIMEFRAME", "1h")
+DEFAULT_NOTIONAL = float(os.getenv("DEFAULT_NOTIONAL", "0"))
+DEFAULT_SYMBOLS = os.getenv("DEFAULT_SYMBOLS", "")  # comma list
+STRATEGIES = ["c1", "c2", "c3", "c4", "c5", "c6"]
+
+# -----------------------------------------------------------------------------
+# StrategyBook import + fallback
+# -----------------------------------------------------------------------------
+_real_SB = None
+try:
+    from strategy_book import StrategyBook as _ImportedStrategyBook  # type: ignore
+    _real_SB = _ImportedStrategyBook
+except Exception as e:
+    log.warning("Could not import StrategyBook from strategy_book: %s", e)
+
+class _FallbackStrategyBook:
+    def scan(self, req: Dict[str, Any], contexts: Dict[str, Any]):
+        return []
+
+class StrategyBook:
+    def __init__(self):
+        self._impl = _real_SB() if _real_SB else _FallbackStrategyBook()
+    def scan(self, req: Dict[str, Any], contexts: Dict[str, Any]):
+        try:
+            return self._impl.scan(req, contexts)
+        except Exception as e:
+            log.warning("StrategyBook.scan failed: %s", e)
+            return []
+
+# -----------------------------------------------------------------------------
+# App + in-memory data
+# -----------------------------------------------------------------------------
+app = FastAPI(title="Crypto System")
+
+_orders_ring: List[Dict[str, Any]] = []
+_MAX_ORDERS = 1000
+
+_pnl_summary = {
+    "equity": 0.0,
+    "pnl_day": 0.0,
+    "pnl_week": 0.0,
+    "pnl_month": 0.0,
+    "updated_at": datetime.now(timezone.utc).isoformat(),
+}
+_attribution = {
+    "by_strategy": {s: 0.0 for s in STRATEGIES},
+    "updated_at": datetime.now(timezone.utc).isoformat(),
+}
+
+def _push_orders(new_orders: List[Dict[str, Any]]):
+    if not new_orders:
+        return
+    for o in new_orders:
+        o.setdefault("ts", time.time())
+        _orders_ring.append(o)
+    if len(_orders_ring) > _MAX_ORDERS:
+        del _orders_ring[: len(_orders_ring) - _MAX_ORDERS]
+
+def _touch_metrics(orders: List[Dict[str, Any]], strategy: str):
+    if not orders:
+        return
+    pnl_bump = sum(float(o.get("pnl", 0.0)) for o in orders)
+    _pnl_summary["pnl_day"] += pnl_bump
+    _pnl_summary["equity"] += pnl_bump
+    _pnl_summary["updated_at"] = datetime.now(timezone.utc).isoformat()
+    _attribution["by_strategy"][strategy] = _attribution["by_strategy"].get(strategy, 0.0) + pnl_bump
+    _attribution["updated_at"] = datetime.now(timezone.utc).isoformat()
+
+# -----------------------------------------------------------------------------
+# Scan bridge (unchanged core)
+# -----------------------------------------------------------------------------
+async def _scan_bridge(strat: str, req: Dict[str, Any], dry: bool = False):
+    tf = req.get("timeframe") or DEFAULT_TIMEFRAME
+    lim = int(req.get("limit") or DEFAULT_LIMIT)
+    notional = req.get("notional") or DEFAULT_NOTIONAL
+    symbols = req.get("symbols") or [s.strip() for s in DEFAULT_SYMBOLS.split(",") if s.strip()]
+
+    ctx_map = {"one": {"timeframe": tf, "symbols": symbols, "notional": notional},
+               "default": {"timeframe": tf, "symbols": symbols, "notional": notional}}
+
+    compact_req = {
+        "strategy": strat,
+        "timeframe": tf,
+        "limit": lim,
+        "notional": notional,
+        "symbols": symbols,
+        "dry": dry,
+        "one": ctx_map["one"],
+        "default": ctx_map["default"],
+        "contexts": ctx_map,
+        "raw": req,
+    }
+    inst = StrategyBook()
+    result: Any = inst.scan(compact_req, ctx_map)
+    if not result: return []
+    if isinstance(result, list): return result
+    if isinstance(result, dict): return [result]
+    return [result]
+
+# -----------------------------------------------------------------------------
+# Scheduler
+# -----------------------------------------------------------------------------
+_scheduler_task: Optional[asyncio.Task] = None
+_scheduler_running = False
+async def _scheduler_loop():
+    global _scheduler_running
+    _scheduler_running = True
+    try:
+        while _scheduler_running:
+            log.info("Scheduler tick: running all strategies (dry=0)")
+            for strat in STRATEGIES:
+                req = {"timeframe": DEFAULT_TIMEFRAME,
+                       "symbols": [s.strip() for s in DEFAULT_SYMBOLS.split(",") if s.strip()],
+                       "limit": DEFAULT_LIMIT,
+                       "notional": DEFAULT_NOTIONAL}
+                try:
+                    orders = await _scan_bridge(strat, req, dry=False)
+                except Exception as e:
+                    log.error("scan bridge failed for '%s': %s", strat, e)
+                    orders = []
+                if orders:
+                    _push_orders(orders)
+                    _touch_metrics(orders, strat)
+            await asyncio.sleep(SCHEDULE_SECONDS)
+    finally:
+        log.info("Scheduler stopped.")
+
+@app.on_event("startup")
+async def _startup():
+    global _scheduler_task
+    log.info("Starting app; scheduler will start.")
+    _scheduler_task = asyncio.create_task(_scheduler_loop())
+
+@app.on_event("shutdown")
+async def _shutdown():
+    global _scheduler_running, _scheduler_task
+    log.info("Shutting down app; scheduler will stop.")
+    _scheduler_running = False
+    try:
+        if _scheduler_task:
+            await asyncio.wait_for(_scheduler_task, timeout=5.0)
+    except Exception:
+        pass
+
+# -----------------------------------------------------------------------------
+# Extra: Performance endpoint
+# -----------------------------------------------------------------------------
+@app.get("/orders/performance", response_class=JSONResponse)
+async def orders_performance(hours: int = Query(4, ge=1, le=48)):
+    cutoff = time.time() - hours * 3600
+    recent = [o for o in _orders_ring if o.get("ts", 0) >= cutoff]
+    perf: Dict[str, Dict[str, Any]] = {}
+    for s in STRATEGIES:
+        trades = [o for o in recent if o.get("strategy") == s]
+        wins = sum(1 for o in trades if float(o.get("pnl", 0)) > 0)
+        losses = sum(1 for o in trades if float(o.get("pnl", 0)) < 0)
+        net = sum(float(o.get("pnl", 0)) for o in trades)
+        perf[s] = {"wins": wins, "losses": losses, "net": net}
+    return JSONResponse({"since": cutoff, "performance": perf, "count": len(recent)})
+
+# -----------------------------------------------------------------------------
+# HTML Dashboard
+# -----------------------------------------------------------------------------
+_DASHBOARD_HTML = """<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Crypto System Dashboard</title>
+  <style>/* (same CSS as before, omitted here for brevity) */</style>
+  <script>
+    async function loadSummary(){ const d=await (await fetch('/pnl/summary')).json();
+      document.getElementById('eq').textContent=Number(d.equity||0).toFixed(2);
+      document.getElementById('pnl_day').textContent=Number(d.pnl_day||0).toFixed(2);}
+    async function loadAttribution(){ const d=await (await fetch('/orders/attribution')).json();
+      const tbody=document.getElementById('attr_body'); tbody.innerHTML='';
+      for(const[k,v] of Object.entries(d.by_strategy)){tbody.innerHTML+=`<tr><td>${k}</td><td>${Number(v).toFixed(2)}</td></tr>`;}}
+    async function loadOrders(){ const d=await (await fetch('/orders/recent?limit=50')).json();
+      const tbody=document.getElementById('orders_body'); tbody.innerHTML='';
+      (d.orders||[]).forEach(o=>{tbody.innerHTML+=`<tr><td>${o.strategy||''}</td><td>${o.symbol||''}</td><td>${o.side||''}</td><td>${o.qty||''}</td><td>${o.px||''}</td><td>${o.pnl||0}</td></tr>`;});}
+    async function loadPerf(){ const d=await (await fetch('/orders/performance?hours=4')).json();
+      const tbody=document.getElementById('perf_body'); tbody.innerHTML='';
+      for(const[k,v] of Object.entries(d.performance)){tbody.innerHTML+=`<tr><td>${k}</td><td>${v.wins}</td><td>${v.losses}</td><td>${Number(v.net).toFixed(2)}</td></tr>`;}}
+    async function refreshAll(){await Promise.all([loadSummary(),loadAttribution(),loadOrders(),loadPerf()]);}
+    setInterval(refreshAll,15000); window.addEventListener('load',refreshAll);
+  </script>
+</head>
+<body>
+  <main>
+    <h2>P&L Summary</h2><div id="eq"></div><div id="pnl_day"></div>
+    <h2>Attribution</h2><table><tbody id="attr_body"></tbody></table>
+    <h2>Recent Orders</h2><table><tbody id="orders_body"></tbody></table>
+    <h2>Strategy Performance (Last 4h)</h2>
+    <table><thead><tr><th>Strategy</th><th>Wins</th><th>Losses</th><th>Net P&L</th></tr></thead><tbody id="perf_body"></tbody></table>
+  </main>
+</body></html>"""
+
+# -----------------------------------------------------------------------------
+# Routes
+# -----------------------------------------------------------------------------
+@app.get("/", response_class=RedirectResponse)
+async def root(): return RedirectResponse("/dashboard", status_code=307)
+@app.get("/dashboard", response_class=HTMLResponse)
+async def dashboard(): return HTMLResponse(content=_DASHBOARD_HTML)
+@app.get("/pnl/summary", response_class=JSONResponse)
+async def pnl_summary(): return JSONResponse(_pnl_summary)
+@app.get("/orders/recent", response_class=JSONResponse)
+async def orders_recent(limit:int=Query(DEFAULT_LIMIT,ge=1,le=1000)):
+    items=list(reversed(_orders_ring[-limit:])); return JSONResponse({"orders":items,"count":len(items)})
+@app.get("/orders/attribution", response_class=JSONResponse)
+async def orders_attribution(): return JSONResponse(_attribution)
+@app.get("/healthz", response_class=JSONResponse)
+async def healthz(): return JSONResponse({"ok":True,"ts":time.time()})
+
+# -----------------------------------------------------------------------------
+# Entrypoint
+# -----------------------------------------------------------------------------
+if __name__=="__main__":
+    import uvicorn
+    port=int(os.getenv("PORT","10000"))
+    log.info("Launching Uvicorn on 0.0.0.0:%d",port)
+    uvicorn.run("app:app",host="0.0.0.0",port=port,reload=False,access_log=True)
+
 from typing import Dict, Any, List, Optional
 
 from fastapi import FastAPI, Query
