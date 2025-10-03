@@ -13,7 +13,7 @@ from fastapi import FastAPI, Query
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 
 # --------------------------------------------------------------------------------------
-# Optional strategy book import (kept graceful like before)
+# Optional strategy book import (kept graceful)
 # --------------------------------------------------------------------------------------
 StrategyBook = None
 try:
@@ -78,6 +78,7 @@ def now_utc() -> datetime:
     return datetime.now(timezone.utc)
 
 def iso(dt: datetime) -> str:
+    # Always RFC3339-ish with Z for UTC
     return dt.isoformat().replace("+00:00", "Z")
 
 def parse_iso(ts: str) -> datetime:
@@ -185,6 +186,44 @@ def _contexts_as_list(ctx_by_name: Dict[str, Any]) -> List[Dict[str, Any]]:
         out.append(d)
     return out
 
+def _try_scan(book, strat: str, req: Dict[str, Any], ctx_by_name: Dict[str, Any], ctx_list: List[Dict[str, Any]]):
+    """
+    Try multiple StrategyBook.scan signatures until one works.
+    Return a list of intents or [].
+    """
+    attempts = [
+        ("scan(req, ctx_list)",           lambda: book.scan(req, ctx_list)),
+        ("scan(req, ctx_by_name)",        lambda: book.scan(req, ctx_by_name)),
+        ("scan(strat, req, ctx_list)",    lambda: book.scan(strat, req, ctx_list)),
+        ("scan(strat, req, ctx_by_name)", lambda: book.scan(strat, req, ctx_by_name)),
+        ("scan(strat, ctx_list)",         lambda: book.scan(strat, ctx_list)),
+        ("scan(strat, ctx_by_name)",      lambda: book.scan(strat, ctx_by_name)),
+    ]
+    last_err = None
+    for label, fn in attempts:
+        try:
+            res = fn()
+            # Normalize: must be list-like
+            if res is None:
+                return []
+            if isinstance(res, dict):
+                # some books return {'intents': [...]}
+                if "intents" in res and isinstance(res["intents"], list):
+                    return res["intents"]
+                # or a single intent dict
+                return [res]
+            if not isinstance(res, list):
+                # single non-dict item? wrap
+                return [res]
+            return res
+        except Exception as e:
+            last_err = (label, e)
+            continue
+    if last_err:
+        label, e = last_err
+        print(f"{iso(now_utc())} WARNING:app:scan attempts exhausted; last='{label}' error: {e}")
+    return []
+
 def run_all_strategies_once(dry: bool = True) -> None:
     started = now_utc()
     print(f"{iso(started)} INFO:app:Scheduler tick: running all strategies (dry={1 if dry else 0})")
@@ -216,26 +255,22 @@ def run_all_strategies_once(dry: bool = True) -> None:
                 "notional": notional,
                 "symbols": symbols,
                 "dry": dry,
-
-                # keep both forms available to downstream code
+                # Provide both forms so downstream code can choose
                 "contexts": ctx_by_name,        # by-name dict
-                "contexts_list": ctx_list,      # iterable list (new)
+                "contexts_list": ctx_list,      # iterable list
                 "one": ctx_by_name.get("one"),
                 "default": ctx_by_name.get("default"),
             }
 
-            # Try preferred signature: scan(req, contexts_list)
-            intents = None
-            try:
-                intents = book.scan(req, ctx_list)  # type: ignore
-            except TypeError:
-                # Fallback to legacy signature: scan(req, contexts_by_name)
-                intents = book.scan(req, ctx_by_name)  # type: ignore
-
+            intents = _try_scan(book, strat, req, ctx_by_name, ctx_list)
             if not intents:
                 continue
 
             for intent in intents:
+                # normalize to a dict
+                intent = intent or {}
+                if not isinstance(intent, dict):
+                    intent = {"_value": intent}
                 o = {
                     "id": intent.get("id") or f"{strat}-{int(time.time()*1000)}",
                     "strategy": strat,
@@ -248,11 +283,14 @@ def run_all_strategies_once(dry: bool = True) -> None:
                     "meta": intent,
                 }
                 if "pnl" in intent:
-                    o["pnl"] = float(intent["pnl"])
+                    try:
+                        o["pnl"] = float(intent["pnl"])
+                    except Exception:
+                        pass
                 ORDERS.add_order(o)
 
         except Exception as e:
-            print(f"{iso(now_utc())} WARNING:app:scan attempt failed (inst.scan(req, contexts)): {e}")
+            print(f"{iso(now_utc())} WARNING:app:scan attempt failed (inst.scan(...)): {e}")
             print(f"{iso(now_utc())} ERROR:app:All scan attempts failed for strategy '{strat}'. Returning empty list. Last error: {e}")
 
 def scheduler_loop():
@@ -317,7 +355,7 @@ async def evaluate_orders(body: Dict[str, Any]):
     return JSONResponse({"ok": True, "ingested": count})
 
 # --------------------------------------------------------------------------------------
-# Dashboard HTML (full page, as before, with Last 4 Hours section)
+# Dashboard HTML (full page with 4h performance)
 # --------------------------------------------------------------------------------------
 
 DASHBOARD_HTML = """
@@ -482,7 +520,6 @@ const fmtPNL = (v) => {
   return `<span class="${cls}">${sign}${n.toFixed(2)}</span>`;
 };
 const pct = (x) => isFinite(x) ? (x*100).toFixed(1) + '%' : '—';
-const right = (v) => `<span style="float:right">${v}</span>`;
 
 async function fetchJSON(url) {
   const r = await fetch(url, {cache:'no-store'});
@@ -514,7 +551,7 @@ async function refresh() {
     const agg = perf4h._ALL || {};
     document.getElementById('kpi4h').innerHTML = fmtPNL(agg.total_pnl || 0);
     document.getElementById('kpi4hTrades').textContent =
-      `${agg.trades||0} trades (${agg.wins||0} wins / ${agg.losses||0} losses)`;
+      `${(agg.trades||0)} trades (${agg.wins||0} wins / ${agg.losses||0} losses)`;
 
     const attribBody = document.querySelector('#tblAttrib tbody');
     attribBody.innerHTML = '';
