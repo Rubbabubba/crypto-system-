@@ -7,6 +7,7 @@ import logging
 import os
 import time
 from datetime import datetime, timezone
+from statistics import mean
 from typing import Any, Dict, List, Optional, Tuple
 
 from fastapi import FastAPI, Query
@@ -30,6 +31,7 @@ DEFAULT_LIMIT = int(os.getenv("DEFAULT_LIMIT", "100"))
 DEFAULT_TIMEFRAME = os.getenv("DEFAULT_TIMEFRAME", "1h")
 DEFAULT_NOTIONAL = float(os.getenv("DEFAULT_NOTIONAL", "0"))
 DEFAULT_SYMBOLS = os.getenv("DEFAULT_SYMBOLS", "")  # comma list
+DEFAULT_WINDOW_HOURS = float(os.getenv("DEFAULT_WINDOW_HOURS", "4"))
 
 # Strategies to iterate on each tick (match your logs)
 STRATEGIES = ["c1", "c2", "c3", "c4", "c5", "c6"]
@@ -145,12 +147,12 @@ _pnl_summary = {
     "pnl_day": 0.0,
     "pnl_week": 0.0,
     "pnl_month": 0.0,
-    "updated_at": datetime.now(timezone.utc).isoformat(),
+    "updated_at": datetime.now(timezone.utc).toisoformat(),
 }
 
 _attribution = {
     "by_strategy": {s: 0.0 for s in STRATEGIES},
-    "updated_at": datetime.now(timezone.utc).isoformat(),
+    "updated_at": datetime.now(timezone.utc).toisoformat(),
 }
 
 def _push_orders(new_orders: List[Dict[str, Any]]):
@@ -168,10 +170,10 @@ def _touch_metrics(orders: List[Dict[str, Any]], strategy: str):
     pnl_bump = sum(float(o.get("pnl", 0.0)) for o in orders)
     _pnl_summary["pnl_day"] += pnl_bump
     _pnl_summary["equity"] += pnl_bump
-    _pnl_summary["updated_at"] = datetime.now(timezone.utc).isoformat()
+    _pnl_summary["updated_at"] = datetime.now(timezone.utc).toisoformat()
 
     _attribution["by_strategy"][strategy] = _attribution["by_strategy"].get(strategy, 0.0) + pnl_bump
-    _attribution["updated_at"] = datetime.now(timezone.utc).isoformat()
+    _attribution["updated_at"] = datetime.now(timezone.utc).toisoformat()
 
 # -----------------------------------------------------------------------------
 # Contexts
@@ -332,6 +334,9 @@ async def _scheduler_loop():
                     orders = []
 
                 if orders:
+                    # Stamp strategy name if not present
+                    for o in orders:
+                        o.setdefault("strategy", strat)
                     _push_orders(orders)
                     _touch_metrics(orders, strat)
             await asyncio.sleep(SCHEDULE_SECONDS)
@@ -359,7 +364,22 @@ async def _shutdown():
         pass
 
 # -----------------------------------------------------------------------------
-# HTML (full inline page)
+# Helpers for windowed analysis
+# -----------------------------------------------------------------------------
+def _filter_window_orders(window_seconds: float) -> Tuple[List[Dict[str, Any]], float, float]:
+    now = time.time()
+    start = now - window_seconds
+    items = [o for o in _orders_ring if float(o.get("ts", 0)) >= start]
+    return items, start, now
+
+def _safe_float(x: Any, default: float = 0.0) -> float:
+    try:
+        return float(x)
+    except Exception:
+        return default
+
+# -----------------------------------------------------------------------------
+# HTML (full inline page) — restored and extended
 # -----------------------------------------------------------------------------
 _DASHBOARD_HTML = """
 <!doctype html>
@@ -379,6 +399,7 @@ _DASHBOARD_HTML = """
       --red:#ff6b6b;
       --chip:#1a2336;
       --chip-br:#26324a;
+      --amber:#ffb86b;
     }
     *{box-sizing:border-box}
     body{
@@ -399,7 +420,7 @@ _DASHBOARD_HTML = """
       color:var(--muted);
       padding:4px 8px;border-radius:999px;
     }
-    main{padding:24px;max-width:1200px;margin:0 auto}
+    main{padding:24px;max-width:1400px;margin:0 auto}
     .grid{
       display:grid;
       grid-template-columns: repeat(12, 1fr);
@@ -412,6 +433,7 @@ _DASHBOARD_HTML = """
       padding:16px;
       box-shadow: 0 10px 24px rgba(0,0,0,.2);
     }
+    .span-3{grid-column: span 3}
     .span-4{grid-column: span 4}
     .span-6{grid-column: span 6}
     .span-8{grid-column: span 8}
@@ -422,6 +444,7 @@ _DASHBOARD_HTML = """
     .kpi{font-size:28px;font-weight:700}
     .good{color:var(--accent)}
     .bad{color:var(--red)}
+    .warn{color:var(--amber)}
     table{width:100%;border-collapse:collapse;font-size:14px}
     th,td{padding:8px;border-bottom:1px solid #1a2740;text-align:left}
     th{color:#9db0c9;font-weight:600}
@@ -431,26 +454,43 @@ _DASHBOARD_HTML = """
       border:1px solid var(--chip-br);
       padding:6px 10px;border-radius:999px;font-size:12px;color:#c7d2e3;
     }
-    a.btn{
+    a.btn, button.btn{
       display:inline-block;padding:8px 12px;border-radius:10px;text-decoration:none;
       background:var(--accent2);color:#0b1220;font-weight:700;border:1px solid #2a3f6b;
+      cursor:pointer;
+    }
+    select, input[type=number]{
+      background:#0d1628;border:1px solid #1a2740;color:var(--ink);
+      border-radius:8px;padding:6px 8px;min-width:80px;
     }
     footer{padding:28px;color:var(--muted);text-align:center}
-    @media (max-width: 900px){
-      .span-4,.span-6,.span-8{grid-column: span 12}
+    @media (max-width: 1100px){
+      .span-3,.span-4,.span-6,.span-8{grid-column: span 12}
     }
     code{
       background:#0d1628;border:1px solid #1a2740;padding:2px 6px;border-radius:6px
     }
+    .pill{
+      padding:3px 8px;border-radius:999px;font-size:12px;border:1px solid #1a2740;
+      display:inline-block
+    }
+    .pill.win{background:rgba(93,212,163,.1);border-color:#275b48;color:var(--accent)}
+    .pill.loss{background:rgba(255,107,107,.08);border-color:#5b2736;color:var(--red)}
+    .pill.draw{background:rgba(255,184,107,.08);border-color:#5b4a27;color:var(--amber)}
   </style>
   <script>
+    let windowHours = {DEFAULT_WINDOW_HOURS};
+
+    function money(x){ return Number(x||0).toFixed(2) }
+    function pct(x){ return (Number(x||0)*100).toFixed(1)+'%' }
+
     async function loadSummary(){
       const r = await fetch('/pnl/summary');
       const d = await r.json();
-      document.getElementById('eq').textContent = Number(d.equity || 0).toFixed(2);
-      document.getElementById('pnl_day').textContent = Number(d.pnl_day || 0).toFixed(2);
-      document.getElementById('pnl_week').textContent = Number(d.pnl_week || 0).toFixed(2);
-      document.getElementById('pnl_month').textContent = Number(d.pnl_month || 0).toFixed(2);
+      document.getElementById('eq').textContent = money(d.equity);
+      document.getElementById('pnl_day').textContent = money(d.pnl_day);
+      document.getElementById('pnl_week').textContent = money(d.pnl_week);
+      document.getElementById('pnl_month').textContent = money(d.pnl_month);
       document.getElementById('updated').textContent = d.updated_at ? new Date(d.updated_at).toLocaleString() : '-';
     }
     async function loadAttribution(){
@@ -461,7 +501,7 @@ _DASHBOARD_HTML = """
       if (d.by_strategy){
         for (const [k,v] of Object.entries(d.by_strategy)){
           const tr = document.createElement('tr');
-          tr.innerHTML = `<td>${k}</td><td>${Number(v).toFixed(2)}</td>`;
+          tr.innerHTML = `<td>${k}</td><td>${money(v)}</td>`;
           tbody.appendChild(tr);
         }
       }
@@ -481,15 +521,85 @@ _DASHBOARD_HTML = """
           <td>${o.qty ?? ''}</td>
           <td>${o.px ?? ''}</td>
           <td>${o.strategy ?? ''}</td>
-          <td>${o.pnl ?? 0}</td>
+          <td>${money(o.pnl)}</td>
           <td>${o.ts ? new Date(o.ts*1000).toLocaleString() : ''}</td>
         `;
         tbody.appendChild(tr);
       });
     }
-    async function refreshAll(){
-      await Promise.all([loadSummary(), loadAttribution(), loadOrders()]);
+
+    async function loadScoreboard(){
+      const r = await fetch('/orders/scoreboard?window_hours='+windowHours);
+      const d = await r.json();
+      document.getElementById('win_window_from').textContent = new Date(d.from_ts*1000).toLocaleString();
+      document.getElementById('win_window_to').textContent = new Date(d.to_ts*1000).toLocaleString();
+
+      const tbody = document.getElementById('score_body');
+      tbody.innerHTML = '';
+      (d.strategies || []).forEach(s => {
+        const cls = s.gross_pnl >= 0 ? 'good' : 'bad';
+        const tr = document.createElement('tr');
+        tr.innerHTML = `
+          <td>${s.strategy}</td>
+          <td>${s.trades}</td>
+          <td>${s.wins}</td>
+          <td>${s.losses}</td>
+          <td>${pct(s.win_rate)}</td>
+          <td class="${cls}">${money(s.gross_pnl)}</td>
+          <td>${money(s.avg_pnl)}</td>
+          <td>${s.last_trade_ts ? new Date(s.last_trade_ts*1000).toLocaleTimeString() : '-'}</td>
+        `;
+        tbody.appendChild(tr);
+      });
     }
+
+    async function loadWindowTrades(){
+      const r = await fetch('/orders/window?window_hours='+windowHours);
+      const d = await r.json();
+      const tbody = document.getElementById('win_trades_body');
+      tbody.innerHTML = '';
+      (d.orders || []).forEach(o => {
+        const pnl = Number(o.pnl || 0);
+        const tag = pnl > 0 ? 'win' : (pnl < 0 ? 'loss' : 'draw');
+        const tr = document.createElement('tr');
+        tr.innerHTML = `
+          <td>${o.ts ? new Date(o.ts*1000).toLocaleTimeString() : ''}</td>
+          <td>${o.id ?? ''}</td>
+          <td>${o.symbol ?? ''}</td>
+          <td>${o.side ?? ''}</td>
+          <td>${o.qty ?? ''}</td>
+          <td>${o.px ?? ''}</td>
+          <td>${o.strategy ?? ''}</td>
+          <td>${money(o.pnl)}</td>
+          <td><span class="pill ${tag}">${tag.toUpperCase()}</span></td>
+        `;
+        tbody.appendChild(tr);
+      });
+      document.getElementById('win_trades_count').textContent = d.count ?? 0;
+    }
+
+    async function loadInsights(){
+      const r = await fetch('/orders/insights?window_hours='+windowHours);
+      const d = await r.json();
+      const ul = document.getElementById('insights_list');
+      ul.innerHTML = '';
+      (d.insights || []).forEach(x => {
+        const li = document.createElement('li');
+        li.innerHTML = `<strong>${x.strategy}:</strong> ${x.message}`;
+        ul.appendChild(li);
+      });
+      document.getElementById('insights_updated').textContent = new Date().toLocaleTimeString();
+    }
+
+    async function refreshAll(){
+      await Promise.all([loadSummary(), loadAttribution(), loadOrders(), loadScoreboard(), loadWindowTrades(), loadInsights()]);
+    }
+
+    function onWindowChange(sel){
+      const v = Number(sel.value);
+      if (!isNaN(v) && v > 0){ windowHours = v; refreshAll(); }
+    }
+
     setInterval(refreshAll, 15000);
     window.addEventListener('load', refreshAll);
   </script>
@@ -502,40 +612,51 @@ _DASHBOARD_HTML = """
     <div style="margin-left:auto" class="chips">
       <span class="chip">TF: <code id="tf_chip">auto</code></span>
       <span class="chip">Tick: <code>{SCHEDULE_SECONDS}s</code></span>
+      <span class="chip">Window:
+        <select onchange="onWindowChange(this)">
+          <option value="1">1h</option>
+          <option value="2">2h</option>
+          <option value="4" selected>4h</option>
+          <option value="8">8h</option>
+          <option value="24">24h</option>
+        </select>
+      </span>
     </div>
   </header>
 
   <main>
     <div class="grid">
+      <!-- Summary -->
       <section class="card span-8">
         <div class="row" style="margin-bottom:8px">
           <h2 style="margin:0;font-size:16px">P&L Summary</h2>
-          <a class="btn" href="#" onclick="refreshAll();return false;">Refresh</a>
+          <button class="btn" onclick="refreshAll()">Refresh</button>
         </div>
         <div class="grid" style="grid-template-columns:repeat(12,1fr);gap:12px">
-          <div class="span-4">
+          <div class="span-3">
             <div class="muted">Equity</div>
             <div class="kpi" id="eq">0.00</div>
           </div>
-          <div class="span-4">
+          <div class="span-3">
             <div class="muted">PnL (Day)</div>
             <div class="kpi good" id="pnl_day">0.00</div>
           </div>
-          <div class="span-4">
+          <div class="span-3">
             <div class="muted">PnL (Week)</div>
             <div class="kpi" id="pnl_week">0.00</div>
           </div>
-          <div class="span-4">
+          <div class="span-3">
             <div class="muted">PnL (Month)</div>
             <div class="kpi" id="pnl_month">0.00</div>
           </div>
-          <div class="span-8">
+          <div class="span-12" style="margin-top:6px">
             <div class="muted">Last Updated</div>
             <div id="updated" class="kpi" style="font-size:16px">-</div>
           </div>
         </div>
       </section>
 
+      <!-- Attribution -->
       <section class="card span-4">
         <div class="row" style="margin-bottom:8px">
           <h2 style="margin:0;font-size:16px">Attribution</h2>
@@ -547,6 +668,7 @@ _DASHBOARD_HTML = """
         <div class="muted" style="margin-top:8px">Updated: <span id="attr_updated">-</span></div>
       </section>
 
+      <!-- Recent Orders -->
       <section class="card span-12">
         <div class="row" style="margin-bottom:8px">
           <h2 style="margin:0;font-size:16px">Recent Orders</h2>
@@ -561,6 +683,53 @@ _DASHBOARD_HTML = """
           <tbody id="orders_body"></tbody>
         </table>
       </section>
+
+      <!-- Strategy Performance (Window) -->
+      <section class="card span-8">
+        <div class="row" style="margin-bottom:8px">
+          <h2 style="margin:0;font-size:16px">Strategy Performance (window)</h2>
+          <div class="muted">From <span id="win_window_from">-</span> to <span id="win_window_to">-</span></div>
+        </div>
+        <table>
+          <thead>
+            <tr>
+              <th>Strategy</th><th>Trades</th><th>Wins</th><th>Losses</th>
+              <th>Win%</th><th>Gross PnL</th><th>Avg PnL</th><th>Last Trade</th>
+            </tr>
+          </thead>
+          <tbody id="score_body"></tbody>
+        </table>
+      </section>
+
+      <!-- Window Trades -->
+      <section class="card span-4">
+        <div class="row" style="margin-bottom:8px">
+          <h2 style="margin:0;font-size:16px">Trades in Window</h2>
+          <div class="muted"><span id="win_trades_count">0</span> trades</div>
+        </div>
+        <div style="max-height:300px;overflow:auto;border:1px solid #1a2740;border-radius:8px">
+          <table>
+            <thead>
+              <tr>
+                <th>Time</th><th>ID</th><th>Sym</th><th>Side</th><th>Qty</th><th>Px</th><th>Strat</th><th>PnL</th><th>Result</th>
+              </tr>
+            </thead>
+            <tbody id="win_trades_body"></tbody>
+          </table>
+        </div>
+      </section>
+
+      <!-- Insights -->
+      <section class="card span-12">
+        <div class="row" style="margin-bottom:8px">
+          <h2 style="margin:0;font-size:16px">Insights & Triage</h2>
+          <div class="muted">Updated: <span id="insights_updated">-</span></div>
+        </div>
+        <ul id="insights_list" style="margin:0 0 0 18px;padding:0;line-height:1.6"></ul>
+        <div class="muted" style="margin-top:8px">
+          Heuristics: flags low win-rate & negative PnL; suggests reducing size, pausing, or reviewing entry/exit rules.
+        </div>
+      </section>
     </div>
   </main>
 
@@ -573,7 +742,7 @@ _DASHBOARD_HTML = """
   </script>
 </body>
 </html>
-""".replace("{SCHEDULE_SECONDS}", str(SCHEDULE_SECONDS)).replace("{DEFAULT_TIMEFRAME}", DEFAULT_TIMEFRAME)
+""".replace("{SCHEDULE_SECONDS}", str(SCHEDULE_SECONDS)).replace("{DEFAULT_TIMEFRAME}", DEFAULT_TIMEFRAME).replace("{DEFAULT_WINDOW_HOURS}", str(DEFAULT_WINDOW_HOURS))
 
 # -----------------------------------------------------------------------------
 # Routes
@@ -598,6 +767,84 @@ async def orders_recent(limit: int = Query(DEFAULT_LIMIT, ge=1, le=1000)):
 @app.get("/orders/attribution", response_class=JSONResponse)
 async def orders_attribution():
     return JSONResponse(_attribution)
+
+# ---------- New: Windowed performance endpoints ----------
+
+@app.get("/orders/window", response_class=JSONResponse)
+async def orders_window(window_hours: float = Query(DEFAULT_WINDOW_HOURS, ge=0.1, le=48.0)):
+    orders, start, now = _filter_window_orders(window_hours * 3600.0)
+    # sort newest first
+    orders_sorted = sorted(orders, key=lambda o: float(o.get("ts", 0)), reverse=True)
+    return JSONResponse({"orders": orders_sorted, "count": len(orders_sorted), "from_ts": start, "to_ts": now})
+
+@app.get("/orders/scoreboard", response_class=JSONResponse)
+async def orders_scoreboard(window_hours: float = Query(DEFAULT_WINDOW_HOURS, ge=0.1, le=48.0)):
+    orders, start, now = _filter_window_orders(window_hours * 3600.0)
+    by: Dict[str, List[Dict[str, Any]]] = {}
+    for o in orders:
+        strat = (o.get("strategy") or "unknown")
+        by.setdefault(strat, []).append(o)
+
+    rows = []
+    for strat, items in by.items():
+        pnls = [_safe_float(o.get("pnl", 0.0)) for o in items]
+        wins = sum(1 for p in pnls if p > 0)
+        losses = sum(1 for p in pnls if p < 0)
+        trades = len(items)
+        gross = sum(pnls)
+        avg = (mean(pnls) if trades else 0.0)
+        win_rate = (wins / trades) if trades else 0.0
+        last_ts = max(float(o.get("ts", 0)) for o in items) if items else 0.0
+        rows.append({
+            "strategy": strat,
+            "trades": trades,
+            "wins": wins,
+            "losses": losses,
+            "win_rate": win_rate,
+            "gross_pnl": gross,
+            "avg_pnl": avg,
+            "last_trade_ts": last_ts,
+        })
+
+    # include any strategies with no trades to keep the table complete
+    for s in STRATEGIES:
+        if not any(r["strategy"] == s for r in rows):
+            rows.append({
+                "strategy": s, "trades": 0, "wins": 0, "losses": 0,
+                "win_rate": 0.0, "gross_pnl": 0.0, "avg_pnl": 0.0, "last_trade_ts": 0.0
+            })
+
+    # sort by gross pnl desc
+    rows.sort(key=lambda r: r["gross_pnl"], reverse=True)
+    return JSONResponse({"strategies": rows, "from_ts": start, "to_ts": now})
+
+@app.get("/orders/insights", response_class=JSONResponse)
+async def orders_insights(window_hours: float = Query(DEFAULT_WINDOW_HOURS, ge=0.1, le=48.0)):
+    sb = (await orders_scoreboard(window_hours)).body
+    data = json.loads(sb.decode("utf-8")) if isinstance(sb, (bytes, bytearray)) else sb
+    strategies = data.get("strategies", [])
+    insights: List[Dict[str, str]] = []
+
+    for r in strategies:
+        s = r["strategy"]
+        trades = r["trades"]
+        wins = r["wins"]
+        losses = r["losses"]
+        win_rate = r["win_rate"]
+        gross = r["gross_pnl"]
+        avg = r["avg_pnl"]
+
+        # Basic heuristics
+        if trades >= 3 and gross < 0 and win_rate < 0.4:
+            insights.append({"strategy": s, "message": "Underperforming: low win-rate & negative PnL. Consider pausing, reducing size, or revisiting signals."})
+        elif trades >= 3 and gross > 0 and win_rate >= 0.6:
+            insights.append({"strategy": s, "message": "Healthy: positive PnL with decent win-rate. Consider carefully scaling or widening limits."})
+        elif trades >= 3 and abs(avg) < 1e-9:
+            insights.append({"strategy": s, "message": "Flat average PnL. Review TP/SL or fees/slippage; signals may need sharpening."})
+        elif trades == 0:
+            insights.append({"strategy": s, "message": "No trades in the window — confirm triggers, market filters, and symbol/timeframe coverage."})
+
+    return JSONResponse({"insights": insights})
 
 @app.get("/healthz", response_class=JSONResponse, include_in_schema=False)
 async def healthz():
