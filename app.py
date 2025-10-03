@@ -9,8 +9,8 @@ import threading
 from datetime import datetime, timedelta, timezone
 from typing import Dict, Any, List, Optional
 
-from fastapi import FastAPI, Query, Response
-from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, PlainTextResponse
+from fastapi import FastAPI, Query
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 
 # --------------------------------------------------------------------------------------
 # Optional strategy book import (kept graceful like before)
@@ -20,18 +20,13 @@ try:
     from strategy_book import StrategyBook as _SB  # type: ignore
     StrategyBook = _SB
 except Exception as e:
-    # Keep the same tone as your logs
     print(f"{datetime.now(timezone.utc).isoformat()} WARNING:app:Could not import StrategyBook from strategy_book: {e}")
 
 # --------------------------------------------------------------------------------------
-# Simple in-memory store for orders and a tiny event bus for scheduler -> store
+# Simple in-memory store for orders
 # --------------------------------------------------------------------------------------
 
 class OrderStore:
-    """
-    Thread-safe in-memory order store. In your live stack this is where you can
-    swap in a DB or your execution provider hooks.
-    """
     def __init__(self):
         self._lock = threading.RLock()
         self._orders: List[Dict[str, Any]] = []
@@ -57,16 +52,13 @@ class OrderStore:
             if isinstance(data, list):
                 for row in data:
                     if "timestamp" in row and isinstance(row["timestamp"], str):
-                        # normalize timestamps to ISO with Z
                         try:
-                            # try parse; if it already has 'Z' keep it
                             ts = row["timestamp"]
                             if isinstance(ts, str) and ts.endswith("Z"):
                                 row["_ts_dt"] = datetime.fromisoformat(ts.replace("Z", "+00:00"))
                             else:
                                 row["_ts_dt"] = datetime.fromisoformat(ts)
                         except Exception:
-                            # best effort: assume now
                             row["_ts_dt"] = datetime.now(timezone.utc)
                     else:
                         row["_ts_dt"] = datetime.now(timezone.utc)
@@ -74,10 +66,7 @@ class OrderStore:
         except Exception as e:
             print(f"{datetime.now(timezone.utc).isoformat()} WARNING:app:Failed to seed orders from {path}: {e}")
 
-
 ORDERS = OrderStore()
-
-# Try to seed from an attached file if present (the user attached trades.json earlier)
 ATTACHED_TRADES = os.environ.get("ATTACHED_TRADES_PATH", "/mnt/data/trades.json")
 ORDERS.seed_from_file(ATTACHED_TRADES)
 
@@ -89,20 +78,16 @@ def now_utc() -> datetime:
     return datetime.now(timezone.utc)
 
 def iso(dt: datetime) -> str:
-    # Fix for previous bug: use .isoformat()
     return dt.isoformat().replace("+00:00", "Z")
 
 def parse_iso(ts: str) -> datetime:
-    # Accept "Z" and offset
     if ts.endswith("Z"):
         ts = ts.replace("Z", "+00:00")
     return datetime.fromisoformat(ts)
 
 def pnl_for_order(order: Dict[str, Any]) -> float:
-    # Simple, configurable PnL calculation. Expect order to carry 'pnl' if already computed.
     if "pnl" in order and isinstance(order["pnl"], (int, float)):
         return float(order["pnl"])
-    # Otherwise try from fill fields if available
     qty = float(order.get("qty", 0) or 0)
     side = str(order.get("side", "")).lower()
     price_in = float(order.get("price_in", order.get("avg_fill_price", 0)) or 0)
@@ -110,7 +95,7 @@ def pnl_for_order(order: Dict[str, Any]) -> float:
     if qty == 0 or price_out == 0:
         return 0.0
     delta = price_out - price_in
-    if side == "sell" or side == "short":
+    if side in ("sell", "short"):
         delta = -delta
     return qty * delta
 
@@ -150,7 +135,6 @@ def strategy_stats_last_n_hours(orders: List[Dict[str, Any]], hours: int = 4) ->
             "avg_pnl": (sum(pnls) / len(pnls)) if pnls else 0.0,
             "orders": rows,
         }
-    # Also put a combined "ALL"
     all_pnls = [pnl_for_order(o) for o in window_orders]
     result["_ALL"] = {
         "trades": len(window_orders),
@@ -177,7 +161,7 @@ def attribution(orders: List[Dict[str, Any]]) -> Dict[str, Any]:
     return out
 
 # --------------------------------------------------------------------------------------
-# Background scheduler (optional)
+# Background scheduler
 # --------------------------------------------------------------------------------------
 
 SCHEDULER_ENABLED = os.environ.get("SCHEDULER_ENABLED", "1") != "0"
@@ -187,27 +171,35 @@ DEFAULT_TIMEFRAME = os.environ.get("DEFAULT_TIMEFRAME", "1m")
 DEFAULT_LIMIT = int(os.environ.get("DEFAULT_LIMIT", "200"))
 DEFAULT_NOTIONAL = float(os.environ.get("DEFAULT_NOTIONAL", "100"))
 
+def _contexts_as_list(ctx_by_name: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """
+    Convert a name->dict mapping into a list of dicts (with 'name'),
+    so StrategyBook implementations that iterate contexts work.
+    """
+    out: List[Dict[str, Any]] = []
+    for name, val in ctx_by_name.items():
+        if isinstance(val, dict):
+            d = {"name": name, **val}
+        else:
+            d = {"name": name, "value": val}
+        out.append(d)
+    return out
+
 def run_all_strategies_once(dry: bool = True) -> None:
-    """
-    Call into StrategyBook (if available) and append any resulting orders into ORDERS.
-    Includes the COMPACT REQ PATCH requested by the user.
-    """
     started = now_utc()
     print(f"{iso(started)} INFO:app:Scheduler tick: running all strategies (dry={1 if dry else 0})")
 
-    # Try to load StrategyBook
     if StrategyBook is None:
         return
 
-    # Example strategies you previously listed in logs
     strategies = ["c1", "c2", "c3", "c4", "c5", "c6"]
 
-    # Example contexts your strategies may want.
-    ctx_map: Dict[str, Any] = {
+    ctx_by_name: Dict[str, Any] = {
         "one": {"tf": DEFAULT_TIMEFRAME, "limit": DEFAULT_LIMIT},
         "default": {"notional": DEFAULT_NOTIONAL},
         "alts": {"universe": DEFAULT_SYMBOLS},
     }
+    ctx_list = _contexts_as_list(ctx_by_name)
 
     book = StrategyBook()  # type: ignore
     for strat in strategies:
@@ -217,7 +209,6 @@ def run_all_strategies_once(dry: bool = True) -> None:
             notional = DEFAULT_NOTIONAL
             symbols = DEFAULT_SYMBOLS
 
-            # Caller request (could be from your config / UI in the future)
             req: Dict[str, Any] = {
                 "strategy": strat,
                 "timeframe": tf,
@@ -225,38 +216,26 @@ def run_all_strategies_once(dry: bool = True) -> None:
                 "notional": notional,
                 "symbols": symbols,
                 "dry": dry,
-                "contexts": ctx_map,
+
+                # keep both forms available to downstream code
+                "contexts": ctx_by_name,        # by-name dict
+                "contexts_list": ctx_list,      # iterable list (new)
+                "one": ctx_by_name.get("one"),
+                "default": ctx_by_name.get("default"),
             }
 
-            # ================== COMPACT REQ PATCH (as you requested) ==================
-            compact_req = {
-                # canonical fields
-                "strategy": strat,
-                "timeframe": tf,
-                "limit": lim,
-                "notional": notional,
-                "symbols": symbols,
-                "dry": dry,
+            # Try preferred signature: scan(req, contexts_list)
+            intents = None
+            try:
+                intents = book.scan(req, ctx_list)  # type: ignore
+            except TypeError:
+                # Fallback to legacy signature: scan(req, contexts_by_name)
+                intents = book.scan(req, ctx_by_name)  # type: ignore
 
-                # <-- NEW: mirror contexts into req so strategies that expect req['one']
-                # or req['default'] keep working. Also include req['contexts'].
-                "one": ctx_map.get("one"),
-                "default": ctx_map.get("default"),
-                "contexts": ctx_map,
-
-                # passthrough for anything else the caller provided
-                "raw": req,
-            }
-            # =========================================================================
-
-            # The StrategyBook API is hypothetical; adapt to your real interface.
-            # Expecting something like: list of intents/orders
-            intents = book.scan(compact_req, ctx_map)  # type: ignore
             if not intents:
                 continue
 
             for intent in intents:
-                # Normalize an order record
                 o = {
                     "id": intent.get("id") or f"{strat}-{int(time.time()*1000)}",
                     "strategy": strat,
@@ -268,13 +247,11 @@ def run_all_strategies_once(dry: bool = True) -> None:
                     "timestamp": iso(now_utc()),
                     "meta": intent,
                 }
-                # If the book produced a terminal fill with PnL, capture it
                 if "pnl" in intent:
                     o["pnl"] = float(intent["pnl"])
                 ORDERS.add_order(o)
 
         except Exception as e:
-            # Mimic your previous logs
             print(f"{iso(now_utc())} WARNING:app:scan attempt failed (inst.scan(req, contexts)): {e}")
             print(f"{iso(now_utc())} ERROR:app:All scan attempts failed for strategy '{strat}'. Returning empty list. Last error: {e}")
 
@@ -327,9 +304,6 @@ def orders_performance_4h():
 
 @app.post("/evaluate")
 async def evaluate_orders(body: Dict[str, Any]):
-    """
-    Take posted orders (e.g., from a backtest or batch), add them into the store.
-    """
     items = body if isinstance(body, list) else body.get("orders") or []
     count = 0
     for row in items:
@@ -343,7 +317,7 @@ async def evaluate_orders(body: Dict[str, Any]):
     return JSONResponse({"ok": True, "ingested": count})
 
 # --------------------------------------------------------------------------------------
-# Dashboard HTML (full page, with new 'Last 4 Hours' section)
+# Dashboard HTML (full page, as before, with Last 4 Hours section)
 # --------------------------------------------------------------------------------------
 
 DASHBOARD_HTML = """
@@ -394,7 +368,6 @@ DASHBOARD_HTML = """
     border: 1px solid var(--border); border-radius: 12px; padding: 16px;
   }
   .span-4 { grid-column: span 4; }
-  .span-6 { grid-column: span 6; }
   .span-8 { grid-column: span 8; }
   .span-12 { grid-column: span 12; }
   h1, h2, h3 { margin: 0 0 8px 0; }
@@ -408,14 +381,10 @@ DASHBOARD_HTML = """
   .neg { color: var(--neg); }
   .muted { color: var(--muted); }
   .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace; }
-  .tag {
-    display:inline-block; padding: 2px 8px; border-radius: 999px; background: #162130; border:1px solid var(--border); color: var(--muted); font-size: 12px;
-  }
+  .tag { display:inline-block; padding: 2px 8px; border-radius: 999px; background: #162130; border:1px solid var(--border); color: var(--muted); font-size: 12px; }
   .kpi { font-size: 28px; font-weight: 700; }
   .sub { color: var(--muted); font-size: 12px; }
   .small { font-size: 12px; }
-  .pill { padding: 2px 6px; border-radius: 6px; background: #141b26; border: 1px solid var(--border); }
-  .warn { color: var(--warn); }
   .right { text-align: right; }
 </style>
 </head>
@@ -529,12 +498,10 @@ async function refresh() {
       fetchJSON('/orders/recent?limit=500'),
     ]);
 
-    // KPIs
     const total = pnl.total_pnl || 0;
     document.getElementById('kpiTotal').innerHTML = fmtPNL(total);
     document.getElementById('lastUpdated').textContent = 'updated ' + (pnl.updated_at || '—');
 
-    // All-time win rate/trades
     let allTrades = 0, allWins = 0;
     Object.values(attrib).forEach(row => {
       allTrades += row.trades || 0;
@@ -544,13 +511,11 @@ async function refresh() {
     document.getElementById('kpiWinRate').textContent = pct(wr);
     document.getElementById('kpiTrades').textContent = `${allTrades} trades`;
 
-    // 4h KPIs
     const agg = perf4h._ALL || {};
     document.getElementById('kpi4h').innerHTML = fmtPNL(agg.total_pnl || 0);
     document.getElementById('kpi4hTrades').textContent =
       `${agg.trades||0} trades (${agg.wins||0} wins / ${agg.losses||0} losses)`;
 
-    // Attribution table
     const attribBody = document.querySelector('#tblAttrib tbody');
     attribBody.innerHTML = '';
     Object.entries(attrib).sort((a,b)=> (b[1].pnl||0) - (a[1].pnl||0)).forEach(([k,v])=>{
@@ -565,7 +530,6 @@ async function refresh() {
       attribBody.appendChild(tr);
     });
 
-    // 4h per strategy
     const body4h = document.querySelector('#tbl4h tbody');
     body4h.innerHTML = '';
     Object.entries(perf4h)
@@ -582,7 +546,6 @@ async function refresh() {
         body4h.appendChild(tr);
       });
 
-    // Recent trades (limit 500, but render last 4h visually)
     const tbody = document.querySelector('#tblTrades tbody');
     tbody.innerHTML = '';
     (recent || [])
@@ -622,7 +585,7 @@ async function refresh() {
 let timer = null;
 function start() {
   refresh();
-  timer = setInterval(refresh, 15_000);
+  timer = setInterval(refresh, 15000);
 }
 document.addEventListener('visibilitychange', ()=>{
   if (document.hidden) {
@@ -663,7 +626,6 @@ def _on_shutdown():
 # --------------------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    # On Render you typically don't need this, but it's convenient for local dev.
     import uvicorn
     host = os.environ.get("HOST", "0.0.0.0")
     port = int(os.environ.get("PORT", "10000"))
