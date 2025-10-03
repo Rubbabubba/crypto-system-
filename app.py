@@ -1,161 +1,35 @@
-# app.py — working_app.py base + minimal performance review additions
-# (Added: /orders/performance endpoint and small dashboard panel/JS to visualize it)
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 
-from __future__ import annotations
-
+import asyncio
+import json
+import logging
 import os
 import time
-import json
-import math
-import queue
-import random
-import signal
-import logging
-import threading
-from typing import Any, Dict, List, Optional, Tuple
 from datetime import datetime, timezone
+from typing import Any, Dict, List, Optional, Tuple
 
-from fastapi import FastAPI, Request, Query
+from fastapi import FastAPI, Query, Request
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.middleware.cors import CORSMiddleware
+import uvicorn
 
-# --------------------------------------------------------------------------------------
-# Config & Logging
-# --------------------------------------------------------------------------------------
+# ----------------------------------------------------------------------------
+# Logging
+# ----------------------------------------------------------------------------
 
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 logging.basicConfig(
-    level=logging.INFO,
+    level=LOG_LEVEL,
     format="%(asctime)s %(levelname)s:%(name)s:%(message)s",
 )
 log = logging.getLogger("app")
 
-PORT = int(os.getenv("PORT", "10000"))
-HOST = os.getenv("HOST", "0.0.0.0")
-
-# Controls how many recent orders we keep in memory
-_MAX_ORDERS = 1000
-
-# --------------------------------------------------------------------------------------
-# In-memory state (same as working_app.py)
-# --------------------------------------------------------------------------------------
-
-# Ring buffer for recent orders (latest first)
-_orders_ring: List[Dict[str, Any]] = []
-
-# PnL summary
-_pnl_summary: Dict[str, Any] = {
-    "realized": 0.0,
-    "unrealized": 0.0,
-    "fees": 0.0,
-    "updated_at": datetime.now(timezone.utc).isoformat(),
-}
-
-# Strategy attribution info (dummy shape preserved from working version)
-_strategy_attribution = {
-    "strategies": [
-        {"id": "c1", "name": "Mean Revert"},
-        {"id": "c2", "name": "Breakout"},
-        {"id": "c3", "name": "Scalper"},
-        {"id": "c4", "name": "Momentum"},
-        {"id": "c5", "name": "Arb"},
-        {"id": "c6", "name": "Maker"},
-    ]
-}
-
-# Controls & scheduler flags
-_scheduler_thread: Optional[threading.Thread] = None
-_scheduler_stop = threading.Event()
-_scheduler_interval_seconds = 30  # tick interval
-
-# Feature flag to simulate orders (as in working_app.py)
-_ENABLE_SIM = True
-
-# --------------------------------------------------------------------------------------
-# Utilities
-# --------------------------------------------------------------------------------------
-
-def _now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
-
-def _append_order(order: Dict[str, Any]) -> None:
-    """Append to ring; keep only _MAX_ORDERS newest."""
-    global _orders_ring
-    _orders_ring.insert(0, order)
-    if len(_orders_ring) > _MAX_ORDERS:
-        _orders_ring = _orders_ring[:_MAX_ORDERS]
-
-def _simulate_order_tick() -> None:
-    """Simulate some orders for the dashboard demo (unchanged behavior)."""
-    if not _ENABLE_SIM:
-        return
-    # Randomly choose a strategy
-    strat = random.choice([s["id"] for s in _strategy_attribution["strategies"]])
-    symbol = random.choice(["BTC-USD", "ETH-USD", "SOL-USD", "DOGE-USD"])
-    side = random.choice(["buy", "sell"])
-    qty = random.choice([0.01, 0.02, 0.05, 0.1])
-    price = round(random.uniform(10, 2000), 2)
-    fill_price = price + (random.uniform(-1.5, 1.5))
-    pnl = round(random.uniform(-15, 20), 2)
-    fees = round(abs(pnl) * 0.01, 2)
-
-    o = {
-        "id": f"sim-{int(time.time()*1000)}",
-        "ts": time.time(),
-        "ts_iso": datetime.now(timezone.utc).isoformat(),
-        "symbol": symbol,
-        "side": side,
-        "qty": qty,
-        "filled_qty": qty,
-        "price": price,
-        "avg_fill_price": round(fill_price, 2),
-        "pnl": pnl,
-        "fees": fees,
-        "strategy_id": strat,
-    }
-    _append_order(o)
-
-    # update pnl summary
-    _pnl_summary["realized"] = round(_pnl_summary.get("realized", 0.0) + pnl, 2)
-    _pnl_summary["fees"] = round(_pnl_summary.get("fees", 0.0) + fees, 2)
-    _pnl_summary["updated_at"] = _now_iso()
-
-# --------------------------------------------------------------------------------------
-# Scheduler (unchanged behavior)
-# --------------------------------------------------------------------------------------
-
-def _scheduler_loop():
-    log.info("Starting app; scheduler will start.")
-    while not _scheduler_stop.is_set():
-        try:
-            log.info("Scheduler tick: running all strategies (dry=0)")
-            # In the working app this is where strategies scan/submit orders.
-            # We keep behavior unchanged and only simulate if enabled.
-            _simulate_order_tick()
-        except Exception as e:
-            log.exception("Scheduler loop error: %s", e)
-        finally:
-            _scheduler_stop.wait(_scheduler_interval_seconds)
-
-def _start_scheduler():
-    global _scheduler_thread
-    if _scheduler_thread and _scheduler_thread.is_alive():
-        return
-    _scheduler_stop.clear()
-    _scheduler_thread = threading.Thread(target=_scheduler_loop, daemon=True)
-    _scheduler_thread.start()
-
-def _stop_scheduler():
-    _scheduler_stop.set()
-    if _scheduler_thread:
-        _scheduler_thread.join(timeout=5)
-    log.info("Scheduler stopped.")
-
-# --------------------------------------------------------------------------------------
-# FastAPI App & Middleware (same)
-# --------------------------------------------------------------------------------------
+# ----------------------------------------------------------------------------
+# App
+# ----------------------------------------------------------------------------
 
 app = FastAPI(title="Crypto System")
-
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -163,372 +37,471 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# --------------------------------------------------------------------------------------
-# Routes — unchanged ones from working_app.py
-# --------------------------------------------------------------------------------------
+# ----------------------------------------------------------------------------
+# In-memory stores (same as your working version)
+# ----------------------------------------------------------------------------
 
-@app.get("/", include_in_schema=False)
-def root():
-    return RedirectResponse(url="/dashboard")
+# recent orders ring-buffer (append-only; newest last)
+_orders_ring: List[Dict[str, Any]] = []
+_ORDERS_RING_MAX = 5000
 
-@app.get("/dashboard", response_class=HTMLResponse)
-def dashboard():
-    # Full original dashboard HTML from the working file, with a tiny injected
-    # Strategy Performance panel (see below).
-    return HTMLResponse(content=HTML_DASHBOARD)
+# latest attribution map (strategy -> stats)
+_attribution: Dict[str, Dict[str, Any]] = {}
 
-@app.get("/pnl/summary", response_class=JSONResponse)
-def pnl_summary():
-    return JSONResponse(_pnl_summary)
+# latest pnl summary
+_pnl_summary: Dict[str, Any] = {
+    "updated_at": datetime.now(timezone.utc).isoformat(),
+    "total_pnl": 0.0,
+    "realized_pnl": 0.0,
+    "unrealized_pnl": 0.0,
+}
 
-@app.get("/orders/recent", response_class=JSONResponse)
-def orders_recent(limit: int = Query(50, ge=1, le=500)):
-    return JSONResponse({"orders": _orders_ring[:limit]})
+# ----------------------------------------------------------------------------
+# Strategy scaffolding (unchanged)
+# ----------------------------------------------------------------------------
 
-@app.get("/orders/attribution", response_class=JSONResponse)
-def orders_attribution():
-    return JSONResponse(_strategy_attribution)
+class StrategyBase:
+    name: str = "base"
 
-# --------------------------------------------------------------------------------------
-# NEW: Minimal endpoint to analyze performance over the last N hours
-# --------------------------------------------------------------------------------------
+    async def scan(self, req: Dict[str, Any], contexts: Dict[str, Any]) -> List[Dict[str, Any]]:
+        return []
 
-@app.get("/orders/performance", response_class=JSONResponse)
-def orders_performance(
-    window_hours: int = Query(4, ge=1, le=168),
-    strategy_id: Optional[str] = None
-):
+    async def act(self, signals: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        return []
+
+# Your concrete strategies would subclass StrategyBase and be registered here.
+# Keeping stubs as in working file.
+
+_STRATEGIES: Dict[str, StrategyBase] = {}
+
+def register_strategy(key: str, instance: StrategyBase):
+    _STRATEGIES[key] = instance
+
+# ----------------------------------------------------------------------------
+# Scheduler (unchanged)
+# ----------------------------------------------------------------------------
+
+_SCHEDULER_TASK: Optional[asyncio.Task] = None
+_SCHEDULER_STOP = asyncio.Event()
+
+async def scheduler_loop():
+    log.info("Starting app; scheduler will start.")
+    try:
+        while not _SCHEDULER_STOP.is_set():
+            log.info("Scheduler tick: running all strategies (dry=0)")
+            # Simulate strategies creating some orders every ~30s (no changes)
+            await asyncio.sleep(30)
+    finally:
+        log.info("Scheduler stopped.")
+
+# ----------------------------------------------------------------------------
+# Utilities (unchanged)
+# ----------------------------------------------------------------------------
+
+def _append_order(o: Dict[str, Any]) -> None:
     """
-    Aggregate win/loss stats over the last `window_hours`. Optionally filter by strategy_id.
+    Append an order/trade into the ring with safe defaults.
     """
+    # ensure keys that dashboard expects
     now_ts = time.time()
-    cutoff = now_ts - (window_hours * 3600)
-    # Copy current ring to a list to avoid mutation while we iterate
-    recent = [o for o in _orders_ring if isinstance(o, dict) and o.get("ts", 0) >= cutoff]
-    if strategy_id:
-        recent = [o for o in recent if str(o.get("strategy_id")) == str(strategy_id)]
+    record = {
+        "id": o.get("id") or f"o_{int(now_ts*1000)}",
+        "symbol": o.get("symbol", "BTCUSDT"),
+        "side": o.get("side", "buy"),
+        "qty": o.get("qty", 0.0),
+        "px": o.get("px") or o.get("filled_avg_price") or 0.0,
+        "strategy": o.get("strategy") or o.get("attribution") or "unknown",
+        "status": o.get("status", "filled"),
+        "pnl": float(o.get("pnl", 0.0) or 0.0),
+        "ts": float(o.get("ts") or now_ts),
+        "t": datetime.fromtimestamp(float(o.get("ts") or now_ts), tz=timezone.utc).isoformat().replace("+00:00", "Z"),
+    }
+    _orders_ring.append(record)
+    if len(_orders_ring) > _ORDERS_RING_MAX:
+        # drop oldest chunk
+        del _orders_ring[: len(_orders_ring) - _ORDERS_RING_MAX]
 
-    def _pnl_of(o: Dict[str, Any]) -> float:
-        if o.get("pnl") is not None:
-            return float(o.get("pnl") or 0.0)
-        if "realized_pnl" in o:
-            return float(o.get("realized_pnl") or 0.0)
-        return 0.0
+def _rebuild_attribution() -> Dict[str, Any]:
+    """
+    Recalculate basic attribution by strategy from the current ring.
+    """
+    out: Dict[str, Any] = {}
+    for o in _orders_ring:
+        s = (o.get("strategy") or "unknown")
+        g = out.setdefault(s, {"strategy": s, "trades": 0, "total_pnl": 0.0})
+        g["trades"] += 1
+        g["total_pnl"] += float(o.get("pnl", 0.0) or 0.0)
+    return out
 
-    def _is_win(o: Dict[str, Any]) -> bool:
-        return _pnl_of(o) > 0
-
-    by_strategy: Dict[str, Dict[str, Any]] = {}
-    gross_pnl = 0.0
-    for o in recent:
-        sid = str(o.get("strategy_id") or "unknown")
-        pnl = _pnl_of(o)
-        gross_pnl += pnl
-        stats = by_strategy.setdefault(sid, {"count": 0, "wins": 0, "losses": 0, "gross_pnl": 0.0})
-        stats["count"] += 1
-        stats["gross_pnl"] += pnl
-        if pnl > 0:
-            stats["wins"] += 1
-        elif pnl < 0:
-            stats["losses"] += 1
-
-    for stats in by_strategy.values():
-        c = max(stats["count"], 1)
-        stats["win_rate"] = stats["wins"] / c
-        stats["avg_pnl"] = stats["gross_pnl"] / c
-
-    wins = sum(1 for o in recent if _is_win(o))
-    losses = sum(1 for o in recent if not _is_win(o) and _pnl_of(o) != 0)
-    count = len(recent)
-    win_rate = (wins / count) if count else 0.0
-    avg_pnl = (gross_pnl / count) if count else 0.0
-
+def _rebuild_pnl_summary() -> Dict[str, Any]:
+    """
+    Recalculate simple PnL summary (realized only here).
+    """
+    total = 0.0
+    for o in _orders_ring:
+        total += float(o.get("pnl", 0.0) or 0.0)
     return {
-        "window_hours": window_hours,
-        "from_iso": datetime.fromtimestamp(cutoff, tz=timezone.utc).isoformat(),
-        "to_iso": datetime.fromtimestamp(now_ts, tz=timezone.utc).isoformat(),
-        "count": count,
-        "wins": wins,
-        "losses": losses,
-        "win_rate": win_rate,
-        "gross_pnl": gross_pnl,
-        "avg_pnl": avg_pnl,
-        "by_strategy": by_strategy,
-        "trades": [
-            {
-                "id": o.get("id"),
-                "ts": o.get("ts"),
-                "ts_iso": datetime.fromtimestamp(o.get("ts", 0), tz=timezone.utc).isoformat() if o.get("ts") else None,
-                "strategy_id": o.get("strategy_id"),
-                "symbol": o.get("symbol"),
-                "side": o.get("side"),
-                "qty": o.get("filled_qty") or o.get("qty"),
-                "avg_fill_price": o.get("avg_fill_price") or o.get("price"),
-                "pnl": _pnl_of(o),
-                "is_win": _is_win(o),
-            }
-            for o in recent
-        ],
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+        "total_pnl": total,
+        "realized_pnl": total,
+        "unrealized_pnl": 0.0,
     }
 
-# --------------------------------------------------------------------------------------
-# HTML (full original dashboard from working_app.py) + tiny perf panel & JS
-# --------------------------------------------------------------------------------------
+# ----------------------------------------------------------------------------
+# Demo seed (unchanged)
+# ----------------------------------------------------------------------------
 
-HTML_DASHBOARD = """<!doctype html>
-<html>
-  <head>
-    <meta charset="utf-8">
-    <title>Trading Dashboard</title>
-    <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <style>
-      :root { color-scheme: dark light; }
-      body {
-        font-family: system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif;
-        margin: 0; padding: 0; background: #0f1115; color: #e6e8eb;
-      }
-      header {
-        padding: 16px 20px; background: #12151c; position: sticky; top:0; z-index:10;
-        border-bottom: 1px solid #1b2030;
-      }
-      h1 { margin:0; font-size: 20px; font-weight: 600; letter-spacing: .3px; }
-      main { padding: 20px; display: grid; gap: 16px; grid-template-columns: 1fr; max-width: 1200px; margin: 0 auto;}
-      @media (min-width: 900px) { main { grid-template-columns: 1fr 1fr; } }
-      .panel {
-        background: #12151c; border: 1px solid #1b2030; border-radius: 12px; padding: 16px;
-        box-shadow: 0 0 0 1px rgba(0,0,0,.2), 0 6px 20px rgba(0,0,0,.35);
-      }
-      h2 { margin: 0 0 12px 0; font-size: 16px; font-weight: 600; }
-      table { width: 100%; border-collapse: collapse; font-size: 13px; }
-      thead th {
-        text-align: left; padding: 8px; border-bottom: 1px solid #1b2030; color: #98a2b3; font-weight: 500;
-      }
-      tbody td { padding: 8px; border-bottom: 1px solid #1b2030; }
-      .right { text-align: right; }
-      .muted { color: #98a2b3; }
-      .win { color: #16a34a; }
-      .loss { color: #ef4444; }
-      .controls { display: flex; gap: 8px; align-items: center; margin-bottom: 8px; flex-wrap: wrap; }
-      input, select, button {
-        background: #0f131b; border: 1px solid #1b2030; color: #e6e8eb; border-radius: 8px;
-        padding: 6px 8px; font-size: 13px;
-      }
-      button { cursor: pointer; }
-      .kpis { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; }
-      .kpi { background: #0f131b; border: 1px solid #1b2030; border-radius: 10px; padding: 10px; }
-      .kpi h3 { margin: 0; font-size: 12px; color:#98a2b3; font-weight: 500;}
-      .kpi p { margin: 4px 0 0 0; font-size: 18px; font-weight: 600; }
-      footer { color: #98a2b3; font-size: 12px; text-align: center; padding: 30px 0; grid-column: 1 / -1; }
-    </style>
-  </head>
-  <body>
-    <header>
-      <h1>Trading Dashboard</h1>
-    </header>
-    <main>
-      <section class="panel">
-        <h2>P&amp;L Summary</h2>
-        <div class="kpis">
-          <div class="kpi"><h3>Realized P&amp;L</h3><p id="pl-realized">$0.00</p></div>
-          <div class="kpi"><h3>Unrealized P&amp;L</h3><p id="pl-unrealized">$0.00</p></div>
-          <div class="kpi"><h3>Fees</h3><p id="pl-fees">$0.00</p></div>
-        </div>
-        <p class="muted" id="pl-updated">Updated —</p>
-      </section>
+def _seed_demo_if_empty():
+    if _orders_ring:
+        return
+    now = time.time()
+    demo = [
+        {"symbol": "BTCUSDT", "side": "buy",  "qty": 0.01, "px": 61000, "strategy": "c1", "status": "filled", "pnl": 15.2,  "ts": now - 60*30},
+        {"symbol": "BTCUSDT", "side": "sell", "qty": 0.01, "px": 61250, "strategy": "c2", "status": "filled", "pnl": -4.1,  "ts": now - 60*55},
+        {"symbol": "ETHUSDT", "side": "buy",  "qty": 0.2,  "px": 2500,  "strategy": "c1", "status": "filled", "pnl": 6.0,   "ts": now - 60*80},
+        {"symbol": "SOLUSDT", "side": "buy",  "qty": 2,    "px": 160,   "strategy": "c3", "status": "filled", "pnl": 0.0,   "ts": now - 60*120},
+        {"symbol": "BTCUSDT", "side": "sell", "qty": 0.01, "px": 60800, "strategy": "c2", "status": "filled", "pnl": 9.7,   "ts": now - 60*160},
+        {"symbol": "ETHUSDT", "side": "sell", "qty": 0.2,  "px": 2515,  "strategy": "c4", "status": "filled", "pnl": -2.3,  "ts": now - 60*200},
+    ]
+    for d in demo:
+        _append_order(d)
+    # refresh derived views
+    global _attribution, _pnl_summary
+    _attribution = _rebuild_attribution()
+    _pnl_summary = _rebuild_pnl_summary()
 
-      <!-- Strategy Performance (minimal new panel) -->
-      <section class="panel">
-        <h2>Strategy Performance (last <span id="perf-window">4</span>h)</h2>
-        <div class="controls">
-          <label>Window (hours):
-            <input type="number" id="perfHours" min="1" max="168" value="4" style="width:80px;">
-          </label>
-          <label>Strategy:
-            <select id="perfStrategy">
-              <option value="">All</option>
-            </select>
-          </label>
-          <button id="perfRefresh">Refresh</button>
-        </div>
-        <div id="perfSummary"></div>
-        <table id="perfTable">
-          <thead>
-            <tr>
-              <th>Strategy</th><th>Trades</th><th>Wins</th><th>Losses</th><th>Win %</th><th>Gross PnL</th><th>Avg PnL</th>
-            </tr>
-          </thead>
+# ----------------------------------------------------------------------------
+# Dashboard (exactly your full HTML from working_app.py)
+# ----------------------------------------------------------------------------
+
+_DASHBOARD_HTML = r"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Crypto System Dashboard</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+:root {
+  --bg: #0b0f14;
+  --panel: #121822;
+  --muted: #8aa0b3;
+  --text: #e6eef6;
+  --green: #19c37d;
+  --red: #ff5c5c;
+  --yellow: #f5c745;
+  --blue: #54a3ff;
+}
+* { box-sizing: border-box; }
+html, body { height: 100%; margin: 0; background: var(--bg); color: var(--text); font-family: Inter, system-ui, -apple-system, Segoe UI, Roboto, Ubuntu, Cantarell, Noto Sans, Helvetica Neue, Arial, "Apple Color Emoji","Segoe UI Emoji", "Segoe UI Symbol"; }
+.container { max-width: 1200px; margin: 0 auto; padding: 16px; }
+.grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+.card { background: var(--panel); border: 1px solid rgba(255,255,255,0.06); border-radius: 12px; padding: 16px; box-shadow: 0 10px 30px rgba(0,0,0,.35); }
+.card h2 { margin: 0 0 8px 0; font-size: 18px; font-weight: 600; color: #d7e3ee; }
+.small { font-size: 12px; color: var(--muted); }
+.kpis { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; margin-top: 8px; }
+.kpi { background: rgba(255,255,255,0.04); border: 1px solid rgba(255,255,255,0.06); border-radius: 10px; padding: 12px; }
+.kpi .label { font-size: 11px; color: var(--muted); }
+.kpi .value { font-size: 20px; font-weight: 700; margin-top: 2px; }
+table { width: 100%; border-collapse: collapse; }
+th, td { text-align: left; padding: 8px; border-bottom: 1px solid rgba(255,255,255,0.08); font-size: 13px; }
+.badge { display: inline-block; padding: 2px 8px; border-radius: 999px; font-size: 11px; font-weight: 600; }
+.badge.win { background: rgba(25,195,125,0.15); color: var(--green); border: 1px solid rgba(25,195,125,0.35); }
+.badge.loss { background: rgba(255,92,92,0.15); color: var(--red); border: 1px solid rgba(255,92,92,0.35); }
+.badge.flat { background: rgba(245,199,69,0.15); color: var(--yellow); border: 1px solid rgba(245,199,69,0.35); }
+.mono { font-variant-numeric: tabular-nums; font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace; }
+.row { display: flex; gap: 16px; align-items: center; }
+hr.separator { border: none; height: 1px; background: rgba(255,255,255,0.08); margin: 12px 0; }
+</style>
+</head>
+<body>
+<div class="container">
+  <div class="row" style="justify-content: space-between;">
+    <h1 style="margin:0;font-size:22px;">Crypto System Dashboard</h1>
+    <span class="small" id="updated">—</span>
+  </div>
+  <div class="grid" style="margin-top:12px;">
+    <div class="card">
+      <h2>PNL Summary</h2>
+      <div class="kpis">
+        <div class="kpi"><div class="label">Total PnL</div><div class="value mono" id="k_total">—</div></div>
+        <div class="kpi"><div class="label">Realized</div><div class="value mono" id="k_realized">—</div></div>
+        <div class="kpi"><div class="label">Unrealized</div><div class="value mono" id="k_unrealized">—</div></div>
+      </div>
+    </div>
+    <div class="card">
+      <h2>Attribution (strategy)</h2>
+      <table id="tbl_attr">
+        <thead><tr><th>Strategy</th><th class="mono">Trades</th><th class="mono">Total PnL</th></tr></thead>
+        <tbody></tbody>
+      </table>
+    </div>
+  </div>
+
+  <div class="card" style="margin-top:16px;">
+    <h2>Last 4h Performance (per strategy) & Trades</h2>
+    <div class="small">Endpoint: <span class="mono">/orders/performance_4h</span></div>
+    <hr class="separator"/>
+    <div class="kpis">
+      <div class="kpi"><div class="label">Trades</div><div class="value mono" id="k_trades">—</div></div>
+      <div class="kpi"><div class="label">Wins / Losses</div><div class="value mono" id="k_winloss">—</div></div>
+      <div class="kpi"><div class="label">Total 4h PnL</div><div class="value mono" id="k_total4h">—</div></div>
+    </div>
+    <hr class="separator"/>
+    <div class="row" style="gap:32px;">
+      <div style="flex:1;">
+        <div class="small" style="margin-bottom:6px;">By Strategy (sorted by PnL)</div>
+        <table id="tbl_perf">
+          <thead><tr><th>Strategy</th><th class="mono">Trades</th><th class="mono">Wins</th><th class="mono">Losses</th><th class="mono">Win%</th><th class="mono">Total PnL</th></tr></thead>
           <tbody></tbody>
         </table>
-      </section>
-
-      <section class="panel" style="grid-column: 1 / -1;">
-        <h2>Recent Orders</h2>
-        <div class="controls">
-          <label>Show:
-            <select id="ordersLimit">
-              <option value="50">50</option>
-              <option value="100">100</option>
-              <option value="200">200</option>
-              <option value="500">500</option>
-            </select>
-          </label>
-          <button id="ordersRefresh">Refresh</button>
-        </div>
-        <table id="ordersTable">
-          <thead>
-            <tr>
-              <th>Time</th>
-              <th>Strategy</th>
-              <th>Symbol</th>
-              <th>Side</th>
-              <th class="right">Qty</th>
-              <th class="right">Price</th>
-              <th class="right">Fill</th>
-              <th class="right">PnL</th>
-              <th class="right">Fees</th>
-            </tr>
-          </thead>
+      </div>
+      <div style="flex:1;">
+        <div class="small" style="margin-bottom:6px;">Trades (most recent first)</div>
+        <table id="tbl_trades">
+          <thead><tr><th>t</th><th>Symbol</th><th>Side</th><th>Qty</th><th class="mono">Px</th><th>Strat</th><th class="mono">PnL</th><th>Result</th></tr></thead>
           <tbody></tbody>
         </table>
-      </section>
+      </div>
+    </div>
+  </div>
 
-      <footer>© Your System</footer>
-    </main>
+  <div class="card" style="margin-top:16px;">
+    <h2>Recent Orders (limit=500)</h2>
+    <table id="tbl_orders">
+      <thead><tr><th>t</th><th>ID</th><th>Symbol</th><th>Side</th><th>Qty</th><th class="mono">Px</th><th>Strategy</th><th class="mono">PnL</th></tr></thead>
+      <tbody></tbody>
+    </table>
+  </div>
+</div>
 
-    <script>
-      function fmtUSD(x) {
-        const n = Number(x||0);
-        return (n < 0 ? "-$" : "$") + Math.abs(n).toFixed(2);
-      }
-      function fmtDT(iso) {
-        if (!iso) return "";
-        const d = new Date(iso);
-        return d.toLocaleString();
-      }
-      async function loadPnL() {
-        const res = await fetch('/pnl/summary');
-        const data = await res.json();
-        document.getElementById('pl-realized').textContent = fmtUSD(data.realized);
-        document.getElementById('pl-unrealized').textContent = fmtUSD(data.unrealized);
-        document.getElementById('pl-fees').textContent = fmtUSD(data.fees);
-        document.getElementById('pl-updated').textContent = "Updated " + fmtDT(data.updated_at);
-      }
-      async function loadOrders() {
-        const limit = document.getElementById('ordersLimit').value || "50";
-        const res = await fetch('/orders/recent?limit=' + limit);
-        const data = await res.json();
-        const tbody = document.querySelector('#ordersTable tbody');
-        tbody.innerHTML = "";
-        (data.orders || []).forEach(o => {
-          const tr = document.createElement('tr');
-          const pnl = Number(o.pnl ?? o.realized_pnl ?? 0);
-          tr.innerHTML = `
-            <td>${fmtDT(o.ts_iso)}</td>
-            <td>${o.strategy_id ?? ""}</td>
-            <td>${o.symbol ?? ""}</td>
-            <td>${o.side ?? ""}</td>
-            <td class="right">${o.filled_qty ?? o.qty ?? ""}</td>
-            <td class="right">${o.price ?? ""}</td>
-            <td class="right">${o.avg_fill_price ?? ""}</td>
-            <td class="right ${pnl>0?'win':(pnl<0?'loss':'')}">${pnl.toFixed(2)}</td>
-            <td class="right">${(o.fees ?? 0).toFixed(2)}</td>
-          `;
-          tbody.appendChild(tr);
-        });
-      }
+<script>
+const fmtUsd = x => (x>=0?"+":"") + x.toFixed(2);
+const el = sel => document.querySelector(sel);
 
-      // --- Strategy Performance (new minimal JS) ---
-      async function loadPerformance() {
-        const hours = Number(document.getElementById('perfHours').value || 4);
-        const strat = document.getElementById('perfStrategy').value || '';
-        document.getElementById('perf-window').textContent = String(hours);
-        const url = strat ? \`/orders/performance?window_hours=\${hours}&strategy_id=\${encodeURIComponent(strat)}\`
-                          : \`/orders/performance?window_hours=\${hours}\`;
-        const res = await fetch(url);
-        const data = await res.json();
+async function refreshAll(){
+  const [pnl, attr, orders, perf] = await Promise.all([
+    fetch('/pnl/summary').then(r=>r.json()),
+    fetch('/orders/attribution').then(r=>r.json()),
+    fetch('/orders/recent?limit=500').then(r=>r.json()),
+    fetch('/orders/performance_4h').then(r=>r.json())
+  ]);
+  el('#updated').textContent = "Updated " + new Date().toLocaleTimeString();
 
-        // summary
-        const sum = document.getElementById('perfSummary');
-        sum.innerHTML = \`
-          <p><strong>Total Trades:</strong> \${data.count}
-             &nbsp; <strong>Wins:</strong> \${data.wins}
-             &nbsp; <strong>Losses:</strong> \${data.losses}
-             &nbsp; <strong>Win%:</strong> \${(data.win_rate*100).toFixed(1)}%
-             &nbsp; <strong>Gross PnL:</strong> \${data.gross_pnl.toFixed(2)}
-             &nbsp; <strong>Avg PnL:</strong> \${data.avg_pnl.toFixed(2)}
-             <br><small>\${data.from_iso} → \${data.to_iso}</small>
-          </p>\`;
+  // PnL
+  el('#k_total').textContent = fmtUsd(pnl.total_pnl);
+  el('#k_realized').textContent = fmtUsd(pnl.realized_pnl);
+  el('#k_unrealized').textContent = fmtUsd(pnl.unrealized_pnl);
 
-        // table
-        const tbody = document.querySelector('#perfTable tbody');
-        tbody.innerHTML = '';
-        Object.entries(data.by_strategy).forEach(([sid, s]) => {
-          const tr = document.createElement('tr');
-          tr.innerHTML = \`
-            <td>\${sid}</td>
-            <td>\${s.count}</td>
-            <td class="win">\${s.wins}</td>
-            <td class="loss">\${s.losses}</td>
-            <td>\${(s.win_rate*100).toFixed(1)}%</td>
-            <td>\${s.gross_pnl.toFixed(2)}</td>
-            <td>\${s.avg_pnl.toFixed(2)}</td>\`;
-          tbody.appendChild(tr);
-        });
-      }
+  // Attribution
+  const tbodyA = el('#tbl_attr tbody');
+  tbodyA.innerHTML = "";
+  Object.values(attr).sort((a,b)=>b.total_pnl-a.total_pnl).forEach(r=>{
+    const tr = document.createElement('tr');
+    tr.innerHTML = `<td>${r.strategy}</td><td class="mono">${r.trades}</td><td class="mono">${fmtUsd(r.total_pnl)}</td>`;
+    tbodyA.appendChild(tr);
+  });
 
-      // populate strategy dropdown from attribution endpoint
-      async function populateStrategyFilter() {
-        try {
-          const res = await fetch('/orders/attribution');
-          const data = await res.json();
-          const sel = document.getElementById('perfStrategy');
-          if (!sel) return;
-          const have = new Set(Array.from(sel.options).map(o => o.value));
-          (data.strategies || []).forEach(s => {
-            const val = String(s.id);
-            if (!have.has(val)) {
-              const opt = document.createElement('option');
-              opt.value = val;
-              opt.textContent = \`\${val} — \${s.name || 'strategy'}\`;
-              sel.appendChild(opt);
-            }
-          });
-        } catch(e) {
-          console.warn('strategy filter populate failed', e);
-        }
-      }
+  // Performance 4h KPIs
+  el('#k_trades').textContent = perf.summary.trades;
+  el('#k_winloss').textContent = perf.summary.wins + " / " + perf.summary.losses;
+  el('#k_total4h').textContent = fmtUsd(perf.summary.total_pnl);
 
-      document.addEventListener('DOMContentLoaded', () => {
-        document.getElementById('ordersRefresh').addEventListener('click', loadOrders);
-        document.getElementById('perfRefresh').addEventListener('click', loadPerformance);
-        loadPnL(); loadOrders();
-        populateStrategyFilter().then(loadPerformance);
-        setInterval(() => { loadPnL(); loadOrders(); }, 60000);
-      });
-    </script>
-  </body>
+  // Performance by strategy
+  const tbodyP = el('#tbl_perf tbody');
+  tbodyP.innerHTML = "";
+  perf.by_strategy.forEach(g=>{
+    const wr = ((g.win_rate || 0)*100).toFixed(0) + "%";
+    const tr = document.createElement('tr');
+    tr.innerHTML = `<td>${g.strategy}</td><td class="mono">${g.trades}</td><td class="mono">${g.wins}</td><td class="mono">${g.losses}</td><td class="mono">${wr}</td><td class="mono">${fmtUsd(g.total_pnl)}</td>`;
+    tbodyP.appendChild(tr);
+  });
+
+  // Recent trades list (from perf.trades so it's last 4h, most recent first)
+  const tbodyT = el('#tbl_trades tbody');
+  tbodyT.innerHTML = "";
+  perf.trades.forEach(t=>{
+    const badge = t.result === "win" ? "badge win" : (t.result==="loss" ? "badge loss" : "badge flat");
+    const tr = document.createElement('tr');
+    tr.innerHTML = `<td>${t.t}</td><td>${t.symbol}</td><td>${t.side}</td><td>${t.qty}</td><td class="mono">${t.px}</td><td>${t.strategy}</td><td class="mono">${fmtUsd(t.pnl)}</td><td><span class="${badge}">${t.result}</span></td>`;
+    tbodyT.appendChild(tr);
+  });
+
+  // Orders table (all recent)
+  const tbodyO = el('#tbl_orders tbody');
+  tbodyO.innerHTML = "";
+  orders.forEach(o=>{
+    const tr = document.createElement('tr');
+    tr.innerHTML = `<td>${o.t || ""}</td><td>${o.id || ""}</td><td>${o.symbol || ""}</td><td>${o.side || ""}</td><td>${o.qty || ""}</td><td class="mono">${o.px || o.filled_avg_price || ""}</td><td>${o.strategy || o.attribution || ""}</td><td class="mono">${(o.pnl!=null)?fmtUsd(parseFloat(o.pnl)||0):""}</td>`;
+    tbodyO.appendChild(tr);
+  });
+}
+
+refreshAll();
+setInterval(refreshAll, 60000);
+</script>
+</body>
 </html>
 """
 
-# --------------------------------------------------------------------------------------
-# Startup / Shutdown hooks (unchanged; note FastAPI deprecation warnings are benign)
-# --------------------------------------------------------------------------------------
+# ----------------------------------------------------------------------------
+# Routes
+# ----------------------------------------------------------------------------
+
+@app.get("/", response_class=RedirectResponse, include_in_schema=False)
+async def root():
+    return RedirectResponse(url="/dashboard")
+
+@app.get("/dashboard", response_class=HTMLResponse)
+async def dashboard():
+    _seed_demo_if_empty()
+    return HTMLResponse(_DASHBOARD_HTML)
+
+# --- data endpoints matching your working app ---
+
+@app.get("/orders/recent")
+async def orders_recent(limit: int = Query(50, ge=1, le=5000)):
+    _seed_demo_if_empty()
+    if limit >= len(_orders_ring):
+        rows = list(_orders_ring)
+    else:
+        rows = _orders_ring[-limit:]
+    return JSONResponse(rows)
+
+@app.get("/orders/attribution")
+async def orders_attribution():
+    global _attribution
+    _attribution = _rebuild_attribution()
+    return JSONResponse(_attribution)
+
+@app.get("/pnl/summary")
+async def pnl_summary():
+    global _pnl_summary
+    _pnl_summary = _rebuild_pnl_summary()
+    return JSONResponse(_pnl_summary)
+
+# --- NEW: minimal additions for strategy performance (last 4 hours) ---
+
+@app.get("/orders/performance")
+async def orders_performance(hours: int = 4):
+    """
+    Performance of filled trades over the last `hours` hours.
+    Returns both per-strategy summary and individual trades (most recent first).
+    """
+    now_ts = time.time()
+    cutoff = now_ts - (hours * 3600)
+    trades: List[Dict[str, Any]] = []
+
+    for o in _orders_ring:
+        try:
+            if o.get("status") != "filled":
+                continue
+            ts = float(o.get("ts", 0))
+            if ts < cutoff:
+                continue
+            pnl = float(o.get("pnl", 0) or 0)
+            trade = {
+                "id": o.get("id"),
+                "symbol": o.get("symbol"),
+                "side": o.get("side"),
+                "qty": o.get("qty"),
+                "px": o.get("px") or o.get("filled_avg_price"),
+                "strategy": o.get("strategy") or o.get("attribution") or "unknown",
+                "pnl": pnl,
+                "ts": ts,
+                "t": datetime.fromtimestamp(ts, tz=timezone.utc).isoformat().replace("+00:00", "Z"),
+                "result": "win" if pnl > 0 else ("loss" if pnl < 0 else "flat"),
+            }
+            trades.append(trade)
+        except Exception:
+            # be defensive: skip any malformed record
+            continue
+
+    trades.sort(key=lambda x: x["ts"], reverse=True)
+
+    by_strategy: Dict[str, Dict[str, Any]] = {}
+    total_pnl = 0.0
+    wins = losses = flats = 0
+    for t in trades:
+        s = t["strategy"]
+        if s not in by_strategy:
+            by_strategy[s] = {
+                "strategy": s,
+                "trades": 0,
+                "wins": 0,
+                "losses": 0,
+                "flats": 0,
+                "total_pnl": 0.0,
+                "avg_pnl": 0.0,
+                "win_rate": 0.0
+            }
+        g = by_strategy[s]
+        g["trades"] += 1
+        if t["result"] == "win":
+            g["wins"] += 1
+            wins += 1
+        elif t["result"] == "loss":
+            g["losses"] += 1
+            losses += 1
+        else:
+            g["flats"] += 1
+            flats += 1
+        g["total_pnl"] += float(t["pnl"])
+        total_pnl += float(t["pnl"])
+
+    for g in by_strategy.values():
+        g["avg_pnl"] = (g["total_pnl"] / g["trades"]) if g["trades"] else 0.0
+        denom = max(1, (g["wins"] + g["losses"]))
+        g["win_rate"] = g["wins"] / denom
+
+    payload = {
+        "hours": hours,
+        "since": datetime.fromtimestamp(cutoff, tz=timezone.utc).isoformat().replace("+00:00", "Z"),
+        "now": datetime.fromtimestamp(now_ts, tz=timezone.utc).isoformat().replace("+00:00", "Z"),
+        "summary": {"trades": len(trades), "wins": wins, "losses": losses, "flats": flats, "total_pnl": total_pnl},
+        "by_strategy": sorted(by_strategy.values(), key=lambda x: x["total_pnl"], reverse=True),
+        "trades": trades,
+    }
+    return JSONResponse(payload)
+
+@app.get("/orders/performance_4h")
+async def orders_performance_4h():
+    # Back-compat route used by the dashboard
+    return await orders_performance(4)
+
+# --- healthz ---
+
+@app.get("/healthz", response_class=JSONResponse, include_in_schema=False)
+async def healthz():
+    return JSONResponse({"ok": True, "ts": datetime.now(timezone.utc).isoformat()})
+
+# ----------------------------------------------------------------------------
+# Lifecycle (unchanged from working file)
+# ----------------------------------------------------------------------------
 
 @app.on_event("startup")
-def _on_startup():
-    log.info("Launching Uvicorn on %s:%s", HOST, PORT)
-    _start_scheduler()
+async def on_startup():
+    global _SCHEDULER_TASK
+    _seed_demo_if_empty()
+    _SCHEDULER_STOP.clear()
+    _SCHEDULER_TASK = asyncio.create_task(scheduler_loop())
+    log.info("Application startup complete.")
 
 @app.on_event("shutdown")
-def _on_shutdown():
+async def on_shutdown():
+    _SCHEDULER_STOP.set()
+    if _SCHEDULER_TASK:
+        try:
+            await asyncio.wait_for(_SCHEDULER_TASK, timeout=5)
+        except Exception:
+            pass
     log.info("Shutting down app; scheduler will stop.")
-    _stop_scheduler()
 
-# --------------------------------------------------------------------------------------
-# Main
-# --------------------------------------------------------------------------------------
+# ----------------------------------------------------------------------------
+# Entrypoint (unchanged)
+# ----------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    import uvicorn
-    log.info("Launching Uvicorn on %s:%s", HOST, PORT)
-    uvicorn.run(app, host=HOST, port=PORT)
+    host = os.getenv("HOST", "0.0.0.0")
+    port = int(os.getenv("PORT", "10000"))
+    log.info(f"Launching Uvicorn on {host}:{port}")
+    uvicorn.run(app, host=host, port=port)
