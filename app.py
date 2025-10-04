@@ -1,640 +1,613 @@
-# app.py (FastAPI + Uvicorn single-file app)
-# Version: v1.7.2+strategy-review
-# Notes:
-# - Adds /orders/performance_4h endpoint (4-hour performance per strategy, win/loss tagging)
-# - Keeps existing endpoints intact: /, /dashboard, /orders/recent, /orders/attribution, /pnl/summary
-# - Dashboard shows strategies 1–6 cards, recent trades table (last 4 hours), win/loss badges, and auto-refresh
-# - Mobile-friendly layout tweaks
-# - Uses isoformat() (not toisoformat()) for timestamps
-# -----------------------------------------------------------------------------
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 
-
-import os
+import asyncio
 import json
-import math
+import logging
+import os
 import time
-import threading
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
-import pandas as pd
-from fastapi import FastAPI, Response, status
+from fastapi import FastAPI, Query
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
-from fastapi.middleware.cors import CORSMiddleware
-import uvicorn
-import logging
 
 # -----------------------------------------------------------------------------
 # Logging
 # -----------------------------------------------------------------------------
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 logging.basicConfig(
-    level=os.getenv("LOG_LEVEL", "INFO"),
+    level=LOG_LEVEL,
     format="%(asctime)s %(levelname)s:%(name)s:%(message)s",
 )
 log = logging.getLogger("app")
 
 # -----------------------------------------------------------------------------
-# App init
+# Config
 # -----------------------------------------------------------------------------
-app = FastAPI(title="Crypto System", version="v1.7.2+strategy-review")
+SCHEDULE_SECONDS = int(os.getenv("SCHEDULE_SECONDS", "60"))
+DEFAULT_LIMIT = int(os.getenv("DEFAULT_LIMIT", "100"))
+DEFAULT_TIMEFRAME = os.getenv("DEFAULT_TIMEFRAME", "1h")
+DEFAULT_NOTIONAL = float(os.getenv("DEFAULT_NOTIONAL", "0"))
+DEFAULT_SYMBOLS = os.getenv("DEFAULT_SYMBOLS", "")  # comma list
 
-# CORS (keep permissive for your dashboard)
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=False,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+# Strategies to iterate on each tick (match your logs)
+STRATEGIES = ["c1", "c2", "c3", "c4", "c5", "c6"]
 
 # -----------------------------------------------------------------------------
-# In-memory state & scheduler (lightweight)
+# StrategyBook import + compatibility wrapper
 # -----------------------------------------------------------------------------
-STATE = {
-    "strategies": ["c1", "c2", "c3", "c4", "c5", "c6"],
-    "last_scan_at": None,
-    "dry_run": False,
-    "running": True,
-    "pnl_summary": {
-        "total_pnl": 0.0,
-        "day_pnl": 0.0,
-        "week_pnl": 0.0,
-        "month_pnl": 0.0,
-        "updated_at": datetime.now(timezone.utc).isoformat(),
-    },
+_real_SB = None
+try:
+    # Adjust this to your project layout if needed
+    from strategy_book import StrategyBook as _ImportedStrategyBook  # type: ignore
+    _real_SB = _ImportedStrategyBook
+except Exception as e:
+    log.warning("Could not import StrategyBook from strategy_book: %s", e)
+
+class _FallbackStrategyBook:
+    """No-op fallback so the service boots even without the real book."""
+    def scan(self, req: Dict[str, Any], contexts: Dict[str, Any]):
+        return []
+
+def _ensure_ctx_shape(ctx_map: Optional[Dict[str, Any]], tf: str, symbols: List[str], notional: float) -> Dict[str, Any]:
+    """Make sure contexts has at least 'one' and 'default' with basic fields."""
+    ctx_map = ctx_map or {}
+    if not isinstance(ctx_map, dict):
+        ctx_map = {}
+    base = {"timeframe": tf, "symbols": symbols, "notional": notional}
+    one = ctx_map.get("one") if isinstance(ctx_map.get("one"), dict) else {}
+    default = ctx_map.get("default") if isinstance(ctx_map.get("default"), dict) else {}
+    one = {**base, **one}
+    default = {**base, **(default or one)}
+    ctx_map["one"] = one
+    ctx_map["default"] = default
+    return ctx_map
+
+class StrategyBook:  # compatibility facade
+    """
+    Wraps the real StrategyBook (if present) and calls its scan in a safe way.
+    It:
+      * Guarantees req['one'], req['default'], req['contexts']
+      * Guarantees contexts['one'], contexts['default']
+      * Tries a couple of call shapes to satisfy older signatures
+      * Quiets repeated warnings per strategy
+    """
+
+    def __init__(self):
+        self._impl = _real_SB() if _real_SB else _FallbackStrategyBook()
+        self._warned: Dict[str, bool] = {}
+
+    def _once_warn(self, strategy: str, msg: str):
+        if not self._warned.get(strategy):
+            log.warning(msg)
+            self._warned[strategy] = True
+
+    def scan(self, req: Dict[str, Any], contexts: Dict[str, Any]):
+        strategy = req.get("strategy", "unknown")
+        tf = req.get("timeframe") or DEFAULT_TIMEFRAME
+        symbols = req.get("symbols") or []
+        notional = req.get("notional") or DEFAULT_NOTIONAL
+
+        # Always harden shapes before first attempt
+        contexts = _ensure_ctx_shape(contexts, tf, symbols, notional)
+
+        # Ensure req mirrors contexts (so req['one'] exists even if strategy reads from req)
+        req.setdefault("one", contexts.get("one"))
+        req.setdefault("default", contexts.get("default"))
+        req.setdefault("contexts", contexts)
+
+        # Try the canonical shape first
+        try:
+            return self._impl.scan(req, contexts)
+        except KeyError as ke:
+            # Common issue: KeyError('one')
+            if str(ke) in ("'one'", "one"):
+                self._once_warn(strategy, f"scan: strategy '{strategy}' accessed missing key 'one'; repairing payload and retrying once.")
+                # Rebuild shapes then retry once
+                contexts = _ensure_ctx_shape(contexts, tf, symbols, notional)
+                req["one"] = contexts["one"]
+                req["default"] = contexts["default"]
+                req["contexts"] = contexts
+                try:
+                    return self._impl.scan(req, contexts)
+                except Exception as e2:
+                    self._once_warn(strategy, f"scan retry still failed for '{strategy}': {e2}")
+                    return []
+            else:
+                self._once_warn(strategy, f"scan raised KeyError for '{strategy}': {ke}")
+                return []
+        except TypeError as te:
+            # As a last resort, attempt a legacy (req-only) call if the impl accepts it
+            self._once_warn(strategy, f"scan TypeError for '{strategy}' with (req, contexts): {te}. Trying (req) only.")
+            try:
+                return self._impl.scan(req)  # type: ignore[arg-type]
+            except Exception as e2:
+                self._once_warn(strategy, f"scan (req) also failed for '{strategy}': {e2}")
+                return []
+        except Exception as e:
+            self._once_warn(strategy, f"scan failed for '{strategy}': {e}")
+            return []
+
+# -----------------------------------------------------------------------------
+# App
+# -----------------------------------------------------------------------------
+app = FastAPI(title="Crypto System")
+
+# -----------------------------------------------------------------------------
+# In-memory “DB” for demo endpoints
+# -----------------------------------------------------------------------------
+_orders_ring: List[Dict[str, Any]] = []
+_MAX_ORDERS = 1000
+
+_pnl_summary = {
+    "equity": 0.0,
+    "pnl_day": 0.0,
+    "pnl_week": 0.0,
+    "pnl_month": 0.0,
+    "updated_at": datetime.now(timezone.utc).isoformat(),
 }
 
-_FAKE_LOCK = threading.Lock()
+_attribution = {
+    "by_strategy": {s: 0.0 for s in STRATEGIES},
+    "updated_at": datetime.now(timezone.utc).isoformat(),
+}
 
+def _push_orders(new_orders: List[Dict[str, Any]]):
+    if not new_orders:
+        return
+    for o in new_orders:
+        o.setdefault("ts", time.time())
+        _orders_ring.append(o)
+    if len(_orders_ring) > _MAX_ORDERS:
+        del _orders_ring[: len(_orders_ring) - _MAX_ORDERS]
 
-def _now() -> datetime:
-    return datetime.now(timezone.utc)
+def _touch_metrics(orders: List[Dict[str, Any]], strategy: str):
+    if not orders:
+        return
+    pnl_bump = sum(float(o.get("pnl", 0.0)) for o in orders)
+    _pnl_summary["pnl_day"] += pnl_bump
+    _pnl_summary["equity"] += pnl_bump
+    _pnl_summary["updated_at"] = datetime.now(timezone.utc).isoformat()
 
+    _attribution["by_strategy"][strategy] = _attribution["by_strategy"].get(strategy, 0.0) + pnl_bump
+    _attribution["updated_at"] = datetime.now(timezone.utc).isoformat()
 
-def _ts() -> str:
-    return _now().isoformat()
+# -----------------------------------------------------------------------------
+# Contexts
+# -----------------------------------------------------------------------------
+def _prepare_contexts(req: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Build a robust contexts map that *always* contains:
+      - 'one': a single context dict
+      - 'default': same as 'one' unless overridden
+    and also preserves any user-provided contexts.
+    Supports incoming contexts as dict, list, or None.
+    """
+    tf = req.get("timeframe") or req.get("tf") or DEFAULT_TIMEFRAME
 
+    symbols_raw = req.get("symbols") or req.get("symbol") or []
+    if isinstance(symbols_raw, str):
+        if symbols_raw.strip():
+            symbols = [s.strip() for s in symbols_raw.split(",")]
+        else:
+            symbols = []
+    elif isinstance(symbols_raw, list):
+        symbols = symbols_raw
+    else:
+        env_syms = [s.strip() for s in DEFAULT_SYMBOLS.split(",") if s.strip()]
+        symbols = env_syms
 
-def _safe_float(x: Any, default: float = 0.0) -> float:
+    notional = req.get("notional") or req.get("size") or DEFAULT_NOTIONAL
+
+    base_ctx = {
+        "timeframe": tf,
+        "symbols": symbols,
+        "notional": notional,
+    }
+
+    provided = req.get("contexts")
+    ctx_map: Dict[str, Any] = {}
+
+    if isinstance(provided, dict):
+        ctx_map.update({k: (v or {}) for k, v in provided.items()})
+    elif isinstance(provided, list) and provided:
+        first = provided[0] if isinstance(provided[0], dict) else {}
+        ctx_map["list"] = [(c if isinstance(c, dict) else {}) for c in provided]
+        ctx_map["one"] = {**base_ctx, **first}
+    elif isinstance(provided, list) and not provided:
+        pass
+    elif isinstance(provided, (str, int, float)):
+        ctx_map["one"] = {**base_ctx, "tag": str(provided)}
+
+    if "one" not in ctx_map:
+        if "default" in ctx_map and isinstance(ctx_map["default"], dict):
+            ctx_map["one"] = {**base_ctx, **ctx_map["default"]}
+        else:
+            ctx_map["one"] = dict(base_ctx)
+
+    if "default" not in ctx_map:
+        ctx_map["default"] = dict(ctx_map["one"])
+
+    for k in ("one", "default"):
+        ctx_k = ctx_map.get(k) or {}
+        ctx_k.setdefault("timeframe", tf)
+        ctx_k.setdefault("symbols", symbols)
+        ctx_k.setdefault("notional", notional)
+        ctx_map[k] = ctx_k
+
+    return ctx_map
+
+# -----------------------------------------------------------------------------
+# Hardened scan bridge (keeps YOUR PATCH verbatim)
+# -----------------------------------------------------------------------------
+async def _scan_bridge(strat: str, req: Dict[str, Any], dry: bool = False):
+    """
+    Normalizes inputs and calls StrategyBook.scan in a way that keeps
+    older strategies happy. Guarantees both:
+      - contexts['one'] and contexts['default'] exist
+      - req['one'], req['default'], and req['contexts'] exist
+    """
+    req = req or {}
+    tf = req.get("timeframe") or req.get("tf") or DEFAULT_TIMEFRAME
+    lim = int(req.get("limit") or DEFAULT_LIMIT)
+    notional = req.get("notional") or DEFAULT_NOTIONAL
+
+    # Normalize symbols from req or env
+    symbols_field = req.get("symbols") or ([req.get("symbol")] if req.get("symbol") else None)
+    if symbols_field is None:
+        env_syms = [s.strip() for s in DEFAULT_SYMBOLS.split(",") if s.strip()]
+        symbols = env_syms
+    elif isinstance(symbols_field, str):
+        symbols = [symbols_field]
+    else:
+        symbols = list(symbols_field)
+
+    # Build safe contexts
+    ctx_map = _prepare_contexts(req)
+
+    # ----------------- YOUR PREVIOUS PATCH (kept verbatim) -----------------
+    # Minimal, safe req payload your strategies can rely on
+    compact_req = {
+        # canonical fields
+        "strategy": strat,
+        "timeframe": tf,
+        "limit": lim,
+        "notional": notional,
+        "symbols": symbols,
+        "dry": dry,
+
+        # <-- NEW: mirror contexts into req so strategies that expect req['one']
+        # or req['default'] keep working. Also include req['contexts'].
+        "one": ctx_map.get("one"),
+        "default": ctx_map.get("default"),
+        "contexts": ctx_map,
+
+        # passthrough for anything else the caller provided
+        "raw": req,
+    }
+    # ----------------------------------------------------------------------
+
+    inst = StrategyBook()
+
+    result: Any = inst.scan(compact_req, ctx_map)
+
+    # Normalize output
+    if not result:
+        return []
+    if isinstance(result, dict):
+        if "orders" in result and isinstance(result["orders"], list):
+            return result["orders"]
+        return [result]
+    if isinstance(result, list):
+        return result
+    return [result]
+
+# -----------------------------------------------------------------------------
+# Background scheduler
+# -----------------------------------------------------------------------------
+_scheduler_task: Optional[asyncio.Task] = None
+_scheduler_running = False
+
+async def _scheduler_loop():
+    global _scheduler_running
+    _scheduler_running = True
     try:
-        return float(x)
+        while _scheduler_running:
+            log.info("Scheduler tick: running all strategies (dry=0)")
+            for strat in STRATEGIES:
+                req = {
+                    "timeframe": DEFAULT_TIMEFRAME,
+                    "symbols": [s.strip() for s in DEFAULT_SYMBOLS.split(",") if s.strip()],
+                    "limit": DEFAULT_LIMIT,
+                    "notional": DEFAULT_NOTIONAL,
+                    # callers can push their own contexts here later
+                }
+                orders: List[Dict[str, Any]] = []
+                try:
+                    orders = await _scan_bridge(strat, req, dry=False)
+                except Exception as e:
+                    # Shouldn’t happen now, but keep it contained
+                    log.error("scan bridge failed for '%s': %s", strat, e)
+                    orders = []
+
+                if orders:
+                    _push_orders(orders)
+                    _touch_metrics(orders, strat)
+            await asyncio.sleep(SCHEDULE_SECONDS)
+    finally:
+        log.info("Scheduler stopped.")
+
+# -----------------------------------------------------------------------------
+# Startup / Shutdown
+# -----------------------------------------------------------------------------
+@app.on_event("startup")
+async def _startup():
+    global _scheduler_task
+    log.info("Starting app; scheduler will start.")
+    _scheduler_task = asyncio.create_task(_scheduler_loop())
+
+@app.on_event("shutdown")
+async def _shutdown():
+    global _scheduler_running, _scheduler_task
+    log.info("Shutting down app; scheduler will stop.")
+    _scheduler_running = False
+    try:
+        if _scheduler_task:
+            await asyncio.wait_for(_scheduler_task, timeout=5.0)
     except Exception:
-        return default
-
+        pass
 
 # -----------------------------------------------------------------------------
-# Data helpers
+# HTML (full inline page)
 # -----------------------------------------------------------------------------
-def _load_recent_orders_from_json() -> List[Dict[str, Any]]:
-    """
-    For your local testing, this will load from /mnt/data/trades.json when present.
-    In production (Render), your app hits your real data source behind these endpoints.
-    """
-    p = "/mnt/data/trades.json"
-    if os.path.exists(p):
-        try:
-            with open(p, "r") as f:
-                data = json.load(f)
-                if isinstance(data, dict) and "orders" in data:
-                    return data["orders"]
-                if isinstance(data, list):
-                    return data
-        except Exception as e:
-            log.warning("Failed to read trades.json: %s", e)
-    return []
-
-
-def _parse_order_row(o: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Normalize an order row with safe fields used by dashboard & performance calc.
-    """
-    # Expected keys (best effort): id, strategy, side, qty, price, pnl, created_at, filled_at, symbol
-    created_at = o.get("created_at") or o.get("time") or o.get("timestamp")
-    filled_at = o.get("filled_at") or created_at
-    # Parse times
-    def _parse_dt(s: Optional[str]) -> Optional[datetime]:
-        if not s:
-            return None
-        try:
-            return datetime.fromisoformat(s.replace("Z", "+00:00"))
-        except Exception:
-            try:
-                # last-ditch: epoch seconds
-                return datetime.fromtimestamp(float(s), tz=timezone.utc)
-            except Exception:
-                return None
-
-    ca = _parse_dt(created_at)
-    fa = _parse_dt(filled_at)
-
-    return {
-        "id": o.get("id") or o.get("order_id") or "",
-        "symbol": o.get("symbol") or o.get("pair") or "UNKNOWN",
-        "strategy": str(o.get("strategy") or o.get("tag") or o.get("algo") or ""),
-        "side": (o.get("side") or "").upper(),
-        "qty": _safe_float(o.get("qty") or o.get("quantity")),
-        "price": _safe_float(o.get("price") or o.get("fill_price")),
-        "pnl": _safe_float(o.get("pnl") or o.get("profit")),
-        "created_at": ca,
-        "filled_at": fa,
-        "raw": o,
+_DASHBOARD_HTML = """
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Crypto System Dashboard</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <style>
+    :root{
+      --bg:#0b1220;
+      --panel:#111a2b;
+      --ink:#e6edf3;
+      --muted:#a6b3c2;
+      --accent:#5dd4a3;
+      --accent2:#66a3ff;
+      --red:#ff6b6b;
+      --chip:#1a2336;
+      --chip-br:#26324a;
     }
-
-
-def _orders_df(orders: List[Dict[str, Any]]) -> pd.DataFrame:
-    rows = [_parse_order_row(o) for o in orders]
-    if not rows:
-        return pd.DataFrame(
-            columns=[
-                "id",
-                "symbol",
-                "strategy",
-                "side",
-                "qty",
-                "price",
-                "pnl",
-                "created_at",
-                "filled_at",
-            ]
-        )
-    df = pd.DataFrame(rows)
-    # enforce dtypes
-    if "created_at" in df.columns:
-        df["created_at"] = pd.to_datetime(df["created_at"], utc=True, errors="coerce")
-    if "filled_at" in df.columns:
-        df["filled_at"] = pd.to_datetime(df["filled_at"], utc=True, errors="coerce")
-    for col in ["qty", "price", "pnl"]:
-        if col in df.columns:
-            df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0.0)
-    # canonical strategy tag: c1..c6 or whatever present
-    if "strategy" in df.columns:
-        df["strategy"] = df["strategy"].astype(str)
-    return df
-
-
-def _win_loss_label(pnl: float) -> str:
-    if pnl > 0:
-        return "WIN"
-    if pnl < 0:
-        return "LOSS"
-    return "FLAT"
-
-
-def _compute_performance_last_hours(
-    df: pd.DataFrame, hours: int = 4
-) -> Dict[str, Any]:
-    """
-    Returns:
-    {
-      "window_hours": 4,
-      "as_of": "...",
-      "strategies": {
-         "c1": {"trades": 3, "wins": 2, "losses": 1, "pnl": 12.3, "avg_pnl": 4.1, "win_rate": 0.67},
-         ...
-      },
-      "trades": [ {id, strategy, symbol, side, qty, price, pnl, filled_at, label}, ... ]  # only within last N hours
+    *{box-sizing:border-box}
+    body{
+      margin:0;
+      font-family: system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, "Apple Color Emoji","Segoe UI Emoji";
+      background: linear-gradient(160deg, #0b1220 0%, #0e172a 100%);
+      color:var(--ink);
     }
-    """
-    if df.empty:
-        return {
-            "window_hours": hours,
-            "as_of": _ts(),
-            "strategies": {},
-            "trades": [],
-        }
-
-    cutoff = _now() - timedelta(hours=hours)
-    # prefer filled_at, fallback to created_at
-    when = df["filled_at"].fillna(df["created_at"])
-    df4 = df[when >= cutoff].copy()
-    df4["when"] = when[when >= cutoff]
-    if df4.empty:
-        return {
-            "window_hours": hours,
-            "as_of": _ts(),
-            "strategies": {},
-            "trades": [],
-        }
-
-    # win/loss label
-    df4["label"] = df4["pnl"].apply(_win_loss_label)
-
-    per = {}
-    for strat, sdf in df4.groupby("strategy", dropna=False):
-        trades = len(sdf)
-        wins = int((sdf["pnl"] > 0).sum())
-        losses = int((sdf["pnl"] < 0).sum())
-        pnl = float(sdf["pnl"].sum())
-        avg_pnl = float(sdf["pnl"].mean()) if trades else 0.0
-        win_rate = float(wins / trades) if trades else 0.0
-        per[str(strat)] = {
-            "trades": trades,
-            "wins": wins,
-            "losses": losses,
-            "pnl": round(pnl, 6),
-            "avg_pnl": round(avg_pnl, 6),
-            "win_rate": round(win_rate, 4),
-        }
-
-    trades_list = []
-    for _, r in df4.sort_values("when", ascending=False).iterrows():
-        trades_list.append(
-            {
-                "id": r.get("id", ""),
-                "strategy": r.get("strategy", ""),
-                "symbol": r.get("symbol", ""),
-                "side": r.get("side", ""),
-                "qty": float(r.get("qty", 0.0) or 0.0),
-                "price": float(r.get("price", 0.0) or 0.0),
-                "pnl": float(r.get("pnl", 0.0) or 0.0),
-                "filled_at": r.get("when").isoformat() if pd.notna(r.get("when")) else None,
-                "label": _win_loss_label(float(r.get("pnl", 0.0) or 0.0)),
-            }
-        )
-
-    return {
-        "window_hours": hours,
-        "as_of": _ts(),
-        "strategies": per,
-        "trades": trades_list,
+    header{
+      padding:20px 24px;
+      border-bottom:1px solid #16233b;
+      display:flex;align-items:center;gap:12px;
     }
+    .badge{
+      font-size:12px;
+      background:var(--chip);
+      border:1px solid var(--chip-br);
+      color:var(--muted);
+      padding:4px 8px;border-radius:999px;
+    }
+    main{padding:24px;max-width:1200px;margin:0 auto}
+    .grid{
+      display:grid;
+      grid-template-columns: repeat(12, 1fr);
+      gap:16px;
+    }
+    .card{
+      background:var(--panel);
+      border:1px solid #1a2740;
+      border-radius:14px;
+      padding:16px;
+      box-shadow: 0 10px 24px rgba(0,0,0,.2);
+    }
+    .span-4{grid-column: span 4}
+    .span-6{grid-column: span 6}
+    .span-8{grid-column: span 8}
+    .span-12{grid-column: span 12}
+    h1{font-size:18px;margin:0}
+    .muted{color:var(--muted)}
+    .row{display:flex;align-items:center;justify-content:space-between;gap:12px}
+    .kpi{font-size:28px;font-weight:700}
+    .good{color:var(--accent)}
+    .bad{color:var(--red)}
+    table{width:100%;border-collapse:collapse;font-size:14px}
+    th,td{padding:8px;border-bottom:1px solid #1a2740;text-align:left}
+    th{color:#9db0c9;font-weight:600}
+    .chips{display:flex;flex-wrap:wrap;gap:8px}
+    .chip{
+      background:var(--chip);
+      border:1px solid var(--chip-br);
+      padding:6px 10px;border-radius:999px;font-size:12px;color:#c7d2e3;
+    }
+    a.btn{
+      display:inline-block;padding:8px 12px;border-radius:10px;text-decoration:none;
+      background:var(--accent2);color:#0b1220;font-weight:700;border:1px solid #2a3f6b;
+    }
+    footer{padding:28px;color:var(--muted);text-align:center}
+    @media (max-width: 900px){
+      .span-4,.span-6,.span-8{grid-column: span 12}
+    }
+    code{
+      background:#0d1628;border:1px solid #1a2740;padding:2px 6px;border-radius:6px
+    }
+  </style>
+  <script>
+    async function loadSummary(){
+      const r = await fetch('/pnl/summary');
+      const d = await r.json();
+      document.getElementById('eq').textContent = Number(d.equity || 0).toFixed(2);
+      document.getElementById('pnl_day').textContent = Number(d.pnl_day || 0).toFixed(2);
+      document.getElementById('pnl_week').textContent = Number(d.pnl_week || 0).toFixed(2);
+      document.getElementById('pnl_month').textContent = Number(d.pnl_month || 0).toFixed(2);
+      document.getElementById('updated').textContent = d.updated_at ? new Date(d.updated_at).toLocaleString() : '-';
+    }
+    async function loadAttribution(){
+      const r = await fetch('/orders/attribution');
+      const d = await r.json();
+      const tbody = document.getElementById('attr_body');
+      tbody.innerHTML = '';
+      if (d.by_strategy){
+        for (const [k,v] of Object.entries(d.by_strategy)){
+          const tr = document.createElement('tr');
+          tr.innerHTML = `<td>${k}</td><td>${Number(v).toFixed(2)}</td>`;
+          tbody.appendChild(tr);
+        }
+      }
+      document.getElementById('attr_updated').textContent = d.updated_at ? new Date(d.updated_at).toLocaleString() : '-';
+    }
+    async function loadOrders(){
+      const r = await fetch('/orders/recent?limit=50');
+      const d = await r.json();
+      const tbody = document.getElementById('orders_body');
+      tbody.innerHTML = '';
+      (d.orders || []).forEach(o => {
+        const tr = document.createElement('tr');
+        tr.innerHTML = `
+          <td>${o.id ?? ''}</td>
+          <td>${o.symbol ?? ''}</td>
+          <td>${o.side ?? ''}</td>
+          <td>${o.qty ?? ''}</td>
+          <td>${o.px ?? ''}</td>
+          <td>${o.strategy ?? ''}</td>
+          <td>${o.pnl ?? 0}</td>
+          <td>${o.ts ? new Date(o.ts*1000).toLocaleString() : ''}</td>
+        `;
+        tbody.appendChild(tr);
+      });
+    }
+    async function refreshAll(){
+      await Promise.all([loadSummary(), loadAttribution(), loadOrders()]);
+    }
+    setInterval(refreshAll, 15000);
+    window.addEventListener('load', refreshAll);
+  </script>
+</head>
+<body>
+  <header class="row">
+    <h1>Crypto System</h1>
+    <span class="badge">Live</span>
+    <span class="badge">Scheduler: <code>active</code></span>
+    <div style="margin-left:auto" class="chips">
+      <span class="chip">TF: <code id="tf_chip">auto</code></span>
+      <span class="chip">Tick: <code>{SCHEDULE_SECONDS}s</code></span>
+    </div>
+  </header>
 
+  <main>
+    <div class="grid">
+      <section class="card span-8">
+        <div class="row" style="margin-bottom:8px">
+          <h2 style="margin:0;font-size:16px">P&L Summary</h2>
+          <a class="btn" href="#" onclick="refreshAll();return false;">Refresh</a>
+        </div>
+        <div class="grid" style="grid-template-columns:repeat(12,1fr);gap:12px">
+          <div class="span-4">
+            <div class="muted">Equity</div>
+            <div class="kpi" id="eq">0.00</div>
+          </div>
+          <div class="span-4">
+            <div class="muted">PnL (Day)</div>
+            <div class="kpi good" id="pnl_day">0.00</div>
+          </div>
+          <div class="span-4">
+            <div class="muted">PnL (Week)</div>
+            <div class="kpi" id="pnl_week">0.00</div>
+          </div>
+          <div class="span-4">
+            <div class="muted">PnL (Month)</div>
+            <div class="kpi" id="pnl_month">0.00</div>
+          </div>
+          <div class="span-8">
+            <div class="muted">Last Updated</div>
+            <div id="updated" class="kpi" style="font-size:16px">-</div>
+          </div>
+        </div>
+      </section>
 
-# -----------------------------------------------------------------------------
-# Fake scheduler loop (no-op but keeps logs consistent)
-# -----------------------------------------------------------------------------
-def _scheduler_loop():
-    while STATE["running"]:
-        try:
-            # In your real app, kick off your strategies here.
-            STATE["last_scan_at"] = _ts()
-            log.info("Scheduler tick: running all strategies (dry=%s)", int(STATE["dry_run"]))
-            time.sleep(30)
-        except Exception:
-            time.sleep(30)
+      <section class="card span-4">
+        <div class="row" style="margin-bottom:8px">
+          <h2 style="margin:0;font-size:16px">Attribution</h2>
+        </div>
+        <table>
+          <thead><tr><th>Strategy</th><th>PnL</th></tr></thead>
+          <tbody id="attr_body"></tbody>
+        </table>
+        <div class="muted" style="margin-top:8px">Updated: <span id="attr_updated">-</span></div>
+      </section>
 
+      <section class="card span-12">
+        <div class="row" style="margin-bottom:8px">
+          <h2 style="margin:0;font-size:16px">Recent Orders</h2>
+        </div>
+        <table>
+          <thead>
+            <tr>
+              <th>ID</th><th>Symbol</th><th>Side</th><th>Qty</th><th>Price</th>
+              <th>Strategy</th><th>PnL</th><th>Time</th>
+            </tr>
+          </thead>
+          <tbody id="orders_body"></tbody>
+        </table>
+      </section>
+    </div>
+  </main>
+
+  <footer>
+    Built with FastAPI • Tick interval: {SCHEDULE_SECONDS}s
+  </footer>
+
+  <script>
+    document.getElementById('tf_chip').textContent = "{DEFAULT_TIMEFRAME}";
+  </script>
+</body>
+</html>
+""".replace("{SCHEDULE_SECONDS}", str(SCHEDULE_SECONDS)).replace("{DEFAULT_TIMEFRAME}", DEFAULT_TIMEFRAME)
 
 # -----------------------------------------------------------------------------
 # Routes
 # -----------------------------------------------------------------------------
-@app.get("/", response_class=HTMLResponse)
-def root():
-    # redirect to dashboard for convenience
-    return RedirectResponse(url="/dashboard", status_code=status.HTTP_307_TEMPORARY_REDIRECT)
-
+@app.get("/", response_class=RedirectResponse, include_in_schema=False)
+async def root():
+    return RedirectResponse(url="/dashboard", status_code=307)
 
 @app.get("/dashboard", response_class=HTMLResponse)
-def dashboard():
-    """
-    Single-file HTML (minimal CSS/JS) with:
-    - 6 strategy cards (c1..c6)
-    - P&L summary
-    - 4h performance cards + table of trades with win/loss chips
-    - Auto-refresh (every 30s), collapsible sections, mobile tweaks
-    """
-    html = f"""<!doctype html>
-<html lang="en">
-<head>
-<meta charset="utf-8" />
-<meta name="viewport" content="width=device-width,initial-scale=1" />
-<title>Crypto System — Dashboard</title>
-<style>
-  :root {{
-    --bg: #0b0f14;
-    --panel: #121821;
-    --muted: #8aa0b4;
-    --text: #e8eef5;
-    --accent: #2aa7ff;
-    --win: #0fbf66;
-    --loss: #ff4d4f;
-    --flat: #999;
-    --warn: #e8b23c;
-    --card-gap: 14px;
-  }}
-  * {{ box-sizing: border-box; }}
-  html, body {{ margin:0; background:var(--bg); color:var(--text); font-family: Inter, system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; }}
-  a {{ color: var(--accent); text-decoration: none; }}
-  .wrap {{ max-width: 1200px; margin: 0 auto; padding: 18px; }}
-  .row {{ display: grid; grid-template-columns: repeat(12, 1fr); gap: var(--card-gap); }}
-  .card {{ background: var(--panel); border: 1px solid #1b2431; border-radius: 12px; padding: 14px; }}
-  .card h3 {{ margin: 2px 0 10px; font-size: 16px; letter-spacing: .3px; }}
-  .small {{ font-size: 12px; color: var(--muted); }}
-  .pill {{ display:inline-block; padding: 2px 8px; border-radius: 999px; font-size: 12px; margin-left: 6px; }}
-  .pill.win {{ background: rgba(15,191,102,.15); color: var(--win); border: 1px solid rgba(15,191,102,.35); }}
-  .pill.loss {{ background: rgba(255,77,79,.15); color: var(--loss); border: 1px solid rgba(255,77,79,.35); }}
-  .pill.flat {{ background: rgba(255,255,255,.05); color: var(--flat); border: 1px solid rgba(255,255,255,.15); }}
-  .grid-3 {{ grid-column: span 3; }}
-  .grid-4 {{ grid-column: span 4; }}
-  .grid-6 {{ grid-column: span 6; }}
-  .grid-12 {{ grid-column: span 12; }}
-  .kpi {{ font-size: 22px; font-weight: 600; }}
-  .muted {{ color: var(--muted); }}
-  .flex {{ display: flex; align-items: center; justify-content: space-between; gap: 10px; }}
-  .hr {{ height: 1px; background: #1b2431; margin: 12px 0; border:0; }}
-  table {{ width: 100%; border-collapse: collapse; font-size: 13px; }}
-  th, td {{ padding: 8px; border-bottom: 1px solid #1b2431; text-align: left; }}
-  th {{ color: var(--muted); font-weight: 500; }}
-  .right {{ text-align: right; }}
-  .center {{ text-align: center; }}
-  .badge {{ font-size: 11px; opacity: .9; }}
-  .skeleton {{ background: linear-gradient(90deg, #141b25, #0e131a, #141b25); background-size: 200% 100%; animation: shimmer 1.5s infinite; border-radius: 8px; }}
-  @keyframes shimmer {{
-    0% {{ background-position: 200% 0; }}
-    100% {{ background-position: -200% 0; }}
-  }}
-  @media (max-width: 920px) {{
-    .grid-3 {{ grid-column: span 6; }}
-    .grid-4 {{ grid-column: span 6; }}
-    .grid-6 {{ grid-column: span 12; }}
-  }}
-  @media (max-width: 640px) {{
-    .grid-3, .grid-4 {{ grid-column: span 12; }}
-    .wrap {{ padding: 12px; }}
-  }}
-</style>
-</head>
-<body>
-<div class="wrap">
-  <div class="row">
-    <div class="grid-12">
-      <div class="flex">
-        <h2 style="margin:0;">Crypto System <span class="small">v{app.version}</span></h2>
-        <div class="small" id="updatedAt">loading…</div>
-      </div>
-    </div>
+async def dashboard():
+    return HTMLResponse(content=_DASHBOARD_HTML, status_code=200)
 
-    <!-- P&L Summary -->
-    <div class="grid-4 card">
-      <h3>P&amp;L Summary</h3>
-      <div class="kpi" id="totalPnl">—</div>
-      <div class="small muted">Day: <span id="dayPnl">—</span> · Week: <span id="weekPnl">—</span> · Month: <span id="monthPnl">—</span></div>
-      <hr class="hr" />
-      <div class="small">Updated <span id="pnlUpdated">—</span></div>
-    </div>
+@app.get("/pnl/summary", response_class=JSONResponse)
+async def pnl_summary():
+    return JSONResponse(_pnl_summary)
 
-    <!-- Strategy Cards c1..c6 -->
-    <div class="grid-8 card">
-      <div class="flex">
-        <h3>Strategies</h3>
-        <div class="small muted">Last scan: <span id="lastScan">—</span></div>
-      </div>
-      <div class="row" id="strategyCards">
-        <!-- 6 placeholders -->
-        {''.join(f'''
-        <div class="grid-4">
-          <div class="card">
-            <div class="flex"><div><strong>Strategy {i}</strong> <span class="badge muted" id="s{i}Tag">c{i}</span></div><div class="small muted" id="s{i}Status">—</div></div>
-            <div class="hr"></div>
-            <div class="small">Trades 4h: <strong id="s{i}Trades">—</strong> <span class="pill win" id="s{i}Wins">W: —</span> <span class="pill loss" id="s{i}Losses">L: —</span></div>
-            <div class="small">PnL 4h: <strong id="s{i}Pnl">—</strong> · Win%: <strong id="s{i}WR">—</strong></div>
-          </div>
-        </div>''' for i in range(1,7))}
-      </div>
-    </div>
+@app.get("/orders/recent", response_class=JSONResponse)
+async def orders_recent(limit: int = Query(DEFAULT_LIMIT, ge=1, le=1000)):
+    items = list(reversed(_orders_ring[-limit:]))
+    return JSONResponse({"orders": items, "count": len(items)})
 
-    <!-- 4h Performance & Trades -->
-    <div class="grid-12 card">
-      <div class="flex">
-        <h3>Last 4 Hours</h3>
-        <div class="small muted">As of <span id="asOf">—</span> · window <span id="windowHrs">4</span>h</div>
-      </div>
-      <div class="row">
-        <div class="grid-6">
-          <table>
-            <thead><tr><th>Strategy</th><th class="right">Trades</th><th class="right">Wins</th><th class="right">Losses</th><th class="right">PnL</th><th class="right">Win%</th></tr></thead>
-            <tbody id="perfBody"><tr><td colspan="6" class="center muted">Loading…</td></tr></tbody>
-          </table>
-        </div>
-        <div class="grid-6">
-          <table>
-            <thead><tr><th>Time</th><th>Strat</th><th>Symbol</th><th>Side</th><th class="right">Qty</th><th class="right">Price</th><th class="right">PnL</th><th>Result</th></tr></thead>
-            <tbody id="tradesBody"><tr><td colspan="8" class="center muted">Loading…</td></tr></tbody>
-          </table>
-        </div>
-      </div>
-    </div>
+@app.get("/orders/attribution", response_class=JSONResponse)
+async def orders_attribution():
+    return JSONResponse(_attribution)
 
-  </div>
-</div>
-
-<script>
-const fmtMoney = (x) => {{
-  if (x === null || x === undefined || isNaN(x)) return "—";
-  const s = Number(x).toFixed(2);
-  const n = Number(x);
-  const color = n > 0 ? 'var(--win)' : (n < 0 ? 'var(--loss)' : 'var(--flat)');
-  return `<span style="color:${{color}}">${{s}}</span>`;
-}};
-
-const pct = (x) => {{
-  if (!x && x !== 0) return "—";
-  return (Number(x) * 100).toFixed(0) + "%";
-}};
-
-async function getJSON(path) {{
-  const r = await fetch(path, {{ cache: 'no-store' }});
-  if (!r.ok) throw new Error(path + " -> " + r.status);
-  return await r.json();
-}}
-
-async function refresh() {{
-  try {{
-    // PnL
-    const pnl = await getJSON('/pnl/summary');
-    document.getElementById('totalPnl').innerHTML = fmtMoney(pnl.total_pnl);
-    document.getElementById('dayPnl').innerHTML = fmtMoney(pnl.day_pnl);
-    document.getElementById('weekPnl').innerHTML = fmtMoney(pnl.week_pnl);
-    document.getElementById('monthPnl').innerHTML = fmtMoney(pnl.month_pnl);
-    document.getElementById('pnlUpdated').textContent = pnl.updated_at ?? '—';
-
-    // Orders attribution (used for c1..c6 tags/status if you extend later)
-    const attr = await getJSON('/orders/attribution');
-
-    // 4h performance
-    const perf = await getJSON('/orders/performance_4h');
-    document.getElementById('asOf').textContent = perf.as_of ?? '—';
-    document.getElementById('windowHrs').textContent = perf.window_hours ?? 4;
-
-    // fill performance table
-    const per = perf.strategies || {{}};
-    const keys = Object.keys(per).sort();
-    const perfBody = document.getElementById('perfBody');
-    perfBody.innerHTML = '';
-    if (keys.length === 0) {{
-      perfBody.innerHTML = '<tr><td colspan="6" class="center muted">No trades in the last 4 hours.</td></tr>';
-    }} else {{
-      for (const k of keys) {{
-        const s = per[k];
-        const wr = (s.win_rate ?? 0) * 100;
-        perfBody.insertAdjacentHTML('beforeend', `
-          <tr>
-            <td><strong>${{k}}</strong></td>
-            <td class="right">${{s.trades}}</td>
-            <td class="right"><span class="pill win">W: ${{s.wins}}</span></td>
-            <td class="right"><span class="pill loss">L: ${{s.losses}}</span></td>
-            <td class="right">${{fmtMoney(s.pnl)}}</td>
-            <td class="right">${{wr.toFixed(0)}}%</td>
-          </tr>
-        `);
-      }}
-    }}
-
-    // fill trades table
-    const trades = perf.trades || [];
-    const tradesBody = document.getElementById('tradesBody');
-    tradesBody.innerHTML = '';
-    if (trades.length === 0) {{
-      tradesBody.innerHTML = '<tr><td colspan="8" class="center muted">No trades in the last 4 hours.</td></tr>';
-    }} else {{
-      for (const t of trades) {{
-        const pillCls = t.label === 'WIN' ? 'pill win' : (t.label === 'LOSS' ? 'pill loss' : 'pill flat');
-        tradesBody.insertAdjacentHTML('beforeend', `
-          <tr>
-            <td>${{t.filled_at?.replace('T',' ').replace('Z','') ?? '—'}}</td>
-            <td>${{t.strategy ?? '—'}}</td>
-            <td>${{t.symbol ?? '—'}}</td>
-            <td>${{t.side ?? '—'}}</td>
-            <td class="right">${{(t.qty ?? 0).toFixed(4)}}</td>
-            <td class="right">${{(t.price ?? 0).toFixed(4)}}</td>
-            <td class="right">${{fmtMoney(t.pnl)}}</td>
-            <td><span class="${{pillCls}}">${{t.label}}</span></td>
-          </tr>
-        `);
-      }}
-    }}
-
-    // strategy cards (1..6)
-    for (let i=1;i<=6;i++) {{
-      const id = 'c' + i;
-      const elTrades = document.getElementById('s'+i+'Trades');
-      const elWins   = document.getElementById('s'+i+'Wins');
-      const elLosses = document.getElementById('s'+i+'Losses');
-      const elPnl    = document.getElementById('s'+i+'Pnl');
-      const elWR     = document.getElementById('s'+i+'WR');
-      const elTag    = document.getElementById('s'+i+'Tag');
-      const elStatus = document.getElementById('s'+i+'Status');
-
-      const s = per[id] || null;
-      elTag.textContent = id;
-      if (!s) {{
-        elTrades.textContent = '0';
-        elWins.textContent = 'W: 0';
-        elLosses.textContent = 'L: 0';
-        elPnl.innerHTML = fmtMoney(0);
-        elWR.textContent = '0%';
-        elStatus.textContent = 'idle';
-      }} else {{
-        elTrades.textContent = String(s.trades ?? 0);
-        elWins.textContent = 'W: ' + String(s.wins ?? 0);
-        elLosses.textContent = 'L: ' + String(s.losses ?? 0);
-        elPnl.innerHTML = fmtMoney(s.pnl ?? 0);
-        elWR.textContent = ((s.win_rate ?? 0) * 100).toFixed(0) + '%';
-        elStatus.textContent = s.trades > 0 ? 'active' : 'idle';
-      }}
-    }}
-
-    document.getElementById('updatedAt').textContent = new Date().toISOString();
-  }} catch (e) {{
-    console.error(e);
-  }}
-}}
-
-setInterval(refresh, 30000);
-refresh();
-</script>
-</body>
-</html>
-"""
-    return HTMLResponse(content=html)
-
-
-@app.get("/orders/recent")
-def orders_recent(limit: int = 50):
-    """
-    Returns up to `limit` most recent orders. In your env this is proxied to your data source.
-    For local debug, we read /mnt/data/trades.json (if present) and trim.
-    """
-    orders = _load_recent_orders_from_json()
-    # Sort by filled_at/created_at desc
-    df = _orders_df(orders)
-    if not df.empty:
-        when = df["filled_at"].fillna(df["created_at"])
-        df = df.assign(_when=when).sort_values("_when", ascending=False).drop(columns=["_when"])
-        if limit and limit > 0:
-            df = df.head(int(limit))
-        out = df.to_dict(orient="records")
-        # stringify datetimes
-        for r in out:
-            for k in ["created_at", "filled_at"]:
-                if isinstance(r.get(k), datetime):
-                    r[k] = r[k].isoformat()
-        return JSONResponse(out)
-    return JSONResponse([])
-
-
-@app.get("/orders/attribution")
-def orders_attribution():
-    """
-    Minimal stub: return strategies and counts of orders per strategy from recent.
-    """
-    orders = _load_recent_orders_from_json()
-    df = _orders_df(orders)
-    res: Dict[str, Any] = {}
-    if not df.empty and "strategy" in df.columns:
-        counts = df["strategy"].value_counts(dropna=False).to_dict()
-        for k, v in counts.items():
-            res[str(k)] = {"orders": int(v)}
-    # Ensure c1..c6 keys exist
-    for i in range(1, 7):
-        key = f"c{i}"
-        res.setdefault(key, {"orders": 0})
-    return JSONResponse(res)
-
-
-@app.get("/pnl/summary")
-def pnl_summary():
-    """
-    Returns rolling totals (kept in memory here).
-    In your setup, this would hit your PnL service/data store.
-    """
-    # Update "updated_at" on each call
-    STATE["pnl_summary"]["updated_at"] = _ts()
-    return JSONResponse(STATE["pnl_summary"])
-
-
-@app.get("/orders/performance_4h")
-def orders_performance_4h():
-    """
-    Compute performance by strategy for the last 4 hours, plus the individual trades
-    in that window, labeled WIN/LOSS/FLAT.
-    """
-    orders = _load_recent_orders_from_json()
-    df = _orders_df(orders)
-    res = _compute_performance_last_hours(df, hours=4)
-    return JSONResponse(res)
-
-
-# -----------------------------------------------------------------------------
-# Lifecycle (FastAPI)
-# -----------------------------------------------------------------------------
-@app.on_event("startup")
-def _on_startup():
-    log.info("Starting app; scheduler will start.")
-    t = threading.Thread(target=_scheduler_loop, name="scheduler", daemon=True)
-    t.start()
-
-
-@app.on_event("shutdown")
-def _on_shutdown():
-    log.info("Shutting down app; scheduler will stop.")
-    STATE["running"] = False
-
+@app.get("/healthz", response_class=JSONResponse, include_in_schema=False)
+async def healthz():
+    return JSONResponse({"ok": True, "ts": time.time()})
 
 # -----------------------------------------------------------------------------
 # Entrypoint
 # -----------------------------------------------------------------------------
 if __name__ == "__main__":
-    host = os.getenv("HOST", "0.0.0.0")
+    import uvicorn  # type: ignore
     port = int(os.getenv("PORT", "10000"))
-    log.info("Launching Uvicorn on %s:%s", host, port)
-    uvicorn.run(app, host=host, port=port)
+    log.info("Launching Uvicorn on 0.0.0.0:%d", port)
+    uvicorn.run("app:app", host="0.0.0.0", port=port, reload=False, access_log=True)
