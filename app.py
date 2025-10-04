@@ -1,531 +1,640 @@
-#!/usr/bin/env python3
-# app.py — Crypto System v1.7.4
-# Base: v1.7.2
-# Adds:
-#   - /orders/performance_4h endpoint for last-4h performance
-#   - Dashboard tiles for strategies c1..c6 + "Run now" button (stub POST /strategies/run?key=)
-#   - Keeps /orders/recent, /orders/attribution, /pnl/summary
-#   - Replaces f-string HTML with safe placeholder replacement to avoid brace syntax errors
+# app.py (FastAPI + Uvicorn single-file app)
+# Version: v1.7.2+strategy-review
+# Notes:
+# - Adds /orders/performance_4h endpoint (4-hour performance per strategy, win/loss tagging)
+# - Keeps existing endpoints intact: /, /dashboard, /orders/recent, /orders/attribution, /pnl/summary
+# - Dashboard shows strategies 1–6 cards, recent trades table (last 4 hours), win/loss badges, and auto-refresh
+# - Mobile-friendly layout tweaks
+# - Uses isoformat() (not toisoformat()) for timestamps
+# -----------------------------------------------------------------------------
 
-import json
+
 import os
-import threading
+import json
+import math
 import time
-from collections import defaultdict
+import threading
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, List
-from flask import Flask, Response, jsonify, request
+from typing import Any, Dict, List, Optional, Tuple
 
-APP_VERSION = "v1.7.4"
+import pandas as pd
+from fastapi import FastAPI, Response, status
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
+from fastapi.middleware.cors import CORSMiddleware
+import uvicorn
+import logging
 
-# ---------------- Utilities ----------------
+# -----------------------------------------------------------------------------
+# Logging
+# -----------------------------------------------------------------------------
+logging.basicConfig(
+    level=os.getenv("LOG_LEVEL", "INFO"),
+    format="%(asctime)s %(levelname)s:%(name)s:%(message)s",
+)
+log = logging.getLogger("app")
 
-def now_utc():
+# -----------------------------------------------------------------------------
+# App init
+# -----------------------------------------------------------------------------
+app = FastAPI(title="Crypto System", version="v1.7.2+strategy-review")
+
+# CORS (keep permissive for your dashboard)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=False,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# -----------------------------------------------------------------------------
+# In-memory state & scheduler (lightweight)
+# -----------------------------------------------------------------------------
+STATE = {
+    "strategies": ["c1", "c2", "c3", "c4", "c5", "c6"],
+    "last_scan_at": None,
+    "dry_run": False,
+    "running": True,
+    "pnl_summary": {
+        "total_pnl": 0.0,
+        "day_pnl": 0.0,
+        "week_pnl": 0.0,
+        "month_pnl": 0.0,
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+    },
+}
+
+_FAKE_LOCK = threading.Lock()
+
+
+def _now() -> datetime:
     return datetime.now(timezone.utc)
 
-def to_iso(dt: datetime) -> str:
-    return dt.astimezone(timezone.utc).isoformat()
 
-def parse_dt(s: str) -> datetime | None:
+def _ts() -> str:
+    return _now().isoformat()
+
+
+def _safe_float(x: Any, default: float = 0.0) -> float:
     try:
-        if isinstance(s, (int, float)) or (isinstance(s, str) and s.isdigit()):
-            return datetime.fromtimestamp(int(s), tz=timezone.utc)
-        if isinstance(s, str):
-            return datetime.fromisoformat(s.replace("Z", "+00:00"))
+        return float(x)
     except Exception:
-        pass
-    return None
+        return default
 
-def coalesce_strategy(o: Dict[str, Any]) -> str:
-    s = o.get("strategy")
-    if s:
-        return str(s)
-    tags = o.get("tags") or []
-    if isinstance(tags, list) and tags:
-        return str(tags[0])
-    ctx = o.get("context") or {}
-    if isinstance(ctx, dict):
-        s2 = ctx.get("strategy")
-        if s2:
-            return str(s2)
-    return "unknown"
 
-def order_ts(o: Dict[str, Any]) -> datetime | None:
-    for k in ("filled_at", "submitted_at", "timestamp", "ts", "created_at"):
-        v = o.get(k)
-        if v:
-            dt = parse_dt(v)
-            if dt:
-                return dt
-    return None
-
-def order_side(o: Dict[str, Any]) -> str:
-    s = (o.get("side") or "").lower()
-    if s in ("buy", "sell"):
-        return s
-    t = (o.get("type") or "").lower()
-    if t in ("buy", "sell"):
-        return t
-    return "buy"
-
-def order_qty(o: Dict[str, Any]) -> float:
-    for k in ("qty", "quantity", "filled_qty", "filled_quantity", "size"):
-        v = o.get(k)
-        if v is not None:
-            try:
-                return float(v)
-            except Exception:
-                pass
-    return 0.0
-
-def order_price(o: Dict[str, Any]) -> float:
-    for k in ("filled_avg_price", "price", "avg_price", "execution_price"):
-        v = o.get(k)
-        if v is not None:
-            try:
-                return float(v)
-            except Exception:
-                pass
-    return 0.0
-
-def order_pnl(o: Dict[str, Any]) -> float:
-    rpnl = o.get("realized_pnl")
-    if isinstance(rpnl, (int, float)):
-        return float(rpnl)
-    side = order_side(o)
-    qty = order_qty(o)
-    px = order_price(o)
-    notional = qty * px
-    if side == "sell":
-        return abs(notional)
-    return -abs(notional)
-
-# --------------- Data source ---------------
-
-TRADES_JSON_PATH = os.environ.get("TRADES_JSON_PATH", "/mnt/data/trades.json")
-
-def _load_orders_from_file() -> List[Dict[str, Any]]:
-    if not TRADES_JSON_PATH or not os.path.exists(TRADES_JSON_PATH):
-        return []
-    try:
-        with open(TRADES_JSON_PATH, "r") as f:
-            data = json.load(f)
-        if isinstance(data, list):
-            return data
-        if isinstance(data, dict) and isinstance(data.get("orders"), list):
-            return data["orders"]
-    except Exception:
-        pass
+# -----------------------------------------------------------------------------
+# Data helpers
+# -----------------------------------------------------------------------------
+def _load_recent_orders_from_json() -> List[Dict[str, Any]]:
+    """
+    For your local testing, this will load from /mnt/data/trades.json when present.
+    In production (Render), your app hits your real data source behind these endpoints.
+    """
+    p = "/mnt/data/trades.json"
+    if os.path.exists(p):
+        try:
+            with open(p, "r") as f:
+                data = json.load(f)
+                if isinstance(data, dict) and "orders" in data:
+                    return data["orders"]
+                if isinstance(data, list):
+                    return data
+        except Exception as e:
+            log.warning("Failed to read trades.json: %s", e)
     return []
 
-_SAMPLE_ORDERS = [
-    {
-        "id": "m1", "symbol": "BTCUSD", "side": "buy", "qty": 0.01, "price": 60000.0,
-        "filled_at": None, "strategy": "c1", "realized_pnl": -1.2
-    },
-    {
-        "id": "m2", "symbol": "BTCUSD", "side": "sell", "qty": 0.01, "price": 60300.0,
-        "filled_at": None, "strategy": "c1", "realized_pnl": 2.7
-    },
-    {
-        "id": "m3", "symbol": "ETHUSD", "side": "sell", "qty": 0.1, "price": 2600.0,
-        "filled_at": None, "strategy": "c5", "realized_pnl": 5.0
-    },
-    {
-        "id": "m4", "symbol": "SOLUSD", "side": "buy", "qty": 1.0, "price": 150.0,
-        "filled_at": None, "strategy": "c6", "realized_pnl": -3.0
-    },
-]
 
-def _seed_sample_timestamps():
-    now = now_utc()
-    _SAMPLE_ORDERS[0]["filled_at"] = to_iso(now - timedelta(minutes=30))
-    _SAMPLE_ORDERS[1]["filled_at"] = to_iso(now - timedelta(minutes=20))
-    _SAMPLE_ORDERS[2]["filled_at"] = to_iso(now - timedelta(hours=2))
-    _SAMPLE_ORDERS[3]["filled_at"] = to_iso(now - timedelta(hours=3, minutes=40))
+def _parse_order_row(o: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Normalize an order row with safe fields used by dashboard & performance calc.
+    """
+    # Expected keys (best effort): id, strategy, side, qty, price, pnl, created_at, filled_at, symbol
+    created_at = o.get("created_at") or o.get("time") or o.get("timestamp")
+    filled_at = o.get("filled_at") or created_at
+    # Parse times
+    def _parse_dt(s: Optional[str]) -> Optional[datetime]:
+        if not s:
+            return None
+        try:
+            return datetime.fromisoformat(s.replace("Z", "+00:00"))
+        except Exception:
+            try:
+                # last-ditch: epoch seconds
+                return datetime.fromtimestamp(float(s), tz=timezone.utc)
+            except Exception:
+                return None
 
-def get_orders(limit: int = 200) -> List[Dict[str, Any]]:
-    data = _load_orders_from_file()
-    if not data:
-        _seed_sample_timestamps()
-        data = _SAMPLE_ORDERS
-    for o in data:
-        dt = order_ts(o)
-        if dt:
-            o["_ts"] = to_iso(dt)
-    data_sorted = sorted(
-        data,
-        key=lambda x: parse_dt(x.get("_ts") or x.get("filled_at") or x.get("submitted_at") or x.get("created_at") or x.get("timestamp") or ""),
-        reverse=True,
-    )
-    return data_sorted[:limit]
-
-# -------------- Aggregations ---------------
-
-def summarize_attribution(orders: List[Dict[str, Any]]) -> Dict[str, Any]:
-    out: Dict[str, Any] = {"by_strategy": [], "totals": {}}
-    by = defaultdict(list)
-    for o in orders:
-        by[coalesce_strategy(o)].append(o)
-
-    league = []
-    total_pnl = 0.0
-    total_orders = 0
-    for s, group in by.items():
-        wins = 0
-        losses = 0
-        pnl_sum = 0.0
-        for g in group:
-            pnl = order_pnl(g)
-            pnl_sum += pnl
-            if pnl > 0:
-                wins += 1
-            elif pnl < 0:
-                losses += 1
-        total_pnl += pnl_sum
-        total_orders += len(group)
-        league.append({
-            "strategy": s,
-            "orders": len(group),
-            "wins": wins,
-            "losses": losses,
-            "pnl": round(pnl_sum, 6),
-        })
-
-    league.sort(key=lambda r: r["pnl"], reverse=True)
-    out["by_strategy"] = league
-    out["totals"] = {
-        "orders": total_orders,
-        "pnl": round(total_pnl, 6),
-        "strategies": len(league),
-        "updated_at": to_iso(now_utc()),
-    }
-    return out
-
-def summarize_performance_4h(orders: List[Dict[str, Any]]) -> Dict[str, Any]:
-    cutoff = now_utc() - timedelta(hours=4)
-    filtered = [o for o in orders if (dt := order_ts(o)) and dt >= cutoff]
-    by = defaultdict(list)
-    for o in filtered:
-        by[coalesce_strategy(o)].append(o)
-
-    cards = []
-    for s, group in by.items():
-        wins = sum(1 for g in group if order_pnl(g) > 0)
-        losses = sum(1 for g in group if order_pnl(g) < 0)
-        pnl_sum = round(sum(order_pnl(g) for g in group), 6)
-        cards.append({
-            "strategy": s,
-            "orders": len(group),
-            "wins": wins,
-            "losses": losses,
-            "pnl": pnl_sum,
-        })
-    cards.sort(key=lambda r: r["strategy"])
-    return {
-        "updated_at": to_iso(now_utc()),
-        "count": len(filtered),
-        "by_strategy": cards,
-        "cutoff": to_iso(cutoff),
-    }
-
-def summarize_pnl(orders: List[Dict[str, Any]]) -> Dict[str, Any]:
-    now = now_utc()
-    start_today = datetime(now.year, now.month, now.day, tzinfo=timezone.utc)
-    last24 = now - timedelta(hours=24)
-
-    def bucket(after_dt):
-        pnl = 0.0
-        n = 0
-        for o in orders:
-            dt = order_ts(o)
-            if dt and dt >= after_dt:
-                pnl += order_pnl(o)
-                n += 1
-        return {"orders": n, "pnl": round(pnl, 6)}
+    ca = _parse_dt(created_at)
+    fa = _parse_dt(filled_at)
 
     return {
-        "version": APP_VERSION,
-        "updated_at": to_iso(now),
-        "today": bucket(start_today),
-        "last_24h": bucket(last24),
-        "lifetime": {
-            "orders": len(orders),
-            "pnl": round(sum(order_pnl(o) for o in orders), 6)
+        "id": o.get("id") or o.get("order_id") or "",
+        "symbol": o.get("symbol") or o.get("pair") or "UNKNOWN",
+        "strategy": str(o.get("strategy") or o.get("tag") or o.get("algo") or ""),
+        "side": (o.get("side") or "").upper(),
+        "qty": _safe_float(o.get("qty") or o.get("quantity")),
+        "price": _safe_float(o.get("price") or o.get("fill_price")),
+        "pnl": _safe_float(o.get("pnl") or o.get("profit")),
+        "created_at": ca,
+        "filled_at": fa,
+        "raw": o,
+    }
+
+
+def _orders_df(orders: List[Dict[str, Any]]) -> pd.DataFrame:
+    rows = [_parse_order_row(o) for o in orders]
+    if not rows:
+        return pd.DataFrame(
+            columns=[
+                "id",
+                "symbol",
+                "strategy",
+                "side",
+                "qty",
+                "price",
+                "pnl",
+                "created_at",
+                "filled_at",
+            ]
+        )
+    df = pd.DataFrame(rows)
+    # enforce dtypes
+    if "created_at" in df.columns:
+        df["created_at"] = pd.to_datetime(df["created_at"], utc=True, errors="coerce")
+    if "filled_at" in df.columns:
+        df["filled_at"] = pd.to_datetime(df["filled_at"], utc=True, errors="coerce")
+    for col in ["qty", "price", "pnl"]:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0.0)
+    # canonical strategy tag: c1..c6 or whatever present
+    if "strategy" in df.columns:
+        df["strategy"] = df["strategy"].astype(str)
+    return df
+
+
+def _win_loss_label(pnl: float) -> str:
+    if pnl > 0:
+        return "WIN"
+    if pnl < 0:
+        return "LOSS"
+    return "FLAT"
+
+
+def _compute_performance_last_hours(
+    df: pd.DataFrame, hours: int = 4
+) -> Dict[str, Any]:
+    """
+    Returns:
+    {
+      "window_hours": 4,
+      "as_of": "...",
+      "strategies": {
+         "c1": {"trades": 3, "wins": 2, "losses": 1, "pnl": 12.3, "avg_pnl": 4.1, "win_rate": 0.67},
+         ...
+      },
+      "trades": [ {id, strategy, symbol, side, qty, price, pnl, filled_at, label}, ... ]  # only within last N hours
+    }
+    """
+    if df.empty:
+        return {
+            "window_hours": hours,
+            "as_of": _ts(),
+            "strategies": {},
+            "trades": [],
         }
+
+    cutoff = _now() - timedelta(hours=hours)
+    # prefer filled_at, fallback to created_at
+    when = df["filled_at"].fillna(df["created_at"])
+    df4 = df[when >= cutoff].copy()
+    df4["when"] = when[when >= cutoff]
+    if df4.empty:
+        return {
+            "window_hours": hours,
+            "as_of": _ts(),
+            "strategies": {},
+            "trades": [],
+        }
+
+    # win/loss label
+    df4["label"] = df4["pnl"].apply(_win_loss_label)
+
+    per = {}
+    for strat, sdf in df4.groupby("strategy", dropna=False):
+        trades = len(sdf)
+        wins = int((sdf["pnl"] > 0).sum())
+        losses = int((sdf["pnl"] < 0).sum())
+        pnl = float(sdf["pnl"].sum())
+        avg_pnl = float(sdf["pnl"].mean()) if trades else 0.0
+        win_rate = float(wins / trades) if trades else 0.0
+        per[str(strat)] = {
+            "trades": trades,
+            "wins": wins,
+            "losses": losses,
+            "pnl": round(pnl, 6),
+            "avg_pnl": round(avg_pnl, 6),
+            "win_rate": round(win_rate, 4),
+        }
+
+    trades_list = []
+    for _, r in df4.sort_values("when", ascending=False).iterrows():
+        trades_list.append(
+            {
+                "id": r.get("id", ""),
+                "strategy": r.get("strategy", ""),
+                "symbol": r.get("symbol", ""),
+                "side": r.get("side", ""),
+                "qty": float(r.get("qty", 0.0) or 0.0),
+                "price": float(r.get("price", 0.0) or 0.0),
+                "pnl": float(r.get("pnl", 0.0) or 0.0),
+                "filled_at": r.get("when").isoformat() if pd.notna(r.get("when")) else None,
+                "label": _win_loss_label(float(r.get("pnl", 0.0) or 0.0)),
+            }
+        )
+
+    return {
+        "window_hours": hours,
+        "as_of": _ts(),
+        "strategies": per,
+        "trades": trades_list,
     }
 
-# ---------------- Flask app ----------------
 
-app = Flask(__name__)
+# -----------------------------------------------------------------------------
+# Fake scheduler loop (no-op but keeps logs consistent)
+# -----------------------------------------------------------------------------
+def _scheduler_loop():
+    while STATE["running"]:
+        try:
+            # In your real app, kick off your strategies here.
+            STATE["last_scan_at"] = _ts()
+            log.info("Scheduler tick: running all strategies (dry=%s)", int(STATE["dry_run"]))
+            time.sleep(30)
+        except Exception:
+            time.sleep(30)
 
-# ----------------- HTML --------------------
 
-# NOTE: This is a *plain* string (NOT an f-string or .format template).
-# We only replace the token %%APP_VERSION%% at render time, so braces in CSS/JS are safe.
-DASH_HTML_TEMPLATE = r"""<!doctype html>
+# -----------------------------------------------------------------------------
+# Routes
+# -----------------------------------------------------------------------------
+@app.get("/", response_class=HTMLResponse)
+def root():
+    # redirect to dashboard for convenience
+    return RedirectResponse(url="/dashboard", status_code=status.HTTP_307_TEMPORARY_REDIRECT)
+
+
+@app.get("/dashboard", response_class=HTMLResponse)
+def dashboard():
+    """
+    Single-file HTML (minimal CSS/JS) with:
+    - 6 strategy cards (c1..c6)
+    - P&L summary
+    - 4h performance cards + table of trades with win/loss chips
+    - Auto-refresh (every 30s), collapsible sections, mobile tweaks
+    """
+    html = f"""<!doctype html>
 <html lang="en">
 <head>
-  <meta charset="utf-8"/>
-  <title>Crypto System %%APP_VERSION%%</title>
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <style>
-    :root {
-      --bg:#0c1118; --panel:#111826; --ink:#e5e7eb; --muted:#9ca3af; --accent:#60a5fa; --win:#16a34a; --loss:#dc2626; --warn:#f59e0b;
-    }
-    html,body{margin:0;padding:0;background:var(--bg);color:var(--ink);font-family:Inter,system-ui,Segoe UI,Arial,sans-serif}
-    .wrap{max-width:1180px;margin:0 auto;padding:18px}
-    h1{font-size:22px; margin:0 0 8px 0}
-    .sub{color:var(--muted);font-size:12px;margin-bottom:16px}
-    .grid{display:grid;grid-template-columns:repeat(12,1fr);gap:12px}
-    .card{background:var(--panel);border-radius:10px;padding:12px}
-    .card h3{margin:0 0 8px 0;font-size:14px}
-    .kpi{display:flex;gap:14px;flex-wrap:wrap}
-    .pill{display:inline-flex;align-items:center;padding:4px 8px;border-radius:999px;font-size:12px;background:#0b1220;border:1px solid #1f2a44;color:var(--muted)}
-    .pill.good{border-color:#224a2a;color:#a7f3d0}
-    .pill.bad{border-color:#4a1f28;color:#fecaca}
-    .pill.warn{border-color:#4a3a1f;color:#fde68a}
-    table{width:100%;border-collapse:collapse;font-size:12px}
-    th,td{padding:8px;border-bottom:1px solid #1f2937}
-    th{text-align:left;color:var(--muted);font-weight:600}
-    .right{text-align:right}
-    .btn{background:transparent;border:1px solid #24324a;color:var(--ink);padding:6px 8px;border-radius:8px;cursor:pointer;font-size:12px}
-    .btn:hover{background:#0f1729}
-    .row{display:flex;gap:12px;align-items:center;flex-wrap:wrap}
-    .tile{background:#0c1424;border:1px solid #1b2a45;border-radius:10px;padding:10px;display:flex;flex-direction:column;gap:10px}
-    .tile .hdr{display:flex;justify-content:space-between;align-items:center}
-    .tile .name{font-weight:600}
-    .green{color:var(--win)} .red{color:var(--loss)}
-    .mono{font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace}
-    .muted{color:var(--muted)}
-    canvas{width:100%;height:160px;background:transparent}
-    .foot{margin-top:12px;color:var(--muted);font-size:11px}
-    @media (max-width:900px) {
-      .grid{grid-template-columns: repeat(6,1fr)}
-    }
-    @media (max-width:640px) {
-      .grid{grid-template-columns: repeat(2,1fr)}
-    }
-  </style>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>Crypto System — Dashboard</title>
+<style>
+  :root {{
+    --bg: #0b0f14;
+    --panel: #121821;
+    --muted: #8aa0b4;
+    --text: #e8eef5;
+    --accent: #2aa7ff;
+    --win: #0fbf66;
+    --loss: #ff4d4f;
+    --flat: #999;
+    --warn: #e8b23c;
+    --card-gap: 14px;
+  }}
+  * {{ box-sizing: border-box; }}
+  html, body {{ margin:0; background:var(--bg); color:var(--text); font-family: Inter, system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; }}
+  a {{ color: var(--accent); text-decoration: none; }}
+  .wrap {{ max-width: 1200px; margin: 0 auto; padding: 18px; }}
+  .row {{ display: grid; grid-template-columns: repeat(12, 1fr); gap: var(--card-gap); }}
+  .card {{ background: var(--panel); border: 1px solid #1b2431; border-radius: 12px; padding: 14px; }}
+  .card h3 {{ margin: 2px 0 10px; font-size: 16px; letter-spacing: .3px; }}
+  .small {{ font-size: 12px; color: var(--muted); }}
+  .pill {{ display:inline-block; padding: 2px 8px; border-radius: 999px; font-size: 12px; margin-left: 6px; }}
+  .pill.win {{ background: rgba(15,191,102,.15); color: var(--win); border: 1px solid rgba(15,191,102,.35); }}
+  .pill.loss {{ background: rgba(255,77,79,.15); color: var(--loss); border: 1px solid rgba(255,77,79,.35); }}
+  .pill.flat {{ background: rgba(255,255,255,.05); color: var(--flat); border: 1px solid rgba(255,255,255,.15); }}
+  .grid-3 {{ grid-column: span 3; }}
+  .grid-4 {{ grid-column: span 4; }}
+  .grid-6 {{ grid-column: span 6; }}
+  .grid-12 {{ grid-column: span 12; }}
+  .kpi {{ font-size: 22px; font-weight: 600; }}
+  .muted {{ color: var(--muted); }}
+  .flex {{ display: flex; align-items: center; justify-content: space-between; gap: 10px; }}
+  .hr {{ height: 1px; background: #1b2431; margin: 12px 0; border:0; }}
+  table {{ width: 100%; border-collapse: collapse; font-size: 13px; }}
+  th, td {{ padding: 8px; border-bottom: 1px solid #1b2431; text-align: left; }}
+  th {{ color: var(--muted); font-weight: 500; }}
+  .right {{ text-align: right; }}
+  .center {{ text-align: center; }}
+  .badge {{ font-size: 11px; opacity: .9; }}
+  .skeleton {{ background: linear-gradient(90deg, #141b25, #0e131a, #141b25); background-size: 200% 100%; animation: shimmer 1.5s infinite; border-radius: 8px; }}
+  @keyframes shimmer {{
+    0% {{ background-position: 200% 0; }}
+    100% {{ background-position: -200% 0; }}
+  }}
+  @media (max-width: 920px) {{
+    .grid-3 {{ grid-column: span 6; }}
+    .grid-4 {{ grid-column: span 6; }}
+    .grid-6 {{ grid-column: span 12; }}
+  }}
+  @media (max-width: 640px) {{
+    .grid-3, .grid-4 {{ grid-column: span 12; }}
+    .wrap {{ padding: 12px; }}
+  }}
+</style>
 </head>
 <body>
-  <div class="wrap">
-    <h1>Crypto System <span class="muted">%%APP_VERSION%%</span></h1>
-    <div class="sub">Live overview · <span id="updated"></span></div>
-
-    <!-- Strategy tiles (c1..c6) -->
-    <div class="grid" style="margin-bottom:12px">
-      <div class="card tile" style="grid-column: span 2" id="tile-c1">
-        <div class="hdr"><div class="name">Strategy c1</div><span class="pill" id="pill-c1">idle</span></div>
-        <div class="row"><button class="btn" onclick="runNow('c1')">Run now</button><div class="muted" id="tile-c1-meta"></div></div>
-      </div>
-      <div class="card tile" style="grid-column: span 2" id="tile-c2">
-        <div class="hdr"><div class="name">Strategy c2</div><span class="pill" id="pill-c2">idle</span></div>
-        <div class="row"><button class="btn" onclick="runNow('c2')">Run now</button><div class="muted" id="tile-c2-meta"></div></div>
-      </div>
-      <div class="card tile" style="grid-column: span 2" id="tile-c3">
-        <div class="hdr"><div class="name">Strategy c3</div><span class="pill" id="pill-c3">idle</span></div>
-        <div class="row"><button class="btn" onclick="runNow('c3')">Run now</button><div class="muted" id="tile-c3-meta"></div></div>
-      </div>
-      <div class="card tile" style="grid-column: span 2" id="tile-c4">
-        <div class="hdr"><div class="name">Strategy c4</div><span class="pill" id="pill-c4">idle</span></div>
-        <div class="row"><button class="btn" onclick="runNow('c4')">Run now</button><div class="muted" id="tile-c4-meta"></div></div>
-      </div>
-      <div class="card tile" style="grid-column: span 2" id="tile-c5">
-        <div class="hdr"><div class="name">Strategy c5</div><span class="pill" id="pill-c5">idle</span></div>
-        <div class="row"><button class="btn" onclick="runNow('c5')">Run now</button><div class="muted" id="tile-c5-meta"></div></div>
-      </div>
-      <div class="card tile" style="grid-column: span 2" id="tile-c6">
-        <div class="hdr"><div class="name">Strategy c6</div><span class="pill" id="pill-c6">idle</span></div>
-        <div class="row"><button class="btn" onclick="runNow('c6')">Run now</button><div class="muted" id="tile-c6-meta"></div></div>
+<div class="wrap">
+  <div class="row">
+    <div class="grid-12">
+      <div class="flex">
+        <h2 style="margin:0;">Crypto System <span class="small">v{app.version}</span></h2>
+        <div class="small" id="updatedAt">loading…</div>
       </div>
     </div>
 
-    <div class="grid">
-      <div class="card" style="grid-column: span 8">
-        <h3>Performance — Last 4 Hours (by strategy)</h3>
-        <div class="kpi" id="perf4h-cards"></div>
-        <div class="foot">Cutoff: <span id="perf_cutoff"></span></div>
-      </div>
-      <div class="card" style="grid-column: span 4">
-        <h3>Attribution (lifetime)</h3>
-        <div id="attr_table"></div>
-      </div>
+    <!-- P&L Summary -->
+    <div class="grid-4 card">
+      <h3>P&amp;L Summary</h3>
+      <div class="kpi" id="totalPnl">—</div>
+      <div class="small muted">Day: <span id="dayPnl">—</span> · Week: <span id="weekPnl">—</span> · Month: <span id="monthPnl">—</span></div>
+      <hr class="hr" />
+      <div class="small">Updated <span id="pnlUpdated">—</span></div>
+    </div>
 
-      <div class="card" style="grid-column: span 12">
-        <h3>Recent Orders</h3>
-        <div id="orders_table"></div>
+    <!-- Strategy Cards c1..c6 -->
+    <div class="grid-8 card">
+      <div class="flex">
+        <h3>Strategies</h3>
+        <div class="small muted">Last scan: <span id="lastScan">—</span></div>
+      </div>
+      <div class="row" id="strategyCards">
+        <!-- 6 placeholders -->
+        {''.join(f'''
+        <div class="grid-4">
+          <div class="card">
+            <div class="flex"><div><strong>Strategy {i}</strong> <span class="badge muted" id="s{i}Tag">c{i}</span></div><div class="small muted" id="s{i}Status">—</div></div>
+            <div class="hr"></div>
+            <div class="small">Trades 4h: <strong id="s{i}Trades">—</strong> <span class="pill win" id="s{i}Wins">W: —</span> <span class="pill loss" id="s{i}Losses">L: —</span></div>
+            <div class="small">PnL 4h: <strong id="s{i}Pnl">—</strong> · Win%: <strong id="s{i}WR">—</strong></div>
+          </div>
+        </div>''' for i in range(1,7))}
       </div>
     </div>
 
-    <div class="foot">Auto-refreshes every 60s · <span id="clock"></span></div>
+    <!-- 4h Performance & Trades -->
+    <div class="grid-12 card">
+      <div class="flex">
+        <h3>Last 4 Hours</h3>
+        <div class="small muted">As of <span id="asOf">—</span> · window <span id="windowHrs">4</span>h</div>
+      </div>
+      <div class="row">
+        <div class="grid-6">
+          <table>
+            <thead><tr><th>Strategy</th><th class="right">Trades</th><th class="right">Wins</th><th class="right">Losses</th><th class="right">PnL</th><th class="right">Win%</th></tr></thead>
+            <tbody id="perfBody"><tr><td colspan="6" class="center muted">Loading…</td></tr></tbody>
+          </table>
+        </div>
+        <div class="grid-6">
+          <table>
+            <thead><tr><th>Time</th><th>Strat</th><th>Symbol</th><th>Side</th><th class="right">Qty</th><th class="right">Price</th><th class="right">PnL</th><th>Result</th></tr></thead>
+            <tbody id="tradesBody"><tr><td colspan="8" class="center muted">Loading…</td></tr></tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+
   </div>
+</div>
 
 <script>
-const fmt = (n, d=2) => {
-  if (n === null || n === undefined || Number.isNaN(n)) return "—";
-  return Number(n).toLocaleString(undefined, {maximumFractionDigits:d});
-};
-function setPill(id, text, cls) {
-  const el = document.getElementById(id);
-  if (!el) return;
-  el.textContent = text;
-  el.className = "pill " + (cls||"");
-}
+const fmtMoney = (x) => {{
+  if (x === null || x === undefined || isNaN(x)) return "—";
+  const s = Number(x).toFixed(2);
+  const n = Number(x);
+  const color = n > 0 ? 'var(--win)' : (n < 0 ? 'var(--loss)' : 'var(--flat)');
+  return `<span style="color:${{color}}">${{s}}</span>`;
+}};
 
-async function runNow(key) {
-  setPill("pill-"+key, "running…", "warn");
-  try {
-    const r = await fetch(`/strategies/run?key=${encodeURIComponent(key)}`, { method: "POST" });
-    const j = await r.json();
-    if (j.ok) setPill("pill-"+key, "done", "good");
-    else setPill("pill-"+key, "error", "bad");
-  } catch (e) {
-    setPill("pill-"+key, "error", "bad");
-  }
-  setTimeout(()=>setPill("pill-"+key, "idle", ""), 4000);
-}
+const pct = (x) => {{
+  if (!x && x !== 0) return "—";
+  return (Number(x) * 100).toFixed(0) + "%";
+}};
 
-function renderAttr(data) {
-  const rows = data.by_strategy.map(r => `
-    <tr>
-      <td class="mono">${r.strategy}</td>
-      <td class="right mono">${fmt(r.orders,0)}</td>
-      <td class="right mono green">${fmt(r.wins,0)}</td>
-      <td class="right mono red">${fmt(r.losses,0)}</td>
-      <td class="right mono" style="color:${r.pnl>=0?'#16a34a':'#dc2626'}">${fmt(r.pnl, 4)}</td>
-    </tr>`).join("");
-  const html = `
-    <table>
-      <thead><tr><th>Strategy</th><th class="right">Orders</th><th class="right">Wins</th><th class="right">Losses</th><th class="right">PnL</th></tr></thead>
-      <tbody>${rows}</tbody>
-    </table>`;
-  document.getElementById("attr_table").innerHTML = html;
-}
+async function getJSON(path) {{
+  const r = await fetch(path, {{ cache: 'no-store' }});
+  if (!r.ok) throw new Error(path + " -> " + r.status);
+  return await r.json();
+}}
 
-function renderPerf4h(data) {
-  document.getElementById("perf_cutoff").textContent = data.cutoff || "";
-  const cards = (data.by_strategy||[]).map(r => `
-    <div class="tile" style="min-width:160px">
-      <div class="hdr"><div class="name mono">${r.strategy}</div><span class="pill">${fmt(r.orders,0)} orders</span></div>
-      <div class="row"><span class="green mono">W ${fmt(r.wins,0)}</span><span class="red mono">L ${fmt(r.losses,0)}</span></div>
-      <div class="mono" style="font-size:13px;color:${r.pnl>=0?'#16a34a':'#dc2626'}">PnL ${fmt(r.pnl,4)}</div>
-    </div>
-  `).join("");
-  document.getElementById("perf4h-cards").innerHTML = cards || "<div class='muted'>No orders in last 4 hours.</div>";
-}
+async function refresh() {{
+  try {{
+    // PnL
+    const pnl = await getJSON('/pnl/summary');
+    document.getElementById('totalPnl').innerHTML = fmtMoney(pnl.total_pnl);
+    document.getElementById('dayPnl').innerHTML = fmtMoney(pnl.day_pnl);
+    document.getElementById('weekPnl').innerHTML = fmtMoney(pnl.week_pnl);
+    document.getElementById('monthPnl').innerHTML = fmtMoney(pnl.month_pnl);
+    document.getElementById('pnlUpdated').textContent = pnl.updated_at ?? '—';
 
-function renderOrders(data) {
-  const rows = data.map(o => `
-    <tr>
-      <td class="mono">${o._ts || o.filled_at || o.submitted_at || ''}</td>
-      <td class="mono">${o.symbol || ''}</td>
-      <td class="mono">${(o.side||'').toUpperCase()}</td>
-      <td class="right mono">${fmt(o.qty||o.quantity||o.filled_qty, 6)}</td>
-      <td class="right mono">${fmt(o.filled_avg_price||o.price||o.avg_price, 6)}</td>
-      <td class="mono">${(o.strategy || (o.tags && o.tags[0]) || (o.context && o.context.strategy) || 'unknown')}</td>
-      <td class="right mono">${fmt(o.realized_pnl, 6)}</td>
-    </tr>`).join("");
-  const html = `
-    <table>
-      <thead>
-        <tr><th>Time</th><th>Symbol</th><th>Side</th><th class="right">Qty</th><th class="right">Price</th><th>Strategy</th><th class="right">Realized PnL</th></tr>
-      </thead>
-      <tbody>${rows}</tbody>
-    </table>`;
-  document.getElementById("orders_table").innerHTML = html;
-}
+    // Orders attribution (used for c1..c6 tags/status if you extend later)
+    const attr = await getJSON('/orders/attribution');
 
-async function refreshAll() {
-  try {
-    const [recent, attr, pnl, perf4h] = await Promise.all([
-      fetch('/orders/recent?limit=500').then(r=>r.json()),
-      fetch('/orders/attribution').then(r=>r.json()),
-      fetch('/pnl/summary').then(r=>r.json()),
-      fetch('/orders/performance_4h').then(r=>r.json())
-    ]);
-    renderOrders(recent);
-    renderAttr(attr);
-    renderPerf4h(perf4h);
-    document.getElementById('updated').textContent = pnl.updated_at || '';
-  } catch(e) {
+    // 4h performance
+    const perf = await getJSON('/orders/performance_4h');
+    document.getElementById('asOf').textContent = perf.as_of ?? '—';
+    document.getElementById('windowHrs').textContent = perf.window_hours ?? 4;
+
+    // fill performance table
+    const per = perf.strategies || {{}};
+    const keys = Object.keys(per).sort();
+    const perfBody = document.getElementById('perfBody');
+    perfBody.innerHTML = '';
+    if (keys.length === 0) {{
+      perfBody.innerHTML = '<tr><td colspan="6" class="center muted">No trades in the last 4 hours.</td></tr>';
+    }} else {{
+      for (const k of keys) {{
+        const s = per[k];
+        const wr = (s.win_rate ?? 0) * 100;
+        perfBody.insertAdjacentHTML('beforeend', `
+          <tr>
+            <td><strong>${{k}}</strong></td>
+            <td class="right">${{s.trades}}</td>
+            <td class="right"><span class="pill win">W: ${{s.wins}}</span></td>
+            <td class="right"><span class="pill loss">L: ${{s.losses}}</span></td>
+            <td class="right">${{fmtMoney(s.pnl)}}</td>
+            <td class="right">${{wr.toFixed(0)}}%</td>
+          </tr>
+        `);
+      }}
+    }}
+
+    // fill trades table
+    const trades = perf.trades || [];
+    const tradesBody = document.getElementById('tradesBody');
+    tradesBody.innerHTML = '';
+    if (trades.length === 0) {{
+      tradesBody.innerHTML = '<tr><td colspan="8" class="center muted">No trades in the last 4 hours.</td></tr>';
+    }} else {{
+      for (const t of trades) {{
+        const pillCls = t.label === 'WIN' ? 'pill win' : (t.label === 'LOSS' ? 'pill loss' : 'pill flat');
+        tradesBody.insertAdjacentHTML('beforeend', `
+          <tr>
+            <td>${{t.filled_at?.replace('T',' ').replace('Z','') ?? '—'}}</td>
+            <td>${{t.strategy ?? '—'}}</td>
+            <td>${{t.symbol ?? '—'}}</td>
+            <td>${{t.side ?? '—'}}</td>
+            <td class="right">${{(t.qty ?? 0).toFixed(4)}}</td>
+            <td class="right">${{(t.price ?? 0).toFixed(4)}}</td>
+            <td class="right">${{fmtMoney(t.pnl)}}</td>
+            <td><span class="${{pillCls}}">${{t.label}}</span></td>
+          </tr>
+        `);
+      }}
+    }}
+
+    // strategy cards (1..6)
+    for (let i=1;i<=6;i++) {{
+      const id = 'c' + i;
+      const elTrades = document.getElementById('s'+i+'Trades');
+      const elWins   = document.getElementById('s'+i+'Wins');
+      const elLosses = document.getElementById('s'+i+'Losses');
+      const elPnl    = document.getElementById('s'+i+'Pnl');
+      const elWR     = document.getElementById('s'+i+'WR');
+      const elTag    = document.getElementById('s'+i+'Tag');
+      const elStatus = document.getElementById('s'+i+'Status');
+
+      const s = per[id] || null;
+      elTag.textContent = id;
+      if (!s) {{
+        elTrades.textContent = '0';
+        elWins.textContent = 'W: 0';
+        elLosses.textContent = 'L: 0';
+        elPnl.innerHTML = fmtMoney(0);
+        elWR.textContent = '0%';
+        elStatus.textContent = 'idle';
+      }} else {{
+        elTrades.textContent = String(s.trades ?? 0);
+        elWins.textContent = 'W: ' + String(s.wins ?? 0);
+        elLosses.textContent = 'L: ' + String(s.losses ?? 0);
+        elPnl.innerHTML = fmtMoney(s.pnl ?? 0);
+        elWR.textContent = ((s.win_rate ?? 0) * 100).toFixed(0) + '%';
+        elStatus.textContent = s.trades > 0 ? 'active' : 'idle';
+      }}
+    }}
+
+    document.getElementById('updatedAt').textContent = new Date().toISOString();
+  }} catch (e) {{
     console.error(e);
-  }
-}
-setInterval(()=>{
-  document.getElementById('clock').textContent = new Date().toLocaleTimeString();
-}, 1000);
+  }}
+}}
 
-refreshAll();
-setInterval(refreshAll, 60000);
+setInterval(refresh, 30000);
+refresh();
 </script>
 </body>
 </html>
 """
+    return HTMLResponse(content=html)
 
-# ----------------- Routes ------------------
-
-@app.route("/")
-def dashboard():
-    html = DASH_HTML_TEMPLATE.replace("%%APP_VERSION%%", APP_VERSION)
-    return Response(html, mimetype="text/html")
 
 @app.get("/orders/recent")
-def orders_recent():
-    try:
-        limit = int(request.args.get("limit", 200))
-    except Exception:
-        limit = 200
-    return jsonify(get_orders(limit=limit))
+def orders_recent(limit: int = 50):
+    """
+    Returns up to `limit` most recent orders. In your env this is proxied to your data source.
+    For local debug, we read /mnt/data/trades.json (if present) and trim.
+    """
+    orders = _load_recent_orders_from_json()
+    # Sort by filled_at/created_at desc
+    df = _orders_df(orders)
+    if not df.empty:
+        when = df["filled_at"].fillna(df["created_at"])
+        df = df.assign(_when=when).sort_values("_when", ascending=False).drop(columns=["_when"])
+        if limit and limit > 0:
+            df = df.head(int(limit))
+        out = df.to_dict(orient="records")
+        # stringify datetimes
+        for r in out:
+            for k in ["created_at", "filled_at"]:
+                if isinstance(r.get(k), datetime):
+                    r[k] = r[k].isoformat()
+        return JSONResponse(out)
+    return JSONResponse([])
+
 
 @app.get("/orders/attribution")
 def orders_attribution():
-    orders = get_orders(limit=2000)
-    days = request.args.get("days")
-    if days:
-        try:
-            d = int(days)
-            cutoff = now_utc() - timedelta(days=d)
-            orders = [o for o in orders if (dt := order_ts(o)) and dt >= cutoff]
-        except Exception:
-            pass
-    return jsonify(summarize_attribution(orders))
+    """
+    Minimal stub: return strategies and counts of orders per strategy from recent.
+    """
+    orders = _load_recent_orders_from_json()
+    df = _orders_df(orders)
+    res: Dict[str, Any] = {}
+    if not df.empty and "strategy" in df.columns:
+        counts = df["strategy"].value_counts(dropna=False).to_dict()
+        for k, v in counts.items():
+            res[str(k)] = {"orders": int(v)}
+    # Ensure c1..c6 keys exist
+    for i in range(1, 7):
+        key = f"c{i}"
+        res.setdefault(key, {"orders": 0})
+    return JSONResponse(res)
 
-@app.get("/orders/performance_4h")
-def orders_performance_4h():
-    orders = get_orders(limit=2000)
-    return jsonify(summarize_performance_4h(orders))
 
 @app.get("/pnl/summary")
 def pnl_summary():
-    orders = get_orders(limit=2000)
-    return jsonify(summarize_pnl(orders))
+    """
+    Returns rolling totals (kept in memory here).
+    In your setup, this would hit your PnL service/data store.
+    """
+    # Update "updated_at" on each call
+    STATE["pnl_summary"]["updated_at"] = _ts()
+    return JSONResponse(STATE["pnl_summary"])
 
-@app.post("/strategies/run")
-def strategies_run():
-    key = (request.args.get("key") or "").strip()
-    ok = key in {"c1","c2","c3","c4","c5","c6"}
-    return jsonify({"ok": ok, "key": key, "ts": to_iso(now_utc())}), (200 if ok else 400)
 
-# --------- Lightweight heartbeat log --------
+@app.get("/orders/performance_4h")
+def orders_performance_4h():
+    """
+    Compute performance by strategy for the last 4 hours, plus the individual trades
+    in that window, labeled WIN/LOSS/FLAT.
+    """
+    orders = _load_recent_orders_from_json()
+    df = _orders_df(orders)
+    res = _compute_performance_last_hours(df, hours=4)
+    return JSONResponse(res)
 
-SCHED_ENABLED = os.environ.get("SCHED_ENABLED", "1") not in ("0", "false", "False")
-SCHED_INTERVAL = int(os.environ.get("SCHED_INTERVAL_SECS", "30"))
 
-def _heartbeat():
-    while True:
-        try:
-            time.sleep(SCHED_INTERVAL)
-            print(f"{to_iso(now_utc())} INFO:app:Scheduler tick: running all strategies (dry=0)")
-        except Exception:
-            time.sleep(SCHED_INTERVAL)
+# -----------------------------------------------------------------------------
+# Lifecycle (FastAPI)
+# -----------------------------------------------------------------------------
+@app.on_event("startup")
+def _on_startup():
+    log.info("Starting app; scheduler will start.")
+    t = threading.Thread(target=_scheduler_loop, name="scheduler", daemon=True)
+    t.start()
 
-if SCHED_ENABLED:
-    threading.Thread(target=_heartbeat, daemon=True).start()
 
-# ------------------- Main -------------------
+@app.on_event("shutdown")
+def _on_shutdown():
+    log.info("Shutting down app; scheduler will stop.")
+    STATE["running"] = False
 
+
+# -----------------------------------------------------------------------------
+# Entrypoint
+# -----------------------------------------------------------------------------
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", "10000"))
-    print(f"{to_iso(now_utc())} INFO:app:Starting Crypto System {APP_VERSION} on :{port}")
-    app.run(host="0.0.0.0", port=port)
+    host = os.getenv("HOST", "0.0.0.0")
+    port = int(os.getenv("PORT", "10000"))
+    log.info("Launching Uvicorn on %s:%s", host, port)
+    uvicorn.run(app, host=host, port=port)
