@@ -8,7 +8,6 @@ ALPACA_KEY_ID     = os.getenv("ALPACA_KEY_ID","")
 ALPACA_SECRET_KEY = os.getenv("ALPACA_SECRET_KEY","")
 ALPACA_PAPER      = os.getenv("ALPACA_PAPER","1") in ("1","true","True")
 
-# Prefer explicit host envs if provided
 DEFAULT_TRADE_HOST = "https://paper-api.alpaca.markets" if ALPACA_PAPER else "https://api.alpaca.markets"
 trading_base = os.getenv("ALPACA_TRADE_HOST", DEFAULT_TRADE_HOST)
 data_base    = os.getenv("ALPACA_DATA_HOST",  "https://data.alpaca.markets")
@@ -21,16 +20,14 @@ HEADERS = {
 }
 
 def _trading_symbol(sym_slash: str) -> str:
-    # Alpaca trading wants BTCUSD (no slash)
-    return sym_slash.replace("/", "")
+    return sym_slash.replace("/", "")  # BTC/USD -> BTCUSD
 
 def _data_symbol(sym_slash: str) -> str:
-    # Alpaca v1beta3 crypto uses BTC/USD
-    return sym_slash
+    return sym_slash  # v1beta3 uses BTC/USD
 
 def _http(method: str, url: str, **kw):
     r = requests.request(method, url, headers=HEADERS, timeout=30, **kw)
-    ct = r.headers.get("content-type","")
+    ct = (r.headers.get("content-type") or "")
     if r.status_code >= 400:
         raise RuntimeError(f"HTTP {r.status_code}: {r.text}")
     if r.text and "application/json" in ct:
