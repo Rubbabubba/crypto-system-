@@ -66,43 +66,108 @@ def list_positions() -> List[Dict[str,Any]]:
 def get_bars(symbols, timeframe: str = "5Min", limit: int = 600, merge: bool = False):
     """
     Return dict[symbol_slash] -> list of bars ({o,h,l,c,v,t}) from Alpaca v1beta3 crypto.
-    - Accepts symbols with slash (BTC/USD).
-    - Robustly maps response keys that may come as BTC/USD or BTCUSD.
-    - Ensures list is sorted by timestamp ascending.
+
+    Improvements:
+    - Adds robust key mapping (slash / no-slash).
+    - Supplies a 'start' timestamp based on requested lookback.
+    - Paginates with 'page_token' until 'limit' is reached (or no more data).
+    - Sorts bars ascending by timestamp.
+
+    Uses env:
+      FETCH_PAGE_LIMIT (fallback 1000)
+      OVERSHOOT_MULT   (fallback 2.0) to ensure enough lookback time window
     """
+    from datetime import datetime, timedelta, timezone
+
     if isinstance(symbols, str):
         symbols = [symbols]
+
+    # Normalize request symbols
     req_syms_slash = [s.strip().upper() for s in symbols]
     req_syms_noslash = [s.replace("/", "") for s in req_syms_slash]
-    syms_param = ",".join(req_syms_slash)  # Alpaca accepts slash-form for crypto
+    syms_param = ",".join(req_syms_slash)
+
+    # --- compute a reasonable start time window based on limit & TF ---
+    tf = timeframe.strip()
+    # crude minutes-per-bar map
+    tf_minutes = 1
+    if tf.endswith("Min"):
+        try:
+            tf_minutes = int(tf.replace("Min", ""))
+        except Exception:
+            tf_minutes = 5
+    elif tf in ("1H", "1Hour", "1Hour", "1h"):
+        tf_minutes = 60
+    elif tf in ("5m","1m","15m","30m"):  # if someone passes lowercase
+        tf_minutes = int(tf.replace("m",""))
+    else:
+        # default to 5 minutes if unknown
+        tf_minutes = 5
+
+    overshoot = float(os.getenv("OVERSHOOT_MULT", "2.0"))  # widen window to be safe
+    lookback_minutes = int(limit * tf_minutes * overshoot)
+    start_dt = datetime.now(timezone.utc) - timedelta(minutes=lookback_minutes)
+    start_iso = start_dt.isoformat(timespec="seconds").replace("+00:00", "Z")
+
+    per_page = int(os.getenv("FETCH_PAGE_LIMIT", "1000"))
+    if per_page <= 0:
+        per_page = 1000
 
     url = f"{data_base}/v1beta3/crypto/us/bars"
-    params = {"timeframe": timeframe, "symbols": syms_param, "limit": int(limit)}
 
-    j = _http("GET", url, params=params) or {}
-    data = j.get("bars") or {}
+    # Collect pages
+    collected: Dict[str, list] = {s: [] for s in req_syms_slash}
+    page_token = None
 
-    # Build a lookup that tolerates slash/no-slash keys in the response
-    # e.g., response might use "BTC/USD" or "BTCUSD"
-    def _rows_for(k: str):
-        return data.get(k) or data.get(k.replace("/", "")) or []
+    while True:
+        params = {
+            "timeframe": timeframe,
+            "symbols": syms_param,
+            "limit": min(per_page, limit),
+            "start": start_iso,
+            # You can also add "end" if you want a fixed window; we allow up to "now".
+            # "sort": "asc"  # default may be desc; we sort afterwards anyway
+        }
+        if page_token:
+            params["page_token"] = page_token
 
-    out: Dict[str, Any] = {}
-    for s_slash, s_plain in zip(req_syms_slash, req_syms_noslash):
-        rows_src = _rows_for(s_slash) or _rows_for(s_plain)
-        rows = []
-        for r in rows_src:
-            rows.append({
-                "o": r.get("o"),
-                "h": r.get("h"),
-                "l": r.get("l"),
-                "c": r.get("c"),
-                "v": r.get("v"),
-                "t": r.get("t") or r.get("Timestamp") or r.get("timestamp"),
-            })
-        # sort ascending by timestamp if present
+        j = _http("GET", url, params=params) or {}
+        data = j.get("bars") or {}
+        page_token = j.get("next_page_token")
+
+        # Map slash/no-slash keys from response into our slash-form keys
+        def _rows_for(k: str):
+            return data.get(k) or data.get(k.replace("/", "")) or []
+
+        # Append rows
+        for s_slash, s_plain in zip(req_syms_slash, req_syms_noslash):
+            rows_src = _rows_for(s_slash) or _rows_for(s_plain)
+            if rows_src:
+                dest = collected[s_slash]
+                for r in rows_src:
+                    dest.append({
+                        "o": r.get("o"),
+                        "h": r.get("h"),
+                        "l": r.get("l"),
+                        "c": r.get("c"),
+                        "v": r.get("v"),
+                        "t": r.get("t") or r.get("Timestamp") or r.get("timestamp"),
+                    })
+                # truncate to requested limit in case server returns extra
+                if len(dest) >= limit:
+                    collected[s_slash] = dest[:limit]
+
+        # stop conditions: no more pages, or everyone reached limit
+        have_all = all(len(collected[s]) >= limit for s in req_syms_slash)
+        if have_all or not page_token:
+            break
+
+    # final sort (ascending) and ensure presence for each requested key
+    out: Dict[str, list] = {}
+    for s_slash in req_syms_slash:
+        rows = collected.get(s_slash, [])
         rows.sort(key=lambda x: x.get("t") or "")
-        out[s_slash] = rows
+        out[s_slash] = rows[:limit]
     return out
 
 def last_trade_map(symbols) -> Dict[str,Any]:
