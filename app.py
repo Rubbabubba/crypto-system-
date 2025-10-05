@@ -6,12 +6,49 @@ import json
 import logging
 import os
 import time
+import csv, io
+from collections import defaultdict, deque
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
-
 from fastapi import FastAPI, Query
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from datetime import datetime, timezone
+
+
+# ---------- Analytics helpers ----------
+def _parse_ts(ts):
+    if not ts:
+        return None
+    try:
+        return datetime.fromisoformat(ts.replace("Z","+00:00")).astimezone(timezone.utc)
+    except Exception:
+        return None
+
+def _order_is_fill_like(o: dict) -> bool:
+    st = (o.get("status") or "").lower()
+    fq = float(o.get("filled_qty") or 0.0)
+    fp = float(o.get("filled_avg_price") or 0.0)
+    return (st in ("filled","partially_filled","done")) or (fq > 0 and fp > 0)
+
+def _extract_strategy_from_order(o: dict) -> str:
+    s = (o.get("strategy") or "").strip().lower()
+    if s:
+        return s
+    coid = (o.get("client_order_id") or o.get("clientOrderId") or "").strip()
+    if coid:
+        token = coid.split("-")[0].strip().lower()
+        if token:
+            return token
+    for k in ("tag","subtag","strategy_tag","algo"):
+        v = (o.get(k) or "").strip().lower()
+        if v:
+            return v
+    return "unknown"
+
+def _norm_symbol(s: str) -> str:
+    if not s: return s
+    s = s.upper()
+    return s if "/" in s else (s[:-3] + "/" + s[-3:] if len(s) > 3 else s)
 
 def _sym_to_slash(s: str) -> str:
     if not s:
@@ -29,6 +66,103 @@ def _extract_strategy(coid: str, fallback: str = "") -> str:
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
+def _fetch_filled_orders_last_hours(hours: int) -> list:
+    import broker as br
+    since = datetime.now(timezone.utc) - timedelta(hours=hours)
+    raw = br.list_orders(status="all", limit=1000) or []
+    out = []
+    for o in raw:
+        if not _order_is_fill_like(o):
+            continue
+        t = _parse_ts(o.get("filled_at") or o.get("updated_at") or o.get("submitted_at") or o.get("created_at"))
+        if t and t >= since:
+            out.append(o)
+    out.sort(key=lambda r: _parse_ts(r.get("filled_at") or r.get("updated_at") or r.get("submitted_at") or r.get("created_at")) or datetime.min.replace(tzinfo=timezone.utc))
+    return out
+
+def _normalize_trade_row(o: dict) -> dict:
+    sym = _norm_symbol(o.get("symbol") or o.get("asset_symbol") or "")
+    side = (o.get("side") or "").lower()
+    qty  = float(o.get("filled_qty") or o.get("qty") or o.get("quantity") or o.get("size") or 0.0)
+    px   = float(o.get("filled_avg_price") or o.get("price") or o.get("limit_price") or o.get("avg_price") or 0.0)
+    coid = o.get("client_order_id") or o.get("clientOrderId") or ""
+    ts   = o.get("filled_at") or o.get("updated_at") or o.get("submitted_at") or o.get("created_at")
+    return {
+        "id": o.get("id") or coid,
+        "symbol": sym,
+        "side": side,
+        "qty": qty,
+        "price": px,
+        "strategy": _extract_strategy_from_order(o),
+        "time": (_parse_ts(ts) or datetime.now(timezone.utc)).isoformat(),
+        "status": (o.get("status") or "").lower(),
+        "client_order_id": coid,
+        "notional": float(o.get("notional") or 0.0),
+    }
+
+def _compute_strategy_metrics(rows: list) -> dict:
+    books = defaultdict(lambda: deque())  # (strategy,symbol) -> deque of [qty, price]
+    stats = defaultdict(lambda: {
+        "trades": 0, "wins": 0, "losses": 0,
+        "gross_profit": 0.0, "gross_loss": 0.0,
+        "net_pnl": 0.0, "volume": 0.0
+    })
+    realized_rows = []
+
+    for r in rows:
+        key = (r["strategy"], r["symbol"])
+        side, qty, px = r["side"], float(r["qty"] or 0), float(r["price"] or 0)
+        if qty <= 0 or px <= 0:
+            continue
+
+        if side == "buy":
+            books[key].append([qty, px])
+            stats[key]["volume"] += qty * px
+        elif side == "sell":
+            remaining = qty
+            trade_realized = 0.0
+            stats[key]["volume"] += qty * px
+            while remaining > 0 and books[key]:
+                lot_qty, lot_px = books[key][0]
+                use = min(remaining, lot_qty)
+                pnl = (px - lot_px) * use
+                trade_realized += pnl
+                lot_qty -= use
+                remaining -= use
+                if lot_qty <= 1e-12:
+                    books[key].popleft()
+                else:
+                    books[key][0][0] = lot_qty
+            if abs(trade_realized) > 0:
+                sk = stats[key]
+                sk["trades"] += 1
+                sk["net_pnl"] += trade_realized
+                if trade_realized >= 0:
+                    sk["wins"] += 1
+                    sk["gross_profit"] += trade_realized
+                else:
+                    sk["losses"] += 1
+                    sk["gross_loss"] += -trade_realized
+                realized_rows.append({**r, "realized_pnl": trade_realized})
+
+    per_strategy = defaultdict(lambda: {
+        "trades": 0, "wins": 0, "losses": 0, "gross_profit": 0.0,
+        "gross_loss": 0.0, "net_pnl": 0.0, "profit_factor": None,
+        "win_rate": None, "avg_trade": None, "volume": 0.0
+    })
+    for (strategy, _symbol), s in stats.items():
+        agg = per_strategy[strategy]
+        for k in ("trades","wins","losses","gross_profit","gross_loss","net_pnl","volume"):
+            agg[k] += s[k]
+
+    for strategy, s in per_strategy.items():
+        t = s["trades"]
+        gp, gl = s["gross_profit"], s["gross_loss"]
+        s["profit_factor"] = (gp / gl) if gl > 0 else (None if gp == 0 else float("inf"))
+        s["win_rate"] = (s["wins"] / t) if t > 0 else None
+        s["avg_trade"] = (s["net_pnl"] / t) if t > 0 else None
+
+    return {"per_strategy": per_strategy, "per_pair": stats, "realized_rows": realized_rows}
 
 # -----------------------------------------------------------------------------
 # Logging
@@ -637,6 +771,101 @@ async def orders_recent(limit: int = Query(100, ge=1, le=1000)):
 @app.get("/orders/attribution", response_class=JSONResponse)
 async def orders_attribution():
     return JSONResponse(_attribution)
+
+from fastapi.responses import PlainTextResponse
+
+@app.get("/analytics/trades")
+async def analytics_trades(hours: int = 12):
+    orders = _fetch_filled_orders_last_hours(int(hours))
+    rows = [_normalize_trade_row(o) for o in orders]
+    metrics = _compute_strategy_metrics(rows)
+    per_strategy = {k: dict(v) for k, v in metrics["per_strategy"].items()}
+    per_pair = {f"{k[0]}::{k[1]}": dict(v) for k, v in metrics["per_pair"].items()}
+    return {
+        "window_hours": hours,
+        "summary_per_strategy": per_strategy,
+        "detail_per_strategy_symbol": per_pair,
+        "realized_trades": metrics["realized_rows"],
+        "count_orders_considered": len(rows)
+    }
+
+@app.get("/analytics/trades.csv", response_class=PlainTextResponse)
+async def analytics_trades_csv(hours: int = 12):
+    orders = _fetch_filled_orders_last_hours(int(hours))
+    rows = [_normalize_trade_row(o) for o in orders]
+    buf = io.StringIO()
+    w = csv.DictWriter(buf, fieldnames=["time","strategy","symbol","side","qty","price","id","client_order_id","status","notional"])
+    w.writeheader()
+    for r in rows:
+        w.writerow(r)
+    return buf.getvalue()
+
+@app.post("/init/positions")
+async def init_positions():
+    """Seed the in-memory positions state from Alpaca current positions."""
+    try:
+        import broker as br
+        pos = br.list_positions() or []
+        global _positions_state
+        _positions_state = {}
+        for p in pos:
+            sym = _sym_to_slash(p.get("symbol") or p.get("Symbol") or "")
+            try:
+                qty = float(p.get("qty") or p.get("quantity") or p.get("qty_available") or p.get("size") or 0.0)
+            except Exception:
+                qty = 0.0
+            avg = float(p.get("avg_entry_price") or p.get("average_entry_price") or p.get("avg_price") or 0.0)
+            if sym and qty and avg:
+                _positions_state[sym] = {"qty": qty, "avg_price": avg}
+        _summary["equity"] = _recalc_equity()
+        ts = _now_iso()
+        _summary["updated_at"] = ts
+        _attribution["updated_at"] = ts
+        return {"ok": True, "positions": _positions_state}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/init/backfill")
+async def init_backfill(days: int = None, status: str = "closed"):
+    """
+    Pull recent filled orders and replay them into the P&L/attribution.
+    - days: lookback (defaults to INIT_BACKFILL_DAYS or 7)
+    - status: 'closed' or 'all' (Alpaca v2)
+    """
+    try:
+        import broker as br
+        lookback_days = int(days or os.getenv("INIT_BACKFILL_DAYS", "7"))
+        after = datetime.now(timezone.utc) - timedelta(days=lookback_days)
+        raws = br.list_orders(status=status, limit=1000) or []
+        selected = []
+        for r in raws:
+            ts = r.get("filled_at") or r.get("updated_at") or r.get("submitted_at") or r.get("created_at")
+            try:
+                when = datetime.fromisoformat(ts.replace("Z","+00:00")) if isinstance(ts, str) else None
+            except Exception:
+                when = None
+            if when and when >= after:
+                selected.append(r)
+
+        orders = []
+        for r in selected:
+            st = (r.get("status") or "").lower()
+            filled_px = float(r.get("filled_avg_price") or 0.0)
+            filled_qty = float(r.get("filled_qty") or 0.0)
+            if st in ("filled","partially_filled","done") or (filled_px > 0 and filled_qty > 0):
+                orders.append(r)
+
+        _push_orders(orders)
+        return {"ok": True, "considered": len(raws), "selected": len(selected), "replayed": len(orders)}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/diag/orders_raw")
+async def diag_orders_raw(status: str = "all", limit: int = 25):
+    import broker as br
+    data = br.list_orders(status=status, limit=limit) or []
+    return {"status": status, "limit": limit, "orders": data}
+
 
 @app.get("/healthz", response_class=JSONResponse, include_in_schema=False)
 async def healthz():
