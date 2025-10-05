@@ -627,6 +627,195 @@ def _recalc_equity() -> float:
             eq += q * last
     return eq
 
+class BacktestExec:
+    """Ultra-simple executor: fill on the bar close, one position per (strategy,symbol)."""
+    def __init__(self, notional: float = 25.0, fee_bps: float = 0.0, slip_bps: float = 0.0):
+        self.notional = float(notional)
+        self.fee_bps = float(fee_bps)
+        self.slip_bps = float(slip_bps)
+        # open positions keyed by (strategy, symbol)
+        self.pos: Dict[Tuple[str, str], Dict[str, Any]] = {}
+
+    def _price_with_costs(self, px: float, side: str) -> float:
+        # add slippage in direction of trade; fees as bps on notional -> convert to px bump
+        if px <= 0:
+            return px
+        slip = px * (self.slip_bps / 10000.0)
+        px_eff = px + (slip if side == "buy" else -slip)
+        return px_eff
+
+    def on_order(self, when: datetime, strategy: str, symbol: str, side: str, bar_close: float) -> Optional[Dict[str, Any]]:
+        strategy = (strategy or "unknown").lower()
+        symbol = _sym_to_slash(symbol)
+        side = side.lower()
+        px = float(bar_close or 0.0)
+        if px <= 0:
+            return None
+        px_eff = self._price_with_costs(px, side)
+        qty = self.notional / px_eff
+
+        key = (strategy, symbol)
+        realized = 0.0
+        made_trade = None
+
+        if side == "buy":
+            # open/replace
+            self.pos[key] = {"qty": qty, "avg_price": px_eff, "ts": when}
+        elif side == "sell":
+            # close if open
+            if key in self.pos:
+                p = self.pos.pop(key)
+                # realized pnl in notional currency (USD)
+                realized = (px_eff - float(p["avg_price"])) * float(p["qty"])
+            else:
+                # nothing to close; ignore
+                pass
+
+        made_trade = {
+            "id": str(uuid.uuid4()),
+            "symbol": symbol,
+            "side": side,
+            "qty": qty,
+            "price": px_eff,
+            "strategy": strategy,
+            "time": when.isoformat(),
+            "status": "filled",
+            "client_order_id": f"bt-{strategy}-{symbol}-{int(when.timestamp())}",
+            "notional": self.notional,
+            "realized_pnl": realized,
+        }
+        return made_trade
+
+    def mtm_equity(self, last_prices: Dict[str, float]) -> float:
+        eq = 0.0
+        for (strategy, symbol), p in self.pos.items():
+            px = float(last_prices.get(symbol) or 0.0)
+            if px <= 0:
+                continue
+            eq += (px - float(p["avg_price"])) * float(p["qty"])
+        return eq
+
+
+class BacktestEngine:
+    def __init__(self):
+        self.exec = None
+
+    def run(self, *, strategies: List[str], timeframe: str, days: int, notional: float, fee_bps: float = 0.0, slip_bps: float = 0.0) -> Dict[str, Any]:
+        global _BACKTEST_LAST
+        _BACKTEST_LAST = {
+            "args": {"strategies": strategies, "timeframe": timeframe, "days": days, "notional": notional, "fee_bps": fee_bps, "slip_bps": slip_bps},
+            "started_at": _now_iso(),
+            "finished_at": None,
+            "trades": [],
+            "per_strategy": {},
+            "per_strategy_symbol": {},
+            "equity_curve": [],
+        }
+
+        # 1) gather symbols by asking StrategyBook once
+        sb = StrategyBook()
+        probe = {"strategy": strategies[0], "timeframe": timeframe, "limit": 300, "notional": notional, "symbols": DEFAULT_SYMBOLS, "dry": True, "raw": {}}
+        syms = probe.get("symbols") or DEFAULT_SYMBOLS
+        # 2) download bars for all symbols for the backtest window
+        lookback_bars = int(days * 24 * (12 if timeframe.lower() == "5min" else 1) * 12)  # generous upper bound
+        try:
+            import broker as br
+            bars_map = br.get_bars(syms, timeframe=timeframe, limit=lookback_bars) or {}
+        except Exception:
+            bars_map = {}
+
+        # align by index (assumes each list is in chronological order)
+        # build a unified timeline (UTC ISO) from the longest symbol
+        lens = {s: len(bars_map.get(s, [])) for s in syms}
+        if not any(lens.values()):
+            return _BACKTEST_LAST
+        # reference series
+        ref_sym = max(lens.items(), key=lambda kv: kv[1])[0]
+        ref = bars_map.get(ref_sym, [])
+
+        self.exec = BacktestExec(notional=notional, fee_bps=fee_bps, slip_bps=slip_bps)
+
+        for i in range(len(ref)):
+            # timestamp = ref bar time (prefer 't' or 'time')
+            bt = ref[i]
+            ts = bt.get("t") or bt.get("time")
+            if isinstance(ts, str):
+                try:
+                    when = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+                except Exception:
+                    when = datetime.now(timezone.utc)
+            else:
+                when = datetime.now(timezone.utc)
+
+            # last prices for MTM
+            last_px: Dict[str, float] = {}
+            closes_for_sym: Dict[str, float] = {}
+
+            for sym in syms:
+                bs = bars_map.get(sym) or []
+                if i < len(bs):
+                    c = float(bs[i].get("c") or bs[i].get("close") or 0.0)
+                    last_px[sym] = c
+                    closes_for_sym[sym] = c
+
+            # ask StrategyBook for orders **as of this bar**
+            # Your strategies typically look at the *latest*  N bars. We pass a snapshot of bars via raw.
+            scan_args = {
+                "strategy": strategies[0],              # StrategyBook will run all if 'all' later
+                "timeframe": timeframe,
+                "limit": min(300, i + 1),               # only up to 'now'
+                "notional": notional,
+                "symbols": syms,
+                "dry": True,
+                "raw": {"bars_map": {s: (bars_map.get(s) or [])[: i + 1] for s in syms}},
+            }
+
+            orders = []
+            # if strategies == ['all'] run each; else just the requested subset
+            want = (strategies if "all" not in strategies else ["c1", "c2", "c3", "c4", "c5", "c6"])
+            for strat in want:
+                scan_args["strategy"] = strat
+                out = sb.scan(scan_args, {"one": {"timeframe": timeframe, "symbols": syms, "notional": notional}})
+                if not out:
+                    continue
+                if isinstance(out, dict):
+                    out = out.get("orders") or out.get("placed") or []
+                for o in out:
+                    # fill on this bar's close
+                    side = (o.get("side") or "").lower()
+                    symbol = _sym_to_slash(o.get("symbol") or "")
+                    price = float(closes_for_sym.get(symbol) or 0.0)
+                    if price <= 0:
+                        continue
+                    filled = self.exec.on_order(when, strat, symbol, side, price)
+                    if filled:
+                        orders.append(filled)
+
+            # record equity (realized so far + MTM)
+            realized = sum(float(t.get("realized_pnl") or 0.0) for t in _BACKTEST_LAST["trades"])
+            mtm = self.exec.mtm_equity(last_px)
+            _BACKTEST_LAST["equity_curve"].append({"time": when.isoformat(), "equity": realized + mtm})
+
+            # fold in the new trades
+            for o in orders:
+                row = _normalize_order(o)
+                # your normalization already adds pnl if present; ensure float
+                pnl = float(o.get("realized_pnl") or 0.0)
+                row["pnl"] = float(row.get("pnl") or 0.0) + pnl
+                _BACKTEST_LAST["trades"].append(row)
+
+                s = (row.get("strategy") or "unknown").lower()
+                ss = f"{s}::{row.get('symbol')}"
+                _BACKTEST_LAST["per_strategy"][s] = _BACKTEST_LAST["per_strategy"].get(s, 0.0) + pnl
+                _BACKTEST_LAST["per_strategy_symbol"][ss] = _BACKTEST_LAST["per_strategy_symbol"].get(ss, 0.0) + pnl
+
+        _BACKTEST_LAST["finished_at"] = _now_iso()
+        return _BACKTEST_LAST
+
+
+_BT = BacktestEngine()
+
+
 # -----------------------------------------------------------------------------
 # App + state
 # -----------------------------------------------------------------------------
@@ -768,6 +957,16 @@ async def _exit_nanny(symbols: list[str], timeframe: str):
                 except Exception:
                     logging.getLogger("app").exception("exit_nanny no-cross submit failed")
 
+# ---- backtest state ----
+_BACKTEST_LAST: Dict[str, Any] = {
+    "args": None,
+    "started_at": None,
+    "finished_at": None,
+    "trades": [],            # normalized trade rows (like recent orders)
+    "per_strategy": {},      # pnl by strategy
+    "per_strategy_symbol": {},  # pnl by strategy+symbol
+    "equity_curve": [],      # (ts, equity)
+}
 
 # -----------------------------------------------------------------------------
 # Scan bridge (unchanged external behavior)
@@ -1271,6 +1470,37 @@ async def diag_alpaca():
 
 from fastapi import HTTPException
 from datetime import datetime, timedelta, timezone
+
+@app.get("/backtest/run")
+def backtest_run(strategy: str = Query("all"), days: int = Query(3, ge=1, le=90), timeframe: str = Query("5Min"), notional: float = Query(25.0), fee_bps: float = 0.0, slip_bps: float = 0.0):
+    """
+    Run strategies on historical bars.
+    Example: /backtest/run?strategy=all&days=7&timeframe=5Min&notional=25
+    """
+    strats = [s.strip().lower() for s in (strategy.split(",") if strategy else []) if s.strip()]
+    if not strats:
+        strats = ["all"]
+    out = _BT.run(strategies=strats, timeframe=timeframe, days=days, notional=notional, fee_bps=fee_bps, slip_bps=slip_bps)
+    return {"ok": True, "args": out["args"], "started_at": out["started_at"], "finished_at": out["finished_at"], "per_strategy": out["per_strategy"], "per_strategy_symbol": out["per_strategy_symbol"], "trades": len(out["trades"]), "equity_points": len(out["equity_curve"])}
+
+@app.get("/backtest/results")
+def backtest_results():
+    return _BACKTEST_LAST
+
+@app.get("/backtest/results.csv")
+def backtest_results_csv():
+    # trades CSV
+    rows = _BACKTEST_LAST.get("trades") or []
+    if not rows:
+        return PlainTextResponse("", media_type="text/csv")
+    cols = ["time","strategy","symbol","side","qty","price","notional","pnl","id","client_order_id","status"]
+    sio = io.StringIO()
+    w = csv.DictWriter(sio, fieldnames=cols)
+    w.writeheader()
+    for r in rows:
+        w.writerow({k: r.get(k) for k in cols})
+    return PlainTextResponse(sio.getvalue(), media_type="text/csv")
+
 
 def _iso(dt: datetime) -> str:
     return dt.astimezone(timezone.utc).isoformat().replace("+00:00","Z")
