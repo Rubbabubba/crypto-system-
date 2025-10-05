@@ -49,38 +49,54 @@ class RealStrategiesAdapter:
             return self._mods[name]
         try:
             mod = importlib.import_module(f"strategies.{name}")
+            logging.getLogger("app").info("adapter: imported strategies.%s", name)
         except Exception:
             mod = importlib.import_module(name)  # fallback if in top-level
+            logging.getLogger("app").info("adapter: imported %s (top-level)", name)
         self._mods[name] = mod
         return mod
 
     def scan(self, req: Dict[str, Any], _contexts: Dict[str, Any]) -> List[Dict[str, Any]]:
+        log = logging.getLogger("app")
         strat = (req.get("strategy") or "").lower()
         if not strat:
+            log.warning("adapter: missing 'strategy' in req")
             return []
-        tf = req.get("timeframe") or DEFAULT_TIMEFRAME
-        lim = int(req.get("limit") or DEFAULT_LIMIT)
-        notional = float(req.get("notional") or DEFAULT_NOTIONAL)
+
+        tf = req.get("timeframe") or os.getenv("DEFAULT_TIMEFRAME", "5Min")
+        lim = int(req.get("limit") or int(os.getenv("DEFAULT_LIMIT", "300")))
+        notional = float(req.get("notional") or float(os.getenv("DEFAULT_NOTIONAL", "25")))
         symbols = req.get("symbols") or []
         if isinstance(symbols, str):
             symbols = [s.strip() for s in symbols.split(",") if s.strip()]
+        else:
+            symbols = [s.strip() for s in symbols]
         dry = bool(req.get("dry", False))
         raw = req.get("raw") or {}
+
         try:
             mod = self._get_mod(strat)
+            log.info("adapter: calling %s.run_scan syms=%s tf=%s lim=%s notional=%s dry=%s",
+                     strat, ",".join(symbols), tf, lim, notional, int(dry))
             result = mod.run_scan(symbols, tf, lim, notional, dry, raw)
-            # normalize to list of orders
+
+            # normalize
+            orders: List[Dict[str, Any]] = []
             if isinstance(result, dict):
                 if isinstance(result.get("placed"), list):
-                    return result["placed"]
-                if isinstance(result.get("orders"), list):
-                    return result["orders"]
-                return []
-            if isinstance(result, list):
-                return result
-            return []
+                    orders = result["placed"]
+                elif isinstance(result.get("orders"), list):
+                    orders = result["orders"]
+            elif isinstance(result, list):
+                orders = result
+
+            log.info("adapter: %s produced %d order(s)", strat, len(orders))
+            if len(orders) == 0:
+                # helpful breadcrumb for debugging strategy returns
+                log.info("adapter: %s raw result keys=%s type=%s", strat, list(result.keys()) if isinstance(result, dict) else "-", type(result).__name__)
+            return orders or []
         except Exception as e:
-            log.exception("Adapter scan failed for %s: %s", strat, e)
+            log.exception("adapter: scan failed for %s: %s", strat, e)
             return []
 
 # keep a tiny facade so downstream code doesn’t change
@@ -441,6 +457,57 @@ async def orders_attribution():
 @app.get("/healthz", response_class=JSONResponse, include_in_schema=False)
 async def healthz():
     return JSONResponse({"ok": True, "ts": time.time(), "version": APP_VERSION})
+    
+from fastapi import HTTPException
+
+@app.get("/diag/imports")
+async def diag_imports():
+    out = {}
+    for name in [s.strip() for s in os.getenv("STRATEGY_LIST", "c1,c2,c3,c4,c5,c6").split(",") if s.strip()]:
+        try:
+            import importlib
+            try:
+                importlib.import_module(f"strategies.{name}")
+                out[name] = "ok: strategies.%s" % name
+            except Exception:
+                importlib.import_module(name)
+                out[name] = "ok: top-level %s" % name
+        except Exception as e:
+            out[name] = f"ERROR: {e}"
+    return out
+
+@app.get("/diag/scan")
+async def diag_scan(strategy: str, symbols: str = "BTC/USD,ETH/USD",
+                    tf: str = None, limit: int = None, notional: float = None, dry: int = 1):
+    tf = tf or os.getenv("DEFAULT_TIMEFRAME", "5Min")
+    limit = limit or int(os.getenv("DEFAULT_LIMIT", "300"))
+    notional = notional or float(os.getenv("DEFAULT_NOTIONAL", "25"))
+    syms = [s.strip() for s in symbols.split(",") if s.strip()]
+    req = {
+        "strategy": strategy,
+        "timeframe": tf,
+        "limit": limit,
+        "notional": notional,
+        "symbols": syms,
+        "dry": bool(dry),
+        "raw": {}
+    }
+    sb = StrategyBook()
+    orders = sb.scan(req, {"one": {"timeframe": tf, "symbols": syms, "notional": notional}})
+    return {"args": req, "orders_count": len(orders or []), "orders": orders}
+
+@app.get("/diag/alpaca")
+async def diag_alpaca():
+    try:
+        import broker as br
+        pos = br.list_positions()
+        bars = br.get_bars(["BTC/USD","ETH/USD"], timeframe=os.getenv("DEFAULT_TIMEFRAME","5Min"), limit=3)
+        return {"positions_len": len(pos if isinstance(pos, list) else []),
+                "bars_keys": list(bars.keys()),
+                "bars_len_each": {k: len(v) for k, v in bars.items()}}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
 
 # -----------------------------------------------------------------------------
 # Entrypoint
