@@ -460,6 +460,18 @@ async def healthz():
     
 from fastapi import HTTPException
 
+@app.get("/diag/bars")
+async def diag_bars(symbols: str = "BTC/USD,ETH/USD", tf: str = "5Min", limit: int = 360):
+    import broker as br
+    syms = [s.strip().upper() for s in symbols.split(",") if s.strip()]
+    bars = br.get_bars(syms, timeframe=tf, limit=int(limit))
+    return {
+        "timeframe": tf,
+        "limit": limit,
+        "counts": {k: len(v) for k, v in bars.items()},
+        "keys": list(bars.keys())
+    }
+
 @app.get("/diag/imports")
 async def diag_imports():
     out = {}

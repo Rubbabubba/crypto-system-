@@ -64,18 +64,34 @@ def list_positions() -> List[Dict[str,Any]]:
 
 # ---------- Market data ----------
 def get_bars(symbols, timeframe: str = "5Min", limit: int = 600, merge: bool = False):
-    """Return dict[symbol] -> list of bars ({o,h,l,c,v,t}) using v1beta3 crypto bars."""
+    """
+    Return dict[symbol_slash] -> list of bars ({o,h,l,c,v,t}) from Alpaca v1beta3 crypto.
+    - Accepts symbols with slash (BTC/USD).
+    - Robustly maps response keys that may come as BTC/USD or BTCUSD.
+    - Ensures list is sorted by timestamp ascending.
+    """
     if isinstance(symbols, str):
         symbols = [symbols]
-    syms = ",".join([_data_symbol(s) for s in symbols])
+    req_syms_slash = [s.strip().upper() for s in symbols]
+    req_syms_noslash = [s.replace("/", "") for s in req_syms_slash]
+    syms_param = ",".join(req_syms_slash)  # Alpaca accepts slash-form for crypto
+
     url = f"{data_base}/v1beta3/crypto/us/bars"
-    params = {"timeframe": timeframe, "symbols": syms, "limit": int(limit)}
+    params = {"timeframe": timeframe, "symbols": syms_param, "limit": int(limit)}
+
     j = _http("GET", url, params=params) or {}
     data = j.get("bars") or {}
+
+    # Build a lookup that tolerates slash/no-slash keys in the response
+    # e.g., response might use "BTC/USD" or "BTCUSD"
+    def _rows_for(k: str):
+        return data.get(k) or data.get(k.replace("/", "")) or []
+
     out: Dict[str, Any] = {}
-    for s in symbols:
+    for s_slash, s_plain in zip(req_syms_slash, req_syms_noslash):
+        rows_src = _rows_for(s_slash) or _rows_for(s_plain)
         rows = []
-        for r in data.get(s, []):
+        for r in rows_src:
             rows.append({
                 "o": r.get("o"),
                 "h": r.get("h"),
@@ -84,7 +100,9 @@ def get_bars(symbols, timeframe: str = "5Min", limit: int = 600, merge: bool = F
                 "v": r.get("v"),
                 "t": r.get("t") or r.get("Timestamp") or r.get("timestamp"),
             })
-        out[s] = rows
+        # sort ascending by timestamp if present
+        rows.sort(key=lambda x: x.get("t") or "")
+        out[s_slash] = rows
     return out
 
 def last_trade_map(symbols) -> Dict[str,Any]:
