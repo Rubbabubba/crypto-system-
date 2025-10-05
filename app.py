@@ -139,20 +139,27 @@ def _get_last_price(symbol_slash: str) -> float:
 
 def _normalize_order(o: dict) -> dict:
     """
-    Produce a row with the columns your dashboard shows, while keeping legacy keys too.
-    Returns a dict with at least: id, symbol, side, qty, price, strategy, pnl, time
+    Populate columns: id, symbol, side, qty, price, strategy, pnl, time
+    and keep legacy keys for compatibility.
     """
-    # raw fields, various naming possibilities
-    coid = o.get("client_order_id") or o.get("clientOrderId") or ""
-    oid  = o.get("id") or coid or ""
-    sym  = _sym_to_slash(o.get("symbol") or o.get("Symbol") or "")
-    side = (o.get("side") or o.get("Side") or "").lower()
-    status = o.get("status") or o.get("Status") or ""
-    # quantities & prices
-    qty = o.get("qty") or o.get("quantity") or o.get("filled_qty") or o.get("filled_quantity") or 0
-    price = o.get("filled_avg_price") or o.get("price") or o.get("limit_price") or 0
-    notional = o.get("notional") or 0
-    # convert numerics
+    coid = o.get("client_order_id") or o.get("clientOrderId") or o.get("client_orderid") or ""
+    oid  = o.get("id") or o.get("order_id") or coid or ""
+    raw_sym = o.get("symbol") or o.get("Symbol") or o.get("asset_symbol") or ""
+    sym  = _sym_to_slash(raw_sym)
+    side = (o.get("side") or o.get("Side") or o.get("order_side") or "").lower()
+    status = (o.get("status") or o.get("Status") or "").lower()
+
+    # qty / price / notional with many fallbacks
+    qty = (
+        o.get("filled_qty") or o.get("qty") or o.get("quantity") or
+        o.get("size") or o.get("filled_quantity") or 0
+    )
+    price = (
+        o.get("filled_avg_price") or o.get("price") or
+        o.get("limit_price") or o.get("avg_price") or 0
+    )
+    notional = o.get("notional") or o.get("notional_value") or 0
+
     try: qty = float(qty)
     except Exception: qty = 0.0
     try: price = float(price)
@@ -160,42 +167,33 @@ def _normalize_order(o: dict) -> dict:
     try: notional = float(notional)
     except Exception: notional = 0.0
 
-    # if no price, fetch a last trade to fill the display
     if price <= 0:
+        # fall back to latest trade to display *something*
         price = _get_last_price(sym)
-
-    # if no qty but we have a notional + price, estimate qty for display
     if qty <= 0 and notional and price:
         qty = round(notional / price, 8)
 
-    # strategy column
-    strategy = (o.get("strategy") or _extract_strategy(coid, ""))
+    # timestamps: prefer filled_at > updated_at > submitted/created
+    ts = (
+        o.get("filled_at") or o.get("updated_at") or
+        o.get("submitted_at") or o.get("created_at") or
+        o.get("timestamp")
+    )
+    ts = ts or _now_iso()
 
-    # time column: prefer submitted/filled timestamps if present
-    ts = o.get("filled_at") or o.get("submitted_at") or o.get("timestamp") or _now_iso()
+    # Strategy extraction
+    strategy = (o.get("strategy") or _extract_strategy(coid, "") or o.get("tag") or o.get("subtag") or "")
 
-    # default pnl per-order (we’ll compute realized PnL below on sells)
+    # pnl (if provided by upstream; else computed later)
     pnl = o.get("pnl") or 0.0
     try: pnl = float(pnl)
     except Exception: pnl = 0.0
 
-    row = {
-        # columns your UI shows
-        "id": oid,
-        "symbol": sym,
-        "side": side,
-        "qty": qty,
-        "price": price,
-        "strategy": strategy,
-        "pnl": pnl,
-        "time": ts,
-
-        # keep legacy keys so older UI rows still render something
-        "client_order_id": coid,
-        "status": status,
-        "notional": notional,
+    return {
+        "id": oid, "symbol": sym, "side": side, "qty": qty, "price": price,
+        "strategy": (strategy or "unknown").lower(), "pnl": pnl, "time": ts,
+        "client_order_id": coid, "status": status, "notional": notional,
     }
-    return row
 
 def _apply_realized_pnl(row: dict) -> float:
     """
@@ -703,6 +701,80 @@ async def diag_alpaca():
         return {"positions_len": len(pos if isinstance(pos, list) else []),
                 "bars_keys": list(bars.keys()),
                 "bars_len_each": {k: len(v) for k, v in bars.items()}}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+from fastapi import HTTPException
+from datetime import datetime, timedelta, timezone
+
+def _iso(dt: datetime) -> str:
+    return dt.astimezone(timezone.utc).isoformat().replace("+00:00","Z")
+
+@app.post("/init/positions")
+async def init_positions():
+    """Seed the in-memory positions state from Alpaca current positions."""
+    try:
+        import broker as br
+        pos = br.list_positions() or []
+        # Reset local state
+        global _positions_state
+        _positions_state = {}
+        for p in pos:
+            sym = _sym_to_slash(p.get("symbol") or p.get("Symbol") or "")
+            qty = float(p.get("qty") or p.get("quantity") or p.get("qty_available") or p.get("qty_i") or p.get("Qty") or 0.0)
+            try:
+                # Alpaca uses string qty; average_entry_price for crypto
+                qty = float(p.get("qty") or p.get("quantity") or p.get("qty_available") or p.get("qty_i") or p.get("Qty") or p.get("size") or 0.0)
+            except Exception:
+                pass
+            avg = float(p.get("avg_entry_price") or p.get("average_entry_price") or p.get("avg_price") or 0.0)
+            if sym and qty and avg:
+                _positions_state[sym] = {"qty": qty, "avg_price": avg}
+        # refresh equity
+        _summary["equity"] = _recalc_equity()
+        ts = _now_iso()
+        _summary["updated_at"] = ts
+        _attribution["updated_at"] = ts
+        return {"ok": True, "positions": _positions_state}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/init/backfill")
+async def init_backfill(days: int = None, status: str = "closed"):
+    """
+    Pull recent filled orders and replay them into the P&L/attribution.
+    - days: lookback (defaults to INIT_BACKFILL_DAYS or 7)
+    - status: 'closed' or 'all' (Alpaca v2)
+    """
+    try:
+        import broker as br
+        lookback_days = int(days or os.getenv("INIT_BACKFILL_DAYS", "7"))
+        after = datetime.now(timezone.utc) - timedelta(days=lookback_days)
+        # broker.list_orders supports status/limit; we add simple 'after' filtering here
+        raws = br.list_orders(status=status, limit=1000) or []
+        # filter by 'filled_at' or 'updated_at' >= after
+        selected = []
+        for r in raws:
+            ts = r.get("filled_at") or r.get("updated_at") or r.get("submitted_at") or r.get("created_at")
+            try:
+                when = datetime.fromisoformat(ts.replace("Z","+00:00")) if isinstance(ts, str) else None
+            except Exception:
+                when = None
+            if when and when >= after:
+                selected.append(r)
+
+        # Normalize & push so P&L/Attribution update
+        # We only push FILLEDs (or anything with filled_avg_price>0)
+        orders = []
+        for r in selected:
+            st = (r.get("status") or "").lower()
+            filled_px = float(r.get("filled_avg_price") or 0.0)
+            filled_qty = float(r.get("filled_qty") or 0.0)
+            if st in ("filled","partially_filled","done") or (filled_px > 0 and filled_qty > 0):
+                orders.append(r)
+
+        _push_orders(orders)
+        return {"ok": True, "considered": len(raws), "selected": len(selected), "replayed": len(orders)}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
