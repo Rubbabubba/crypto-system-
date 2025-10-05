@@ -13,6 +13,10 @@ from typing import Any, Dict, List, Optional
 from fastapi import FastAPI, Query
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from datetime import datetime, timezone
+from collections import defaultdict, deque
+from datetime import datetime, timedelta, timezone
+from math import isfinite
+from functools import lru_cache
 
 
 # ---------- Analytics helpers ----------
@@ -100,69 +104,252 @@ def _normalize_trade_row(o: dict) -> dict:
         "notional": float(o.get("notional") or 0.0),
     }
 
-def _compute_strategy_metrics(rows: list) -> dict:
-    books = defaultdict(lambda: deque())  # (strategy,symbol) -> deque of [qty, price]
-    stats = defaultdict(lambda: {
-        "trades": 0, "wins": 0, "losses": 0,
-        "gross_profit": 0.0, "gross_loss": 0.0,
-        "net_pnl": 0.0, "volume": 0.0
-    })
-    realized_rows = []
 
-    for r in rows:
-        key = (r["strategy"], r["symbol"])
-        side, qty, px = r["side"], float(r["qty"] or 0), float(r["price"] or 0)
-        if qty <= 0 or px <= 0:
+def _compute_strategy_metrics(
+    orders: list[dict],
+    hours: int = 12,
+    tz: timezone = timezone.utc,
+) -> dict:
+    """
+    Realizes P&L FIFO per SYMBOL, attributes P&L to the strategy that OPENED the lot.
+    Also tracks who CLOSED each lot, so you can analyze 'exiter' performance.
+
+    Expected order fields (as seen in your logs):
+      - 'time' ISO8601 string
+      - 'strategy' str like 'c1'
+      - 'symbol' str like 'BCH/USD'
+      - 'side' 'buy'|'sell'
+      - 'qty' float
+      - 'price' float
+      - 'status' 'filled' (others ignored)
+      - 'notional' float (optional)
+      - 'realized_pnl' may exist on some records (ignored; we recompute)
+
+    Returns:
+      {
+        "window_hours": hours,
+        "summary_per_strategy": { strategy: {...} },
+        "detail_per_strategy_symbol": { "c1::BCH/USD": {...} },
+        "summary_closed_by": { closer_strategy: {...} },
+        "realized_trades": [ ...realized fills with pnl... ],
+        "count_orders_considered": int
+      }
+    """
+    now = datetime.now(tz)
+    cutoff = now - timedelta(hours=hours)
+
+    # Filter relevant / normalized
+    def _parse_ts(s: str) -> datetime:
+        # handle 'Z' and with offset
+        return datetime.fromisoformat(s.replace("Z", "+00:00"))
+    fills = []
+    for o in orders:
+        if o.get("status") != "filled":
             continue
+        try:
+            ts = _parse_ts(o["time"])
+        except Exception:
+            continue
+        if ts < cutoff:
+            continue
+        side = o.get("side")
+        if side not in ("buy","sell"):
+            continue
+        price = float(o.get("price", 0.0))
+        qty = float(o.get("qty", 0.0))
+        if qty <= 0 or price <= 0:
+            continue
+        fills.append({
+            "time": ts,
+            "strategy": str(o.get("strategy") or ""),
+            "symbol": str(o.get("symbol") or ""),
+            "side": side,
+            "qty": qty,
+            "price": price,
+            "id": o.get("id"),
+            "client_order_id": o.get("client_order_id"),
+            "notional": float(o.get("notional", qty * price)),
+        })
+    fills.sort(key=lambda x: x["time"])
 
-        if side == "buy":
-            books[key].append([qty, px])
-            stats[key]["volume"] += qty * px
-        elif side == "sell":
-            remaining = qty
-            trade_realized = 0.0
-            stats[key]["volume"] += qty * px
-            while remaining > 0 and books[key]:
-                lot_qty, lot_px = books[key][0]
-                use = min(remaining, lot_qty)
-                pnl = (px - lot_px) * use
-                trade_realized += pnl
-                lot_qty -= use
-                remaining -= use
-                if lot_qty <= 1e-12:
-                    books[key].popleft()
-                else:
-                    books[key][0][0] = lot_qty
-            if abs(trade_realized) > 0:
-                sk = stats[key]
-                sk["trades"] += 1
-                sk["net_pnl"] += trade_realized
-                if trade_realized >= 0:
-                    sk["wins"] += 1
-                    sk["gross_profit"] += trade_realized
-                else:
-                    sk["losses"] += 1
-                    sk["gross_loss"] += -trade_realized
-                realized_rows.append({**r, "realized_pnl": trade_realized})
+    # Per-symbol FIFO book (independent of strategy); each lot carries opened_by
+    book: dict[str, deque] = defaultdict(deque)
+    # Metrics
+    S = lambda: dict(trades=0, wins=0, losses=0,
+                     gross_profit=0.0, gross_loss=0.0,
+                     net_pnl=0.0, profit_factor=None,
+                     win_rate=None, avg_trade=None, volume=0.0)
+    per_open_strategy = defaultdict(S)          # attribution to opener
+    per_open_strategy_sym = defaultdict(S)      # opener + symbol
+    per_close_strategy = defaultdict(S)         # who closed (optional view)
+    realized_trades = []
 
-    per_strategy = defaultdict(lambda: {
-        "trades": 0, "wins": 0, "losses": 0, "gross_profit": 0.0,
-        "gross_loss": 0.0, "net_pnl": 0.0, "profit_factor": None,
-        "win_rate": None, "avg_trade": None, "volume": 0.0
-    })
-    for (strategy, _symbol), s in stats.items():
-        agg = per_strategy[strategy]
-        for k in ("trades","wins","losses","gross_profit","gross_loss","net_pnl","volume"):
-            agg[k] += s[k]
+    def _bump(stats, pnl, notional):
+        stats["trades"] += 1
+        stats["net_pnl"] += pnl
+        if pnl >= 0:
+            stats["wins"] += 1
+            stats["gross_profit"] += pnl
+        else:
+            stats["losses"] += 1
+            stats["gross_loss"] += -pnl
+        stats["volume"] += notional
 
-    for strategy, s in per_strategy.items():
-        t = s["trades"]
-        gp, gl = s["gross_profit"], s["gross_loss"]
-        s["profit_factor"] = (gp / gl) if gl > 0 else (None if gp == 0 else float("inf"))
-        s["win_rate"] = (s["wins"] / t) if t > 0 else None
-        s["avg_trade"] = (s["net_pnl"] / t) if t > 0 else None
+    # Process fills
+    for f in fills:
+        sym = f["symbol"]
+        strat = f["strategy"] or "unknown"
+        if f["side"] == "buy":
+            # append lot carrying the opener
+            book[sym].append({
+                "qty": f["qty"],
+                "price": f["price"],
+                "opened_by": strat,
+                "time": f["time"],
+                "open_id": f.get("id"),
+            })
+        else:  # sell
+            qty_to_close = f["qty"]
+            sell_price = f["price"]
+            while qty_to_close > 1e-12 and book[sym]:
+                lot = book[sym][0]
+                use_qty = min(qty_to_close, lot["qty"])
+                pnl = (sell_price - lot["price"]) * use_qty
+                notional = use_qty * sell_price
+                opened_by = lot["opened_by"]
 
-    return {"per_strategy": per_strategy, "per_pair": stats, "realized_rows": realized_rows}
+                # Attribute to opener
+                _bump(per_open_strategy[opened_by], pnl, notional)
+                _bump(per_open_strategy_sym[f"{opened_by}::{sym}"], pnl, notional)
+                # Also record who closed
+                _bump(per_close_strategy[strat], pnl, notional)
+
+                realized_trades.append({
+                    "id": f.get("id"),
+                    "symbol": sym,
+                    "side": "sell",
+                    "qty": use_qty,
+                    "price": sell_price,
+                    "strategy_opened": opened_by,
+                    "strategy_closed": strat,
+                    "time": f["time"].isoformat(),
+                    "status": "filled",
+                    "client_order_id": f.get("client_order_id"),
+                    "notional": notional,
+                    "realized_pnl": pnl,
+                })
+
+                # reduce lot
+                lot["qty"] -= use_qty
+                qty_to_close -= use_qty
+                if lot["qty"] <= 1e-12:
+                    book[sym].popleft()
+
+        # Add raw volume to the firing strategy (useful even if not opener/closer)
+        # (Optional – comment out if you prefer "volume == turnover behind realized trades only")
+        # per_open_strategy[strat]["volume"] += f["notional"]
+
+    # final KPIs
+    def _finalize(stats):
+        gp = stats["gross_profit"]
+        gl = stats["gross_loss"]
+        t  = stats["trades"]
+        if gl > 0:
+            stats["profit_factor"] = gp / gl
+        elif gp > 0:
+            stats["profit_factor"] = float("inf")
+        else:
+            stats["profit_factor"] = None
+        if t > 0:
+            stats["win_rate"] = stats["wins"] / t
+            stats["avg_trade"] = stats["net_pnl"] / t
+        else:
+            stats["win_rate"] = None
+            stats["avg_trade"] = None
+
+    for d in (per_open_strategy, per_open_strategy_sym, per_close_strategy):
+        for k in d:
+            _finalize(d[k])
+
+    return {
+        "window_hours": hours,
+        "summary_per_strategy": dict(per_open_strategy),
+        "detail_per_strategy_symbol": dict(per_open_strategy_sym),
+        "summary_closed_by": dict(per_close_strategy),
+        "realized_trades": realized_trades,
+        "count_orders_considered": len(fills),
+    }
+
+# --- STRATEGY GUARD STATE ----------------------------------------------------
+class StrategyGuard:
+    def __init__(self):
+        self.cooldown_until_bar = {}          # (symbol)->bar_index_until
+        self.closes_per_hour = defaultdict(lambda: deque()) # (symbol)->timestamps deque
+        self.loss_streak = defaultdict(int)   # (strategy)->count
+        self.last_bar_index = 0               # set from your bar clock
+
+    def on_bar(self, bar_index: int):
+        self.last_bar_index = bar_index
+
+    def on_realized(self, symbol: str, opener: str, closer: str, pnl: float, when: datetime):
+        if pnl < 0:
+            self.cooldown_until_bar[symbol] = max(
+                self.cooldown_until_bar.get(symbol, 0),
+                self.last_bar_index + GUARDS["cooldown_bars_after_loss"]
+            )
+            self.loss_streak[opener] = self.loss_streak.get(opener, 0) + 1
+        else:
+            self.loss_streak[opener] = 0
+
+        dq = self.closes_per_hour[symbol]
+        dq.append(when)
+        cutoff = when - timedelta(hours=1)
+        while dq and dq[0] < cutoff:
+            dq.popleft()
+
+    def can_open(self, strategy: str, symbol: str, edge_bps_val: float,
+                 spread_bps: float, price_above_ema: bool) -> tuple[bool, str]:
+        if not GUARDS["enable"]:
+            return True, "guards_disabled"
+
+        if self.last_bar_index < self.cooldown_until_bar.get(symbol, -1):
+            return False, f"cooldown_active_until_bar_{self.cooldown_until_bar[symbol]}"
+
+        if self.loss_streak.get(strategy, 0) >= GUARDS["max_consecutive_losses_per_strategy"]:
+            return False, f"loss_streak_{self.loss_streak[strategy]}"
+
+        if edge_bps_val < GUARDS["min_edge_bps"]:
+            return False, f"edge_bps_{edge_bps_val:.2f}_lt_min_{GUARDS['min_edge_bps']}"
+        if edge_bps_val < GUARDS["min_edge_vs_spread_x"] * spread_bps:
+            return False, f"edge_vs_spread_{edge_bps_val:.2f}/{spread_bps:.2f}"
+        if not price_above_ema:
+            return False, "ema_alignment_fail"
+
+        return True, "ok"
+
+    def can_close_now(self, symbol: str, when: datetime) -> tuple[bool, str]:
+        dq = self.closes_per_hour[symbol]
+        cutoff = when - timedelta(hours=1)
+        while dq and dq[0] < cutoff:
+            dq.popleft()
+        if len(dq) >= GUARDS["max_closes_per_symbol_per_hour"]:
+            return False, f"closes_per_hour_cap_{len(dq)}"
+        return True, "ok"
+
+GUARD = StrategyGuard()
+
+def _tf_seconds(tf: str) -> int:
+    t = tf.lower()
+    if t in ("1min", "1m"): return 60
+    if t in ("5min", "5m"): return 300
+    if t in ("15min", "15m"): return 900
+    if t in ("1h", "60min"): return 3600
+    return 300  # default 5m
+
+def bar_index_now(timeframe: str = "5Min") -> int:
+    now = datetime.now(timezone.utc)
+    return int(now.timestamp() // _tf_seconds(timeframe))
+
 
 # -----------------------------------------------------------------------------
 # Logging
@@ -186,6 +373,60 @@ TRADING_ENABLED = os.getenv("TRADING_ENABLED", "1") in ("1","true","True")
 APP_VERSION = os.getenv("APP_VERSION", "2025.10.04-crypto-v2")
 
 STRATEGIES = [s.strip() for s in os.getenv("STRATEGY_LIST", "c1,c2,c3,c4,c5,c6").split(",") if s.strip()]
+
+# --- GUARDRAILS CONFIG -------------------------------------------------------
+GUARDS = {
+    "enable": True,
+    "cooldown_bars_after_loss": 6,
+    "max_closes_per_symbol_per_hour": 4,
+    "max_consecutive_losses_per_strategy": 3,
+    "consec_lookback_hours": 2,
+    "min_edge_bps": 5.0,
+    "min_edge_vs_spread_x": 2.0,
+    "ema_fast": 20,
+    "ema_slow": 50,
+    "breakeven_trigger_bps": 8.0,
+    "time_bail_bars": 8,
+    "tp_target_bps": 12.0,
+    "no_cross_exit": True,
+}
+
+# --- EMA / PRICE UTILITIES ---------------------------------------------------
+def _bps(pct: float) -> float:
+    return pct * 1e4
+
+def _edge_bps(entry_price: float, expected_price: float) -> float:
+    return _bps((expected_price - entry_price) / entry_price)
+
+@lru_cache(maxsize=4096)
+def _ema(series_key: tuple, prices: tuple[float, ...], period: int) -> float:
+    k = 2.0 / (period + 1.0)
+    ema = prices[0]
+    for p in prices[1:]:
+        ema = p * k + ema * (1 - k)
+    return ema
+
+def ema_value(symbol: str, timeframe: str, closes: list[float], period: int) -> float:
+    if not closes:
+        return float("nan")
+    key = (symbol, timeframe, len(closes), period)
+    return _ema(key, tuple(closes), period)
+
+def _price_above_ema_fast(symbol: str, timeframe: str, closes: list[float]) -> bool:
+    # Use fast EMA for alignment; you can blend with slow if you want
+    try:
+        ema = ema_value(symbol, timeframe, closes, GUARDS["ema_fast"])
+        last = closes[-1] if closes else float("nan")
+        return isfinite(ema) and isfinite(last) and (last >= ema)
+    except Exception:
+        return True  # fail-open if we can't compute
+
+def _spread_bps(last: float, bid: float = None, ask: float = None) -> float:
+    # Simple proxy if you don't have L2: assume 4 bps if unknown
+    if bid and ask and bid > 0 and ask > bid:
+        mid = 0.5*(bid+ask)
+        return _bps((ask - bid) / mid)
+    return 4.0
 
 # -----------------------------------------------------------------------------
 # Strategy adapter (real c1..c6.run_scan)
@@ -420,6 +661,20 @@ def _push_orders(orders: List[Dict[str, Any]]):
             r = _apply_realized_pnl(row)
         except Exception:
             r = 0.0
+
+        # notify guard on realized sell PnL (approximate opener as closer for now)
+        try:
+            if (row.get("side") == "sell") and r != 0.0:
+                GUARD.on_realized(
+                    symbol=row.get("symbol"),
+                    opener=(row.get("strategy") or "unknown"),
+                    closer=(row.get("strategy") or "unknown"),
+                    pnl=float(r),
+                    when=datetime.now(timezone.utc),
+                )
+        except Exception:
+            log.exception("guard on_realized failed")
+
         row["pnl"] = float(row.get("pnl") or 0.0) + float(r or 0.0)
         realized_total += float(r or 0.0)
 
@@ -439,13 +694,79 @@ def _push_orders(orders: List[Dict[str, Any]]):
 
     # realized PnL goes into the day bucket (simple running total from app start)
     _summary["pnl_day"] = float(_summary.get("pnl_day") or 0.0) + realized_total
-    # week/month rollups could be added later if you want date-aware buckets
 
     # equity: mark-to-market of open positions (approx)
     try:
         _summary["equity"] = _recalc_equity()
     except Exception:
         pass
+
+
+async def _exit_nanny(symbols: list[str], timeframe: str):
+    """
+    Simple rule-based exits applied to open positions.
+    Uses last closes and GUARDS to decide optional sells.
+    """
+    try:
+        import broker as br
+        bars_map = br.get_bars(symbols, timeframe=timeframe, limit=max(GUARDS["ema_slow"], 60)) or {}
+        last_trade_map = br.last_trade_map(symbols) or {}
+    except Exception:
+        bars_map, last_trade_map = {}, {}
+
+    for sym, pos in list(_positions_state.items()):
+        qty = float(pos.get("qty") or 0.0)
+        if qty <= 0:  # flat
+            continue
+
+        closes = [float(b.get("c") or b.get("close") or 0.0) for b in (bars_map.get(sym) or []) if float(b.get("c") or b.get("close") or 0.0) > 0]
+        if not closes:
+            continue
+
+        last = float((last_trade_map.get(sym, {}) or {}).get("price") or closes[-1] or 0.0)
+        if last <= 0:
+            continue
+
+        entry = float(pos.get("avg_price") or 0.0)
+        if entry <= 0:
+            continue
+
+        # 7.1 Breakeven: if in profit by X bps, require stop >= entry
+        up_bps = _bps((last - entry) / entry)
+        if up_bps >= GUARDS["breakeven_trigger_bps"]:
+            # advisory; to fully enforce you'd need per-order stops
+            logging.getLogger("app").info("exit_nanny: %s hit breakeven trigger (%.1f bps)", sym, up_bps)
+
+        # 7.2 Time bail: if position older than N bars (we don't track age per-lot in _positions_state),
+        # you can implement a soft gate via bar clock only (skip here) or add per-lot tracking later.
+
+        # 7.3 TP target: take profit at +tp_target_bps
+        if up_bps >= GUARDS["tp_target_bps"]:
+            ok, why = GUARD.can_close_now(sym, datetime.now(timezone.utc))
+            if ok and TRADING_ENABLED:
+                try:
+                    br.submit_order(symbol=sym, side="sell", notional=min(DEFAULT_NOTIONAL, qty*last))
+                    logging.getLogger("app").info("exit_nanny: TP sell placed for %s", sym)
+                    continue
+                except Exception:
+                    logging.getLogger("app").exception("exit_nanny TP submit failed")
+
+        # 7.4 No-cross exit (example: price below slow EMA)
+        slow_ok = True
+        try:
+            slow_ema = ema_value(sym, timeframe, closes, GUARDS["ema_slow"])
+            slow_ok = not (isfinite(slow_ema) and last < slow_ema)  # exit if crossed below
+        except Exception:
+            pass
+
+        if (not slow_ok) and TRADING_ENABLED:
+            ok, why = GUARD.can_close_now(sym, datetime.now(timezone.utc))
+            if ok:
+                try:
+                    br.submit_order(symbol=sym, side="sell", notional=min(DEFAULT_NOTIONAL, qty*last))
+                    logging.getLogger("app").info("exit_nanny: no-cross sell placed for %s", sym)
+                except Exception:
+                    logging.getLogger("app").exception("exit_nanny no-cross submit failed")
 
 
 # -----------------------------------------------------------------------------
@@ -470,7 +791,56 @@ async def _scan_bridge(strat: str, req: Dict[str, Any], dry: bool = False) -> Li
 
     sb = StrategyBook()
     orders = sb.scan(req, {"one": {"timeframe": req["timeframe"], "symbols": syms, "notional": req["notional"]}})
-    # normalize
+
+    # ---- GUARD: filter proposed OPEN/CLOSE orders before returning ----
+    try:
+        import broker as br
+        # pull recent closes for EMA: keep it light — 60 bars is enough
+        bars_map = br.get_bars(req["symbols"], timeframe=req["timeframe"], limit=60) or {}
+    except Exception:
+        bars_map = {}
+
+    filtered = []
+    now_dt = datetime.now(timezone.utc)
+
+    for o in (orders or []):
+        side = (o.get("side") or "").lower()
+        sym = _sym_to_slash(o.get("symbol") or "")
+        strat_name = (req.get("strategy") or "").lower()
+
+        # Try to recover last price and closes
+        closes = [float(b.get("c") or b.get("close") or 0.0) for b in (bars_map.get(sym) or []) if float(b.get("c") or b.get("close") or 0.0) > 0]
+        px = float(o.get("price") or 0.0)
+        if px <= 0 and closes:
+            px = closes[-1]
+
+        # If strategy supplies edge_bps in the order payload, use it; else 0
+        edge_bps_val = float(o.get("edge_bps") or o.get("edge") or 0.0)
+
+        # crude spread proxy (upgrade to real bid/ask if you have it)
+        spr_bps = _spread_bps(px)
+
+        # EMA alignment
+        ema_ok = _price_above_ema_fast(sym, req["timeframe"], closes)
+
+        if side == "buy":
+            ok, why = GUARD.can_open(strat_name, sym, edge_bps_val, spr_bps, ema_ok)
+            if not ok:
+                log.info("guard: DROP OPEN %s %s by %s (%s)", sym, side, strat_name, why)
+                continue
+
+        if side == "sell":
+            # conservative: throttle closes/hour per symbol
+            ok, why = GUARD.can_close_now(sym, now_dt)
+            if not ok:
+                log.info("guard: DROP CLOSE %s by %s (%s)", sym, strat_name, why)
+                continue
+
+        filtered.append(o)
+
+    orders = filtered
+
+    # normalize return shape for callers
     if not orders:
         return []
     if isinstance(orders, dict):
@@ -492,6 +862,10 @@ async def _scheduler_loop():
             log.info("Scheduler tick: running all strategies (dry=%d)", int(dry_flag))
             for strat in STRATEGIES:
                 try:
+                    GUARD.on_bar(bar_index_now(DEFAULT_TIMEFRAME))
+                except Exception:
+                    log.exception("guard tick failed")
+                try:
                     orders = await _scan_bridge(
                         strat,
                         {
@@ -509,6 +883,10 @@ async def _scheduler_loop():
                     _push_orders(orders)
                 except Exception:
                     log.exception("push orders error")
+                try:
+                    await _exit_nanny(DEFAULT_SYMBOLS, DEFAULT_TIMEFRAME)
+                except Exception:
+                    log.exception("exit nanny failed")
             await asyncio.sleep(SCHEDULE_SECONDS)
     finally:
         _running = False
@@ -766,7 +1144,26 @@ async def pnl_summary():
 @app.get("/orders/recent", response_class=JSONResponse)
 async def orders_recent(limit: int = Query(100, ge=1, le=1000)):
     items = _orders_ring[-limit:] if _orders_ring else []
-    return JSONResponse({"orders": items, "updated_at": datetime.now(timezone.utc).isoformat()})
+    # map to frontend’s expected keys
+    mapped = []
+    for o in items:
+        # time may be ISO string; emit epoch seconds for the table
+        ts_iso = o.get("time") or ""
+        try:
+            ts_epoch = int(datetime.fromisoformat(ts_iso.replace("Z","+00:00")).timestamp())
+        except Exception:
+            ts_epoch = None
+        mapped.append({
+            "id": o.get("id"),
+            "symbol": o.get("symbol"),
+            "side": o.get("side"),
+            "qty": o.get("qty"),
+            "px": o.get("price"),
+            "strategy": o.get("strategy"),
+            "pnl": o.get("pnl"),
+            "ts": ts_epoch,
+        })
+    return JSONResponse({"orders": mapped, "updated_at": datetime.now(timezone.utc).isoformat()})
 
 @app.get("/orders/attribution", response_class=JSONResponse)
 async def orders_attribution():
@@ -778,15 +1175,14 @@ from fastapi.responses import PlainTextResponse
 async def analytics_trades(hours: int = 12):
     orders = _fetch_filled_orders_last_hours(int(hours))
     rows = [_normalize_trade_row(o) for o in orders]
-    metrics = _compute_strategy_metrics(rows)
-    per_strategy = {k: dict(v) for k, v in metrics["per_strategy"].items()}
-    per_pair = {f"{k[0]}::{k[1]}": dict(v) for k, v in metrics["per_pair"].items()}
+    metrics = _compute_strategy_metrics(rows, hours=int(hours))
     return {
-        "window_hours": hours,
-        "summary_per_strategy": per_strategy,
-        "detail_per_strategy_symbol": per_pair,
-        "realized_trades": metrics["realized_rows"],
-        "count_orders_considered": len(rows)
+        "window_hours": metrics["window_hours"],
+        "summary_per_strategy": metrics["summary_per_strategy"],
+        "detail_per_strategy_symbol": metrics["detail_per_strategy_symbol"],
+        "summary_closed_by": metrics["summary_closed_by"],
+        "realized_trades": metrics["realized_trades"],
+        "count_orders_considered": metrics["count_orders_considered"],
     }
 
 @app.get("/analytics/trades.csv", response_class=PlainTextResponse)
@@ -799,66 +1195,6 @@ async def analytics_trades_csv(hours: int = 12):
     for r in rows:
         w.writerow(r)
     return buf.getvalue()
-
-@app.post("/init/positions")
-async def init_positions():
-    """Seed the in-memory positions state from Alpaca current positions."""
-    try:
-        import broker as br
-        pos = br.list_positions() or []
-        global _positions_state
-        _positions_state = {}
-        for p in pos:
-            sym = _sym_to_slash(p.get("symbol") or p.get("Symbol") or "")
-            try:
-                qty = float(p.get("qty") or p.get("quantity") or p.get("qty_available") or p.get("size") or 0.0)
-            except Exception:
-                qty = 0.0
-            avg = float(p.get("avg_entry_price") or p.get("average_entry_price") or p.get("avg_price") or 0.0)
-            if sym and qty and avg:
-                _positions_state[sym] = {"qty": qty, "avg_price": avg}
-        _summary["equity"] = _recalc_equity()
-        ts = _now_iso()
-        _summary["updated_at"] = ts
-        _attribution["updated_at"] = ts
-        return {"ok": True, "positions": _positions_state}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-@app.post("/init/backfill")
-async def init_backfill(days: int = None, status: str = "closed"):
-    """
-    Pull recent filled orders and replay them into the P&L/attribution.
-    - days: lookback (defaults to INIT_BACKFILL_DAYS or 7)
-    - status: 'closed' or 'all' (Alpaca v2)
-    """
-    try:
-        import broker as br
-        lookback_days = int(days or os.getenv("INIT_BACKFILL_DAYS", "7"))
-        after = datetime.now(timezone.utc) - timedelta(days=lookback_days)
-        raws = br.list_orders(status=status, limit=1000) or []
-        selected = []
-        for r in raws:
-            ts = r.get("filled_at") or r.get("updated_at") or r.get("submitted_at") or r.get("created_at")
-            try:
-                when = datetime.fromisoformat(ts.replace("Z","+00:00")) if isinstance(ts, str) else None
-            except Exception:
-                when = None
-            if when and when >= after:
-                selected.append(r)
-
-        orders = []
-        for r in selected:
-            st = (r.get("status") or "").lower()
-            filled_px = float(r.get("filled_avg_price") or 0.0)
-            filled_qty = float(r.get("filled_qty") or 0.0)
-            if st in ("filled","partially_filled","done") or (filled_px > 0 and filled_qty > 0):
-                orders.append(r)
-
-        _push_orders(orders)
-        return {"ok": True, "considered": len(raws), "selected": len(selected), "replayed": len(orders)}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/diag/orders_raw")
 async def diag_orders_raw(status: str = "all", limit: int = 25):
