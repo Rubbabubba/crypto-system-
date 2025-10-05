@@ -11,6 +11,24 @@ from typing import Any, Dict, List, Optional
 
 from fastapi import FastAPI, Query
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
+from datetime import datetime, timezone
+
+def _sym_to_slash(s: str) -> str:
+    if not s:
+        return s
+    s = s.upper()
+    return s if "/" in s else (s[:-3] + "/" + s[-3:] if len(s) > 3 else s)
+
+def _extract_strategy(coid: str, fallback: str = "") -> str:
+    if not coid:
+        return fallback
+    # common pattern: c2-<timestamp>-btcusd or similar
+    part = coid.split("-")[0].lower()
+    return part if part else (fallback or "unknown")
+
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
 
 # -----------------------------------------------------------------------------
 # Logging
@@ -107,6 +125,135 @@ class StrategyBook:
     def scan(self, req: Dict[str, Any], contexts: Optional[Dict[str, Any]] = None):
         return self._impl.scan(req, contexts or {})
 
+
+_positions_state = {}  # symbol -> {"qty": float, "avg_price": float}
+
+def _get_last_price(symbol_slash: str) -> float:
+    try:
+        import broker as br
+        pmap = br.last_trade_map([symbol_slash])
+        px = float(pmap.get(symbol_slash, {}).get("price") or 0.0)
+        return px
+    except Exception:
+        return 0.0
+
+def _normalize_order(o: dict) -> dict:
+    """
+    Produce a row with the columns your dashboard shows, while keeping legacy keys too.
+    Returns a dict with at least: id, symbol, side, qty, price, strategy, pnl, time
+    """
+    # raw fields, various naming possibilities
+    coid = o.get("client_order_id") or o.get("clientOrderId") or ""
+    oid  = o.get("id") or coid or ""
+    sym  = _sym_to_slash(o.get("symbol") or o.get("Symbol") or "")
+    side = (o.get("side") or o.get("Side") or "").lower()
+    status = o.get("status") or o.get("Status") or ""
+    # quantities & prices
+    qty = o.get("qty") or o.get("quantity") or o.get("filled_qty") or o.get("filled_quantity") or 0
+    price = o.get("filled_avg_price") or o.get("price") or o.get("limit_price") or 0
+    notional = o.get("notional") or 0
+    # convert numerics
+    try: qty = float(qty)
+    except Exception: qty = 0.0
+    try: price = float(price)
+    except Exception: price = 0.0
+    try: notional = float(notional)
+    except Exception: notional = 0.0
+
+    # if no price, fetch a last trade to fill the display
+    if price <= 0:
+        price = _get_last_price(sym)
+
+    # if no qty but we have a notional + price, estimate qty for display
+    if qty <= 0 and notional and price:
+        qty = round(notional / price, 8)
+
+    # strategy column
+    strategy = (o.get("strategy") or _extract_strategy(coid, ""))
+
+    # time column: prefer submitted/filled timestamps if present
+    ts = o.get("filled_at") or o.get("submitted_at") or o.get("timestamp") or _now_iso()
+
+    # default pnl per-order (we’ll compute realized PnL below on sells)
+    pnl = o.get("pnl") or 0.0
+    try: pnl = float(pnl)
+    except Exception: pnl = 0.0
+
+    row = {
+        # columns your UI shows
+        "id": oid,
+        "symbol": sym,
+        "side": side,
+        "qty": qty,
+        "price": price,
+        "strategy": strategy,
+        "pnl": pnl,
+        "time": ts,
+
+        # keep legacy keys so older UI rows still render something
+        "client_order_id": coid,
+        "status": status,
+        "notional": notional,
+    }
+    return row
+
+def _apply_realized_pnl(row: dict) -> float:
+    """
+    Update a tiny in-memory position book and return realized P&L for this fill.
+    Assumes 'qty' and 'price' are set on the normalized row.
+    Only computes when we have both qty>0 and price>0.
+    """
+    sym = row.get("symbol")
+    side = (row.get("side") or "").lower()
+    qty = float(row.get("qty") or 0)
+    price = float(row.get("price") or 0)
+    status = row.get("status") or ""
+    # If the order isn’t filled yet, skip PnL math—just display the row
+    # If your Alpaca webhook/refresh later adds fill info, this will catch it then.
+    if qty <= 0 or price <= 0:
+        return 0.0
+
+    pos = _positions_state.setdefault(sym, {"qty": 0.0, "avg_price": 0.0})
+    realized = 0.0
+
+    if side == "buy":
+        # new avg = (old_cost + new_cost) / new_qty
+        new_qty = pos["qty"] + qty
+        if new_qty > 0:
+            pos["avg_price"] = ((pos["qty"] * pos["avg_price"]) + (qty * price)) / new_qty
+        pos["qty"] = new_qty
+
+    elif side == "sell":
+        # realized PnL on the sold size at current avg
+        sell_qty = min(qty, max(pos["qty"], 0.0))
+        if sell_qty > 0:
+            realized = (price - pos["avg_price"]) * sell_qty
+            pos["qty"] = pos["qty"] - sell_qty
+            # keep avg the same for remaining qty; if flat, leave last avg
+    return realized
+
+def _recalc_equity() -> float:
+    """Mark-to-market equity of open positions using last trade prices."""
+    if not _positions_state:
+        return 0.0
+    syms = [s for s, p in _positions_state.items() if p.get("qty", 0) > 0]
+    if not syms:
+        return 0.0
+    try:
+        import broker as br
+        pmap = br.last_trade_map(syms)
+    except Exception:
+        pmap = {}
+    eq = 0.0
+    for s, p in _positions_state.items():
+        q = float(p.get("qty") or 0)
+        if q <= 0:
+            continue
+        last = float((pmap.get(s, {}) or {}).get("price") or 0.0)
+        if last > 0:
+            eq += q * last
+    return eq
+
 # -----------------------------------------------------------------------------
 # App + state
 # -----------------------------------------------------------------------------
@@ -117,18 +264,57 @@ _attribution: Dict[str, Any] = {"by_strategy": {}, "updated_at": None}
 _summary: Dict[str, Any] = {"equity": 0.0, "pnl_day": 0.0, "pnl_week": 0.0, "pnl_month": 0.0, "updated_at": None}
 
 def _push_orders(orders: List[Dict[str, Any]]):
+    """
+    - Normalize each incoming order so dashboard columns are populated.
+    - Compute realized P&L on sells; update attribution & summary.
+    - Keep ring buffer compatible with your existing /orders/recent endpoint.
+    """
     global _orders_ring, _attribution, _summary
+
     if not orders:
+        # still bump the timestamp so "Last Updated" moves
+        ts = _now_iso()
+        _summary["updated_at"] = ts
+        _attribution["updated_at"] = ts
         return
+
+    realized_total = 0.0
+
     for o in orders:
-        _orders_ring.append(o)
+        row = _normalize_order(o)
+
+        # compute realized pnl if qty/price are known (typically when filled data is present)
+        try:
+            r = _apply_realized_pnl(row)
+        except Exception:
+            r = 0.0
+        row["pnl"] = float(row.get("pnl") or 0.0) + float(r or 0.0)
+        realized_total += float(r or 0.0)
+
+        # ring buffer
+        _orders_ring.append(row)
         if len(_orders_ring) > 1000:
             _orders_ring = _orders_ring[-1000:]
-        strat = (o.get("strategy") or "").lower() or (o.get("client_order_id") or "").split("-")[0]
-        _attribution["by_strategy"][strat] = _attribution["by_strategy"].get(strat, 0.0) + float(o.get("pnl", 0) or 0.0)
-    ts = datetime.now(timezone.utc).isoformat()
+
+        # attribution by strategy (realized only)
+        strat = (row.get("strategy") or "unknown").lower()
+        _attribution["by_strategy"][strat] = _attribution["by_strategy"].get(strat, 0.0) + float(r or 0.0)
+
+    # summary updates
+    ts = _now_iso()
     _attribution["updated_at"] = ts
     _summary["updated_at"] = ts
+
+    # realized PnL goes into the day bucket (simple running total from app start)
+    _summary["pnl_day"] = float(_summary.get("pnl_day") or 0.0) + realized_total
+    # week/month rollups could be added later if you want date-aware buckets
+
+    # equity: mark-to-market of open positions (approx)
+    try:
+        _summary["equity"] = _recalc_equity()
+    except Exception:
+        pass
+
 
 # -----------------------------------------------------------------------------
 # Scan bridge (unchanged external behavior)
