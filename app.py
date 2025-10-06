@@ -370,7 +370,7 @@ DEFAULT_NOTIONAL = float(os.getenv("DEFAULT_NOTIONAL", os.getenv("ORDER_NOTIONAL
 DEFAULT_SYMBOLS = os.getenv("DEFAULT_SYMBOLS", "BTC/USD,ETH/USD").split(",")
 
 TRADING_ENABLED = os.getenv("TRADING_ENABLED", "1") in ("1","true","True")
-P25.10.05-crypto-v3")
+APP_VERSION = os.getenv("APP_VERSION", "2025.10.05-crypto-v3")
 
 STRATEGIES = [s.strip() for s in os.getenv("STRATEGY_LIST", "c1,c2,c3,c4,c5,c6").split(",") if s.strip()]
 
