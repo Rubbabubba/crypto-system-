@@ -618,6 +618,28 @@ def _recalc_equity() -> float:
             eq += q * last
     return eq
 
+def _get_store():
+    """Unified store accessor for metrics routes."""
+    try:
+        return getattr(app.state, "store", None) or {}
+    except Exception:
+        return {}
+
+def _safe_get(key: str, default=None):
+    """Return data from known sources (in-memory globals, app.state.store)."""
+    # 1. app.state.store
+    store = _get_store()
+    if isinstance(store, dict) and key in store:
+        return store[key]
+    # 2. internal globals
+    if key == "orders":
+        return _orders_ring
+    if key == "attribution":
+        return _attribution
+    if key == "summary":
+        return _summary
+    # 3. fallback
+    return default or []
 
 # -----------------------------------------------------------------------------
 # App + state
@@ -1299,60 +1321,131 @@ async def diag_alpaca():
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-@app.get("/metrics/scorecard")
-def metrics_scorecard(days: int = Query(7, ge=1, le=90),
-                      min_trades: int = Query(50, ge=1, le=2000)):
-    # Replace STATE["orders"] with how you store your orders
-    orders = STATE.get("orders", [])
-    data = compute_scorecard(orders, days=days, min_trades=min_trades)
-    return JSONResponse(content=data)
-
-from fastapi import Response
-
-@app.get("/metrics/scorecard")
+@app.get("/metrics/scorecard", response_class=JSONResponse)
 def metrics_scorecard():
     """
-    JSON scorecard across strategies, based on whatever orders the app currently holds.
+    JSON scorecard across all strategies, using the current in-memory orders.
+    Safe against missing global STATE or empty stores.
     """
-    try:
-        orders_iter = _orders_source()
-        data = _compute_strategy_metrics(orders_iter)
-        return {"ok": True, "data": data}
-    except Exception as e:
-        logger.exception("metrics_scorecard failed: %s", e)
-        return {"ok": False, "error": str(e)}
+    import statistics, math
 
-@app.get("/metrics/scorecard.csv")
+    try:
+        orders = _safe_get("orders", [])
+        if not orders:
+            return {"ok": True, "data": {}, "note": "no orders yet"}
+
+        # --- compute metrics ---
+        buckets = {}
+        for o in orders:
+            strat = (o.get("strategy") or "unknown").lower()
+            buckets.setdefault(strat, []).append(o)
+
+        data = {}
+        for sname, items in buckets.items():
+            n = len(items)
+            wins = losses = 0
+            gross_pnl = fees = 0.0
+            rets = []
+
+            for o in items:
+                pnl = float(o.get("pnl") or 0.0)
+                gross_pnl += pnl
+                if pnl > 0:
+                    wins += 1
+                elif pnl < 0:
+                    losses += 1
+                fee = float(o.get("fee") or o.get("fees") or 0.0)
+                fees += fee
+                notional = float(o.get("notional") or 0.0)
+                if notional > 0:
+                    rets.append(pnl / notional)
+
+            win_rate = wins / n if n else 0.0
+            avg_ret = statistics.mean(rets) if rets else 0.0
+            std_ret = statistics.pstdev(rets) if len(rets) > 1 else 0.0
+            sharpe_like = (avg_ret / std_ret) if std_ret > 0 else (float("inf") if avg_ret > 0 else 0.0)
+
+            data[sname] = {
+                "trades": n,
+                "wins": wins,
+                "losses": losses,
+                "win_rate": round(win_rate, 4),
+                "gross_pnl": round(gross_pnl, 2),
+                "fees": round(fees, 2),
+                "net_pnl": round(gross_pnl - fees, 2),
+                "avg_ret": round(avg_ret, 6),
+                "std_ret": round(std_ret, 6),
+                "sharpe_like": (round(sharpe_like, 4) if math.isfinite(sharpe_like) else "inf"),
+            }
+
+        return {"ok": True, "data": data, "count_strategies": len(data)}
+
+    except Exception as e:
+        log.exception("metrics_scorecard failed: %s", e)
+        return JSONResponse(content={"ok": False, "error": str(e)}, status_code=500)
+
+
+@app.get("/metrics/scorecard.csv", response_class=PlainTextResponse)
 def metrics_scorecard_csv():
     """
-    CSV scorecard for spreadsheets. Safe if state containers move around.
+    CSV scorecard export, resilient against missing data.
     """
-    import io, csv
+    import io, csv, math
+
     try:
-        orders_iter = _orders_source()
-        data = _compute_strategy_metrics(orders_iter)
-        # build CSV
+        orders = _safe_get("orders", [])
+        if not orders:
+            return PlainTextResponse("strategy,trades,wins,losses,win_rate,gross_pnl,fees,net_pnl,avg_ret,std_ret,sharpe_like\n")
+
+        # reuse JSON computation
+        buckets = {}
+        for o in orders:
+            strat = (o.get("strategy") or "unknown").lower()
+            buckets.setdefault(strat, []).append(o)
+
         buf = io.StringIO()
         writer = csv.writer(buf)
-        writer.writerow(["strategy","trades","wins","losses","win_rate","gross_pnl","fees","net_pnl","avg_ret","std_ret","sharpe_like"])
-        for sid, row in sorted(data.items()):
+        writer.writerow(["strategy", "trades", "wins", "losses", "win_rate", "gross_pnl", "fees", "net_pnl", "avg_ret", "std_ret", "sharpe_like"])
+
+        import statistics
+        for sname, items in buckets.items():
+            n = len(items)
+            wins = losses = 0
+            gross_pnl = fees = 0.0
+            rets = []
+            for o in items:
+                pnl = float(o.get("pnl") or 0.0)
+                gross_pnl += pnl
+                if pnl > 0:
+                    wins += 1
+                elif pnl < 0:
+                    losses += 1
+                fee = float(o.get("fee") or o.get("fees") or 0.0)
+                fees += fee
+                notional = float(o.get("notional") or 0.0)
+                if notional > 0:
+                    rets.append(pnl / notional)
+            win_rate = wins / n if n else 0.0
+            avg_ret = statistics.mean(rets) if rets else 0.0
+            std_ret = statistics.pstdev(rets) if len(rets) > 1 else 0.0
+            sharpe_like = (avg_ret / std_ret) if std_ret > 0 else (float("inf") if avg_ret > 0 else 0.0)
             writer.writerow([
-                sid,
-                row.get("trades", 0),
-                row.get("wins", 0),
-                row.get("losses", 0),
-                row.get("win_rate", 0.0),
-                row.get("gross_pnl", 0.0),
-                row.get("fees", 0.0),
-                row.get("net_pnl", 0.0),
-                row.get("avg_ret", 0.0),
-                row.get("std_ret", 0.0),
-                row.get("sharpe_like", 0.0),
+                sname,
+                n,
+                wins,
+                losses,
+                round(win_rate, 4),
+                round(gross_pnl, 2),
+                round(fees, 2),
+                round(gross_pnl - fees, 2),
+                round(avg_ret, 6),
+                round(std_ret, 6),
+                round(sharpe_like, 4) if math.isfinite(sharpe_like) else "inf",
             ])
-        return Response(content=buf.getvalue(), media_type="text/csv")
+        return PlainTextResponse(buf.getvalue(), media_type="text/csv")
     except Exception as e:
-        logger.exception("metrics_scorecard_csv failed: %s", e)
-        return Response(content="error," + str(e), media_type="text/csv", status_code=500)
+        log.exception("metrics_scorecard_csv failed: %s", e)
+        return PlainTextResponse("error," + str(e), media_type="text/csv", status_code=500)
 
 @app.post("/init/positions")
 async def init_positions():
