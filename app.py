@@ -114,7 +114,6 @@ def _normalize_trade_row(o: dict) -> dict:
         "notional": float(o.get("notional") or 0.0),
     }
 
-
 # ---------- Analytics: FIFO realized PnL attribution ----------
 def _compute_strategy_metrics(
     orders: List[dict],
@@ -874,6 +873,148 @@ async def _shutdown():
         pass
 
 
+# --- Safe state accessors for metrics ----------------------------------------
+from collections import deque
+
+def _orders_source():
+    """
+    Returns an iterable of normalized order dicts regardless of where you keep them.
+    Supports:
+      - old global STATE = {"orders": deque([...])}
+      - app.state.store["orders"]
+      - global RING.orders (deque/list)
+    Falls back to empty list.
+    """
+    # 1) legacy global STATE
+    try:
+        if "STATE" in globals():
+            gstate = globals()["STATE"]
+            if isinstance(gstate, dict) and "orders" in gstate:
+                return gstate["orders"]
+    except Exception:
+        pass
+
+    # 2) FastAPI state store
+    try:
+        from fastapi import FastAPI  # already imported elsewhere
+        if "app" in globals():
+            store = getattr(app.state, "store", None)
+            if isinstance(store, dict) and "orders" in store:
+                return store["orders"]
+    except Exception:
+        pass
+
+    # 3) ring-style object
+    try:
+        if "RING" in globals():
+            ring = globals()["RING"]
+            if hasattr(ring, "orders"):
+                return ring.orders
+    except Exception:
+        pass
+
+    # 4) nothing found
+    return []
+
+def _as_iter(iterable):
+    try:
+        return list(iterable)
+    except Exception:
+        return []
+
+def _strategy_from_order(o: dict) -> str:
+    # tolerate different shapes
+    if not isinstance(o, dict):
+        return "unknown"
+    sid = o.get("strategy") or o.get("strategy_id") or o.get("tag") or ""
+    if isinstance(sid, str) and sid.strip():
+        return sid
+    # sometimes embedded in client_order_id
+    coid = o.get("client_order_id") or o.get("clientOrderId")
+    if isinstance(coid, str) and ":" in coid:
+        return coid.split(":", 1)[0]
+    return "unknown"
+
+def _pnl_from_order(o: dict) -> float:
+    # prefer realized PnL if present; else signed notional approximation
+    if not isinstance(o, dict):
+        return 0.0
+    if "realized_pnl" in o and o["realized_pnl"] is not None:
+        try:
+            return float(o["realized_pnl"])
+        except Exception:
+            pass
+    # fallback: fill value * side sign (very rough)
+    qty = float(o.get("filled_qty") or o.get("qty") or 0) or 0.0
+    price = float(o.get("fill_price") or o.get("avg_fill_price") or o.get("price") or 0) or 0.0
+    side = (o.get("side") or "").lower()
+    sign = 1.0 if side == "sell" else -1.0 if side == "buy" else 0.0
+    return sign * qty * price * 0.0  # default to 0 because this is not realized; adjust if you want proxy PnL
+
+def _compute_strategy_metrics(orders_iterable):
+    """
+    Produces a per-strategy scorecard dict with conservative defaults.
+    Expects orders to be closed/fill-complete for realized metrics.
+    """
+    import math, statistics, datetime as dt
+
+    orders = [o for o in _as_iter(orders_iterable) if isinstance(o, dict)]
+    buckets = {}  # sid -> list of orders
+    for o in orders:
+        sid = _strategy_from_order(o)
+        buckets.setdefault(sid, []).append(o)
+
+    scorecard = {}
+    for sid, items in buckets.items():
+        n = len(items)
+        rets = []
+        wins = 0
+        losses = 0
+        gross_pnl = 0.0
+        fees = 0.0
+
+        for o in items:
+            r = _pnl_from_order(o)
+            gross_pnl += r
+            # fees if present
+            fee = o.get("fees") or o.get("commission") or 0.0
+            try:
+                fees += float(fee or 0.0)
+            except Exception:
+                pass
+            if r > 0:
+                wins += 1
+            elif r < 0:
+                losses += 1
+            # per-trade return (if notional present)
+            notional = o.get("notional") or (float(o.get("filled_qty") or 0) * float(o.get("avg_fill_price") or o.get("price") or 0))
+            try:
+                notional = float(notional or 0.0)
+            except Exception:
+                notional = 0.0
+            if notional > 0:
+                rets.append(r / notional)
+
+        win_rate = wins / n if n else 0.0
+        avg_ret = statistics.mean(rets) if rets else 0.0
+        std_ret = statistics.pstdev(rets) if len(rets) > 1 else 0.0
+        # simple Sharpe-like (per-trade), avoid div-by-zero
+        sharpe_like = (avg_ret / std_ret) if std_ret > 0 else (float("inf") if avg_ret > 0 else 0.0)
+
+        scorecard[sid] = {
+            "trades": n,
+            "wins": wins,
+            "losses": losses,
+            "win_rate": round(win_rate, 4),
+            "gross_pnl": round(gross_pnl, 2),
+            "fees": round(fees, 2),
+            "net_pnl": round(gross_pnl - fees, 2),
+            "avg_ret": round(avg_ret, 6),
+            "std_ret": round(std_ret, 6),
+            "sharpe_like": (round(sharpe_like, 4) if math.isfinite(sharpe_like) else "inf"),
+        }
+    return scorecard
+
 # -----------------------------------------------------------------------------
 # Dashboard HTML
 # -----------------------------------------------------------------------------
@@ -1166,34 +1307,52 @@ def metrics_scorecard(days: int = Query(7, ge=1, le=90),
     data = compute_scorecard(orders, days=days, min_trades=min_trades)
     return JSONResponse(content=data)
 
-@app.get("/metrics/scorecard.csv")
-def metrics_scorecard_csv(days: int = Query(7, ge=1, le=90),
-                          min_trades: int = Query(50, ge=1, le=2000)):
-    orders = STATE.get("orders", [])
-    data = compute_scorecard(orders, days=days, min_trades=min_trades)
+from fastapi import Response
 
-    # flatten for CSV
-    buf = io.StringIO()
-    writer = csv.writer(buf)
-    writer.writerow(["strategy","trades","win_rate","gross_profit","gross_loss",
-                     "profit_factor","expectancy","median_pnl","max_drawdown",
-                     "avg_hold_min","slippage_avg","slippage_p95",
-                     "top_symbols","bottom_symbols"])
-    for strat, d in data.items():
-        writer.writerow([
-            strat, d["trades"], round(d["win_rate"],4), round(d["gross_profit"],2), round(d["gross_loss"],2),
-            round(d["profit_factor"],3) if math.isfinite(d["profit_factor"]) else "inf",
-            round(d["expectancy"],4), round(d["median_pnl"],4), round(d["max_drawdown"],4),
-            None if d["avg_hold_min"] is None else round(d["avg_hold_min"],2),
-            None if d["slippage_avg"] is None else round(d["slippage_avg"],6),
-            None if d["slippage_p95"] is None else round(d["slippage_p95"],6),
-            "; ".join(f"{s}:{round(p,2)}" for s,p in d["by_symbol_top"]),
-            "; ".join(f"{s}:{round(p,2)}" for s,p in d["by_symbol_bottom"]),
-        ])
-    buf.seek(0)
-    return StreamingResponse(iter([buf.getvalue()]),
-                             media_type="text/csv",
-                             headers={"Content-Disposition": 'attachment; filename="scorecard.csv"'})
+@app.get("/metrics/scorecard")
+def metrics_scorecard():
+    """
+    JSON scorecard across strategies, based on whatever orders the app currently holds.
+    """
+    try:
+        orders_iter = _orders_source()
+        data = _compute_strategy_metrics(orders_iter)
+        return {"ok": True, "data": data}
+    except Exception as e:
+        logger.exception("metrics_scorecard failed: %s", e)
+        return {"ok": False, "error": str(e)}
+
+@app.get("/metrics/scorecard.csv")
+def metrics_scorecard_csv():
+    """
+    CSV scorecard for spreadsheets. Safe if state containers move around.
+    """
+    import io, csv
+    try:
+        orders_iter = _orders_source()
+        data = _compute_strategy_metrics(orders_iter)
+        # build CSV
+        buf = io.StringIO()
+        writer = csv.writer(buf)
+        writer.writerow(["strategy","trades","wins","losses","win_rate","gross_pnl","fees","net_pnl","avg_ret","std_ret","sharpe_like"])
+        for sid, row in sorted(data.items()):
+            writer.writerow([
+                sid,
+                row.get("trades", 0),
+                row.get("wins", 0),
+                row.get("losses", 0),
+                row.get("win_rate", 0.0),
+                row.get("gross_pnl", 0.0),
+                row.get("fees", 0.0),
+                row.get("net_pnl", 0.0),
+                row.get("avg_ret", 0.0),
+                row.get("std_ret", 0.0),
+                row.get("sharpe_like", 0.0),
+            ])
+        return Response(content=buf.getvalue(), media_type="text/csv")
+    except Exception as e:
+        logger.exception("metrics_scorecard_csv failed: %s", e)
+        return Response(content="error," + str(e), media_type="text/csv", status_code=500)
 
 @app.post("/init/positions")
 async def init_positions():
