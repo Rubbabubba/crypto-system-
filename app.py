@@ -1015,6 +1015,10 @@ async def root():
 async def dashboard():
     return HTMLResponse(_DASHBOARD_HTML)
 
+@app.get("/healthz", include_in_schema=False)
+def healthz():
+    return {"ok": True, "version": APP_VERSION, "time": _now_iso()}
+
 @app.get("/pnl/summary", response_class=JSONResponse)
 async def pnl_summary():
     return JSONResponse(_summary)
