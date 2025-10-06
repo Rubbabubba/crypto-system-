@@ -1158,6 +1158,43 @@ async def diag_alpaca():
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+@app.get("/metrics/scorecard")
+def metrics_scorecard(days: int = Query(7, ge=1, le=90),
+                      min_trades: int = Query(50, ge=1, le=2000)):
+    # Replace STATE["orders"] with how you store your orders
+    orders = STATE.get("orders", [])
+    data = compute_scorecard(orders, days=days, min_trades=min_trades)
+    return JSONResponse(content=data)
+
+@app.get("/metrics/scorecard.csv")
+def metrics_scorecard_csv(days: int = Query(7, ge=1, le=90),
+                          min_trades: int = Query(50, ge=1, le=2000)):
+    orders = STATE.get("orders", [])
+    data = compute_scorecard(orders, days=days, min_trades=min_trades)
+
+    # flatten for CSV
+    buf = io.StringIO()
+    writer = csv.writer(buf)
+    writer.writerow(["strategy","trades","win_rate","gross_profit","gross_loss",
+                     "profit_factor","expectancy","median_pnl","max_drawdown",
+                     "avg_hold_min","slippage_avg","slippage_p95",
+                     "top_symbols","bottom_symbols"])
+    for strat, d in data.items():
+        writer.writerow([
+            strat, d["trades"], round(d["win_rate"],4), round(d["gross_profit"],2), round(d["gross_loss"],2),
+            round(d["profit_factor"],3) if math.isfinite(d["profit_factor"]) else "inf",
+            round(d["expectancy"],4), round(d["median_pnl"],4), round(d["max_drawdown"],4),
+            None if d["avg_hold_min"] is None else round(d["avg_hold_min"],2),
+            None if d["slippage_avg"] is None else round(d["slippage_avg"],6),
+            None if d["slippage_p95"] is None else round(d["slippage_p95"],6),
+            "; ".join(f"{s}:{round(p,2)}" for s,p in d["by_symbol_top"]),
+            "; ".join(f"{s}:{round(p,2)}" for s,p in d["by_symbol_bottom"]),
+        ])
+    buf.seek(0)
+    return StreamingResponse(iter([buf.getvalue()]),
+                             media_type="text/csv",
+                             headers={"Content-Disposition": 'attachment; filename="scorecard.csv"'})
+
 @app.post("/init/positions")
 async def init_positions():
     """Seed the in-memory positions state from Alpaca current positions."""
