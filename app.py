@@ -370,7 +370,7 @@ DEFAULT_NOTIONAL = float(os.getenv("DEFAULT_NOTIONAL", os.getenv("ORDER_NOTIONAL
 DEFAULT_SYMBOLS = os.getenv("DEFAULT_SYMBOLS", "BTC/USD,ETH/USD").split(",")
 
 TRADING_ENABLED = os.getenv("TRADING_ENABLED", "1") in ("1","true","True")
-APP_VERSION = os.getenv("APP_VERSION", "2025.10.05-crypto-v3")
+APP_VERSION = os.getenv("APP_VERSION", "2025.10.06-crypto-v3a")
 
 STRATEGIES = [s.strip() for s in os.getenv("STRATEGY_LIST", "c1,c2,c3,c4,c5,c6").split(",") if s.strip()]
 
@@ -659,21 +659,20 @@ def _push_orders(orders: List[Dict[str, Any]]):
         # compute realized pnl if qty/price are known (typically when filled data is present)
         try:
             r = _apply_realized_pnl(row)
-        # notify guard on realized sell PnL (approximate opener as closer for now)
-        try:
-        if (row.get("side") == "sell") and r != 0.0:
-            GUARD.on_realized(
-                symbol=row.get("symbol"),
-                opener=(row.get("strategy") or "unknown"),
-                closer=(row.get("strategy") or "unknown"),
-                pnl=float(r),
-                when=datetime.now(timezone.utc),
-            )
-        except Exception:
-            log.exception("guard on_realized failed")
-
         except Exception:
             r = 0.0
+        # notify guard on realized sell PnL (approximate opener as closer for now)
+        try:
+            if (row.get("side") == "sell") and r != 0.0:
+                GUARD.on_realized(
+                    symbol=row.get("symbol"),
+                    opener=(row.get("strategy") or "unknown"),
+                    closer=(row.get("strategy") or "unknown"),
+                    pnl=float(r),
+                    when=datetime.now(timezone.utc),
+                )
+        except Exception:
+            log.exception("guard on_realized failed")
         row["pnl"] = float(row.get("pnl") or 0.0) + float(r or 0.0)
         realized_total += float(r or 0.0)
 
@@ -838,53 +837,6 @@ async def _scan_bridge(strat: str, req: Dict[str, Any], dry: bool = False) -> Li
         filtered.append(o)
 
     orders = filtered
-    # ---- GUARD: filter proposed OPEN/CLOSE orders before returning ----
-try:
-    import broker as br
-    # pull recent closes for EMA: keep it light — 60 bars is enough
-    bars_map = br.get_bars(req["symbols"], timeframe=req["timeframe"], limit=60) or {}
-except Exception:
-    bars_map = {}
-
-filtered = []
-now_dt = datetime.now(timezone.utc)
-
-for o in (orders or []):
-    side = (o.get("side") or "").lower()
-    sym = _sym_to_slash(o.get("symbol") or "")
-    strat = (req.get("strategy") or "").lower()
-
-    # Try to recover last price and closes
-    closes = [float(b.get("c") or b.get("close") or 0.0) for b in (bars_map.get(sym) or []) if float(b.get("c") or b.get("close") or 0.0) > 0]
-    px = float(o.get("price") or 0.0)
-    if px <= 0 and closes:
-        px = closes[-1]
-
-    # If strategy supplies edge_bps in the order payload, use it; else 0
-    edge_bps_val = float(o.get("edge_bps") or o.get("edge") or 0.0)
-
-    # crude spread proxy (upgrade to real bid/ask if you have it)
-    spr_bps = _spread_bps(px)
-
-    # EMA alignment
-    ema_ok = _price_above_ema_fast(sym, req["timeframe"], closes)
-
-    if side == "buy":
-        ok, why = GUARD.can_open(strat, sym, edge_bps_val, spr_bps, ema_ok)
-        if not ok:
-            log.info("guard: DROP OPEN %s %s by %s (%s)", sym, side, strat, why)
-            continue
-
-    if side == "sell":
-        # conservative: throttle closes/minute per symbol
-        ok, why = GUARD.can_close_now(sym, now_dt)
-        if not ok:
-            log.info("guard: DROP CLOSE %s by %s (%s)", sym, strat, why)
-            continue
-
-    filtered.append(o)
-
-orders = filtered
     # normalize
     if not orders:
         return []
