@@ -114,6 +114,108 @@ def _normalize_trade_row(o: dict) -> dict:
         "notional": float(o.get("notional") or 0.0),
     }
 
+# --- Daily stop (global & per-strategy) ---------------------------------------
+_DISABLED_STRATS: set[str] = set()
+_DAILY_PNL: dict[str, float] = defaultdict(float)  # sid -> pnl today
+_DAILY_TOTAL: float = 0.0
+_LAST_DAY: Optional[str] = None
+
+DAILY_STOP_GLOBAL_USD = float(os.getenv("DAILY_STOP_GLOBAL_USD", "-100.0"))
+DAILY_STOP_PER_STRAT_USD = float(os.getenv("DAILY_STOP_PER_STRAT_USD", "-50.0"))
+
+def _daykey() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+def _roll_day_if_needed():
+    global _LAST_DAY, _DAILY_PNL, _DAILY_TOTAL, _DISABLED_STRATS
+    dk = _daykey()
+    if _LAST_DAY != dk:
+        _LAST_DAY = dk
+        _DAILY_PNL.clear()
+        _DAILY_TOTAL = 0.0
+        _DISABLED_STRATS.clear()
+
+# In the scheduler loop, skip disabled strategies:
+#   for strat in STRATEGIES:
+#       _roll_day_if_needed()
+#       if strat in _DISABLED_STRATS: 
+#           continue
+#       ...
+
+# At the end of _push_orders, after computing per-order pnl 'pnl' and strategy 'sname':
+#   _roll_day_if_needed()
+#   _DAILY_PNL[sname] += float(pnl or 0.0)
+#   _DAILY_TOTAL += float(pnl or 0.0)
+#   if _DAILY_PNL[sname] <= DAILY_STOP_PER_STRAT_USD:
+#       _DISABLED_STRATS.add(sname)
+#       log.warning("Daily stop (per-strategy) hit for %s; disabling until UTC rollover", sname)
+#   if _DAILY_TOTAL <= DAILY_STOP_GLOBAL_USD:
+#       _DISABLED_STRATS.update(STRATEGIES)
+#       log.error("Daily stop (global) hit; disabling all strategies until UTC rollover")
+
+
+# --- Normalize + persist orders to the ring store ---------------------------
+from datetime import timezone
+
+def _normalize_order(o: dict, strategy: str) -> dict:
+    """Map adapter/broker orders into a canonical shape the metrics expect."""
+    now = dt.datetime.now(timezone.utc).isoformat()
+    # Accept several common key spellings; default sensible zeros for PnL until closed
+    sym = o.get("symbol") or o.get("asset") or o.get("sym") or o.get("ticker")
+    side = (o.get("side") or "").lower()  # "buy"/"sell"
+    qnty = o.get("qty") or o.get("quantity") or o.get("size") or 0
+    notional = o.get("notional") or o.get("value") or 0.0
+    status = (o.get("status") or "open").lower()  # open/filled/closed/canceled
+    pnl = o.get("pnl") or o.get("realized_pnl") or 0.0
+    fee = o.get("fee") if "fee" in o else (o.get("fees") or 0.0)
+    price = o.get("price") or o.get("avg_price") or o.get("limit_price") or 0.0
+    opened_at = o.get("filled_at") or o.get("submitted_at") or o.get("created_at") or now
+    closed_at = o.get("closed_at") or None
+    oid = o.get("id") or o.get("order_id") or f"{strategy}-{sym}-{opened_at}"
+
+    return {
+        "id": oid,
+        "symbol": sym,
+        "side": side,
+        "qty": float(qnty) if qnty else 0.0,
+        "price": float(price) if price else 0.0,
+        "notional": float(notional) if notional else 0.0,
+        "strategy": strategy,
+        "status": status,            # open | filled | closed | canceled
+        "pnl": float(pnl),
+        "fee": float(fee),
+        "opened_at": opened_at,
+        "closed_at": closed_at,
+        # Optional passthroughs for later analysis:
+        "time_in_force": o.get("time_in_force"),
+        "type": o.get("type") or o.get("order_type"),
+        "broker": o.get("broker") or "alpaca",
+        "raw": o,                    # keep original shape for debugging
+    }
+
+def _append_orders(orders: list[dict], strategy: str) -> int:
+    """Append normalized orders to the global ring; return count appended."""
+    if not orders:
+        return 0
+    count = 0
+    with _store_lock:
+        ring = _get_store("orders")
+        seen = {r.get("id") for r in ring if isinstance(r, dict)}
+        for o in orders:
+            try:
+                norm = _normalize_order(o, strategy)
+                if norm["id"] in seen:
+                    continue
+                ring.append(norm)
+                seen.add(norm["id"])
+                count += 1
+        # Trim if you keep a cap (optional):
+        cap = SETTINGS.get("orders_ring_cap", 5000)
+        if cap and len(ring) > cap:
+            del ring[:len(ring) - cap]
+    return count
+
+
 # ---------- Analytics: FIFO realized PnL attribution ----------
 def _compute_strategy_metrics(
     orders: List[dict],
@@ -1320,6 +1422,31 @@ async def diag_alpaca():
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/metrics/fliptest", response_class=JSONResponse)
+def metrics_fliptest(hours: int = 168):
+    """Flip-test per strategy by negating realized PnL over last N hours."""
+    orders = _fetch_filled_orders_last_hours(int(hours))
+    # Reuse the normalization already in app
+    rows = [_normalize_trade_row(o) for o in orders]
+    per = defaultdict(list)
+    for r in rows:
+        per[(r.get("strategy") or "unknown").lower()].append(r)
+
+    out = {}
+    for sid, items in per.items():
+        pnl = [float(x.get("pnl") or 0.0) for x in items]
+        gp = sum(x for x in pnl if x > 0); gl = -sum(x for x in pnl if x < 0)
+        gp_r = sum(-x for x in pnl if x < 0); gl_r = -sum(-x for x in pnl if -x < 0)  # reversed
+        n = len(pnl)
+        out[sid] = {
+            "N": n,
+            "PF": (gp / gl) if gl > 0 else (float("inf") if gp > 0 else 0.0),
+            "Expectancy": (sum(pnl) / n) if n else 0.0,
+            "PF_rev": (gp_r / gl_r) if gl_r > 0 else (float("inf") if gp_r > 0 else 0.0),
+            "Expectancy_rev": ((-sum(pnl)) / n) if n else 0.0,
+        }
+    return out
 
 @app.get("/metrics/scorecard", response_class=JSONResponse)
 def metrics_scorecard():
