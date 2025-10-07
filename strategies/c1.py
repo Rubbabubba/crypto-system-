@@ -1,30 +1,20 @@
 # strategies/c1.py
-# Version: 1.4.0 (2025-09-30)
+# Version: 1.5.0 (env-tunable)
 from __future__ import annotations
 import os, time, math, datetime as dt
 from typing import Any, Dict, List
-import requests
 import broker as br
 
 STRATEGY_NAME = "c1"
-STRATEGY_VERSION = "1.4.1"
+STRATEGY_VERSION = "1.5.0"
 
-# ---------- Broker & Data helpers ----------
-ALPACA_TRADE_HOST = os.getenv("ALPACA_TRADE_HOST", "https://paper-api.alpaca.markets")
-ALPACA_DATA_HOST  = os.getenv("ALPACA_DATA_HOST",  "https://data.alpaca.markets")
-ALPACA_KEY_ID     = os.getenv("ALPACA_KEY_ID", "")
-ALPACA_SECRET_KEY = os.getenv("ALPACA_SECRET_KEY", "")
+# === Tunable knobs (defaults match your prior behavior) ===
+# EMA period used as the trend filter
+C1_EMA = int(os.getenv("C1_EMA", "50"))
+# Buy only if price is above EMA and within this pullback below VWAP (e.g., 0.997 = within 0.3% under VWAP)
+C1_VWAP_PULL = float(os.getenv("C1_VWAP_PULL", "0.997"))
 
-def _hdr():
-    if not (ALPACA_KEY_ID and ALPACA_SECRET_KEY):
-        return {}
-    return {
-        "APCA-API-KEY-ID": ALPACA_KEY_ID,
-        "APCA-API-SECRET-KEY": ALPACA_SECRET_KEY,
-        "Accept": "application/json",
-        "Content-Type": "application/json",
-    }
-
+# ---------- Helpers ----------
 def _sym(s: str) -> str:
     return s.replace("/","")
 
@@ -56,10 +46,9 @@ def _place(symbol: str, side: str, notional: float, client_id: str) -> Dict[str,
         return {"error": str(ex)}
 
 def _ema(vals: List[float], n: int) -> List[float]:
-    if not vals or n<=0: return []
+    if not vals or n <= 0: return []
     k = 2/(n+1)
-    out = []
-    ema = None
+    out, ema = [], None
     for v in vals:
         ema = v if ema is None else (v*k + ema*(1-k))
         out.append(ema)
@@ -79,23 +68,26 @@ def _vwap(bars: List[Dict[str,Any]]) -> List[float]:
 
 # ---------- Logic ----------
 def _decide(symbol: str, bars: List[Dict[str,Any]]) -> Dict[str,str]:
-    # need enough bars
-    if len(bars) < 60:
+    # need enough bars for EMA and VWAP; keep a small cushion
+    need = max(60, int(C1_EMA) + 10)
+    if len(bars) < need:
         return {"symbol": symbol, "action":"flat", "reason":"insufficient_bars"}
+
     closes = [float(b["c"]) for b in bars]
-    vwap = _vwap(bars)
-    ema = _ema(closes, 50)
+    vwap   = _vwap(bars)
+    ema    = _ema(closes, int(C1_EMA))
 
-    c = closes[-1]
-    v = vwap[-1]
-    e = ema[-1]
-
+    c, v, e = closes[-1], vwap[-1], ema[-1]
     have_long = _has_long(symbol) is not None
-    # Trend filter: only long if price above EMA50
-    if c > e and c < v * 0.997:         # pullback to/below VWAP in uptrend
+
+    # Long only: in uptrend (price > EMA), dip to/below VWAP by pullback factor
+    if c > e and c < v * float(C1_VWAP_PULL):
         return {"symbol": symbol, "action":"buy", "reason":"vwap_pullback_uptrend"}
-    if have_long and c < e and c < v:   # lose trend & under VWAP -> exit
+
+    # Exit: lose trend and below VWAP
+    if have_long and c < e and c < v:
         return {"symbol": symbol, "action":"sell", "reason":"trend_break_under_vwap"}
+
     return {"symbol": symbol, "action":"flat", "reason":"hold_in_pos" if have_long else "no_signal"}
 
 # ---------- Public API ----------
@@ -106,9 +98,9 @@ def run_scan(symbols: List[str], timeframe: str, limit: int, notional: float, dr
         bars = _bars(s, timeframe, limit)
         decision = _decide(s, bars)
         results.append(decision)
-        if dry or decision["action"] in ("flat",):
+        if dry or decision["action"] == "flat":
             continue
-        # prevent sells if flat
+        # prevent sells if flat (backtester relies on this to realize PnL properly)
         if decision["action"] == "sell" and not _has_long(s):
             continue
         coid = f"{STRATEGY_NAME}-{epoch}-{_sym(s).lower()}"
@@ -116,7 +108,9 @@ def run_scan(symbols: List[str], timeframe: str, limit: int, notional: float, dr
         if "error" not in ordres:
             placed.append({
                 "symbol": s, "side": decision["action"], "notional": notional,
-                "status": ordres.get("status","accepted"), "client_order_id": ordres.get("client_order_id", coid),
-                "filled_avg_price": ordres.get("filled_avg_price"), "id": ordres.get("id")
+                "status": ordres.get("status","accepted"),
+                "client_order_id": ordres.get("client_order_id", coid),
+                "filled_avg_price": ordres.get("filled_avg_price"),
+                "id": ordres.get("id")
             })
     return {"strategy": STRATEGY_NAME, "version": STRATEGY_VERSION, "results": results, "placed": placed}

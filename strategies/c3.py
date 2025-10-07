@@ -1,23 +1,24 @@
 # strategies/c3.py
-# Version: 1.2.0 (2025-09-30)
+# Version: 1.3.0 (env-tunable)
 from __future__ import annotations
 import os, time
 from typing import Any, Dict, List
-import requests
 import broker as br
 
 STRATEGY_NAME = "c3"
-STRATEGY_VERSION = "1.2.1"
+STRATEGY_VERSION = "1.3.0"
 
-ALPACA_TRADE_HOST = os.getenv("ALPACA_TRADE_HOST", "https://paper-api.alpaca.markets")
-ALPACA_DATA_HOST  = os.getenv("ALPACA_DATA_HOST",  "https://data.alpaca.markets")
-ALPACA_KEY_ID     = os.getenv("ALPACA_KEY_ID", "")
-ALPACA_SECRET_KEY = os.getenv("ALPACA_SECRET_KEY", "")
+# === Tunable knobs (defaults match your prior behavior) ===
+# Lookback for prior high breakout
+C3_LOOK    = int(os.getenv("C3_LOOK", "60"))
+# Breakout multiplier (buy trigger if close > prior_max * C3_BREAK_K)
+C3_BREAK_K = float(os.getenv("C3_BREAK_K", "1.002"))
+# Failure multiplier (exit if close < prior_max * C3_FAIL_K when long)
+C3_FAIL_K  = float(os.getenv("C3_FAIL_K",  "0.998"))
 
-def _hdr():
-    if not (ALPACA_KEY_ID and ALPACA_SECRET_KEY): return {}
-    return {"APCA-API-KEY-ID": ALPACA_KEY_ID, "APCA-API-SECRET-KEY": ALPACA_SECRET_KEY, "Accept":"application/json","Content-Type":"application/json"}
-def _sym(s): return s.replace("/","")
+# ---------- Helpers ----------
+def _sym(s: str) -> str:
+    return s.replace("/","")
 
 def _bars(symbol: str, timeframe: str, limit: int) -> List[Dict[str,Any]]:
     try:
@@ -35,7 +36,7 @@ def _positions() -> List[Dict[str,Any]]:
 def _has_long(symbol):
     sym=_sym(symbol)
     for p in _positions():
-        if (p.get("symbol") or p.get("asset_symbol"))==sym and p.get("side","long")=="long":
+        if (p.get("symbol") or p.get("asset_symbol")) == sym and p.get("side","long").lower() == "long":
             return p
     return None
 
@@ -45,34 +46,50 @@ def _place(symbol: str, side: str, notional: float, client_id: str) -> Dict[str,
     except Exception as ex:
         return {"error": str(ex)}
 
+# ---------- Logic ----------
 def _decide(symbol, bars):
-    if len(bars)<120: return {"symbol":symbol,"action":"flat","reason":"insufficient_bars"}
-    highs=[float(b["h"]) for b in bars]
-    closes=[float(b["c"]) for b in bars]
-    c=closes[-1]
-    look=60
-    prior_max=max(highs[-(look+1):-1])
-    have_long=_has_long(symbol) is not None
+    need = max(120, int(C3_LOOK) + 5)        # ensure we have enough bars for the lookback
+    if len(bars) < need:
+        return {"symbol":symbol,"action":"flat","reason":"insufficient_bars"}
+
+    highs  = [float(b["h"]) for b in bars]
+    closes = [float(b["c"]) for b in bars]
+    c = closes[-1]
+
+    look = int(C3_LOOK)
+    prior_max = max(highs[-(look+1):-1])
+
+    have_long = _has_long(symbol) is not None
+
     # breakout
-    if c>prior_max*1.002:
+    if c > prior_max * float(C3_BREAK_K):
         return {"symbol":symbol,"action":"buy","reason":"breakout_lookback"}
-    # failed breakout exit if we’re long: drop back under prior_max
-    if have_long and c<prior_max*0.998:
+
+    # failed breakout exit if we’re long: drop back under prior_max * fail_k
+    if have_long and c < prior_max * float(C3_FAIL_K):
         return {"symbol":symbol,"action":"sell","reason":"failed_breakout"}
+
     return {"symbol":symbol,"action":"flat","reason":"hold_in_pos" if have_long else "no_signal"}
 
+# ---------- Public API ----------
 def run_scan(symbols, timeframe, limit, notional, dry, extra):
     out, placed=[],[]
     epoch=int(time.time())
     for s in symbols:
         dec=_decide(s,_bars(s,timeframe,limit))
         out.append(dec)
-        if dry or dec["action"]=="flat": continue
-        if dec["action"]=="sell" and not _has_long(s): continue
+        if dry or dec["action"]=="flat": 
+            continue
+        if dec["action"]=="sell" and not _has_long(s): 
+            continue
         coid=f"{STRATEGY_NAME}-{epoch}-{_sym(s).lower()}"
         res=_place(s,dec["action"],notional,coid)
         if "error" not in res:
-            placed.append({"symbol":s,"side":dec["action"],"notional":notional,
-                           "status":res.get("status","accepted"),"client_order_id":res.get("client_order_id",coid),
-                           "filled_avg_price":res.get("filled_avg_price"),"id":res.get("id")})
+            placed.append({
+                "symbol":s,"side":dec["action"],"notional":notional,
+                "status":res.get("status","accepted"),
+                "client_order_id":res.get("client_order_id",coid),
+                "filled_avg_price":res.get("filled_avg_price"),
+                "id":res.get("id")
+            })
     return {"strategy":STRATEGY_NAME,"version":STRATEGY_VERSION,"results":out,"placed":placed}
