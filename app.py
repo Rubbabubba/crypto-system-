@@ -2,14 +2,13 @@
 # -*- coding: utf-8 -*-
 """
 Crypto System – FastAPI service (Render-safe)
-Version: 2025.10.07-crypto-v3d
+Version: 2025.10.07-crypto-v3e
 
-Key changes in v3d vs v3c:
-- Dynamic coin universe (uses services.market_crypto.MarketCrypto if available,
-  and respects universe.py when present). Falls back to env or a baked candidate list.
-- Added /universe and /universe/refresh endpoints.
-- Fixed broker.submit_order signature (adds client_order_id) in exit nanny.
-- Minor guards & logging polish.
+v3e adds:
+- Strategy runtime controls (/strategies, /strategies/enable, /disable, /reload)
+- Adapter .reload(name) support + scheduler uses ACTIVE_STRATEGIES set
+- Optional universe.py integration (UniverseBuilder) with cache-like adapter
+- Keeps v3d improvements: exit nanny client_order_id, multi-coin universe, guards, etc.
 """
 
 import asyncio
@@ -73,7 +72,7 @@ LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 logging.basicConfig(level=LOG_LEVEL, format="%(asctime)s %(levelname)s:app:%(message)s")
 log = logging.getLogger("app")
 
-APP_VERSION = os.getenv("APP_VERSION", "2025.10.07-crypto-v3d")
+APP_VERSION = os.getenv("APP_VERSION", "2025.10.07-crypto-v3e")
 TRADING_ENABLED = os.getenv("TRADING_ENABLED", "1") in ("1", "true", "True")
 SCHEDULE_SECONDS = int(os.getenv("SCHEDULE_SECONDS", os.getenv("SCHEDULER_INTERVAL_SEC", "60")))
 DEFAULT_LIMIT = int(os.getenv("DEFAULT_LIMIT", "300"))
@@ -197,7 +196,7 @@ def _try_import_marketcrypto():
 def _build_universe_from_bars(timeframe: str, limit: int, max_symbols: int = 24) -> List[str]:
     """
     Pulls bars for a wide candidate set and keeps coins that returned enough rows.
-    This is intentionally simple and fast for Render dynos.
+    Uses universe.py's UniverseBuilder if available; otherwise falls back to a bar-count filter.
     """
     candidates = _builtin_candidates()
     mod = _try_import_marketcrypto()
@@ -208,7 +207,32 @@ def _build_universe_from_bars(timeframe: str, limit: int, max_symbols: int = 24)
     try:
         MarketCrypto = getattr(mod, "MarketCrypto")
         mc = MarketCrypto.from_env()
-        frames = mc.candles(candidates, timeframe=timeframe, limit=min(limit, 600))
+
+        # ----- Try universe.py integration first -----
+        try:
+            import universe as uni
+            cfg_cls = getattr(uni, "UniverseConfig", None)
+            builder_cls = getattr(uni, "UniverseBuilder", None)
+            if cfg_cls and builder_cls:
+                cfg = cfg_cls()
+                builder = builder_cls(cfg)
+                frames = mc.candles(candidates, timeframe=timeframe, limit=min(limit, 600)) or {}
+
+                class _Cache:
+                    def __init__(self, _frames): self._f = _frames
+                    def rows(self, sym, tf):
+                        df = self._f.get(sym) or None
+                        return int(getattr(df, "shape", [0,0])[0]) if df is not None else 0
+
+                builder.refresh_from_cache_like_source(candidates, _Cache(frames))
+                if getattr(builder, "symbols", None):
+                    return builder.symbols[:max_symbols]
+        except Exception:
+            # If universe.py isn't present or errors, fall through to bar-count filter
+            pass
+
+        # ----- Fallback: simple row-count filter -----
+        frames = mc.candles(candidates, timeframe=timeframe, limit=min(limit, 600)) or {}
         rows_ok = []
         for s, df in (frames or {}).items():
             try:
@@ -228,8 +252,6 @@ def _build_universe_from_bars(timeframe: str, limit: int, max_symbols: int = 24)
 def _load_universe_initial() -> List[str]:
     if _default_symbols_env:
         return _default_symbols_env
-    # If user has universe.py with a builder, we could integrate here later.
-    # For now, do a lightweight bar-based filter.
     return _build_universe_from_bars(DEFAULT_TIMEFRAME, DEFAULT_LIMIT)
 
 def _set_current_symbols(syms: List[str]):
@@ -253,6 +275,19 @@ class RealStrategiesAdapter:
             log.info("adapter: imported %s (top-level)", name)
         self._mods[name] = mod
         return mod
+
+    def reload(self, name: str) -> bool:
+        """Hot-reload a single strategy module if already imported."""
+        if name in self._mods:
+            try:
+                self._mods[name] = importlib.reload(self._mods[name])
+                log.info("adapter: reloaded %s", name)
+                return True
+            except Exception as e:
+                log.exception("adapter: reload failed for %s: %s", name, e)
+                return False
+        # If not imported yet, next scan will import it.
+        return True
 
     def scan(self, req: Dict[str, Any], _contexts: Dict[str, Any]) -> List[Dict[str, Any]]:
         strat = (req.get("strategy") or "").lower()
@@ -411,6 +446,9 @@ _orders_ring: deque = deque(maxlen=max(100, ORDERS_RING_CAP))
 _attribution: Dict[str, Any] = {"by_strategy": {}, "updated_at": None}
 _summary: Dict[str, Any] = {"equity": 0.0, "pnl_day": 0.0, "pnl_week": 0.0, "pnl_month": 0.0, "updated_at": None}
 
+# ---- Strategy runtime toggles ----
+ACTIVE_STRATEGIES = set(STRATEGIES)  # scheduler reads from this at runtime
+
 def _push_orders(orders: List[Dict[str, Any]]):
     global _orders_ring, _attribution, _summary
     if not orders:
@@ -555,7 +593,8 @@ async def _scheduler_loop():
     try:
         while _running:
             _roll_day_if_needed()
-            for strat in STRATEGIES:
+            # Use the runtime ACTIVE_STRATEGIES set
+            for strat in list(ACTIVE_STRATEGIES):
                 if strat in _DISABLED_STRATS:  # daily-stop gating hook
                     continue
                 try:
@@ -588,7 +627,7 @@ async def _scheduler_loop():
 @app.on_event("startup")
 async def _startup():
     global _scheduler_task
-    log.info("App startup; scheduler interval is %ss; strategies=%s; symbols=%d", SCHEDULE_SECONDS, ",".join(STRATEGIES), len(_CURRENT_SYMBOLS))
+    log.info("App startup; scheduler interval is %ss; strategies=%s; symbols=%d", SCHEDULE_SECONDS, ",".join(sorted(ACTIVE_STRATEGIES)), len(_CURRENT_SYMBOLS))
     if _scheduler_task is None:
         _scheduler_task = asyncio.create_task(_scheduler_loop())
 
@@ -743,6 +782,7 @@ async def dashboard():
 def healthz():
     return {"ok": True, "version": APP_VERSION, "time": _now_iso()}
 
+# ---- Universe endpoints ----
 @app.get("/universe", response_class=JSONResponse)
 def get_universe():
     return {"symbols": _CURRENT_SYMBOLS, "count": len(_CURRENT_SYMBOLS), "timeframe": DEFAULT_TIMEFRAME}
@@ -753,6 +793,36 @@ def refresh_universe(max_symbols: int = 24):
     _set_current_symbols(syms)
     return {"ok": True, "symbols": _CURRENT_SYMBOLS, "count": len(_CURRENT_SYMBOLS)}
 
+# ---- Strategy management endpoints ----
+@app.get("/strategies", response_class=JSONResponse)
+def strategies_list():
+    names = sorted(set(STRATEGIES) | ACTIVE_STRATEGIES)
+    out = [{"name": n, "enabled": (n in ACTIVE_STRATEGIES)} for n in names]
+    return {"strategies": out}
+
+@app.post("/strategies/enable", response_class=JSONResponse)
+def strategies_enable(name: str):
+    ACTIVE_STRATEGIES.add(name)
+    return {"ok": True, "enabled": sorted(ACTIVE_STRATEGIES)}
+
+@app.post("/strategies/disable", response_class=JSONResponse)
+def strategies_disable(name: str):
+    ACTIVE_STRATEGIES.discard(name)
+    return {"ok": True, "enabled": sorted(ACTIVE_STRATEGIES)}
+
+@app.post("/strategies/reload", response_class=JSONResponse)
+def strategies_reload(name: str = ""):
+    sb = StrategyBook()
+    if name:
+        ok = sb._impl.reload(name)
+        return {"ok": ok, "reloaded": [name] if ok else []}
+    reloaded = []
+    for k in list(sb._impl._mods.keys()):
+        if sb._impl.reload(k):
+            reloaded.append(k)
+    return {"ok": True, "reloaded": reloaded}
+
+# ---- PnL & orders endpoints ----
 @app.get("/pnl/summary", response_class=JSONResponse)
 async def pnl_summary():
     return JSONResponse(_summary)
@@ -785,6 +855,7 @@ async def orders_recent(limit: int = Query(100, ge=1, le=1000)):
 async def orders_attribution():
     return JSONResponse(_attribution)
 
+# ---- Analytics & diagnostics ----
 @app.get("/analytics/trades", response_class=JSONResponse)
 def analytics_trades(hours: int = 168):
     now = time.time()
@@ -853,7 +924,7 @@ async def diag_bars(symbols: str = "", tf: str = "", limit: int = 360):
 @app.get("/diag/imports")
 async def diag_imports():
     out = {}
-    for name in STRATEGIES:
+    for name in sorted(set(STRATEGIES) | ACTIVE_STRATEGIES):
         try:
             try:
                 importlib.import_module(f"strategies.{name}")
