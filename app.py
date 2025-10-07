@@ -17,14 +17,13 @@ import json
 import logging
 import os
 import time
+import importlib
 from collections import defaultdict, deque
 from datetime import datetime, timedelta, timezone
 from functools import lru_cache
 from math import isfinite
 from typing import Any, Dict, List, Optional, Tuple
-from collections import defaultdict
 from statistics import median
-import importlib
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, RedirectResponse
 
@@ -217,6 +216,20 @@ def _append_orders(orders: list[dict], strategy: str) -> int:
             del ring[:len(ring) - cap]
     return count
 
+# --- ring buffer (orders/events) ---------------------------------------------
+# SETTINGS may come from your existing config loader; fall back to env or default.
+def _int(x, default):
+    try:
+        return int(x)
+    except Exception:
+        return default
+
+ORDERS_RING_CAP_ENV = os.getenv("ORDERS_RING_CAP")
+DEFAULT_CAP = 5000
+cap = _int(ORDERS_RING_CAP_ENV, _int((SETTINGS or {}).get("orders_ring_cap", DEFAULT_CAP), DEFAULT_CAP))
+
+# global ring of recent orders/events; used by scorecard & analytics routes
+_orders_ring = deque(maxlen=cap)
 
 # ---------- Analytics: FIFO realized PnL attribution ----------
 def _compute_strategy_metrics(
