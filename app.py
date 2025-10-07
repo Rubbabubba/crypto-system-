@@ -22,7 +22,8 @@ from datetime import datetime, timedelta, timezone
 from functools import lru_cache
 from math import isfinite
 from typing import Any, Dict, List, Optional, Tuple
-
+from collections import defaultdict
+from statistics import median
 import importlib
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, RedirectResponse
@@ -115,6 +116,7 @@ def _normalize_trade_row(o: dict) -> dict:
     }
 
 # --- Daily stop (global & per-strategy) ---------------------------------------
+TRADING_ENABLED = int(os.getenv("TRADING_ENABLED", "0"))
 _DISABLED_STRATS: set[str] = set()
 _DAILY_PNL: dict[str, float] = defaultdict(float)  # sid -> pnl today
 _DAILY_TOTAL: float = 0.0
@@ -945,7 +947,7 @@ async def _scheduler_loop():
     _running = True
     try:
         while _running:
-            dry_flag = (not TRADING_ENABLED)
+            orders = await _scan_bridge(strat, req, dry=(TRADING_ENABLED == 0))
             log.info("Scheduler tick: running all strategies (dry=%d)", int(dry_flag))
             for strat in STRATEGIES:
                 try:
@@ -1316,19 +1318,25 @@ async def orders_recent(limit: int = Query(100, ge=1, le=1000)):
 async def orders_attribution():
     return JSONResponse(_attribution)
 
-@app.get("/analytics/trades")
-async def analytics_trades(hours: int = 12):
-    orders = _fetch_filled_orders_last_hours(int(hours))
-    rows = [_normalize_trade_row(o) for o in orders]
-    metrics = _compute_strategy_metrics(rows, hours=int(hours))
-    return {
-        "window_hours": metrics["window_hours"],
-        "summary_per_strategy": metrics["summary_per_strategy"],
-        "detail_per_strategy_symbol": metrics["detail_per_strategy_symbol"],
-        "summary_closed_by": metrics["summary_closed_by"],
-        "realized_trades": metrics["realized_trades"],
-        "count_orders_considered": metrics["count_orders_considered"],
-    }
+@app.get("/analytics/trades", response_class=JSONResponse)
+def analytics_trades(hours: int = 168):
+    now = time.time()
+    cutoff = now - (hours * 3600)
+    items = [r for r in _orders_ring if float(r.get("ts", now)) >= cutoff]
+    # Select a compact shape for analysis
+    out = []
+    for r in items:
+        out.append({
+            "ts": float(r.get("ts", now)),
+            "strategy": (r.get("strategy") or "unknown").lower(),
+            "symbol": r.get("symbol") or r.get("sym") or "",
+            "side": r.get("side") or "",
+            "qty": r.get("qty") or r.get("quantity") or 0,
+            "notional": r.get("notional") or 0.0,
+            "pnl": float(r.get("pnl") or 0.0),
+            "closed": bool(r.get("closed") or False),
+        })
+    return JSONResponse({"ok": True, "count": len(out), "rows": out})
 
 @app.get("/analytics/trades.csv", response_class=PlainTextResponse)
 async def analytics_trades_csv(hours: int = 12):
@@ -1425,92 +1433,88 @@ async def diag_alpaca():
 
 @app.get("/metrics/fliptest", response_class=JSONResponse)
 def metrics_fliptest(hours: int = 168):
-    """Flip-test per strategy by negating realized PnL over last N hours."""
-    orders = _fetch_filled_orders_last_hours(int(hours))
-    # Reuse the normalization already in app
-    rows = [_normalize_trade_row(o) for o in orders]
+    now = time.time(); cutoff = now - hours*3600
+    rows = [r for r in _orders_ring if float(r.get("ts", now)) >= cutoff]
     per = defaultdict(list)
     for r in rows:
-        per[(r.get("strategy") or "unknown").lower()].append(r)
+        per[(r.get("strategy") or "unknown").lower()].append(float(r.get("pnl") or 0.0))
+
+    out = {}
+    for sid, pnl in per.items():
+        n = len(pnl)
+        gp = sum(x for x in pnl if x > 0); gl = -sum(x for x in pnl if x < 0)
+        pf = (gp / gl) if gl > 0 else (float("inf") if gp > 0 else 0.0)
+        # reversed (negate pnl)
+        gp_r = sum(-x for x in pnl if x < 0); gl_r = -sum(-x for x in pnl if -x < 0)
+        pf_r = (gp_r / gl_r) if gl_r > 0 else (float("inf") if gp_r > 0 else 0.0)
+        out[sid] = {
+            "N": n,
+            "PF": round(pf, 3),
+            "Expectancy": round((sum(pnl)/n) if n else 0.0, 4),
+            "PF_rev": round(pf_r, 3),
+            "Expectancy_rev": round(((-sum(pnl))/n) if n else 0.0, 4),
+        }
+    return JSONResponse({"ok": True, "data": out})
+
+@app.get("/metrics/scorecard", response_class=JSONResponse)
+def metrics_scorecard(
+    hours: int = 168,          # last 7 days by default
+    last_n_trades: int = 0     # optional override: use last N trades instead of hours window
+):
+    now = time.time()
+    rows = list(_orders_ring)
+
+    # Filter by time window if requested
+    if hours and hours > 0:
+        cutoff = now - (hours * 3600)
+        rows = [r for r in rows if float(r.get("ts", now)) >= cutoff]
+
+    # If last_n_trades is set, slice per strategy
+    per = defaultdict(list)
+    for r in rows:
+        sid = (r.get("strategy") or "unknown").lower()
+        per[sid].append(r)
+    if last_n_trades and last_n_trades > 0:
+        per = {k: v[-last_n_trades:] for k, v in per.items()}
 
     out = {}
     for sid, items in per.items():
-        pnl = [float(x.get("pnl") or 0.0) for x in items]
-        gp = sum(x for x in pnl if x > 0); gl = -sum(x for x in pnl if x < 0)
-        gp_r = sum(-x for x in pnl if x < 0); gl_r = -sum(-x for x in pnl if -x < 0)  # reversed
-        n = len(pnl)
+        pnl = [float(x.get("pnl") or 0.0) for x in items if x.get("pnl") is not None]
+        n = len(items)
+        wins = sum(1 for x in pnl if x > 0)
+        losses = sum(1 for x in pnl if x < 0)
+        gp = sum(x for x in pnl if x > 0)
+        gl = -sum(x for x in pnl if x < 0)
+        net = gp - gl
+        win_rate = (wins / max(wins + losses, 1)) if (wins + losses) else 0.0
+        exp = (net / n) if n else 0.0
+        med = median(pnl) if pnl else 0.0
+        pf = (gp / gl) if gl > 0 else (float("inf") if gp > 0 else 0.0)
+
+        # Simple drawdown estimate across cumulative PnL in window
+        cum = 0.0
+        peak = 0.0
+        maxdd = 0.0
+        for x in pnl:
+            cum += x
+            peak = max(peak, cum)
+            maxdd = min(maxdd, cum - peak)
+
         out[sid] = {
-            "N": n,
-            "PF": (gp / gl) if gl > 0 else (float("inf") if gp > 0 else 0.0),
-            "Expectancy": (sum(pnl) / n) if n else 0.0,
-            "PF_rev": (gp_r / gl_r) if gl_r > 0 else (float("inf") if gp_r > 0 else 0.0),
-            "Expectancy_rev": ((-sum(pnl)) / n) if n else 0.0,
+            "trades": n,
+            "wins": wins,
+            "losses": losses,
+            "win_rate": round(win_rate, 4),
+            "gross_pnl": round(gp, 2),
+            "fees": 0.0,
+            "net_pnl": round(net, 2),
+            "avg_ret": 0.0,      # fill later if you track returns
+            "std_ret": 0.0,      # fill later if you track returns
+            "sharpe_like": 0.0,  # fill later if you track returns
+            "median_pnl": round(med, 2),
+            "max_drawdown": round(maxdd, 2),
         }
-    return out
-
-@app.get("/metrics/scorecard", response_class=JSONResponse)
-def metrics_scorecard():
-    """
-    JSON scorecard across all strategies, using the current in-memory orders.
-    Safe against missing global STATE or empty stores.
-    """
-    import statistics, math
-
-    try:
-        orders = _safe_get("orders", [])
-        if not orders:
-            return {"ok": True, "data": {}, "note": "no orders yet"}
-
-        # --- compute metrics ---
-        buckets = {}
-        for o in orders:
-            strat = (o.get("strategy") or "unknown").lower()
-            buckets.setdefault(strat, []).append(o)
-
-        data = {}
-        for sname, items in buckets.items():
-            n = len(items)
-            wins = losses = 0
-            gross_pnl = fees = 0.0
-            rets = []
-
-            for o in items:
-                pnl = float(o.get("pnl") or 0.0)
-                gross_pnl += pnl
-                if pnl > 0:
-                    wins += 1
-                elif pnl < 0:
-                    losses += 1
-                fee = float(o.get("fee") or o.get("fees") or 0.0)
-                fees += fee
-                notional = float(o.get("notional") or 0.0)
-                if notional > 0:
-                    rets.append(pnl / notional)
-
-            win_rate = wins / n if n else 0.0
-            avg_ret = statistics.mean(rets) if rets else 0.0
-            std_ret = statistics.pstdev(rets) if len(rets) > 1 else 0.0
-            sharpe_like = (avg_ret / std_ret) if std_ret > 0 else (float("inf") if avg_ret > 0 else 0.0)
-
-            data[sname] = {
-                "trades": n,
-                "wins": wins,
-                "losses": losses,
-                "win_rate": round(win_rate, 4),
-                "gross_pnl": round(gross_pnl, 2),
-                "fees": round(fees, 2),
-                "net_pnl": round(gross_pnl - fees, 2),
-                "avg_ret": round(avg_ret, 6),
-                "std_ret": round(std_ret, 6),
-                "sharpe_like": (round(sharpe_like, 4) if math.isfinite(sharpe_like) else "inf"),
-            }
-
-        return {"ok": True, "data": data, "count_strategies": len(data)}
-
-    except Exception as e:
-        log.exception("metrics_scorecard failed: %s", e)
-        return JSONResponse(content={"ok": False, "error": str(e)}, status_code=500)
-
+    return JSONResponse({"ok": True, "data": out, "count_strategies": len(out)})
 
 @app.get("/metrics/scorecard.csv", response_class=PlainTextResponse)
 def metrics_scorecard_csv():
