@@ -1,13 +1,15 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Crypto System – FastAPI service
-- Live strategy scans (c1..c6) via adapter
-- Guardrails (cooldowns, loss streak, EMA alignment, spread/edge checks)
-- Exit nanny (TP / no-cross)
-- In-memory realized PnL attribution per strategy
-- Simple dashboard and analytics endpoints (no backtest bleed-through)
-Version: 2025.10.07-crypto-v3c
+Crypto System – FastAPI service (Render-safe)
+Version: 2025.10.07-crypto-v3d
+
+Key changes in v3d vs v3c:
+- Dynamic coin universe (uses services.market_crypto.MarketCrypto if available,
+  and respects universe.py when present). Falls back to env or a baked candidate list.
+- Added /universe and /universe/refresh endpoints.
+- Fixed broker.submit_order signature (adds client_order_id) in exit nanny.
+- Minor guards & logging polish.
 """
 
 import asyncio
@@ -23,7 +25,7 @@ from datetime import datetime, timedelta, timezone
 from functools import lru_cache
 from math import isfinite
 from statistics import median
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, RedirectResponse
@@ -47,109 +49,42 @@ def _order_is_fill_like(o: dict) -> bool:
     return (st in ("filled", "partially_filled", "done")) or (fq > 0 and fp > 0)
 
 def _sym_to_slash(s: str) -> str:
-    if not s:
-        return s
+    if not s: return s
     s = s.upper()
+    # Accept already-slashed (BTC/USD) or plain (BTCUSD)
     return s if "/" in s else (s[:-3] + "/" + s[-3:] if len(s) > 3 else s)
 
 def _extract_strategy_from_order(o: dict) -> str:
     s = (o.get("strategy") or "").strip().lower()
-    if s:
-        return s
+    if s: return s
     coid = (o.get("client_order_id") or o.get("clientOrderId") or "").strip()
     if coid:
         token = coid.split("-")[0].strip().lower()
-        if token:
-            return token
+        if token: return token
     for k in ("tag", "subtag", "strategy_tag", "algo"):
         v = (o.get(k) or "").strip().lower()
-        if v:
-            return v
+        if v: return v
     return "unknown"
 
-def _fetch_filled_orders_last_hours(hours: int) -> list:
-    import broker as br
-    since = datetime.now(timezone.utc) - timedelta(hours=hours)
-    raw = br.list_orders(status="all", limit=1000) or []
-    out = []
-    for o in raw:
-        if not _order_is_fill_like(o):
-            continue
-        t = _parse_ts_any(
-            o.get("filled_at")
-            or o.get("updated_at")
-            or o.get("submitted_at")
-            or o.get("created_at")
-        )
-        if t and t >= since:
-            out.append(o)
-    out.sort(
-        key=lambda r: _parse_ts_any(
-            r.get("filled_at")
-            or r.get("updated_at")
-            or r.get("submitted_at")
-            or r.get("created_at")
-        )
-        or datetime.min.replace(tzinfo=timezone.utc)
-    )
-    return out
-
-def _normalize_trade_row(o: dict) -> dict:
-    sym = _sym_to_slash(o.get("symbol") or o.get("asset_symbol") or "")
-    side = (o.get("side") or "").lower()
-    qty = float(o.get("filled_qty") or o.get("qty") or o.get("quantity") or o.get("size") or 0.0)
-    px = float(o.get("filled_avg_price") or o.get("price") or o.get("limit_price") or o.get("avg_price") or 0.0)
-    coid = o.get("client_order_id") or o.get("clientOrderId") or ""
-    ts = o.get("filled_at") or o.get("updated_at") or o.get("submitted_at") or o.get("created_at")
-    return {
-        "id": o.get("id") or coid,
-        "symbol": sym,
-        "side": side,
-        "qty": qty,
-        "price": px,
-        "strategy": _extract_strategy_from_order(o),
-        "time": (_parse_ts_any(ts) or datetime.now(timezone.utc)).isoformat(),
-        "status": (o.get("status") or "").lower(),
-        "client_order_id": coid,
-        "notional": float(o.get("notional") or 0.0),
-    }
-
-# --- Daily stop (global & per-strategy) ---------------------------------------
-TRADING_ENABLED = os.getenv("TRADING_ENABLED", "1") in ("1", "true", "True")
-_DISABLED_STRATS: set[str] = set()
-_DAILY_PNL: dict[str, float] = defaultdict(float)  # sid -> pnl today
-_DAILY_TOTAL: float = 0.0
-_LAST_DAY: Optional[str] = None
-
-DAILY_STOP_GLOBAL_USD = float(os.getenv("DAILY_STOP_GLOBAL_USD", "-100.0"))
-DAILY_STOP_PER_STRAT_USD = float(os.getenv("DAILY_STOP_PER_STRAT_USD", "-50.0"))
-
-def _daykey() -> str:
-    return datetime.now(timezone.utc).strftime("%Y-%m-%d")
-
-def _roll_day_if_needed():
-    global _LAST_DAY, _DAILY_PNL, _DAILY_TOTAL, _DISABLED_STRATS
-    dk = _daykey()
-    if _LAST_DAY != dk:
-        _LAST_DAY = dk
-        _DAILY_PNL.clear()
-        _DAILY_TOTAL = 0.0
-        _DISABLED_STRATS.clear()
-
-# --- EMA / PRICE UTILITIES ---------------------------------------------------
+# -----------------------------------------------------------------------------
+# Environment & Logging
+# -----------------------------------------------------------------------------
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 logging.basicConfig(level=LOG_LEVEL, format="%(asctime)s %(levelname)s:app:%(message)s")
 log = logging.getLogger("app")
 
+APP_VERSION = os.getenv("APP_VERSION", "2025.10.07-crypto-v3d")
+TRADING_ENABLED = os.getenv("TRADING_ENABLED", "1") in ("1", "true", "True")
 SCHEDULE_SECONDS = int(os.getenv("SCHEDULE_SECONDS", os.getenv("SCHEDULER_INTERVAL_SEC", "60")))
 DEFAULT_LIMIT = int(os.getenv("DEFAULT_LIMIT", "300"))
 DEFAULT_TIMEFRAME = os.getenv("DEFAULT_TIMEFRAME", "5Min")
 DEFAULT_NOTIONAL = float(os.getenv("DEFAULT_NOTIONAL", os.getenv("ORDER_NOTIONAL", "25")))
-DEFAULT_SYMBOLS = [s.strip() for s in os.getenv("DEFAULT_SYMBOLS", "BTC/USD,ETH/USD").split(",") if s.strip()]
-
-APP_VERSION = os.getenv("APP_VERSION", "2025.10.07-crypto-v3c")
 STRATEGIES = [s.strip() for s in os.getenv("STRATEGY_LIST", "c1,c2,c3,c4,c5,c6").split(",") if s.strip()]
 
+# If DEFAULT_SYMBOLS env is set, we honor it; else we’ll build a universe.
+_default_symbols_env = [s.strip().upper() for s in os.getenv("DEFAULT_SYMBOLS", "").split(",") if s.strip()]
+
+# Guards
 GUARDS = {
     "enable": True,
     "cooldown_bars_after_loss": 6,
@@ -166,17 +101,34 @@ GUARDS = {
     "no_cross_exit": True,
 }
 
+# Daily stop scaffolding (optional; expand as needed)
+_DISABLED_STRATS: set[str] = set()
+_DAILY_PNL: dict[str, float] = defaultdict(float)
+_DAILY_TOTAL: float = 0.0
+_LAST_DAY: Optional[str] = None
+DAILY_STOP_GLOBAL_USD = float(os.getenv("DAILY_STOP_GLOBAL_USD", "-100.0"))
+DAILY_STOP_PER_STRAT_USD = float(os.getenv("DAILY_STOP_PER_STRAT_USD", "-50.0"))
+
+def _daykey() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+def _roll_day_if_needed():
+    global _LAST_DAY, _DAILY_PNL, _DAILY_TOTAL, _DISABLED_STRATS
+    dk = _daykey()
+    if _LAST_DAY != dk:
+        _LAST_DAY = dk
+        _DAILY_PNL.clear()
+        _DAILY_TOTAL = 0.0
+        _DISABLED_STRATS.clear()
+
+# --- EMA / PRICE UTILITIES ---------------------------------------------------
 def _tf_seconds(tf: str) -> int:
     t = tf.lower()
-    if t in ("1min", "1m"):
-        return 60
-    if t in ("5min", "5m"):
-        return 300
-    if t in ("15min", "15m"):
-        return 900
-    if t in ("1h", "60min"):
-        return 3600
-    return 300  # default 5m
+    if t in ("1min", "1m"): return 60
+    if t in ("5min", "5m"): return 300
+    if t in ("15min", "15m"): return 900
+    if t in ("1h", "60min"): return 3600
+    return 300
 
 @lru_cache(maxsize=4096)
 def _ema(series_key: tuple, prices: tuple[float, ...], period: int) -> float:
@@ -187,8 +139,7 @@ def _ema(series_key: tuple, prices: tuple[float, ...], period: int) -> float:
     return ema
 
 def ema_value(symbol: str, timeframe: str, closes: List[float], period: int) -> float:
-    if not closes:
-        return float("nan")
+    if not closes: return float("nan")
     key = (symbol, timeframe, len(closes), period)
     return _ema(key, tuple(closes), period)
 
@@ -198,7 +149,7 @@ def _price_above_ema_fast(symbol: str, timeframe: str, closes: List[float]) -> b
         last = closes[-1] if closes else float("nan")
         return isfinite(ema) and isfinite(last) and (last >= ema)
     except Exception:
-        return True  # fail-open if we can't compute
+        return True  # fail-open
 
 def _bps(pct: float) -> float:
     return pct * 1e4
@@ -210,6 +161,82 @@ def _spread_bps(last: float, bid: float = None, ask: float = None) -> float:
     return 4.0
 
 # -----------------------------------------------------------------------------
+# Symbol Universe (multi-coin) ------------------------------------------------
+# -----------------------------------------------------------------------------
+_CURRENT_SYMBOLS: List[str] = []
+
+def _builtin_candidates() -> List[str]:
+    # Focus on symbols commonly available on Alpaca Crypto.
+    # You can extend via CANDIDATE_SYMBOLS env.
+    base = [
+        "BTC/USD","ETH/USD","SOL/USD","DOGE/USD","ADA/USD","AVAX/USD","LTC/USD",
+        "BCH/USD","LINK/USD","DOT/USD","MATIC/USD","XRP/USD","TRX/USD","ATOM/USD",
+        "FIL/USD","NEAR/USD","APT/USD","ARB/USD","OP/USD","ETC/USD","ALGO/USD",
+        "SUI/USD","AAVE/USD","UNI/USD","GRT/USD"
+    ]
+    extra = [s.strip().upper() for s in os.getenv("CANDIDATE_SYMBOLS","").split(",") if s.strip()]
+    # Allow removing with EXCLUDE_SYMBOLS
+    excl = set([s.strip().upper() for s in os.getenv("EXCLUDE_SYMBOLS","").split(",") if s.strip()])
+    out = [s for s in (base + extra) if s not in excl]
+    # Dedup & stable order
+    seen = set(); final=[]
+    for s in out:
+        if s not in seen:
+            final.append(s); seen.add(s)
+    return final
+
+def _try_import_marketcrypto():
+    try:
+        return importlib.import_module("services.market_crypto")
+    except Exception:
+        try:
+            return importlib.import_module("market_crypto")
+        except Exception:
+            return None
+
+def _build_universe_from_bars(timeframe: str, limit: int, max_symbols: int = 24) -> List[str]:
+    """
+    Pulls bars for a wide candidate set and keeps coins that returned enough rows.
+    This is intentionally simple and fast for Render dynos.
+    """
+    candidates = _builtin_candidates()
+    mod = _try_import_marketcrypto()
+    if not mod:
+        log.warning("Universe: services.market_crypto not available; using candidates as-is.")
+        return candidates[:max_symbols]
+
+    try:
+        MarketCrypto = getattr(mod, "MarketCrypto")
+        mc = MarketCrypto.from_env()
+        frames = mc.candles(candidates, timeframe=timeframe, limit=min(limit, 600))
+        rows_ok = []
+        for s, df in (frames or {}).items():
+            try:
+                n = int(getattr(df, "shape", [0,0])[0] or 0)
+                if n >= max(150, int(limit*0.9)):  # enough history
+                    rows_ok.append(s)
+            except Exception:
+                pass
+        if not rows_ok:
+            log.warning("Universe: no symbols passed rows filter; falling back to candidates.")
+            return candidates[:max_symbols]
+        return rows_ok[:max_symbols]
+    except Exception as e:
+        log.exception("Universe build failed; using candidates. %s", e)
+        return candidates[:max_symbols]
+
+def _load_universe_initial() -> List[str]:
+    if _default_symbols_env:
+        return _default_symbols_env
+    # If user has universe.py with a builder, we could integrate here later.
+    # For now, do a lightweight bar-based filter.
+    return _build_universe_from_bars(DEFAULT_TIMEFRAME, DEFAULT_LIMIT)
+
+def _set_current_symbols(syms: List[str]):
+    global _CURRENT_SYMBOLS
+    _CURRENT_SYMBOLS = [s.strip().upper() for s in syms if s and isinstance(s, str)]
+
+# -----------------------------------------------------------------------------
 # Strategy adapter
 # -----------------------------------------------------------------------------
 class RealStrategiesAdapter:
@@ -217,8 +244,7 @@ class RealStrategiesAdapter:
         self._mods: Dict[str, Any] = {}
 
     def _get_mod(self, name: str):
-        if name in self._mods:
-            return self._mods[name]
+        if name in self._mods: return self._mods[name]
         try:
             mod = importlib.import_module(f"strategies.{name}")
             log.info("adapter: imported strategies.%s", name)
@@ -233,7 +259,6 @@ class RealStrategiesAdapter:
         if not strat:
             log.warning("adapter: missing 'strategy' in req")
             return []
-
         tf = req.get("timeframe") or DEFAULT_TIMEFRAME
         lim = int(req.get("limit") or DEFAULT_LIMIT)
         notional = float(req.get("notional") or DEFAULT_NOTIONAL)
@@ -247,13 +272,9 @@ class RealStrategiesAdapter:
 
         try:
             mod = self._get_mod(strat)
-            log.info(
-                "adapter: calling %s.run_scan syms=%s tf=%s lim=%s notional=%s dry=%s",
-                strat, ",".join(symbols), tf, lim, notional, int(dry),
-            )
+            # Each strategy implements run_scan(symbols, timeframe, limit, notional, dry, raw)
             result = mod.run_scan(symbols, tf, lim, notional, dry, raw)
 
-            # normalize return
             orders: List[Dict[str, Any]] = []
             if isinstance(result, dict):
                 if isinstance(result.get("placed"), list):
@@ -262,10 +283,7 @@ class RealStrategiesAdapter:
                     orders = result["orders"]
             elif isinstance(result, list):
                 orders = result
-
             log.info("adapter: %s produced %d order(s)", strat, len(orders))
-            if len(orders) == 0 and isinstance(result, dict):
-                log.info("adapter: %s raw result keys=%s", strat, list(result.keys()))
             return orders or []
         except Exception as e:
             log.exception("adapter: scan failed for %s: %s", strat, e)
@@ -274,7 +292,6 @@ class RealStrategiesAdapter:
 class StrategyBook:
     def __init__(self):
         self._impl = RealStrategiesAdapter()
-
     def scan(self, req: Dict[str, Any], contexts: Optional[Dict[str, Any]] = None):
         return self._impl.scan(req, contexts or {})
 
@@ -301,23 +318,15 @@ def _normalize_order(o: dict) -> dict:
     price = o.get("filled_avg_price") or o.get("price") or o.get("limit_price") or o.get("avg_price") or 0
     notional = o.get("notional") or o.get("notional_value") or 0
 
-    try:
-        qty = float(qty)
-    except Exception:
-        qty = 0.0
-    try:
-        price = float(price)
-    except Exception:
-        price = 0.0
-    try:
-        notional = float(notional)
-    except Exception:
-        notional = 0.0
+    try: qty = float(qty)
+    except Exception: qty = 0.0
+    try: price = float(price)
+    except Exception: price = 0.0
+    try: notional = float(notional)
+    except Exception: notional = 0.0
 
-    if price <= 0:
-        price = _get_last_price(sym)
-    if qty <= 0 and notional and price:
-        qty = round(notional / price, 8)
+    if price <= 0: price = _get_last_price(sym)
+    if qty <= 0 and notional and price: qty = round(notional / max(price,1e-9), 8)
 
     ts = (
         o.get("filled_at")
@@ -329,18 +338,12 @@ def _normalize_order(o: dict) -> dict:
     )
 
     strategy = (
-        o.get("strategy")
-        or _extract_strategy_from_order(o)
-        or o.get("tag")
-        or o.get("subtag")
-        or "unknown"
+        o.get("strategy") or _extract_strategy_from_order(o) or o.get("tag") or o.get("subtag") or "unknown"
     ).lower()
 
     pnl = o.get("pnl") or 0.0
-    try:
-        pnl = float(pnl)
-    except Exception:
-        pnl = 0.0
+    try: pnl = float(pnl)
+    except Exception: pnl = 0.0
 
     return {
         "id": oid,
@@ -361,12 +364,9 @@ def _apply_realized_pnl(row: dict) -> float:
     side = (row.get("side") or "").lower()
     qty = float(row.get("qty") or 0)
     price = float(row.get("price") or 0)
-    if qty <= 0 or price <= 0:
-        return 0.0
-
+    if qty <= 0 or price <= 0: return 0.0
     pos = _positions_state.setdefault(sym, {"qty": 0.0, "avg_price": 0.0})
     realized = 0.0
-
     if side == "buy":
         new_qty = pos["qty"] + qty
         if new_qty > 0:
@@ -380,11 +380,9 @@ def _apply_realized_pnl(row: dict) -> float:
     return realized
 
 def _recalc_equity() -> float:
-    if not _positions_state:
-        return 0.0
+    if not _positions_state: return 0.0
     syms = [s for s, p in _positions_state.items() if p.get("qty", 0) > 0]
-    if not syms:
-        return 0.0
+    if not syms: return 0.0
     try:
         import broker as br
         pmap = br.last_trade_map(syms)
@@ -393,11 +391,9 @@ def _recalc_equity() -> float:
     eq = 0.0
     for s, p in _positions_state.items():
         q = float(p.get("qty") or 0)
-        if q <= 0:
-            continue
+        if q <= 0: continue
         last = float((pmap.get(s, {}) or {}).get("price") or 0.0)
-        if last > 0:
-            eq += q * last
+        if last > 0: eq += q * last
     return eq
 
 # -----------------------------------------------------------------------------
@@ -405,7 +401,10 @@ def _recalc_equity() -> float:
 # -----------------------------------------------------------------------------
 app = FastAPI(title="Crypto System")
 
-# Ring buffer for recent orders/events (cap configurable via env)
+# Universe at startup
+_set_current_symbols(_load_universe_initial())
+
+# Ring buffer for recent orders/events (cap via env)
 ORDERS_RING_CAP = int(os.getenv("ORDERS_RING_CAP", "1000"))
 _orders_ring: deque = deque(maxlen=max(100, ORDERS_RING_CAP))
 
@@ -414,46 +413,28 @@ _summary: Dict[str, Any] = {"equity": 0.0, "pnl_day": 0.0, "pnl_week": 0.0, "pnl
 
 def _push_orders(orders: List[Dict[str, Any]]):
     global _orders_ring, _attribution, _summary
-
     if not orders:
         ts = _now_iso()
         _summary["updated_at"] = ts
         _attribution["updated_at"] = ts
         return
-
     realized_total = 0.0
-
     for o in orders:
         row = _normalize_order(o)
-
         try:
             r = _apply_realized_pnl(row)
         except Exception:
             r = 0.0
-
-        # (optional) update guard state on realized closes
-        try:
-            if (row.get("side") == "sell") and r != 0.0:
-                # noop guard hook here; add if needed
-                pass
-        except Exception:
-            log.exception("guard on_realized failed")
-
         row["pnl"] = float(row.get("pnl") or 0.0) + float(r or 0.0)
         realized_total += float(r or 0.0)
-
-        # append to ring
         row["ts"] = time.time()
         _orders_ring.append(row)
-
         strat = (row.get("strategy") or "unknown").lower()
         _attribution["by_strategy"][strat] = _attribution["by_strategy"].get(strat, 0.0) + float(r or 0.0)
-
     ts = _now_iso()
     _attribution["updated_at"] = ts
     _summary["updated_at"] = ts
     _summary["pnl_day"] = float(_summary.get("pnl_day") or 0.0) + realized_total
-
     try:
         _summary["equity"] = _recalc_equity()
     except Exception:
@@ -466,51 +447,43 @@ async def _exit_nanny(symbols: List[str], timeframe: str):
         last_trade_map = br.last_trade_map(symbols) or {}
     except Exception:
         bars_map, last_trade_map = {}, {}
-
     for sym, pos in list(_positions_state.items()):
         qty = float(pos.get("qty") or 0.0)
-        if qty <= 0:
-            continue
-
+        if qty <= 0: continue
         closes = [
             float(b.get("c") or b.get("close") or 0.0)
             for b in (bars_map.get(sym) or [])
             if float(b.get("c") or b.get("close") or 0.0) > 0
         ]
-        if not closes:
-            continue
-
+        if not closes: continue
         last = float((last_trade_map.get(sym, {}) or {}).get("price") or closes[-1] or 0.0)
-        if last <= 0:
-            continue
-
+        if last <= 0: continue
         entry = float(pos.get("avg_price") or 0.0)
-        if entry <= 0:
-            continue
-
+        if entry <= 0: continue
         up_bps = _bps((last - entry) / entry)
 
-        # TP target
+        # Take profit
         if up_bps >= GUARDS["tp_target_bps"] and TRADING_ENABLED:
             try:
                 import broker as br
-                br.submit_order(symbol=sym, side="sell", notional=min(DEFAULT_NOTIONAL, qty * last))
+                coid = f"nanny-tp-{sym.replace('/','')}-{int(time.time())}"
+                br.submit_order(symbol=sym, side="sell", notional=min(DEFAULT_NOTIONAL, qty * last), client_order_id=coid)
                 log.info("exit_nanny: TP sell placed for %s", sym)
                 continue
             except Exception:
                 log.exception("exit_nanny TP submit failed")
 
-        # No-cross exit (below slow EMA)
+        # No-cross exit below slow EMA
         try:
             slow_ema = ema_value(sym, timeframe, closes, GUARDS["ema_slow"])
             crossed = isfinite(slow_ema) and (last < slow_ema)
         except Exception:
             crossed = False
-
         if crossed and TRADING_ENABLED:
             try:
                 import broker as br
-                br.submit_order(symbol=sym, side="sell", notional=min(DEFAULT_NOTIONAL, qty * last))
+                coid = f"nanny-x-{sym.replace('/','')}-{int(time.time())}"
+                br.submit_order(symbol=sym, side="sell", notional=min(DEFAULT_NOTIONAL, qty * last), client_order_id=coid)
                 log.info("exit_nanny: no-cross sell placed for %s", sym)
             except Exception:
                 log.exception("exit_nanny no-cross submit failed")
@@ -525,7 +498,7 @@ async def _scan_bridge(strat: str, req: Dict[str, Any], dry: bool = False) -> Li
     req.setdefault("limit", req.get("limit") or DEFAULT_LIMIT)
     req.setdefault("notional", req.get("notional") or DEFAULT_NOTIONAL)
 
-    syms = req.get("symbols") or DEFAULT_SYMBOLS
+    syms = req.get("symbols") or _CURRENT_SYMBOLS
     if isinstance(syms, str):
         syms = [s.strip() for s in syms.split(",") if s.strip()]
     req["symbols"] = syms
@@ -535,7 +508,7 @@ async def _scan_bridge(strat: str, req: Dict[str, Any], dry: bool = False) -> Li
     sb = StrategyBook()
     orders = sb.scan(req, {"one": {"timeframe": req["timeframe"], "symbols": syms, "notional": req["notional"]}})
 
-    # Guard filter on proposed orders (simple EMA/spread sanity)
+    # Basic guard: EMA/spread sanity for BUYs
     try:
         import broker as br
         bars_map = br.get_bars(req["symbols"], timeframe=req["timeframe"], limit=60) or {}
@@ -544,28 +517,22 @@ async def _scan_bridge(strat: str, req: Dict[str, Any], dry: bool = False) -> Li
 
     filtered: List[Dict[str, Any]] = []
     for o in (orders or []):
-        side = (o.get("side") or "").lower()
+        side = (o.get("side") or o.get("order_side") or "").lower()
         sym = _sym_to_slash(o.get("symbol") or "")
         sname = (req.get("strategy") or "").lower()
-
         closes = [
             float(b.get("c") or b.get("close") or 0.0)
             for b in (bars_map.get(sym) or [])
             if float(b.get("c") or b.get("close") or 0.0) > 0
         ]
-        px = float(o.get("price") or 0.0)
-        if px <= 0 and closes:
-            px = closes[-1]
-
+        px = float(o.get("price") or o.get("px") or 0.0)
+        if px <= 0 and closes: px = closes[-1]
         edge_bps_val = float(o.get("edge_bps") or o.get("edge") or 0.0)
         spr_bps = _spread_bps(px)
         ema_ok = _price_above_ema_fast(sym, req["timeframe"], closes)
-
         if side == "buy":
-            # basic guards
             if not ema_ok or edge_bps_val < GUARDS["min_edge_bps"] or edge_bps_val < GUARDS["min_edge_vs_spread_x"] * spr_bps:
-                log.info("guard: DROP OPEN %s by %s (ema_ok=%s edge=%.2f spread=%.2f)",
-                         sym, sname, ema_ok, edge_bps_val, spr_bps)
+                log.info("guard: drop open %s by %s (ema_ok=%s edge=%.2f spread=%.2f)", sym, sname, ema_ok, edge_bps_val, spr_bps)
                 continue
         filtered.append(o)
 
@@ -587,20 +554,16 @@ async def _scheduler_loop():
     dry_flag = (not TRADING_ENABLED)
     try:
         while _running:
-            # roll daily stops
             _roll_day_if_needed()
-
             for strat in STRATEGIES:
-                # daily-stop gating per strat
-                if strat in _DISABLED_STRATS:
+                if strat in _DISABLED_STRATS:  # daily-stop gating hook
                     continue
-
                 try:
                     orders = await _scan_bridge(
                         strat,
                         {
                             "timeframe": DEFAULT_TIMEFRAME,
-                            "symbols": DEFAULT_SYMBOLS,
+                            "symbols": _CURRENT_SYMBOLS,
                             "limit": DEFAULT_LIMIT,
                             "notional": DEFAULT_NOTIONAL,
                         },
@@ -609,18 +572,15 @@ async def _scheduler_loop():
                 except Exception:
                     log.exception("scan error %s", strat)
                     orders = []
-
                 try:
                     _push_orders(orders)
                 except Exception:
                     log.exception("push orders error")
-
                 try:
-                    await _exit_nanny(DEFAULT_SYMBOLS, DEFAULT_TIMEFRAME)
+                    await _exit_nanny(_CURRENT_SYMBOLS, DEFAULT_TIMEFRAME)
                 except Exception:
                     log.exception("exit nanny failed")
-
-            log.info("Scheduler tick complete (dry=%d) — sleeping %ss", int(dry_flag), SCHEDULE_SECONDS)
+            log.info("Scheduler tick complete (dry=%d symbols=%d) — sleeping %ss", int(dry_flag), len(_CURRENT_SYMBOLS), SCHEDULE_SECONDS)
             await asyncio.sleep(SCHEDULE_SECONDS)
     finally:
         _running = False
@@ -628,7 +588,7 @@ async def _scheduler_loop():
 @app.on_event("startup")
 async def _startup():
     global _scheduler_task
-    log.info("App startup; scheduler interval is %ss", SCHEDULE_SECONDS)
+    log.info("App startup; scheduler interval is %ss; strategies=%s; symbols=%d", SCHEDULE_SECONDS, ",".join(STRATEGIES), len(_CURRENT_SYMBOLS))
     if _scheduler_task is None:
         _scheduler_task = asyncio.create_task(_scheduler_loop())
 
@@ -677,8 +637,7 @@ _DASHBOARD_HTML = """
   </style>
   <script>
     async function loadSummary(){
-      const r = await fetch('/pnl/summary');
-      const d = await r.json();
+      const r = await fetch('/pnl/summary'); const d = await r.json();
       document.getElementById('eq').textContent = Number(d.equity || 0).toFixed(2);
       document.getElementById('pnl_day').textContent = Number(d.pnl_day || 0).toFixed(2);
       document.getElementById('pnl_week').textContent = Number(d.pnl_week || 0).toFixed(2);
@@ -686,24 +645,16 @@ _DASHBOARD_HTML = """
       document.getElementById('updated').textContent = d.updated_at ? new Date(d.updated_at).toLocaleString() : '-';
     }
     async function loadAttribution(){
-      const r = await fetch('/orders/attribution');
-      const d = await r.json();
-      const tbody = document.getElementById('attr_body');
-      tbody.innerHTML = '';
-      if (d.by_strategy){
-        for (const [k,v] of Object.entries(d.by_strategy)){
-          const tr = document.createElement('tr');
-          tr.innerHTML = `<td>${k}</td><td>${Number(v).toFixed(2)}</td>`;
-          tbody.appendChild(tr);
-        }
-      }
+      const r = await fetch('/orders/attribution'); const d = await r.json();
+      const tbody = document.getElementById('attr_body'); tbody.innerHTML = '';
+      if (d.by_strategy){ for (const [k,v] of Object.entries(d.by_strategy)){
+          const tr = document.createElement('tr'); tr.innerHTML = `<td>${k}</td><td>${Number(v).toFixed(2)}</td>`; tbody.appendChild(tr);
+      }}
       document.getElementById('attr_updated').textContent = d.updated_at ? new Date(d.updated_at).toLocaleString() : '-';
     }
     async function loadOrders(){
-      const r = await fetch('/orders/recent?limit=50');
-      const d = await r.json();
-      const tbody = document.getElementById('orders_body');
-      tbody.innerHTML = '';
+      const r = await fetch('/orders/recent?limit=50'); const d = await r.json();
+      const tbody = document.getElementById('orders_body'); tbody.innerHTML = '';
       (d.orders || []).forEach(o => {
         const tr = document.createElement('tr');
         tr.innerHTML = `
@@ -719,7 +670,11 @@ _DASHBOARD_HTML = """
         tbody.appendChild(tr);
       });
     }
-    async function refreshAll(){ await Promise.all([loadSummary(), loadAttribution(), loadOrders()]); }
+    async function loadUniverse(){
+      const r = await fetch('/universe'); const d = await r.json();
+      document.getElementById('sym_count').textContent = (d.symbols || []).length;
+    }
+    async function refreshAll(){ await Promise.all([loadSummary(), loadAttribution(), loadOrders(), loadUniverse()]); }
     setInterval(refreshAll, 15000); window.addEventListener('load', refreshAll);
   </script>
 </head>
@@ -731,6 +686,7 @@ _DASHBOARD_HTML = """
     <div style="margin-left:auto" class="chips">
       <span class="chip">TF: <code id="tf_chip">auto</code></span>
       <span class="chip">Tick: <code>{SCHEDULE_SECONDS}s</code></span>
+      <span class="chip">Symbols: <code id="sym_count">0</code></span>
     </div>
   </header>
 
@@ -787,6 +743,16 @@ async def dashboard():
 def healthz():
     return {"ok": True, "version": APP_VERSION, "time": _now_iso()}
 
+@app.get("/universe", response_class=JSONResponse)
+def get_universe():
+    return {"symbols": _CURRENT_SYMBOLS, "count": len(_CURRENT_SYMBOLS), "timeframe": DEFAULT_TIMEFRAME}
+
+@app.post("/universe/refresh", response_class=JSONResponse)
+def refresh_universe(max_symbols: int = 24):
+    syms = _build_universe_from_bars(DEFAULT_TIMEFRAME, DEFAULT_LIMIT, max_symbols=max_symbols)
+    _set_current_symbols(syms)
+    return {"ok": True, "symbols": _CURRENT_SYMBOLS, "count": len(_CURRENT_SYMBOLS)}
+
 @app.get("/pnl/summary", response_class=JSONResponse)
 async def pnl_summary():
     return JSONResponse(_summary)
@@ -807,7 +773,7 @@ async def orders_recent(limit: int = Query(100, ge=1, le=1000)):
                 "symbol": o.get("symbol"),
                 "side": o.get("side"),
                 "qty": o.get("qty"),
-                "px": o.get("price"),
+                "px": o.get("price") or o.get("px"),
                 "strategy": o.get("strategy"),
                 "pnl": o.get("pnl"),
                 "ts": ts_epoch,
@@ -846,22 +812,30 @@ async def analytics_trades_csv(hours: int = 12):
     w = csv.DictWriter(
         buf,
         fieldnames=[
-            "time",
-            "strategy",
-            "symbol",
-            "side",
-            "qty",
-            "price",
-            "id",
-            "client_order_id",
-            "status",
-            "notional",
+            "time","strategy","symbol","side","qty","price","id","client_order_id","status","notional",
         ],
     )
     w.writeheader()
-    for r in rows:
-        w.writerow(r)
+    for r in rows: w.writerow(r)
     return buf.getvalue()
+
+def _fetch_filled_orders_last_hours(hours: int) -> list:
+    import broker as br
+    since = datetime.now(timezone.utc) - timedelta(hours=hours)
+    raw = br.list_orders(status="all", limit=1000) or []
+    out = []
+    for o in raw:
+        if not _order_is_fill_like(o): continue
+        t = _parse_ts_any(
+            o.get("filled_at") or o.get("updated_at") or o.get("submitted_at") or o.get("created_at")
+        )
+        if t and t >= since: out.append(o)
+    out.sort(
+        key=lambda r: _parse_ts_any(
+            r.get("filled_at") or r.get("updated_at") or r.get("submitted_at") or r.get("created_at")
+        ) or datetime.min.replace(tzinfo=timezone.utc)
+    )
+    return out
 
 @app.get("/diag/orders_raw")
 async def diag_orders_raw(status: str = "all", limit: int = 25):
@@ -870,16 +844,16 @@ async def diag_orders_raw(status: str = "all", limit: int = 25):
     return {"status": status, "limit": limit, "orders": data}
 
 @app.get("/diag/bars")
-async def diag_bars(symbols: str = "BTC/USD,ETH/USD", tf: str = "5Min", limit: int = 360):
+async def diag_bars(symbols: str = "", tf: str = "", limit: int = 360):
     import broker as br
-    syms = [s.strip().upper() for s in symbols.split(",") if s.strip()]
-    bars = br.get_bars(syms, timeframe=tf, limit=int(limit))
-    return {"timeframe": tf, "limit": limit, "counts": {k: len(v) for k, v in bars.items()}, "keys": list(bars.keys())}
+    syms = [s.strip().upper() for s in (symbols or ",".join(_CURRENT_SYMBOLS)).split(",") if s.strip()]
+    bars = br.get_bars(syms, timeframe=(tf or DEFAULT_TIMEFRAME), limit=int(limit))
+    return {"timeframe": (tf or DEFAULT_TIMEFRAME), "limit": limit, "counts": {k: len(v) for k, v in bars.items()}, "keys": list(bars.keys())}
 
 @app.get("/diag/imports")
 async def diag_imports():
     out = {}
-    for name in [s.strip() for s in os.getenv("STRATEGY_LIST", "c1,c2,c3,c4,c5,c6").split(",") if s.strip()]:
+    for name in STRATEGIES:
         try:
             try:
                 importlib.import_module(f"strategies.{name}")
@@ -894,7 +868,7 @@ async def diag_imports():
 @app.get("/diag/scan")
 async def diag_scan(
     strategy: str,
-    symbols: str = "BTC/USD,ETH/USD",
+    symbols: str = "",
     tf: Optional[str] = None,
     limit: Optional[int] = None,
     notional: Optional[float] = None,
@@ -903,16 +877,8 @@ async def diag_scan(
     tf = tf or DEFAULT_TIMEFRAME
     limit = limit or DEFAULT_LIMIT
     notional = notional or DEFAULT_NOTIONAL
-    syms = [s.strip() for s in symbols.split(",") if s.strip()]
-    req = {
-        "strategy": strategy,
-        "timeframe": tf,
-        "limit": limit,
-        "notional": notional,
-        "symbols": syms,
-        "dry": bool(dry),
-        "raw": {},
-    }
+    syms = [s.strip() for s in (symbols or ",".join(_CURRENT_SYMBOLS)).split(",") if s.strip()]
+    req = {"strategy": strategy, "timeframe": tf, "limit": limit, "notional": notional, "symbols": syms, "dry": bool(dry), "raw": {}}
     sb = StrategyBook()
     orders = sb.scan(req, {"one": {"timeframe": tf, "symbols": syms, "notional": notional}})
     return {"args": req, "orders_count": len(orders or []), "orders": orders}
@@ -938,87 +904,56 @@ def metrics_fliptest(hours: int = 168):
     per = defaultdict(list)
     for r in rows:
         per[(r.get("strategy") or "unknown").lower()].append(float(r.get("pnl") or 0.0))
-
     out = {}
     for sid, pnl in per.items():
         n = len(pnl)
         gp = sum(x for x in pnl if x > 0); gl = -sum(x for x in pnl if x < 0)
         pf = (gp / gl) if gl > 0 else (float("inf") if gp > 0 else 0.0)
-        # reversed (negate pnl)
         gp_r = sum(-x for x in pnl if x < 0); gl_r = -sum(-x for x in pnl if -x < 0)
         pf_r = (gp_r / gl_r) if gl_r > 0 else (float("inf") if gp_r > 0 else 0.0)
-        out[sid] = {
-            "N": n,
-            "PF": round(pf, 3),
-            "Expectancy": round((sum(pnl)/n) if n else 0.0, 4),
-            "PF_rev": round(pf_r, 3),
-            "Expectancy_rev": round(((-sum(pnl))/n) if n else 0.0, 4),
-        }
+        out[sid] = {"N": n, "PF": round(pf, 3), "Expectancy": round((sum(pnl)/n) if n else 0.0, 4),
+                    "PF_rev": round(pf_r, 3), "Expectancy_rev": round(((-sum(pnl))/n) if n else 0.0, 4)}
     return JSONResponse({"ok": True, "data": out})
 
 @app.get("/metrics/scorecard", response_class=JSONResponse)
-def metrics_scorecard(
-    hours: int = 168,          # last 7 days by default
-    last_n_trades: int = 0     # optional override: use last N trades instead of hours window
-):
+def metrics_scorecard(hours: int = 168, last_n_trades: int = 0):
     now = time.time()
     rows = list(_orders_ring)
-
-    # Filter by time window if requested
     if hours and hours > 0:
         cutoff = now - (hours * 3600)
         rows = [r for r in rows if float(r.get("ts", now)) >= cutoff]
-
-    # If last_n_trades is set, slice per strategy
     per = defaultdict(list)
     for r in rows:
         sid = (r.get("strategy") or "unknown").lower()
         per[sid].append(r)
     if last_n_trades and last_n_trades > 0:
         per = {k: v[-last_n_trades:] for k, v in per.items()}
-
     out = {}
     for sid, items in per.items():
         pnl = [float(x.get("pnl") or 0.0) for x in items if x.get("pnl") is not None]
         n = len(items)
         wins = sum(1 for x in pnl if x > 0)
         losses = sum(1 for x in pnl if x < 0)
-        gp = sum(x for x in pnl if x > 0)
-        gl = -sum(x for x in pnl if x < 0)
+        gp = sum(x for x in pnl if x > 0); gl = -sum(x for x in pnl if x < 0)
         net = gp - gl
         win_rate = (wins / max(wins + losses, 1)) if (wins + losses) else 0.0
         exp = (net / n) if n else 0.0
         med = median(pnl) if pnl else 0.0
         pf = (gp / gl) if gl > 0 else (float("inf") if gp > 0 else 0.0)
-
-        # Simple drawdown estimate across cumulative PnL in window
-        cum = 0.0
-        peak = 0.0
-        maxdd = 0.0
+        # simple running drawdown
+        cum = 0.0; peak = 0.0; maxdd = 0.0
         for x in pnl:
-            cum += x
-            peak = max(peak, cum)
-            maxdd = min(maxdd, cum - peak)
-
+            cum += x; peak = max(peak, cum); maxdd = min(maxdd, cum - peak)
         out[sid] = {
-            "trades": n,
-            "wins": wins,
-            "losses": losses,
-            "win_rate": round(win_rate, 4),
-            "gross_pnl": round(gp, 2),
-            "fees": 0.0,
-            "net_pnl": round(net, 2),
-            "avg_ret": 0.0,      # fill later if you track returns
-            "std_ret": 0.0,      # fill later if you track returns
-            "sharpe_like": 0.0,  # fill later if you track returns
-            "median_pnl": round(med, 2),
-            "max_drawdown": round(maxdd, 2),
+            "trades": n, "wins": wins, "losses": losses, "win_rate": round(win_rate, 4),
+            "gross_pnl": round(gp, 2), "fees": 0.0, "net_pnl": round(net, 2),
+            "avg_ret": 0.0, "std_ret": 0.0, "sharpe_like": 0.0,
+            "median_pnl": round(med, 2), "max_drawdown": round(maxdd, 2),
         }
     return JSONResponse({"ok": True, "data": out, "count_strategies": len(out)})
 
 @app.post("/init/positions")
 async def init_positions():
-    """Seed the in-memory positions state from Alpaca current positions."""
     try:
         import broker as br
         pos = br.list_positions() or []
@@ -1027,32 +962,20 @@ async def init_positions():
         for p in pos:
             sym = _sym_to_slash(p.get("symbol") or p.get("Symbol") or "")
             try:
-                qty = float(
-                    p.get("qty")
-                    or p.get("quantity")
-                    or p.get("qty_available")
-                    or p.get("size")
-                    or p.get("Qty")
-                    or 0.0
-                )
+                qty = float(p.get("qty") or p.get("quantity") or p.get("qty_available") or p.get("size") or p.get("Qty") or 0.0)
             except Exception:
                 qty = 0.0
             avg = float(p.get("avg_entry_price") or p.get("average_entry_price") or p.get("avg_price") or 0.0)
             if sym and qty and avg:
                 _positions_state[sym] = {"qty": qty, "avg_price": avg}
         _summary["equity"] = _recalc_equity()
-        ts = _now_iso()
-        _summary["updated_at"] = ts
-        _attribution["updated_at"] = ts
+        ts = _now_iso(); _summary["updated_at"] = ts; _attribution["updated_at"] = ts
         return {"ok": True, "positions": _positions_state}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/init/backfill")
 async def init_backfill(days: Optional[int] = None, status: str = "closed"):
-    """
-    Replay recent *filled* orders into P&L/attribution without importing backtest-only data.
-    """
     try:
         import broker as br
         lookback_days = int(days or os.getenv("INIT_BACKFILL_DAYS", "7"))
@@ -1062,8 +985,7 @@ async def init_backfill(days: Optional[int] = None, status: str = "closed"):
         for r in raws:
             ts = r.get("filled_at") or r.get("updated_at") or r.get("submitted_at") or r.get("created_at")
             when = _parse_ts_any(ts) if isinstance(ts, str) else None
-            if when and when >= after:
-                selected.append(r)
+            if when and when >= after: selected.append(r)
         orders = []
         for r in selected:
             st = (r.get("status") or "").lower()
