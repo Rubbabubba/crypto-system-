@@ -10,10 +10,10 @@ STRATEGY_VERSION = "1.4.0"
 
 # === Tunables (env overrides) ===
 C2_EMA_FAST = int(os.getenv("C2_EMA_FAST", "12"))
-C2_EMA_SLOW = int(os.getenv("C2_EMA_SLOW", "50"))
+C2_EMA_SLOW = int(os.getenv("C2_EMA_SLOW", "34"))
 C2_RSI_LEN  = int(os.getenv("C2_RSI_LEN",  os.getenv("C2_RSI", "14")))
-C2_RSI_LOW  = int(os.getenv("C2_RSI_LOW",  "30"))
-C2_RSI_HIGH = int(os.getenv("C2_RSI_HIGH", "70"))
+C2_RSI_LOW  = int(os.getenv("C2_RSI_LOW",  "28"))
+C2_RSI_HIGH = int(os.getenv("C2_RSI_HIGH", "65"))
 
 # Back-compat aliases (silence optimizer warnings)
 EMA_FAST = C2_EMA_FAST
