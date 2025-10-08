@@ -9,20 +9,23 @@ STRATEGY_NAME = "c2"
 STRATEGY_VERSION = "1.4.0"
 
 # === Tunables (env overrides) ===
-EMA_FAST = int(os.getenv("C2_EMA_FAST", "12"))
-EMA_SLOW = int(os.getenv("C2_EMA_SLOW", "50"))
-RSI_LEN  = int(os.getenv("C2_RSI_LEN",  os.getenv("C2_RSI", "14")))
-RSI_LO   = int(os.getenv("C2_RSI_LOW",  "30"))
-RSI_HI   = int(os.getenv("C2_RSI_HIGH", "70"))
+C2_EMA_FAST = int(os.getenv("C2_EMA_FAST", "12"))
+C2_EMA_SLOW = int(os.getenv("C2_EMA_SLOW", "50"))
+C2_RSI_LEN  = int(os.getenv("C2_RSI_LEN",  os.getenv("C2_RSI", "14")))
+C2_RSI_LOW  = int(os.getenv("C2_RSI_LOW",  "30"))
+C2_RSI_HIGH = int(os.getenv("C2_RSI_HIGH", "70"))
 
-# Expose aliases used by legacy optimizers (to silence "missing attr" warnings)
-# (they are the same objects above)
-#   EMA_FAST, EMA_SLOW, RSI_LEN, RSI_LO, RSI_HI already defined.
+# Back-compat aliases (silence optimizer warnings)
+EMA_FAST = C2_EMA_FAST
+EMA_SLOW = C2_EMA_SLOW
+RSI_LEN  = C2_RSI_LEN
+RSI_LO   = C2_RSI_LOW
+RSI_HI   = C2_RSI_HIGH
 
 def _sym(s: str) -> str:
     return s.replace("/", "")
 
-def _bars(symbol: str, timeframe: str, limit: int) -> List[Dict[str,Any]]:
+def _bars(symbol: str, timeframe: str, limit: int):
     try:
         m = br.get_bars(symbol, timeframe=timeframe, limit=limit)
         return m.get(symbol, [])
@@ -60,17 +63,15 @@ def _ema(vals, n):
     return out
 
 def _rsi(closes, n=14):
-    # Wilder's RSI
     if len(closes) < n+2: return []
     gains, losses = [], []
     for i in range(1, len(closes)):
         ch = closes[i] - closes[i-1]
         gains.append(max(0.0, ch))
         losses.append(max(0.0, -ch))
-    # seed
     avg_g = sum(gains[:n]) / n
     avg_l = sum(losses[:n]) / n
-    rsis = [None]*(n)  # first n are None
+    rsis = [None]*n
     for i in range(n, len(gains)):
         avg_g = (avg_g*(n-1) + gains[i]) / n
         avg_l = (avg_l*(n-1) + losses[i]) / n
@@ -80,23 +81,23 @@ def _rsi(closes, n=14):
     return rsis
 
 def _decide(symbol, bars):
-    need = max(EMA_SLOW + 10, RSI_LEN + 10, 120)
+    need = max(C2_EMA_SLOW + 10, C2_RSI_LEN + 10, 120)
     if len(bars) < need:
         return {"symbol":symbol, "action":"flat", "reason":"insufficient_bars"}
 
     closes = [float(b["c"]) for b in bars]
     c = closes[-1]
-    ema_f = _ema(closes, EMA_FAST)[-1]
-    ema_s = _ema(closes, EMA_SLOW)[-1]
-    rsi = _rsi(closes, RSI_LEN)[-1]
+    ema_f = _ema(closes, C2_EMA_FAST)[-1]
+    ema_s = _ema(closes, C2_EMA_SLOW)[-1]
+    rsi_v = _rsi(closes, C2_RSI_LEN)[-1]
     have_long = _has_long(symbol) is not None
 
-    # Entry: trend up and RSI re-gaining momentum after dip
-    if c > ema_s and rsi is not None and rsi > RSI_LO and ema_f > ema_s:
+    # Entry: trend up and RSI recovering from oversold
+    if c > ema_s and ema_f > ema_s and rsi_v is not None and rsi_v > C2_RSI_LOW:
         return {"symbol":symbol, "action":"buy", "reason":"trend_up_rsi_recover"}
 
-    # Exit: either momentum overextension/RSi rolloff or trend loss
-    if have_long and ((rsi is not None and rsi > RSI_HI and c < ema_f) or (c < ema_s)):
+    # Exit: momentum fade or trend loss
+    if have_long and ((rsi_v is not None and rsi_v > C2_RSI_HIGH and c < ema_f) or (c < ema_s)):
         return {"symbol":symbol, "action":"sell", "reason":"momentum_faded_or_trend_lost"}
 
     return {"symbol":symbol, "action":"flat", "reason":"hold_in_pos" if have_long else "no_signal"}
