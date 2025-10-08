@@ -14,6 +14,13 @@ ALPACA_DATA_HOST  = os.getenv("ALPACA_DATA_HOST",  "https://data.alpaca.markets"
 ALPACA_KEY_ID     = os.getenv("ALPACA_KEY_ID", "")
 ALPACA_SECRET_KEY = os.getenv("ALPACA_SECRET_KEY", "")
 
+# Tunables (defaults are your current ones—adjust as needed)
+C2_EMA_FAST = int(os.getenv("C2_EMA_FAST", "12"))
+C2_EMA_SLOW = int(os.getenv("C2_EMA_SLOW", "50"))
+C2_RSI_LOW  = int(os.getenv("C2_RSI_LOW",  "30"))
+C2_RSI_HIGH = int(os.getenv("C2_RSI_HIGH", "70"))
+
+
 def _hdr():
     if not (ALPACA_KEY_ID and ALPACA_SECRET_KEY): return {}
     return {"APCA-API-KEY-ID": ALPACA_KEY_ID, "APCA-API-SECRET-KEY": ALPACA_SECRET_KEY, "Accept":"application/json","Content-Type":"application/json"}
