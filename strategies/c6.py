@@ -1,16 +1,20 @@
 # strategies/c6.py
-# Version: 1.2.0 (env-tunable, optimizer-friendly)
+# Version: 1.2.1 (env-tunable, optimizer-friendly)
 from __future__ import annotations
 import os, time
 from typing import Any, Dict, List
 import broker as br
 
 STRATEGY_NAME = "c6"
-STRATEGY_VERSION = "1.2.0"
+STRATEGY_VERSION = "1.2.1"
 
 # === Tunables (env overrides) ===
-C6_EMA    = int(os.getenv("C6_EMA", "50"))       # primary trend EMA
-C6_EXIT_K = float(os.getenv("C6_EXIT_K", "0.998"))  # exit buffer under EMA
+C6_EMA    = int(os.getenv("C6_EMA", "50"))
+C6_EXIT_K = float(os.getenv("C6_EXIT_K", "0.998"))
+
+# expose for optimizers
+EMA     = C6_EMA
+EXIT_K  = C6_EXIT_K
 
 def _sym(s: str) -> str:
     return s.replace("/", "")
@@ -32,7 +36,7 @@ def _has_long(symbol: str):
     sym = _sym(symbol)
     for p in _positions():
         psym = p.get("symbol") or p.get("asset_symbol")
-        if psym == sym and p.get("side", "long").lower() == "long":
+        if psym == sym and p.get("side","long").lower() == "long":
             return p
     return None
 
@@ -44,17 +48,17 @@ def _place(symbol: str, side: str, notional: float, client_id: str):
 
 def _ema(vals, n):
     if not vals or n <= 0: return []
-    k = 2 / (n + 1)
+    k = 2/(n+1)
     out, ema = [], None
     for v in vals:
-        ema = v if ema is None else (v * k + ema * (1 - k))
+        ema = v if ema is None else (v*k + ema*(1-k))
         out.append(ema)
     return out
 
 def _decide(symbol: str, bars: List[Dict[str, Any]]):
     need = max(int(C6_EMA) + 20, 120)
     if len(bars) < need:
-        return {"symbol": symbol, "action": "flat", "reason": "insufficient_bars"}
+        return {"symbol":symbol, "action":"flat", "reason":"insufficient_bars"}
 
     closes = [float(b["c"]) for b in bars]
     c = closes[-1]
@@ -62,18 +66,17 @@ def _decide(symbol: str, bars: List[Dict[str, Any]]):
     e  = ema[-1]
     e_prev = ema[-2] if len(ema) >= 2 else e
     slope_up = e > e_prev
-
     have_long = _has_long(symbol) is not None
 
-    # Entry: price above EMA and EMA rising
+    # Entry: price above EMA with rising slope
     if c > e and slope_up:
-        return {"symbol": symbol, "action": "buy", "reason": "ema_break_and_rising"}
+        return {"symbol":symbol, "action":"buy", "reason":"ema_break_and_rising"}
 
-    # Exit: price dips below EMA * EXIT_K (buffer) or hard cross below EMA
+    # Exit: weakness below EMA * EXIT_K (buffer) or cross back under EMA
     if have_long and (c < e * float(C6_EXIT_K) or c < e):
-        return {"symbol": symbol, "action": "sell", "reason": "ema_weakness_exit"}
+        return {"symbol":symbol, "action":"sell", "reason":"ema_weakness_exit"}
 
-    return {"symbol": symbol, "action": "flat", "reason": "hold_in_pos" if have_long else "no_signal"}
+    return {"symbol":symbol, "action":"flat", "reason":"hold_in_pos" if have_long else "no_signal"}
 
 def run_scan(symbols, timeframe, limit, notional, dry, extra):
     out, placed = [], []
@@ -90,9 +93,9 @@ def run_scan(symbols, timeframe, limit, notional, dry, extra):
         if "error" not in res:
             placed.append({
                 "symbol": s, "side": dec["action"], "notional": notional,
-                "status": res.get("status", "accepted"),
+                "status": res.get("status","accepted"),
                 "client_order_id": res.get("client_order_id", coid),
                 "filled_avg_price": res.get("filled_avg_price"),
                 "id": res.get("id")
             })
-    return {"strategy": STRATEGY_NAME, "version": STRATEGY_VERSION, "results": out, "placed": placed}
+    return {"strategy":STRATEGY_NAME, "version":STRATEGY_VERSION, "results": out, "placed": placed}

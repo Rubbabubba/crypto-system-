@@ -1,21 +1,24 @@
 # strategies/c4.py
-# Version: 1.3.0 (env-tunable, optimizer-friendly)
+# Version: 1.3.1 (env-tunable, optimizer-friendly)
 from __future__ import annotations
 import os, time
 from typing import Any, Dict, List
 import broker as br
 
 STRATEGY_NAME = "c4"
-STRATEGY_VERSION = "1.3.0"
+STRATEGY_VERSION = "1.3.1"
 
 # === Tunables (env overrides) ===
-EMA_FAST = int(os.getenv("C4_EMA_FAST", "12"))
-EMA_SLOW = int(os.getenv("C4_EMA_SLOW", "50"))
-ATR_LEN  = int(os.getenv("C4_ATR_LEN",  "14"))
-ATR_K    = float(os.getenv("C4_ATR_K",  "2.0"))
+C4_EMA_FAST = int(os.getenv("C4_EMA_FAST", "12"))
+C4_EMA_SLOW = int(os.getenv("C4_EMA_SLOW", "50"))
+C4_ATR_LEN  = int(os.getenv("C4_ATR_LEN",  "21"))
+C4_ATR_K    = float(os.getenv("C4_ATR_K",  "2.0"))
 
-# Expose attributes with these exact names to satisfy optimizer warnings:
-#   EMA_FAST, EMA_SLOW, ATR_LEN, ATR_K  (already defined above)
+# Back-compat aliases for optimizers that introspect attributes
+EMA_FAST = C4_EMA_FAST
+EMA_SLOW = C4_EMA_SLOW
+ATR_LEN  = C4_ATR_LEN
+ATR_K    = C4_ATR_K
 
 def _sym(s: str) -> str:
     return s.replace("/", "")
@@ -50,8 +53,7 @@ def _place(symbol: str, side: str, notional: float, client_id: str):
 def _ema(vals, n):
     if not vals or n <= 0: return []
     k = 2/(n+1)
-    out = []
-    ema = None
+    out, ema = [], None
     for v in vals:
         ema = v if ema is None else (v*k + ema*(1-k))
         out.append(ema)
@@ -60,16 +62,14 @@ def _ema(vals, n):
 def _atr(bars, n=14):
     if len(bars) < n+1: return []
     trs = []
-    prev_close = float(bars[0]["c"])
+    pc = float(bars[0]["c"])
     for i in range(1, len(bars)):
         h = float(bars[i]["h"]); l = float(bars[i]["l"]); c = float(bars[i]["c"])
-        tr = max(h-l, abs(h-prev_close), abs(l-prev_close))
-        trs.append(tr)
-        prev_close = c
-    # Wilder smoothing for ATR
+        tr = max(h-l, abs(h-pc), abs(l-pc))
+        trs.append(tr); pc = c
     if len(trs) < n: return []
     atr = sum(trs[:n]) / n
-    out = [None]*(n)  # align with bars
+    out = [None]*n
     out.append(atr)
     for i in range(n, len(trs)):
         atr = (atr*(n-1) + trs[i]) / n
@@ -77,27 +77,27 @@ def _atr(bars, n=14):
     return out
 
 def _decide(symbol, bars):
-    need = max(EMA_SLOW + 10, ATR_LEN + 10, 120)
+    need = max(C4_EMA_SLOW + 10, C4_ATR_LEN + 10, 120)
     if len(bars) < need:
         return {"symbol":symbol, "action":"flat", "reason":"insufficient_bars"}
 
     closes = [float(b["c"]) for b in bars]
     c = closes[-1]
-    ema_f = _ema(closes, EMA_FAST)[-1]
-    ema_s = _ema(closes, EMA_SLOW)[-1]
-    atrs  = _atr(bars, ATR_LEN)
+    ema_f = _ema(closes, C4_EMA_FAST)[-1]
+    ema_s = _ema(closes, C4_EMA_SLOW)[-1]
+    atrs  = _atr(bars, C4_ATR_LEN)
     atr   = atrs[-1] if atrs and atrs[-1] is not None else None
     have_long = _has_long(symbol) is not None
 
     if atr is None:
-        return {"symbol":symbol, "action":"flat", "reason":"atr_warming_up"}
+        return {"symbol":symbol, "action":"flat", "reason":"atr_warmup"}
 
-    # Entry: trend up and price breaks above fast EMA by ATR_K*ATR
-    if c > ema_s and ema_f > ema_s and c > (ema_f + ATR_K * atr):
+    # Entry: trend up and price extends above fast EMA by ATR_K * ATR
+    if c > ema_s and ema_f > ema_s and c > (ema_f + C4_ATR_K * atr):
         return {"symbol":symbol, "action":"buy", "reason":"atr_breakout_trend_up"}
 
-    # Exit: lose fast EMA or move below negative ATR band
-    if have_long and (c < ema_f or c < (ema_f - ATR_K * atr)):
+    # Exit: lose fast EMA or breach below a negative ATR band
+    if have_long and (c < ema_f or c < (ema_f - C4_ATR_K * atr)):
         return {"symbol":symbol, "action":"sell", "reason":"atr_reversal_or_trend_loss"}
 
     return {"symbol":symbol, "action":"flat", "reason":"hold_in_pos" if have_long else "no_signal"}
