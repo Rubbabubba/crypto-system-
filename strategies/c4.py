@@ -1,98 +1,125 @@
 # strategies/c4.py
-# Version: 1.2.0 (2025-09-30)
+# Version: 1.3.0 (env-tunable, optimizer-friendly)
 from __future__ import annotations
 import os, time
 from typing import Any, Dict, List
-import requests
-import broker as br, math
+import broker as br
 
-STRATEGY_NAME="c4"
-STRATEGY_VERSION="1.2.1"
+STRATEGY_NAME = "c4"
+STRATEGY_VERSION = "1.3.0"
 
-ALPACA_TRADE_HOST=os.getenv("ALPACA_TRADE_HOST","https://paper-api.alpaca.markets")
-ALPACA_DATA_HOST =os.getenv("ALPACA_DATA_HOST","https://data.alpaca.markets")
-ALPACA_KEY_ID    =os.getenv("ALPACA_KEY_ID","")
-ALPACA_SECRET_KEY=os.getenv("ALPACA_SECRET_KEY","")
+# === Tunables (env overrides) ===
+EMA_FAST = int(os.getenv("C4_EMA_FAST", "12"))
+EMA_SLOW = int(os.getenv("C4_EMA_SLOW", "50"))
+ATR_LEN  = int(os.getenv("C4_ATR_LEN",  "14"))
+ATR_K    = float(os.getenv("C4_ATR_K",  "2.0"))
 
+# Expose attributes with these exact names to satisfy optimizer warnings:
+#   EMA_FAST, EMA_SLOW, ATR_LEN, ATR_K  (already defined above)
 
-C4_EMA_FAST = int(os.getenv("C4_EMA_FAST", "12"))
-C4_EMA_SLOW = int(os.getenv("C4_EMA_SLOW", "50"))
-C4_ATR_LEN  = int(os.getenv("C4_ATR_LEN",  "14"))
-C4_ATR_K    = float(os.getenv("C4_ATR_K",  "2.0"))
+def _sym(s: str) -> str:
+    return s.replace("/", "")
 
-
-def _hdr():
-    if not (ALPACA_KEY_ID and ALPACA_SECRET_KEY): return {}
-    return {"APCA-API-KEY-ID":ALPACA_KEY_ID,"APCA-API-SECRET-KEY":ALPACA_SECRET_KEY,"Accept":"application/json","Content-Type":"application/json"}
-def _sym(s): return s.replace("/","")
-
-def _bars(symbol: str, timeframe: str, limit: int) -> List[Dict[str,Any]]:
+def _bars(symbol: str, timeframe: str, limit: int):
     try:
         m = br.get_bars(symbol, timeframe=timeframe, limit=limit)
         return m.get(symbol, [])
     except Exception:
         return []
 
-def _positions() -> List[Dict[str,Any]]:
+def _positions():
     try:
         return br.list_positions()
     except Exception:
         return []
 
 def _has_long(symbol):
-    sym=_sym(symbol)
+    sym = _sym(symbol)
     for p in _positions():
-        if (p.get("symbol") or p.get("asset_symbol"))==sym and p.get("side","long")=="long":
+        psym = p.get("symbol") or p.get("asset_symbol")
+        if psym == sym and p.get("side","long").lower() == "long":
             return p
     return None
 
-def _place(symbol: str, side: str, notional: float, client_id: str) -> Dict[str,Any]:
+def _place(symbol: str, side: str, notional: float, client_id: str):
     try:
         return br.place_order(symbol, side, notional, client_id)
     except Exception as ex:
         return {"error": str(ex)}
 
 def _ema(vals, n):
-    if not vals: return []
-    k=2/(n+1); out=[]; ema=None
+    if not vals or n <= 0: return []
+    k = 2/(n+1)
+    out = []
+    ema = None
     for v in vals:
-        ema = v if ema is None else v*k + ema*(1-k)
+        ema = v if ema is None else (v*k + ema*(1-k))
         out.append(ema)
     return out
 
-def _atr_lite(bars, n=14):
-    trs=[]
-    for i in range(1,len(bars)):
-        h=float(bars[i]["h"]); l=float(bars[i]["l"]); pc=float(bars[i-1]["c"])
-        trs.append(max(h-l, abs(h-pc), abs(l-pc)))
-    if len(trs)<n: return None
-    return sum(trs[-n:])/n
+def _atr(bars, n=14):
+    if len(bars) < n+1: return []
+    trs = []
+    prev_close = float(bars[0]["c"])
+    for i in range(1, len(bars)):
+        h = float(bars[i]["h"]); l = float(bars[i]["l"]); c = float(bars[i]["c"])
+        tr = max(h-l, abs(h-prev_close), abs(l-prev_close))
+        trs.append(tr)
+        prev_close = c
+    # Wilder smoothing for ATR
+    if len(trs) < n: return []
+    atr = sum(trs[:n]) / n
+    out = [None]*(n)  # align with bars
+    out.append(atr)
+    for i in range(n, len(trs)):
+        atr = (atr*(n-1) + trs[i]) / n
+        out.append(atr)
+    return out
 
 def _decide(symbol, bars):
-    if len(bars)<80: return {"symbol":symbol,"action":"flat","reason":"insufficient_bars"}
-    closes=[float(b["c"]) for b in bars]
-    ema50=_ema(closes,50)[-1]
-    c=closes[-1]
-    atr=_atr_lite(bars,14) or 0.0
-    have_long=_has_long(symbol) is not None
-    if c>ema50*1.001:
-        return {"symbol":symbol,"action":"buy","reason":"trend_up_ema50"}
-    if have_long and c < (ema50 - 1.5*atr):
-        return {"symbol":symbol,"action":"sell","reason":"trailing_stop_ema50_atr"}
-    return {"symbol":symbol,"action":"flat","reason":"hold_in_pos" if have_long else "no_signal"}
+    need = max(EMA_SLOW + 10, ATR_LEN + 10, 120)
+    if len(bars) < need:
+        return {"symbol":symbol, "action":"flat", "reason":"insufficient_bars"}
+
+    closes = [float(b["c"]) for b in bars]
+    c = closes[-1]
+    ema_f = _ema(closes, EMA_FAST)[-1]
+    ema_s = _ema(closes, EMA_SLOW)[-1]
+    atrs  = _atr(bars, ATR_LEN)
+    atr   = atrs[-1] if atrs and atrs[-1] is not None else None
+    have_long = _has_long(symbol) is not None
+
+    if atr is None:
+        return {"symbol":symbol, "action":"flat", "reason":"atr_warming_up"}
+
+    # Entry: trend up and price breaks above fast EMA by ATR_K*ATR
+    if c > ema_s and ema_f > ema_s and c > (ema_f + ATR_K * atr):
+        return {"symbol":symbol, "action":"buy", "reason":"atr_breakout_trend_up"}
+
+    # Exit: lose fast EMA or move below negative ATR band
+    if have_long and (c < ema_f or c < (ema_f - ATR_K * atr)):
+        return {"symbol":symbol, "action":"sell", "reason":"atr_reversal_or_trend_loss"}
+
+    return {"symbol":symbol, "action":"flat", "reason":"hold_in_pos" if have_long else "no_signal"}
 
 def run_scan(symbols, timeframe, limit, notional, dry, extra):
-    results, placed=[],[]
-    epoch=int(time.time())
+    out, placed = [], []
+    epoch = int(time.time())
     for s in symbols:
-        dec=_decide(s,_bars(s,timeframe,limit))
-        results.append(dec)
-        if dry or dec["action"]=="flat": continue
-        if dec["action"]=="sell" and not _has_long(s): continue
-        coid=f"{STRATEGY_NAME}-{epoch}-{_sym(s).lower()}"
-        res=_place(s,dec["action"],notional,coid)
+        dec = _decide(s, _bars(s, timeframe, limit))
+        out.append(dec)
+        if dry or dec["action"] == "flat":
+            continue
+        if dec["action"] == "sell" and not _has_long(s):
+            continue
+        coid = f"{STRATEGY_NAME}-{epoch}-{_sym(s).lower()}"
+        res = _place(s, dec["action"], notional, coid)
         if "error" not in res:
-            placed.append({"symbol":s,"side":dec["action"],"notional":notional,"status":res.get("status","accepted"),
-                           "client_order_id":res.get("client_order_id",coid),"filled_avg_price":res.get("filled_avg_price"),
-                           "id":res.get("id")})
-    return {"strategy":STRATEGY_NAME,"version":STRATEGY_VERSION,"results":results,"placed":placed}
+            placed.append({
+                "symbol": s, "side": dec["action"], "notional": notional,
+                "status": res.get("status","accepted"),
+                "client_order_id": res.get("client_order_id", coid),
+                "filled_avg_price": res.get("filled_avg_price"),
+                "id": res.get("id")
+            })
+    return {"strategy":STRATEGY_NAME, "version":STRATEGY_VERSION, "results":out, "placed":placed}
