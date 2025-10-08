@@ -1,21 +1,21 @@
 # strategies/c2.py
-# Version: 1.4.0 (env-tunable, optimizer-friendly)
+# Version: 1.5.0 (env-tunable, anti-pyramiding)
 from __future__ import annotations
 import os, time
 from typing import Any, Dict, List
 import broker as br
 
 STRATEGY_NAME = "c2"
-STRATEGY_VERSION = "1.4.0"
+STRATEGY_VERSION = "1.5.0"
 
 # === Tunables (env overrides) ===
 C2_EMA_FAST = int(os.getenv("C2_EMA_FAST", "12"))
-C2_EMA_SLOW = int(os.getenv("C2_EMA_SLOW", "34"))
+C2_EMA_SLOW = int(os.getenv("C2_EMA_SLOW", "50"))
 C2_RSI_LEN  = int(os.getenv("C2_RSI_LEN",  os.getenv("C2_RSI", "14")))
 C2_RSI_LOW  = int(os.getenv("C2_RSI_LOW",  "28"))
 C2_RSI_HIGH = int(os.getenv("C2_RSI_HIGH", "65"))
 
-# Back-compat aliases (silence optimizer warnings)
+# Back-compat aliases
 EMA_FAST = C2_EMA_FAST
 EMA_SLOW = C2_EMA_SLOW
 RSI_LEN  = C2_RSI_LEN
@@ -93,7 +93,7 @@ def _decide(symbol, bars):
     have_long = _has_long(symbol) is not None
 
     # Entry: trend up and RSI recovering from oversold
-    if c > ema_s and ema_f > ema_s and rsi_v is not None and rsi_v > C2_RSI_LOW:
+    if not have_long and c > ema_s and ema_f > ema_s and rsi_v is not None and rsi_v > C2_RSI_LOW:
         return {"symbol":symbol, "action":"buy", "reason":"trend_up_rsi_recover"}
 
     # Exit: momentum fade or trend loss
@@ -108,10 +108,17 @@ def run_scan(symbols, timeframe, limit, notional, dry, extra):
     for s in symbols:
         dec = _decide(s, _bars(s, timeframe, limit))
         out.append(dec)
+
+        # 🔒 prevent pyramiding: if already long, skip any new "buy"
+        already = _has_long(s) is not None
+
         if dry or dec["action"] == "flat":
             continue
-        if dec["action"] == "sell" and not _has_long(s):
+        if dec["action"] == "buy" and already:
             continue
+        if dec["action"] == "sell" and not already:
+            continue
+
         coid = f"{STRATEGY_NAME}-{epoch}-{_sym(s).lower()}"
         res = _place(s, dec["action"], notional, coid)
         if "error" not in res:
