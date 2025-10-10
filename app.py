@@ -1023,24 +1023,36 @@ def metrics_scorecard(hours: int = 168, last_n_trades: int = 0):
     return JSONResponse({"ok": True, "data": out, "count_strategies": len(out)})
 
 @app.post("/init/positions")
-async def init_positions():
+def init_positions():
+    """
+    Initialize the in-memory positions cache from the active broker.
+    Works with both Alpaca and Kraken. If the broker doesn't support positions,
+    falls back to empty positions.
+    """
+    global _positions_cache
     try:
-        pos = br.list_positions() or []
-        global _positions_state
-        _positions_state = {}
-        for p in pos:
-            sym = _sym_to_slash(p.get("symbol") or p.get("Symbol") or "")
-            try:
-                qty = float(p.get("qty") or p.get("quantity") or p.get("qty_available") or p.get("size") or p.get("Qty") or 0.0)
-            except Exception:
-                qty = 0.0
-            avg = float(p.get("avg_entry_price") or p.get("average_entry_price") or p.get("avg_price") or 0.0)
-            if sym and qty and avg:
-                _positions_state[sym] = {"qty": qty, "avg_price": avg}
-        _summary["equity"] = _recalc_equity()
-        ts = _now_iso(); _summary["updated_at"] = ts; _attribution["updated_at"] = ts
-        return {"ok": True, "positions": _positions_state}
+        # use the already-selected module-level 'br' (alpaca or kraken), DO NOT re-import
+        getpos = getattr(br, "get_positions", None)
+        raw_positions = getpos() if callable(getpos) else []
+
+        # Normalize to { "SYMBOL": {qty, avg_price, ...}, ... } like your UI expects.
+        positions = {}
+        for p in (raw_positions or []):
+            sym = (p.get("symbol") or p.get("Symbol") or p.get("pair") or "").upper()
+            if not sym:
+                continue
+            qty = p.get("qty") or p.get("quantity") or p.get("size") or 0
+            avg = p.get("avg_entry_price") or p.get("avg_price") or p.get("price") or 0
+            try: qty = float(qty)
+            except: qty = 0.0
+            try: avg = float(avg)
+            except: avg = 0.0
+            positions[sym] = {"qty": qty, "avg_price": avg}
+
+        _positions_cache = positions
+        return {"ok": True, "positions": positions}
     except Exception as e:
+        log.exception("init/positions failed: %s", e)
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/init/backfill")
