@@ -160,6 +160,15 @@ def _spread_bps(last: float, bid: float = None, ask: float = None) -> float:
     return 4.0
 
 # -----------------------------------------------------------------------------
+# Broker switch (Alpaca vs Kraken)
+# -----------------------------------------------------------------------------
+BROKER = os.getenv("BROKER", "alpaca").lower()
+if BROKER == "kraken":
+    import broker_kraken as br
+else:
+    import broker as br
+
+# -----------------------------------------------------------------------------
 # Symbol Universe (multi-coin) ------------------------------------------------
 # -----------------------------------------------------------------------------
 _CURRENT_SYMBOLS: List[str] = []
@@ -335,7 +344,6 @@ _positions_state: Dict[str, Dict[str, float]] = {}  # symbol -> {"qty": float, "
 
 def _get_last_price(symbol_slash: str) -> float:
     try:
-        import broker as br
         pmap = br.last_trade_map([symbol_slash])
         return float(pmap.get(symbol_slash, {}).get("price") or 0.0)
     except Exception:
@@ -419,7 +427,6 @@ def _recalc_equity() -> float:
     syms = [s for s, p in _positions_state.items() if p.get("qty", 0) > 0]
     if not syms: return 0.0
     try:
-        import broker as br
         pmap = br.last_trade_map(syms)
     except Exception:
         pmap = {}
@@ -480,7 +487,6 @@ def _push_orders(orders: List[Dict[str, Any]]):
 
 async def _exit_nanny(symbols: List[str], timeframe: str):
     try:
-        import broker as br
         bars_map = br.get_bars(symbols, timeframe=timeframe, limit=max(GUARDS["ema_slow"], 60)) or {}
         last_trade_map = br.last_trade_map(symbols) or {}
     except Exception:
@@ -503,7 +509,6 @@ async def _exit_nanny(symbols: List[str], timeframe: str):
         # Take profit
         if up_bps >= GUARDS["tp_target_bps"] and TRADING_ENABLED:
             try:
-                import broker as br
                 coid = f"nanny-tp-{sym.replace('/','')}-{int(time.time())}"
                 br.submit_order(symbol=sym, side="sell", notional=min(DEFAULT_NOTIONAL, qty * last), client_order_id=coid)
                 log.info("exit_nanny: TP sell placed for %s", sym)
@@ -519,7 +524,6 @@ async def _exit_nanny(symbols: List[str], timeframe: str):
             crossed = False
         if crossed and TRADING_ENABLED:
             try:
-                import broker as br
                 coid = f"nanny-x-{sym.replace('/','')}-{int(time.time())}"
                 br.submit_order(symbol=sym, side="sell", notional=min(DEFAULT_NOTIONAL, qty * last), client_order_id=coid)
                 log.info("exit_nanny: no-cross sell placed for %s", sym)
@@ -548,7 +552,6 @@ async def _scan_bridge(strat: str, req: Dict[str, Any], dry: bool = False) -> Li
 
     # Basic guard: EMA/spread sanity for BUYs
     try:
-        import broker as br
         bars_map = br.get_bars(req["symbols"], timeframe=req["timeframe"], limit=60) or {}
     except Exception:
         bars_map = {}
@@ -891,7 +894,6 @@ async def analytics_trades_csv(hours: int = 12):
     return buf.getvalue()
 
 def _fetch_filled_orders_last_hours(hours: int) -> list:
-    import broker as br
     since = datetime.now(timezone.utc) - timedelta(hours=hours)
     raw = br.list_orders(status="all", limit=1000) or []
     out = []
@@ -910,13 +912,11 @@ def _fetch_filled_orders_last_hours(hours: int) -> list:
 
 @app.get("/diag/orders_raw")
 async def diag_orders_raw(status: str = "all", limit: int = 25):
-    import broker as br
     data = br.list_orders(status=status, limit=limit) or []
     return {"status": status, "limit": limit, "orders": data}
 
 @app.get("/diag/bars")
 async def diag_bars(symbols: str = "", tf: str = "", limit: int = 360):
-    import broker as br
     syms = [s.strip().upper() for s in (symbols or ",".join(_CURRENT_SYMBOLS)).split(",") if s.strip()]
     bars = br.get_bars(syms, timeframe=(tf or DEFAULT_TIMEFRAME), limit=int(limit))
     return {"timeframe": (tf or DEFAULT_TIMEFRAME), "limit": limit, "counts": {k: len(v) for k, v in bars.items()}, "keys": list(bars.keys())}
@@ -957,7 +957,6 @@ async def diag_scan(
 @app.get("/diag/alpaca")
 async def diag_alpaca():
     try:
-        import broker as br
         pos = br.list_positions()
         bars = br.get_bars(["BTC/USD", "ETH/USD"], timeframe=DEFAULT_TIMEFRAME, limit=3)
         return {
@@ -1026,7 +1025,6 @@ def metrics_scorecard(hours: int = 168, last_n_trades: int = 0):
 @app.post("/init/positions")
 async def init_positions():
     try:
-        import broker as br
         pos = br.list_positions() or []
         global _positions_state
         _positions_state = {}
@@ -1048,7 +1046,6 @@ async def init_positions():
 @app.post("/init/backfill")
 async def init_backfill(days: Optional[int] = None, status: str = "closed"):
     try:
-        import broker as br
         lookback_days = int(days or os.getenv("INIT_BACKFILL_DAYS", "7"))
         after = datetime.now(timezone.utc) - timedelta(days=lookback_days)
         raws = br.list_orders(status=status, limit=1000) or []
