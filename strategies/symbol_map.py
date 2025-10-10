@@ -1,66 +1,139 @@
 # strategies/symbol_map.py
-# Maps our internal symbols/timeframes <-> Kraken
+"""
+Robust symbol + timeframe mapping for Kraken.
 
-# Kraken uses XBT (not BTC). Most others match 1:1 with "/USD".
-_TO_KRAKEN = {
-    "BTC/USD": "XBT/USD",
-    "ETH/USD": "ETH/USD",
-    "SOL/USD": "SOL/USD",
-    "DOGE/USD": "DOGE/USD",
-    "ADA/USD": "ADA/USD",
-    "AVAX/USD": "AVAX/USD",
-    "LTC/USD": "LTC/USD",
-    "BCH/USD": "BCH/USD",
-    "LINK/USD": "LINK/USD",
-    "DOT/USD": "DOT/USD",
-    "MATIC/USD": "MATIC/USD",
-    "XRP/USD": "XRP/USD",
-    "TRX/USD": "TRX/USD",
-    "ATOM/USD": "ATOM/USD",
-    "FIL/USD": "FIL/USD",
-    "NEAR/USD": "NEAR/USD",
-    "APT/USD": "APT/USD",   # if not listed by Kraken, you’ll get a 400 on bars/orders
-    "ARB/USD": "ARB/USD",
-    "OP/USD":  "OP/USD",
-    "ETC/USD": "ETC/USD",
-    "ALGO/USD":"ALGO/USD",
-    "SUI/USD": "SUI/USD",
-    "AAVE/USD":"AAVE/USD",
-    "UNI/USD": "UNI/USD",
-}
+- Resolves "BASE/QUOTE" (e.g., BTC/USD) to Kraken's OHLC pair "altname" (e.g., XBTUSD)
+  by fetching AssetPairs once and caching the result.
+- Falls back to a small static map if the live fetch fails (startup/offline).
+- Maps app timeframes (e.g., "5Min") to Kraken OHLC `interval` minutes.
+"""
 
-# Inverse map for convenience if ever needed
-_FROM_KRAKEN = {v: k for k, v in _TO_KRAKEN.items()}
+from __future__ import annotations
+import os
+import time
+import threading
+from typing import Dict, Optional
 
-# Our internal timeframes are strings like "1Min", "5Min", "15Min", "60Min"
-# Kraken OHLC intervals are ints: 1,5,15,60,240,1440,10080,21600
-_TF_TO_KRAKEN = {
+import requests
+
+# ---- Timeframe map (add more if your app uses them) ----
+TF_TO_KRAKEN: Dict[str, int] = {
     "1Min": 1,
     "5Min": 5,
     "15Min": 15,
-    "30Min": 30,   # Kraken doesn’t have 30 explicitly; some endpoints support it; if not, you’ll get a 400
-    "60Min": 60,
-    "240Min": 240,
-    "1440Min": 1440,     # 1 day
+    "30Min": 30,
+    "1Hour": 60,
+    "4Hour": 240,
+    "1Day": 1440,
 }
 
-def to_kraken(sym: str) -> str:
-    """Return Kraken pair name for our internal 'XXX/USD'."""
-    return _TO_KRAKEN.get(sym, sym)
+# ---- Fallback static guesses (used only if the live resolver can't load) ----
+FALLBACK_TO_KRAKEN: Dict[str, str] = {
+    "BTC/USD": "XBTUSD",
+    "ETH/USD": "ETHUSD",
+    "SOL/USD": "SOLUSD",
+    "DOGE/USD": "DOGEUSD",   # If your account says XDGUSD, the live resolver will correct it
+    "ADA/USD": "ADAUSD",
+    "AVAX/USD": "AVAXUSD",
+    "LTC/USD": "LTCUSD",
+    "BCH/USD": "BCHUSD",
+    "LINK/USD": "LINKUSD",
+    "DOT/USD": "DOTUSD",
+    "MATIC/USD": "MATICUSD",
+    "XRP/USD": "XRPUSD",
+    "TRX/USD": "TRXUSD",
+    "ATOM/USD": "ATOMUSD",
+    "FIL/USD": "FILUSD",
+    "NEAR/USD": "NEARUSD",
+    "APT/USD": "APTUSD",
+    "ARB/USD": "ARBUSD",
+    "OP/USD": "OPUSD",
+    "ETC/USD": "ETCUSD",
+    "ALGO/USD": "ALGOUSD",
+    "SUI/USD": "SUIUSD",
+    "AAVE/USD": "AAVEUSD",
+    "UNI/USD": "UNIUSD",
+}
 
-def from_kraken(sym: str) -> str:
-    """Return our internal pair for a Kraken pair."""
-    return _FROM_KRAKEN.get(sym, sym)
+# ---- Live resolver (downloads AssetPairs once, refreshable) ----
+
+_ASSETPAIRS_CACHE_LOCK = threading.Lock()
+_ASSETPAIRS_CACHE: Optional[Dict[str, dict]] = None
+_ASSETPAIRS_LAST_LOAD: float = 0.0
+_ASSETPAIRS_TTL_SEC = float(os.getenv("KRAKEN_PAIRS_TTL", "3600"))  # 1 hour default
+
+def _load_assetpairs(force: bool = False) -> Optional[Dict[str, dict]]:
+    global _ASSETPAIRS_CACHE, _ASSETPAIRS_LAST_LOAD
+    now = time.time()
+    with _ASSETPAIRS_CACHE_LOCK:
+        if not force and _ASSETPAIRS_CACHE and (now - _ASSETPAIRS_LAST_LOAD) < _ASSETPAIRS_TTL_SEC:
+            return _ASSETPAIRS_CACHE
+        try:
+            r = requests.get("https://api.kraken.com/0/public/AssetPairs", timeout=10)
+            r.raise_for_status()
+            data = r.json()
+            if data.get("error"):
+                return _ASSETPAIRS_CACHE  # keep old if present
+            result = data.get("result") or {}
+            # Normalize into a dict keyed by uppercase wsname and altname for quick lookups
+            idx: Dict[str, dict] = {}
+            for pair_code, meta in result.items():
+                ws = (meta.get("wsname") or "").upper()      # e.g., "XBT/USD"
+                alt = (meta.get("altname") or "").upper()    # e.g., "XBTUSD"
+                if ws:
+                    idx[ws] = meta
+                if alt:
+                    idx[alt] = meta
+            _ASSETPAIRS_CACHE = idx
+            _ASSETPAIRS_LAST_LOAD = now
+            return _ASSETPAIRS_CACHE
+        except Exception:
+            # network/error — leave cache as-is to allow fallback
+            return _ASSETPAIRS_CACHE
+
+def to_kraken(symbol: str) -> str:
+    """
+    Convert "BTC/USD" style to Kraken OHLC 'pair' (altname), e.g. "XBTUSD".
+    Strategy:
+      1) Try exact wsname lookup (e.g., "XBT/USD") using live AssetPairs
+      2) Try altname lookup (e.g., "XBTUSD")
+      3) If symbol already looks like an altname (no slash), pass through
+      4) Fallback to static guess
+    """
+    s = symbol.strip().upper()
+    # Already altname style?
+    if "/" not in s:
+        return s
+
+    # Load live pairs
+    idx = _load_assetpairs(force=False)
+
+    # 1) Try wsname direct (e.g., "BTC/USD" or "XBT/USD")
+    if idx:
+        # Kraken wsname for BTC/USD is usually "XBT/USD", so check either form
+        if s in idx and idx[s].get("altname"):
+            return idx[s]["altname"].upper()
+
+        # Also try the 'crypto-standard' XBT/USD when user asked for BTC/USD
+        if s.startswith("BTC/"):
+            xbt_ws = "XBT/" + s.split("/", 1)[1]
+            if xbt_ws in idx and idx[xbt_ws].get("altname"):
+                return idx[xbt_ws]["altname"].upper()
+
+    # 2) Try simple join (BASE+QUOTE) as altname (e.g., "BTCUSD"), or XBT tweak
+    base, quote = s.split("/", 1)
+    guesses = [base + quote]
+    if base == "BTC":
+        guesses.insert(0, "XBT" + quote)
+    for g in guesses:
+        if idx and g in idx:
+            return idx[g].get("altname", g).upper()
+
+    # 3) Fallback static
+    return FALLBACK_TO_KRAKEN.get(s, guesses[0].upper())
 
 def tf_to_kraken(tf: str) -> int:
-    """Map '5Min' -> 5 (minutes) for Kraken OHLC endpoints."""
-    if tf in _TF_TO_KRAKEN:
-        return _TF_TO_KRAKEN[tf]
-    # Fallback: try to parse "<N>Min"
-    if tf.endswith("Min"):
-        try:
-            return int(tf[:-3])
-        except:
-            pass
-    # Safe default: 5
-    return 5
+    v = TF_TO_KRAKEN.get(tf)
+    if v is None:
+        raise ValueError(f"Unsupported timeframe for Kraken: {tf}")
+    return v
