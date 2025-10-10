@@ -1,132 +1,76 @@
 # strategies/c2.py
-# Version: 1.5.0 (env-tunable, anti-pyramiding)
-from __future__ import annotations
-import os, time
-from typing import Any, Dict, List
-import broker as br
+import os, math
+from typing import List
+try:
+    import broker as br
+except Exception:
+    from strategies import broker as br
+from strategies import utils_volatility as uv
 
-STRATEGY_NAME = "c2"
-STRATEGY_VERSION = "1.5.0"
-
-# === Tunables (env overrides) ===
-C2_EMA_FAST = int(os.getenv("C2_EMA_FAST", "12"))
-C2_EMA_SLOW = int(os.getenv("C2_EMA_SLOW", "50"))
-C2_RSI_LEN  = int(os.getenv("C2_RSI_LEN",  os.getenv("C2_RSI", "14")))
-C2_RSI_LOW  = int(os.getenv("C2_RSI_LOW",  "28"))
-C2_RSI_HIGH = int(os.getenv("C2_RSI_HIGH", "65"))
-
-# Back-compat aliases
-EMA_FAST = C2_EMA_FAST
-EMA_SLOW = C2_EMA_SLOW
-RSI_LEN  = C2_RSI_LEN
-RSI_LO   = C2_RSI_LOW
-RSI_HI   = C2_RSI_HIGH
-
-def _sym(s: str) -> str:
-    return s.replace("/", "")
-
-def _bars(symbol: str, timeframe: str, limit: int):
-    try:
-        m = br.get_bars(symbol, timeframe=timeframe, limit=limit)
-        return m.get(symbol, [])
-    except Exception:
-        return []
-
-def _positions():
-    try:
-        return br.list_positions()
-    except Exception:
-        return []
-
-def _has_long(symbol):
-    sym = _sym(symbol)
-    for p in _positions():
-        psym = p.get("symbol") or p.get("asset_symbol")
-        if psym == sym and p.get("side","long").lower() == "long":
-            return p
-    return None
-
-def _place(symbol: str, side: str, notional: float, client_id: str):
-    try:
-        return br.place_order(symbol, side, notional, client_id)
-    except Exception as ex:
-        return {"error": str(ex)}
+STRAT = "c2"
+VER   = os.getenv("C2_VER", "v2.0")
 
 def _ema(vals, n):
-    if not vals or n <= 0: return []
-    k = 2/(n+1)
-    out = []
-    ema = None
-    for v in vals:
-        ema = v if ema is None else (v*k + ema*(1-k))
-        out.append(ema)
-    return out
+    if n <= 1 or len(vals) < n: return None
+    k = 2.0/(n+1.0); e = vals[0]
+    for v in vals[1:]: e = v*k + e*(1-k)
+    return e
 
 def _rsi(closes, n=14):
-    if len(closes) < n+2: return []
-    gains, losses = [], []
+    if len(closes) < n+1: return None
+    gains = []; losses=[]
     for i in range(1, len(closes)):
-        ch = closes[i] - closes[i-1]
-        gains.append(max(0.0, ch))
-        losses.append(max(0.0, -ch))
-    avg_g = sum(gains[:n]) / n
-    avg_l = sum(losses[:n]) / n
-    rsis = [None]*n
-    for i in range(n, len(gains)):
-        avg_g = (avg_g*(n-1) + gains[i]) / n
-        avg_l = (avg_l*(n-1) + losses[i]) / n
-        rs = (avg_g / avg_l) if avg_l > 0 else float('inf')
-        rsi = 100 - (100 / (1 + rs))
-        rsis.append(rsi)
-    return rsis
+        d = closes[i]-closes[i-1]
+        gains.append(max(d,0.0)); losses.append(max(-d,0.0))
+    ag = sum(gains[-n:]) / n; al = sum(losses[-n:]) / n
+    rs = (ag / al) if al>0 else float("inf")
+    return 100.0 - (100.0 / (1.0 + rs))
 
-def _decide(symbol, bars):
-    need = max(C2_EMA_SLOW + 10, C2_RSI_LEN + 10, 120)
-    if len(bars) < need:
-        return {"symbol":symbol, "action":"flat", "reason":"insufficient_bars"}
+def _pos_for(symbol):
+    sym = symbol.replace("/", "")
+    for p in br.list_positions():
+        if p.get("symbol")==sym or p.get("asset_symbol")==sym:
+            return float(p.get("qty",0.0)), float(p.get("avg_entry_price",0.0))
+    return 0.0, 0.0
 
-    closes = [float(b["c"]) for b in bars]
-    c = closes[-1]
-    ema_f = _ema(closes, C2_EMA_FAST)[-1]
-    ema_s = _ema(closes, C2_EMA_SLOW)[-1]
-    rsi_v = _rsi(closes, C2_RSI_LEN)[-1]
-    have_long = _has_long(symbol) is not None
+def run_scan(symbols, timeframe, limit, notional, live, ctx):
+    EMA_FAST = int(os.getenv("C2_EMA_FAST", "12"))
+    EMA_SLOW = int(os.getenv("C2_EMA_SLOW", "60"))
+    RSI_LEN  = int(os.getenv("C2_RSI_LEN",  os.getenv("C2_RSI", "14")))
+    RSI_LO   = int(os.getenv("C2_RSI_LOW",  "25"))
+    RSI_HI   = int(os.getenv("C2_RSI_HIGH", "65"))
 
-    # Entry: trend up and RSI recovering from oversold
-    if not have_long and c > ema_s and ema_f > ema_s and rsi_v is not None and rsi_v > C2_RSI_LOW:
-        return {"symbol":symbol, "action":"buy", "reason":"trend_up_rsi_recover"}
+    ATR_LEN   = int(os.getenv("VOL_ATR_LEN", "14"))
+    MED_LEN   = int(os.getenv("VOL_MEDIAN_LEN", "20"))
+    VOL_K     = float(os.getenv("VOL_K", "1.0"))
 
-    # Exit: momentum fade or trend loss
-    if have_long and ((rsi_v is not None and rsi_v > C2_RSI_HIGH and c < ema_f) or (c < ema_s)):
-        return {"symbol":symbol, "action":"sell", "reason":"momentum_faded_or_trend_lost"}
-
-    return {"symbol":symbol, "action":"flat", "reason":"hold_in_pos" if have_long else "no_signal"}
-
-def run_scan(symbols, timeframe, limit, notional, dry, extra):
-    out, placed = [], []
-    epoch = int(time.time())
-    for s in symbols:
-        dec = _decide(s, _bars(s, timeframe, limit))
-        out.append(dec)
-
-        # 🔒 prevent pyramiding: if already long, skip any new "buy"
-        already = _has_long(s) is not None
-
-        if dry or dec["action"] == "flat":
-            continue
-        if dec["action"] == "buy" and already:
-            continue
-        if dec["action"] == "sell" and not already:
+    for sym in (symbols if isinstance(symbols, list) else [symbols]):
+        ok,_ = uv.is_tradeable(sym, timeframe, limit, atr_len=ATR_LEN, median_len=MED_LEN, k=VOL_K)
+        if not ok: 
             continue
 
-        coid = f"{STRATEGY_NAME}-{epoch}-{_sym(s).lower()}"
-        res = _place(s, dec["action"], notional, coid)
-        if "error" not in res:
-            placed.append({
-                "symbol": s, "side": dec["action"], "notional": notional,
-                "status": res.get("status","accepted"),
-                "client_order_id": res.get("client_order_id", coid),
-                "filled_avg_price": res.get("filled_avg_price"),
-                "id": res.get("id")
-            })
-    return {"strategy":STRATEGY_NAME, "version":STRATEGY_VERSION, "results":out, "placed":placed}
+        data = br.get_bars(sym, timeframe=timeframe, limit=max(limit, EMA_SLOW + 5))
+        bars = data.get(sym, [])
+        if len(bars) < EMA_SLOW + 5: 
+            continue
+
+        closes = [float(b["c"]) for b in bars]
+        ema_f = _ema(closes[-EMA_FAST:], EMA_FAST)
+        ema_s = _ema(closes[-EMA_SLOW:], EMA_SLOW)
+        rsi = _rsi(closes, RSI_LEN)
+        if ema_f is None or ema_s is None or rsi is None:
+            continue
+
+        last = closes[-1]
+        have, avg_px = _pos_for(sym)
+        symclean = sym.replace("/", "").lower()
+
+        if have <= 1e-12 and rsi <= RSI_LO and ema_f >= ema_s:
+            cid = f"{STRAT}-{VER}-buy-{symclean}"
+            br.place_order(sym, "buy", notional, cid)
+            return
+
+        if have > 1e-12 and (rsi >= RSI_HI or ema_f < ema_s):
+            cid = f"{STRAT}-{VER}-sell-{symclean}"
+            br.place_order(sym, "sell", notional, cid)
+            return

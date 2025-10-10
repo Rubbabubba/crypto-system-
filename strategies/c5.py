@@ -1,110 +1,59 @@
 # strategies/c5.py
-# Version: 1.2.1 (env-tunable, optimizer-friendly)
-from __future__ import annotations
-import os, time
-from typing import Any, Dict, List
-import broker as br
+import os
+try:
+    import broker as br
+except Exception:
+    from strategies import broker as br
+from strategies import utils_volatility as uv
 
-STRATEGY_NAME = "c5"
-STRATEGY_VERSION = "1.2.1"
+STRAT = "c5"
+VER   = os.getenv("C5_VER", "v2.0")
 
-# === Tunables (env overrides) ===
-C5_BAND_K = float(os.getenv("C5_BAND_K", "0.997"))  # entry: price < vwap * C5_BAND_K
-C5_EXIT_K = float(os.getenv("C5_EXIT_K", "1.002"))  # exit:  price > vwap * C5_EXIT_K
+def _highest(xs, n): return max(xs[-n:]) if len(xs)>=n else None
+def _lowest(xs, n):  return min(xs[-n:]) if len(xs)>=n else None
 
-# expose for optimizers
-BAND_K = C5_BAND_K
-EXIT_K = C5_EXIT_K
+def _pos_for(symbol):
+    sym = symbol.replace("/", "")
+    for p in br.list_positions():
+        if p.get("symbol")==sym or p.get("asset_symbol")==sym:
+            return float(p.get("qty",0.0)), float(p.get("avg_entry_price",0.0))
+    return 0.0, 0.0
 
-def _sym(s: str) -> str:
-    return s.replace("/", "")
+def run_scan(symbols, timeframe, limit, notional, live, ctx):
+    BAND_K = float(os.getenv("C5_BAND_K", "1.03"))
+    EXIT_K = float(os.getenv("C5_EXIT_K", "0.985"))
+    LOOK   = 40
 
-def _bars(symbol: str, timeframe: str, limit: int) -> List[Dict[str, Any]]:
-    try:
-        m = br.get_bars(symbol, timeframe=timeframe, limit=limit)
-        return m.get(symbol, [])
-    except Exception:
-        return []
+    ATR_LEN   = int(os.getenv("VOL_ATR_LEN", "14"))
+    MED_LEN   = int(os.getenv("VOL_MEDIAN_LEN", "20"))
+    VOL_K     = float(os.getenv("VOL_K", "1.0"))
 
-def _positions() -> List[Dict[str, Any]]:
-    try:
-        return br.list_positions()
-    except Exception:
-        return []
-
-def _has_long(symbol: str):
-    sym = _sym(symbol)
-    for p in _positions():
-        psym = p.get("symbol") or p.get("asset_symbol")
-        if psym == sym and p.get("side","long").lower() == "long":
-            return p
-    return None
-
-def _place(symbol: str, side: str, notional: float, client_id: str):
-    try:
-        return br.place_order(symbol, side, notional, client_id)
-    except Exception as ex:
-        return {"error": str(ex)}
-
-def _ema(vals, n):
-    if not vals or n <= 0: return []
-    k = 2/(n+1)
-    out, ema = [], None
-    for v in vals:
-        ema = v if ema is None else (v*k + ema*(1-k))
-        out.append(ema)
-    return out
-
-def _vwap(bars):
-    cum_pv = 0.0; cum_v = 0.0; out=[]
-    for b in bars:
-        h,l,c,v = float(b["h"]), float(b["l"]), float(b["c"]), float(b["v"])
-        tp = (h+l+c)/3.0
-        cum_pv += tp*v
-        cum_v  += v
-        out.append(cum_pv/max(1e-9,cum_v))
-    return out
-
-def _decide(symbol: str, bars: List[Dict[str, Any]]):
-    need = 150
-    if len(bars) < need:
-        return {"symbol":symbol, "action":"flat", "reason":"insufficient_bars"}
-
-    closes = [float(b["c"]) for b in bars]
-    c = closes[-1]
-    v = _vwap(bars)[-1]
-    ema50  = _ema(closes, 50)[-1]
-    ema200 = _ema(closes, 200)[-1]
-    have_long = _has_long(symbol) is not None
-
-    # Entry: uptrend with a dip under VWAP
-    if ema50 > ema200 and c < v * C5_BAND_K:
-        return {"symbol":symbol, "action":"buy", "reason":"vwap_pullback_in_uptrend"}
-
-    # Exit: revert above VWAP*exit_k or trend loss
-    if have_long and (c > v * C5_EXIT_K or ema50 < ema200):
-        return {"symbol":symbol, "action":"sell", "reason":"vwap_revert_or_trend_loss"}
-
-    return {"symbol":symbol, "action":"flat", "reason":"hold_in_pos" if have_long else "no_signal"}
-
-def run_scan(symbols, timeframe, limit, notional, dry, extra):
-    out, placed = [], []
-    epoch = int(time.time())
-    for s in symbols:
-        dec = _decide(s, _bars(s, timeframe, limit))
-        out.append(dec)
-        if dry or dec["action"] == "flat":
+    for sym in (symbols if isinstance(symbols, list) else [symbols]):
+        ok,_ = uv.is_tradeable(sym, timeframe, limit, atr_len=ATR_LEN, median_len=MED_LEN, k=VOL_K)
+        if not ok: 
             continue
-        if dec["action"] == "sell" and not _has_long(s):
+
+        data = br.get_bars(sym, timeframe=timeframe, limit=max(limit, LOOK + 5))
+        bars = data.get(sym, [])
+        if len(bars) < LOOK + 5:
             continue
-        coid = f"{STRATEGY_NAME}-{epoch}-{_sym(s).lower()}"
-        res = _place(s, dec["action"], notional, coid)
-        if "error" not in res:
-            placed.append({
-                "symbol": s, "side": dec["action"], "notional": notional,
-                "status": res.get("status","accepted"),
-                "client_order_id": res.get("client_order_id", coid),
-                "filled_avg_price": res.get("filled_avg_price"),
-                "id": res.get("id")
-            })
-    return {"strategy":STRATEGY_NAME, "version":STRATEGY_VERSION, "results": out, "placed": placed}
+
+        highs = [float(b["h"]) for b in bars]
+        lows  = [float(b["l"]) for b in bars]
+        last  = float(bars[-1]["c"])
+        hh = _highest(highs, LOOK); ll = _lowest(lows, LOOK)
+        if hh is None or ll is None: 
+            continue
+
+        have, avg = _pos_for(sym)
+        symclean = sym.replace("/", "").lower()
+
+        if have <= 1e-12 and last >= hh * BAND_K:
+            cid = f"{STRAT}-{VER}-buy-{symclean}"
+            br.place_order(sym, "buy", notional, cid)
+            return
+
+        if have > 1e-12 and last <= hh * EXIT_K:
+            cid = f"{STRAT}-{VER}-sell-{symclean}"
+            br.place_order(sym, "sell", notional, cid)
+            return

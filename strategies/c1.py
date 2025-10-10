@@ -1,116 +1,74 @@
 # strategies/c1.py
-# Version: 1.5.0 (env-tunable)
-from __future__ import annotations
-import os, time, math, datetime as dt
-from typing import Any, Dict, List
-import broker as br
+import os, math
+from typing import List, Dict
+try:
+    import broker as br
+except Exception:
+    from strategies import broker as br
+from strategies import utils_volatility as uv
 
-STRATEGY_NAME = "c1"
-STRATEGY_VERSION = "1.5.0"
+STRAT = "c1"
+VER   = os.getenv("C1_VER", "v2.0")
 
-# === Tunable knobs (defaults match your prior behavior) ===
-# EMA period used as the trend filter
-C1_EMA = int(os.getenv("C1_EMA", "50"))
-# Buy only if price is above EMA and within this pullback below VWAP (e.g., 0.997 = within 0.3% under VWAP)
-C1_VWAP_PULL = float(os.getenv("C1_VWAP_PULL", "0.997"))
+def _ema(vals, n):
+    if n <= 1 or len(vals) < n: return None
+    k = 2.0 / (n + 1.0)
+    ema = vals[0]
+    for v in vals[1:]:
+        ema = v * k + ema * (1 - k)
+    return ema
 
-# ---------- Helpers ----------
-def _sym(s: str) -> str:
-    return s.replace("/","")
-
-def _bars(symbol: str, timeframe: str, limit: int) -> List[Dict[str,Any]]:
-    try:
-        m = br.get_bars(symbol, timeframe=timeframe, limit=limit)
-        return m.get(symbol, [])
-    except Exception:
-        return []
-
-def _positions() -> List[Dict[str,Any]]:
-    try:
-        return br.list_positions()
-    except Exception:
-        return []
-
-def _has_long(symbol: str) -> Dict[str,Any] | None:
-    sym = _sym(symbol)
-    for p in _positions():
-        psym = p.get("symbol") or p.get("asset_symbol")
-        if psym == sym and (p.get("side","long").lower() == "long"):
-            return p
-    return None
-
-def _place(symbol: str, side: str, notional: float, client_id: str) -> Dict[str,Any]:
-    try:
-        return br.place_order(symbol, side, notional, client_id)
-    except Exception as ex:
-        return {"error": str(ex)}
-
-def _ema(vals: List[float], n: int) -> List[float]:
-    if not vals or n <= 0: return []
-    k = 2/(n+1)
-    out, ema = [], None
-    for v in vals:
-        ema = v if ema is None else (v*k + ema*(1-k))
-        out.append(ema)
-    return out
-
-def _vwap(bars: List[Dict[str,Any]]) -> List[float]:
-    cum_pv = 0.0
-    cum_v  = 0.0
-    out=[]
+def _vwap(bars):
+    num = 0.0; den = 0.0
     for b in bars:
-        h,l,c,v = float(b["h"]), float(b["l"]), float(b["c"]), float(b["v"])
-        tp = (h+l+c)/3.0
-        cum_pv += tp*v
-        cum_v  += v
-        out.append(cum_pv/max(1e-9,cum_v))
-    return out
+        tp = (float(b["h"]) + float(b["l"]) + float(b["c"])) / 3.0
+        v  = float(b["v"])
+        num += tp * v; den += v
+    return (num / den) if den > 0 else float(bars[-1]["c"])
 
-# ---------- Logic ----------
-def _decide(symbol: str, bars: List[Dict[str,Any]]) -> Dict[str,str]:
-    # need enough bars for EMA and VWAP; keep a small cushion
-    need = max(60, int(C1_EMA) + 10)
-    if len(bars) < need:
-        return {"symbol": symbol, "action":"flat", "reason":"insufficient_bars"}
+def _pos_for(symbol):
+    sym = symbol.replace("/", "")
+    for p in br.list_positions():
+        if p.get("symbol") == sym or p.get("asset_symbol") == sym:
+            return float(p.get("qty", 0.0)), float(p.get("avg_entry_price", 0.0))
+    return 0.0, 0.0
 
-    closes = [float(b["c"]) for b in bars]
-    vwap   = _vwap(bars)
-    ema    = _ema(closes, int(C1_EMA))
+def run_scan(symbols, timeframe, limit, notional, live, ctx):
+    EMA = int(os.getenv("C1_EMA", "20"))
+    VWAP_PULL = float(os.getenv("C1_VWAP_PULL", "0.003"))  # 0.3%
 
-    c, v, e = closes[-1], vwap[-1], ema[-1]
-    have_long = _has_long(symbol) is not None
+    ATR_LEN   = int(os.getenv("VOL_ATR_LEN", "14"))
+    MED_LEN   = int(os.getenv("VOL_MEDIAN_LEN", "20"))
+    VOL_K     = float(os.getenv("VOL_K", "1.0"))
 
-    # Long only: in uptrend (price > EMA), dip to/below VWAP by pullback factor
-    if c > e and c < v * float(C1_VWAP_PULL):
-        return {"symbol": symbol, "action":"buy", "reason":"vwap_pullback_uptrend"}
-
-    # Exit: lose trend and below VWAP
-    if have_long and c < e and c < v:
-        return {"symbol": symbol, "action":"sell", "reason":"trend_break_under_vwap"}
-
-    return {"symbol": symbol, "action":"flat", "reason":"hold_in_pos" if have_long else "no_signal"}
-
-# ---------- Public API ----------
-def run_scan(symbols: List[str], timeframe: str, limit: int, notional: float, dry: bool, extra: Dict[str,Any]):
-    results, placed = [], []
-    epoch = int(time.time())
-    for s in symbols:
-        bars = _bars(s, timeframe, limit)
-        decision = _decide(s, bars)
-        results.append(decision)
-        if dry or decision["action"] == "flat":
+    for sym in (symbols if isinstance(symbols, list) else [symbols]):
+        ok, _ = uv.is_tradeable(sym, timeframe, limit, atr_len=ATR_LEN, median_len=MED_LEN, k=VOL_K)
+        if not ok:
             continue
-        # prevent sells if flat (backtester relies on this to realize PnL properly)
-        if decision["action"] == "sell" and not _has_long(s):
+
+        data = br.get_bars(sym, timeframe=timeframe, limit=max(limit, EMA + 5))
+        bars = data.get(sym, [])
+        if len(bars) < EMA + 5: 
             continue
-        coid = f"{STRATEGY_NAME}-{epoch}-{_sym(s).lower()}"
-        ordres = _place(s, decision["action"], notional, coid)
-        if "error" not in ordres:
-            placed.append({
-                "symbol": s, "side": decision["action"], "notional": notional,
-                "status": ordres.get("status","accepted"),
-                "client_order_id": ordres.get("client_order_id", coid),
-                "filled_avg_price": ordres.get("filled_avg_price"),
-                "id": ordres.get("id")
-            })
-    return {"strategy": STRATEGY_NAME, "version": STRATEGY_VERSION, "results": results, "placed": placed}
+
+        closes = [float(b["c"]) for b in bars]
+        ema_n = _ema(closes[-EMA:], EMA)
+        if ema_n is None:
+            continue
+
+        vwap_val = _vwap(bars[-EMA:])
+        last = float(bars[-1]["c"])
+
+        have, avg_px = _pos_for(sym)
+        pull = (vwap_val - last) / max(vwap_val, 1e-9)
+        symclean = sym.replace("/", "").lower()
+
+        if have <= 1e-12 and pull >= VWAP_PULL and last >= ema_n:
+            cid = f"{STRAT}-{VER}-buy-{symclean}"
+            br.place_order(sym, "buy", notional, cid)
+            return
+
+        if have > 1e-12 and (last >= vwap_val or last < ema_n):
+            cid = f"{STRAT}-{VER}-sell-{symclean}"
+            br.place_order(sym, "sell", notional, cid)
+            return
