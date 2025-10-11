@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 Crypto System – FastAPI service (Render-safe)
-Version: 2025.10.07-crypto-v3e
+Version: 2025.10.11-kraken-switch-b
 
 v3e adds:
 - Strategy runtime controls (/strategies, /strategies/enable, /disable, /reload)
@@ -17,6 +17,13 @@ import io
 import json
 import logging
 import os
+
+# --- Broker selection (Alpaca vs Kraken) ---
+BROKER = os.getenv("BROKER","alpaca").lower()
+if BROKER == "kraken":
+    # using selected broker module as br_kraken as br
+else:
+    # using selected broker module as br
 import time
 import importlib
 from collections import defaultdict, deque
@@ -72,7 +79,7 @@ LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 logging.basicConfig(level=LOG_LEVEL, format="%(asctime)s %(levelname)s:app:%(message)s")
 log = logging.getLogger("app")
 
-APP_VERSION = os.getenv("APP_VERSION", "2025.10.07-crypto-v3e")
+APP_VERSION = os.getenv("APP_VERSION", "2025.10.11-kraken-switch-b")
 TRADING_ENABLED = os.getenv("TRADING_ENABLED", "1") in ("1", "true", "True")
 SCHEDULE_SECONDS = int(os.getenv("SCHEDULE_SECONDS", os.getenv("SCHEDULER_INTERVAL_SEC", "60")))
 DEFAULT_LIMIT = int(os.getenv("DEFAULT_LIMIT", "300"))
@@ -158,15 +165,6 @@ def _spread_bps(last: float, bid: float = None, ask: float = None) -> float:
         mid = 0.5 * (bid + ask)
         return _bps((ask - bid) / mid)
     return 4.0
-
-# -----------------------------------------------------------------------------
-# Broker switch (Alpaca vs Kraken)
-# -----------------------------------------------------------------------------
-BROKER = os.getenv("BROKER", "alpaca").lower()
-if BROKER == "kraken":
-    import broker_kraken as br
-else:
-    import broker as br
 
 # -----------------------------------------------------------------------------
 # Symbol Universe (multi-coin) ------------------------------------------------
@@ -344,6 +342,7 @@ _positions_state: Dict[str, Dict[str, float]] = {}  # symbol -> {"qty": float, "
 
 def _get_last_price(symbol_slash: str) -> float:
     try:
+    # using selected broker module as br
         pmap = br.last_trade_map([symbol_slash])
         return float(pmap.get(symbol_slash, {}).get("price") or 0.0)
     except Exception:
@@ -427,6 +426,7 @@ def _recalc_equity() -> float:
     syms = [s for s, p in _positions_state.items() if p.get("qty", 0) > 0]
     if not syms: return 0.0
     try:
+    # using selected broker module as br
         pmap = br.last_trade_map(syms)
     except Exception:
         pmap = {}
@@ -487,6 +487,7 @@ def _push_orders(orders: List[Dict[str, Any]]):
 
 async def _exit_nanny(symbols: List[str], timeframe: str):
     try:
+    # using selected broker module as br
         bars_map = br.get_bars(symbols, timeframe=timeframe, limit=max(GUARDS["ema_slow"], 60)) or {}
         last_trade_map = br.last_trade_map(symbols) or {}
     except Exception:
@@ -509,6 +510,7 @@ async def _exit_nanny(symbols: List[str], timeframe: str):
         # Take profit
         if up_bps >= GUARDS["tp_target_bps"] and TRADING_ENABLED:
             try:
+    # using selected broker module as br
                 coid = f"nanny-tp-{sym.replace('/','')}-{int(time.time())}"
                 br.submit_order(symbol=sym, side="sell", notional=min(DEFAULT_NOTIONAL, qty * last), client_order_id=coid)
                 log.info("exit_nanny: TP sell placed for %s", sym)
@@ -524,6 +526,7 @@ async def _exit_nanny(symbols: List[str], timeframe: str):
             crossed = False
         if crossed and TRADING_ENABLED:
             try:
+    # using selected broker module as br
                 coid = f"nanny-x-{sym.replace('/','')}-{int(time.time())}"
                 br.submit_order(symbol=sym, side="sell", notional=min(DEFAULT_NOTIONAL, qty * last), client_order_id=coid)
                 log.info("exit_nanny: no-cross sell placed for %s", sym)
@@ -552,6 +555,7 @@ async def _scan_bridge(strat: str, req: Dict[str, Any], dry: bool = False) -> Li
 
     # Basic guard: EMA/spread sanity for BUYs
     try:
+    # using selected broker module as br
         bars_map = br.get_bars(req["symbols"], timeframe=req["timeframe"], limit=60) or {}
     except Exception:
         bars_map = {}
@@ -783,7 +787,7 @@ async def dashboard():
 
 @app.get("/healthz", include_in_schema=False)
 def healthz():
-    return {"ok": True, "version": APP_VERSION, "time": _now_iso()}
+    return {"ok": True, "version": APP_VERSION, "time": _now_iso(), "broker": BROKER}
 
 # ---- Universe endpoints ----
 @app.get("/universe", response_class=JSONResponse)
@@ -894,6 +898,7 @@ async def analytics_trades_csv(hours: int = 12):
     return buf.getvalue()
 
 def _fetch_filled_orders_last_hours(hours: int) -> list:
+    # using selected broker module as br
     since = datetime.now(timezone.utc) - timedelta(hours=hours)
     raw = br.list_orders(status="all", limit=1000) or []
     out = []
@@ -912,11 +917,13 @@ def _fetch_filled_orders_last_hours(hours: int) -> list:
 
 @app.get("/diag/orders_raw")
 async def diag_orders_raw(status: str = "all", limit: int = 25):
+    # using selected broker module as br
     data = br.list_orders(status=status, limit=limit) or []
     return {"status": status, "limit": limit, "orders": data}
 
 @app.get("/diag/bars")
 async def diag_bars(symbols: str = "", tf: str = "", limit: int = 360):
+    # using selected broker module as br
     syms = [s.strip().upper() for s in (symbols or ",".join(_CURRENT_SYMBOLS)).split(",") if s.strip()]
     bars = br.get_bars(syms, timeframe=(tf or DEFAULT_TIMEFRAME), limit=int(limit))
     return {"timeframe": (tf or DEFAULT_TIMEFRAME), "limit": limit, "counts": {k: len(v) for k, v in bars.items()}, "keys": list(bars.keys())}
@@ -957,6 +964,7 @@ async def diag_scan(
 @app.get("/diag/alpaca")
 async def diag_alpaca():
     try:
+    # using selected broker module as br
         pos = br.list_positions()
         bars = br.get_bars(["BTC/USD", "ETH/USD"], timeframe=DEFAULT_TIMEFRAME, limit=3)
         return {
@@ -1023,41 +1031,31 @@ def metrics_scorecard(hours: int = 168, last_n_trades: int = 0):
     return JSONResponse({"ok": True, "data": out, "count_strategies": len(out)})
 
 @app.post("/init/positions")
-def init_positions():
-    """
-    Initialize the in-memory positions cache from the active broker.
-    Works with both Alpaca and Kraken. If the broker doesn't support positions,
-    falls back to empty positions.
-    """
-    global _positions_cache
+async def init_positions():
     try:
-        # use the already-selected module-level 'br' (alpaca or kraken), DO NOT re-import
-        getpos = getattr(br, "get_positions", None)
-        raw_positions = getpos() if callable(getpos) else []
-
-        # Normalize to { "SYMBOL": {qty, avg_price, ...}, ... } like your UI expects.
-        positions = {}
-        for p in (raw_positions or []):
-            sym = (p.get("symbol") or p.get("Symbol") or p.get("pair") or "").upper()
-            if not sym:
-                continue
-            qty = p.get("qty") or p.get("quantity") or p.get("size") or 0
-            avg = p.get("avg_entry_price") or p.get("avg_price") or p.get("price") or 0
-            try: qty = float(qty)
-            except: qty = 0.0
-            try: avg = float(avg)
-            except: avg = 0.0
-            positions[sym] = {"qty": qty, "avg_price": avg}
-
-        _positions_cache = positions
-        return {"ok": True, "positions": positions}
+    # using selected broker module as br
+        pos = br.list_positions() or []
+        global _positions_state
+        _positions_state = {}
+        for p in pos:
+            sym = _sym_to_slash(p.get("symbol") or p.get("Symbol") or "")
+            try:
+                qty = float(p.get("qty") or p.get("quantity") or p.get("qty_available") or p.get("size") or p.get("Qty") or 0.0)
+            except Exception:
+                qty = 0.0
+            avg = float(p.get("avg_entry_price") or p.get("average_entry_price") or p.get("avg_price") or 0.0)
+            if sym and qty and avg:
+                _positions_state[sym] = {"qty": qty, "avg_price": avg}
+        _summary["equity"] = _recalc_equity()
+        ts = _now_iso(); _summary["updated_at"] = ts; _attribution["updated_at"] = ts
+        return {"ok": True, "positions": _positions_state}
     except Exception as e:
-        log.exception("init/positions failed: %s", e)
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/init/backfill")
 async def init_backfill(days: Optional[int] = None, status: str = "closed"):
     try:
+    # using selected broker module as br
         lookback_days = int(days or os.getenv("INIT_BACKFILL_DAYS", "7"))
         after = datetime.now(timezone.utc) - timedelta(days=lookback_days)
         raws = br.list_orders(status=status, limit=1000) or []
