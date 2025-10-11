@@ -1,9 +1,9 @@
 # strategies/c3.py
 import os
 try:
-    import broker as br
+    import br_router as br
 except Exception:
-    from strategies import broker as br
+    from strategies import br_router as br
 from strategies import utils_volatility as uv
 
 STRAT = "c3"
@@ -14,38 +14,33 @@ def _highest(xs, n):
 def _lowest(xs, n): 
     return min(xs[-n:]) if len(xs)>=n else None
 
-def _pos_for(symbol):
+def _pos_for(symbol: str):
     sym = symbol.replace("/", "")
-    for p in br.list_positions():
-        if p.get("symbol")==sym or p.get("asset_symbol")==sym:
-            return float(p.get("qty",0.0)), float(p.get("avg_entry_price",0.0))
+    pos = br.list_positions() or []
+    for p in pos:
+        if p.get("symbol","").replace("/","") == sym:
+            return float(p.get("qty",0.0) or 0.0), float(p.get("avg_entry_price",0.0) or 0.0)
     return 0.0, 0.0
 
-def run_scan(symbols, timeframe, limit, notional, live, ctx):
-    LOOK    = int(os.getenv("C3_LOOK", "40"))
-    BREAK_K = float(os.getenv("C3_BREAK_K", "1.002"))
-    FAIL_K  = float(os.getenv("C3_FAIL_K",  "0.997"))
+def run_scan(symbols, timeframe, limit, notional, dry, raw):
+    N_CH     = int(raw.get("ch_n", 55))
+    BREAK_K  = float(raw.get("break_k", 1.0005))
+    FAIL_K   = float(raw.get("fail_k", 0.997))
+    MIN_ATR  = float(raw.get("min_atr", 0.0))
 
-    ATR_LEN   = int(os.getenv("VOL_ATR_LEN", "14"))
-    MED_LEN   = int(os.getenv("VOL_MEDIAN_LEN", "20"))
-    VOL_K     = float(os.getenv("VOL_K", "1.0"))
-
-    for sym in (symbols if isinstance(symbols, list) else [symbols]):
-        ok,_ = uv.is_tradeable(sym, timeframe, limit, atr_len=ATR_LEN, median_len=MED_LEN, k=VOL_K)
-        if not ok: 
+    for sym in symbols:
+        bars = br.get_bars(sym, timeframe, limit) or []
+        if len(bars) < max(60, N_CH):
             continue
 
-        data = br.get_bars(sym, timeframe=timeframe, limit=max(limit, LOOK + 5))
-        bars = data.get(sym, [])
-        if len(bars) < LOOK + 5: 
+        atr = uv.atr_from_bars(bars, 14)
+        if atr < MIN_ATR:
             continue
 
-        highs = [float(b["h"]) for b in bars]
-        lows  = [float(b["l"]) for b in bars]
-        last  = float(bars[-1]["c"])
-
-        ch_hi = _highest(highs, LOOK)
-        ch_lo = _lowest(lows, LOOK)
+        closes = [b["c"] for b in bars]
+        last = closes[-1]
+        ch_hi = _highest(closes, N_CH)
+        ch_lo = _lowest(closes, N_CH)
         if ch_hi is None or ch_lo is None:
             continue
 

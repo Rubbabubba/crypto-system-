@@ -2,9 +2,9 @@
 import os, math
 from typing import List, Dict
 try:
-    import broker as br
+    import br_router as br
 except Exception:
-    from strategies import broker as br
+    from strategies import br_router as br
 from strategies import utils_volatility as uv
 
 STRAT = "c1"
@@ -15,49 +15,45 @@ def _ema(vals, n):
     k = 2.0 / (n + 1.0)
     ema = vals[0]
     for v in vals[1:]:
-        ema = v * k + ema * (1 - k)
+        ema = v * k + ema * (1.0 - k)
     return ema
 
-def _vwap(bars):
-    num = 0.0; den = 0.0
-    for b in bars:
-        tp = (float(b["h"]) + float(b["l"]) + float(b["c"])) / 3.0
-        v  = float(b["v"])
-        num += tp * v; den += v
-    return (num / den) if den > 0 else float(bars[-1]["c"])
+def _vwap(prices: List[float], vols: List[float]) -> float:
+    if not prices or not vols or len(prices) != len(vols): return None
+    num = sum(p*v for p, v in zip(prices, vols))
+    den = sum(vols)
+    return num / max(den, 1e-12)
 
-def _pos_for(symbol):
+def _pos_for(symbol: str):
     sym = symbol.replace("/", "")
-    for p in br.list_positions():
-        if p.get("symbol") == sym or p.get("asset_symbol") == sym:
-            return float(p.get("qty", 0.0)), float(p.get("avg_entry_price", 0.0))
+    pos = br.list_positions() or []
+    for p in pos:
+        if p.get("symbol","").replace("/","") == symbol.replace("/",""):
+            return float(p.get("qty", 0.0) or 0.0), float(p.get("avg_entry_price", 0.0) or 0.0)
     return 0.0, 0.0
 
-def run_scan(symbols, timeframe, limit, notional, live, ctx):
-    EMA = int(os.getenv("C1_EMA", "20"))
-    VWAP_PULL = float(os.getenv("C1_VWAP_PULL", "0.003"))  # 0.3%
+def run_scan(symbols: List[str], timeframe: str, limit: int, notional: float, dry: bool, raw: Dict) -> None:
+    # Parameters
+    N_EMA      = int(raw.get("ema_n", 20))
+    VWAP_PULL  = float(raw.get("vwap_pull", 0.002))
+    MIN_VOL    = float(raw.get("min_vol", 0.0))
 
-    ATR_LEN   = int(os.getenv("VOL_ATR_LEN", "14"))
-    MED_LEN   = int(os.getenv("VOL_MEDIAN_LEN", "20"))
-    VOL_K     = float(os.getenv("VOL_K", "1.0"))
-
-    for sym in (symbols if isinstance(symbols, list) else [symbols]):
-        ok, _ = uv.is_tradeable(sym, timeframe, limit, atr_len=ATR_LEN, median_len=MED_LEN, k=VOL_K)
-        if not ok:
+    for sym in symbols:
+        bars = br.get_bars(sym, timeframe, limit) or []
+        if len(bars) < max(20, N_EMA): 
             continue
 
-        data = br.get_bars(sym, timeframe=timeframe, limit=max(limit, EMA + 5))
-        bars = data.get(sym, [])
-        if len(bars) < EMA + 5: 
+        closes = [b["c"] for b in bars]
+        vols   = [b["v"] for b in bars]
+        if sum(vols[-10:]) < MIN_VOL:
             continue
 
-        closes = [float(b["c"]) for b in bars]
-        ema_n = _ema(closes[-EMA:], EMA)
-        if ema_n is None:
-            continue
+        last      = closes[-1]
+        ema_n     = _ema(closes[-N_EMA:], N_EMA)
+        vwap_val  = _vwap(closes[-N_EMA:], vols[-N_EMA:])
 
-        vwap_val = _vwap(bars[-EMA:])
-        last = float(bars[-1]["c"])
+        if vwap_val is None or ema_n is None:
+            continue
 
         have, avg_px = _pos_for(sym)
         pull = (vwap_val - last) / max(vwap_val, 1e-9)
