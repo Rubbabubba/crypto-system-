@@ -17,8 +17,8 @@ COPY . .
 ENV PORT=10000
 EXPOSE 10000
 
-# Gunicorn serves Flask app
-# - 2 workers is fine for this light API; bump if needed
-# - gthread worker for simple concurrency
-# - bind to 0.0.0.0:$PORT so Render health checks pass
-CMD ["gunicorn", "-w", "2", "-k", "gthread", "-t", "120", "-b", "0.0.0.0:$PORT", "app:app"]
+# Option A: uvicorn directly (simple & fine for Render)
+CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "%PORT%"]
+
+# Option B: gunicorn with uvicorn worker (comment Option A if you use this)
+# CMD ["gunicorn", "-k", "uvicorn.workers.UvicornWorker", "-w", "2", "-t", "120", "-b", "0.0.0.0:$PORT", "app:app"]
