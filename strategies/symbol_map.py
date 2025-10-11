@@ -82,3 +82,4 @@ def tf_to_kraken(tf: str) -> int:
         return 5
     k = tf.strip().lower()
     return _TF_ALIASES.get(k, _TF_ALIASES.get(k.replace("min", "m"), 5))
+    
