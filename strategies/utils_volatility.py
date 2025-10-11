@@ -6,12 +6,7 @@ import os
 from typing import List, Dict, Tuple
 import math
 
-try:
-    # works after backtest patches add these to sys.path
-    import broker as br
-except Exception:
-    # if strategies.broker is the path
-    from strategies import broker as br
+import br_router as br
 
 # ---------- small numeric utils ----------
 def _sma(xs, n):
