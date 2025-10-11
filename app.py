@@ -485,120 +485,222 @@ def orders(status: str = "all", limit: int = 100):
         raise HTTPException(status_code=500, detail=str(e))
 
 # -----------------------------------------------------------------------------
-# Dashboard HTML
+# HTML (full inline page)
 # -----------------------------------------------------------------------------
-DASHBOARD_HTML = f"""
+_DASHBOARD_HTML = """
 <!doctype html>
 <html lang="en">
 <head>
-<meta charset="utf-8"/>
-<title>{SERVICE_NAME} — Dashboard</title>
-<meta name="viewport" content="width=device-width, initial-scale=1"/>
-<style>
-body {{ font-family: -apple-system, Segoe UI, Roboto, Arial, sans-serif; background:#0b0d10; color:#e6edf3; margin:0; }}
-.header {{ display:flex; align-items:center; justify-content:space-between; padding:12px 16px; border-bottom:1px solid #222; }}
-.badge {{ padding:3px 8px; border-radius:12px; font-size:12px; }}
-.badge.kraken {{ background:#163; color:#b5f5b5; }}
-.badge.alpaca {{ background:#322; color:#f5b5b5; }}
-.card {{ background:#11161a; border:1px solid #1e242c; border-radius:10px; padding:12px; margin:12px; }}
-.grid {{ display:grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); grid-gap:12px; }}
-.table {{ width:100%; border-collapse: collapse; }}
-.table th, .table td {{ border-bottom:1px solid #1e242c; padding:6px 8px; text-align:left; font-size:13px; }}
-.mono {{ font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }}
-.subtle {{ color:#9fb0c0; font-size:12px; }}
-h2 {{ margin:0 0 8px 0; font-size:16px; }}
-.small {{ font-size:12px; }}
-.green {{ color:#6bdc6b; }}
-.red {{ color:#ff6b6b; }}
-</style>
-<script>
-async function fetchJSON(url) {{
-  const r = await fetch(url);
-  return await r.json();
-}}
-async function refresh() {{
-  try {{
-    const [health, cfg, uni, summary, attrib, recent] = await Promise.all([
-      fetchJSON('/healthz'),
-      fetchJSON('/config'),
-      fetchJSON('/universe'),
-      fetchJSON('/pnl/summary'),
-      fetchJSON('/orders/attribution'),
-      fetchJSON('/orders/recent?limit=50'),
-    ]);
-    document.getElementById('ver').textContent = health.version;
-    document.getElementById('ts').textContent = new Date(health.time).toLocaleString();
-    const broker = cfg.BROKER;
-    document.getElementById('broker').textContent = broker;
-    document.getElementById('broker').className = 'badge ' + (broker === 'kraken' ? 'kraken' : 'alpaca');
-    document.getElementById('tf').textContent = cfg.DEFAULT_TIMEFRAME;
-    document.getElementById('limit').textContent = cfg.DEFAULT_LIMIT;
-    document.getElementById('notional').textContent = cfg.DEFAULT_NOTIONAL;
-    document.getElementById('strats').textContent = cfg.STRATEGY_LIST.join(', ');
-    document.getElementById('symbols').textContent = uni.symbols.join(', ');
-    document.getElementById('equity').textContent = (summary.equity||0).toFixed(2);
-    document.getElementById('day').textContent = (summary.day||0).toFixed(2);
-    const tbodyA = document.getElementById('attrib');
-    tbodyA.innerHTML = '';
-    Object.entries(attrib.by_strategy || {{}}).forEach(([k,v]) => {{
-      const tr = document.createElement('tr');
-      tr.innerHTML = `<td>${{k}}</td><td class="mono">${{v.toFixed(2)}}</td>`;
-      tbodyA.appendChild(tr);
-    }});
-    const tbodyR = document.getElementById('recent');
-    tbodyR.innerHTML = '';
-    (recent || []).forEach(o => {{
-      const tr = document.createElement('tr');
-      const pn = (o.side==='buy' ? '+' : '-') + (o.notional||0);
-      tr.innerHTML = `<td class="mono">${{o.ts||''}}</td><td>${{o.strategy||''}}</td><td>${{o.symbol||''}}</td><td>${{o.side||''}}</td><td class="mono">${{(o.notional||0).toFixed(2)}}</td><td class="small mono">${{o.client_order_id||''}}</td>`;
-      tbodyR.appendChild(tr);
-    }});
-  }} catch (e) {{
-    console.error(e);
-  }}
-}}
-setInterval(refresh, 5000);
-window.addEventListener('load', refresh);
-</script>
+  <meta charset="utf-8">
+  <title>Crypto System Dashboard</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <style>
+    :root{
+      --bg:#0b1220;
+      --panel:#111a2b;
+      --ink:#e6edf3;
+      --muted:#a6b3c2;
+      --accent:#5dd4a3;
+      --accent2:#66a3ff;
+      --red:#ff6b6b;
+      --chip:#1a2336;
+      --chip-br:#26324a;
+    }
+    *{box-sizing:border-box}
+    body{
+      margin:0;
+      font-family: system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, "Apple Color Emoji","Segoe UI Emoji";
+      background: linear-gradient(160deg, #0b1220 0%, #0e172a 100%);
+      color:var(--ink);
+    }
+    header{
+      padding:20px 24px;
+      border-bottom:1px solid #16233b;
+      display:flex;align-items:center;gap:12px;
+    }
+    .badge{
+      font-size:12px;
+      background:var(--chip);
+      border:1px solid var(--chip-br);
+      color:var(--muted);
+      padding:4px 8px;border-radius:999px;
+    }
+    main{padding:24px;max-width:1200px;margin:0 auto}
+    .grid{
+      display:grid;
+      grid-template-columns: repeat(12, 1fr);
+      gap:16px;
+    }
+    .card{
+      background:var(--panel);
+      border:1px solid #1a2740;
+      border-radius:14px;
+      padding:16px;
+      box-shadow: 0 10px 24px rgba(0,0,0,.2);
+    }
+    .span-4{grid-column: span 4}
+    .span-6{grid-column: span 6}
+    .span-8{grid-column: span 8}
+    .span-12{grid-column: span 12}
+    h1{font-size:18px;margin:0}
+    .muted{color:var(--muted)}
+    .row{display:flex;align-items:center;justify-content:space-between;gap:12px}
+    .kpi{font-size:28px;font-weight:700}
+    .good{color:var(--accent)}
+    .bad{color:var(--red)}
+    table{width:100%;border-collapse:collapse;font-size:14px}
+    th,td{padding:8px;border-bottom:1px solid #1a2740;text-align:left}
+    th{color:#9db0c9;font-weight:600}
+    .chips{display:flex;flex-wrap:wrap;gap:8px}
+    .chip{
+      background:var(--chip);
+      border:1px solid var(--chip-br);
+      padding:6px 10px;border-radius:999px;font-size:12px;color:#c7d2e3;
+    }
+    a.btn{
+      display:inline-block;padding:8px 12px;border-radius:10px;text-decoration:none;
+      background:var(--accent2);color:#0b1220;font-weight:700;border:1px solid #2a3f6b;
+    }
+    footer{padding:28px;color:var(--muted);text-align:center}
+    @media (max-width: 900px){
+      .span-4,.span-6,.span-8{grid-column: span 12}
+    }
+    code{
+      background:#0d1628;border:1px solid #1a2740;padding:2px 6px;border-radius:6px
+    }
+  </style>
+  <script>
+    async function loadSummary(){
+      const r = await fetch('/pnl/summary');
+      const d = await r.json();
+      document.getElementById('eq').textContent = Number(d.equity || 0).toFixed(2);
+      document.getElementById('pnl_day').textContent = Number(d.pnl_day || 0).toFixed(2);
+      document.getElementById('pnl_week').textContent = Number(d.pnl_week || 0).toFixed(2);
+      document.getElementById('pnl_month').textContent = Number(d.pnl_month || 0).toFixed(2);
+      document.getElementById('updated').textContent = d.updated_at ? new Date(d.updated_at).toLocaleString() : '-';
+    }
+    async function loadAttribution(){
+      const r = await fetch('/orders/attribution');
+      const d = await r.json();
+      const tbody = document.getElementById('attr_body');
+      tbody.innerHTML = '';
+      if (d.by_strategy){
+        for (const [k,v] of Object.entries(d.by_strategy)){
+          const tr = document.createElement('tr');
+          tr.innerHTML = `<td>${k}</td><td>${Number(v).toFixed(2)}</td>`;
+          tbody.appendChild(tr);
+        }
+      }
+      document.getElementById('attr_updated').textContent = d.updated_at ? new Date(d.updated_at).toLocaleString() : '-';
+    }
+    async function loadOrders(){
+      const r = await fetch('/orders/recent?limit=50');
+      const d = await r.json();
+      const tbody = document.getElementById('orders_body');
+      tbody.innerHTML = '';
+      (d.orders || []).forEach(o => {
+        const tr = document.createElement('tr');
+        tr.innerHTML = `
+          <td>${o.id ?? ''}</td>
+          <td>${o.symbol ?? ''}</td>
+          <td>${o.side ?? ''}</td>
+          <td>${o.qty ?? ''}</td>
+          <td>${o.px ?? ''}</td>
+          <td>${o.strategy ?? ''}</td>
+          <td>${o.pnl ?? 0}</td>
+          <td>${o.ts ? new Date(o.ts*1000).toLocaleString() : ''}</td>
+        `;
+        tbody.appendChild(tr);
+      });
+    }
+    async function refreshAll(){
+      await Promise.all([loadSummary(), loadAttribution(), loadOrders()]);
+    }
+    setInterval(refreshAll, 15000);
+    window.addEventListener('load', refreshAll);
+  </script>
 </head>
 <body>
-<div class="header">
-  <div>
-    <div class="small subtle">{SERVICE_NAME} · v<span id="ver">-</span></div>
-    <div class="small subtle">Last update: <span id="ts">-</span></div>
-  </div>
-  <div class="badge {('kraken' if USING_KRAKEN else 'alpaca')}" id="broker">{('kraken' if USING_KRAKEN else 'alpaca')}</div>
-</div>
-<div class="grid">
-  <div class="card">
-    <h2>Config</h2>
-    <div class="small">TF: <span id="tf" class="mono">-</span> · Limit: <span id="limit" class="mono">-</span> · Notional: <span id="notional" class="mono">-</span></div>
-    <div class="small">Strategies: <span id="strats" class="mono">-</span></div>
-    <div class="small">Symbols: <span id="symbols" class="mono">-</span></div>
-  </div>
-  <div class="card">
-    <h2>Equity & Day P&L</h2>
-    <div>Equity: <span class="mono green" id="equity">0.00</span></div>
-    <div>Day P&L: <span class="mono" id="day">0.00</span></div>
-  </div>
-  <div class="card">
-    <h2>Attribution</h2>
-    <table class="table">
-      <thead><tr><th>Strategy</th><th>Notional</th></tr></thead>
-      <tbody id="attrib"></tbody>
-    </table>
-  </div>
-  <div class="card" style="grid-column:1/-1">
-    <h2>Recent Orders</h2>
-    <table class="table">
-      <thead><tr><th>Time</th><th>Strategy</th><th>Symbol</th><th>Side</th><th>Notional</th><th>Client ID</th></tr></thead>
-      <tbody id="recent"></tbody>
-    </table>
-  </div>
-</div>
+  <header class="row">
+    <h1>Crypto System</h1>
+    <span class="badge">Live</span>
+    <span class="badge">Scheduler: <code>active</code></span>
+    <div style="margin-left:auto" class="chips">
+      <span class="chip">TF: <code id="tf_chip">auto</code></span>
+      <span class="chip">Tick: <code>{SCHEDULE_SECONDS}s</code></span>
+    </div>
+  </header>
+
+  <main>
+    <div class="grid">
+      <section class="card span-8">
+        <div class="row" style="margin-bottom:8px">
+          <h2 style="margin:0;font-size:16px">P&L Summary</h2>
+          <a class="btn" href="#" onclick="refreshAll();return false;">Refresh</a>
+        </div>
+        <div class="grid" style="grid-template-columns:repeat(12,1fr);gap:12px">
+          <div class="span-4">
+            <div class="muted">Equity</div>
+            <div class="kpi" id="eq">0.00</div>
+          </div>
+          <div class="span-4">
+            <div class="muted">PnL (Day)</div>
+            <div class="kpi good" id="pnl_day">0.00</div>
+          </div>
+          <div class="span-4">
+            <div class="muted">PnL (Week)</div>
+            <div class="kpi" id="pnl_week">0.00</div>
+          </div>
+          <div class="span-4">
+            <div class="muted">PnL (Month)</div>
+            <div class="kpi" id="pnl_month">0.00</div>
+          </div>
+          <div class="span-8">
+            <div class="muted">Last Updated</div>
+            <div id="updated" class="kpi" style="font-size:16px">-</div>
+          </div>
+        </div>
+      </section>
+
+      <section class="card span-4">
+        <div class="row" style="margin-bottom:8px">
+          <h2 style="margin:0;font-size:16px">Attribution</h2>
+        </div>
+        <table>
+          <thead><tr><th>Strategy</th><th>PnL</th></tr></thead>
+          <tbody id="attr_body"></tbody>
+        </table>
+        <div class="muted" style="margin-top:8px">Updated: <span id="attr_updated">-</span></div>
+      </section>
+
+      <section class="card span-12">
+        <div class="row" style="margin-bottom:8px">
+          <h2 style="margin:0;font-size:16px">Recent Orders</h2>
+        </div>
+        <table>
+          <thead>
+            <tr>
+              <th>ID</th><th>Symbol</th><th>Side</th><th>Qty</th><th>Price</th>
+              <th>Strategy</th><th>PnL</th><th>Time</th>
+            </tr>
+          </thead>
+          <tbody id="orders_body"></tbody>
+        </table>
+      </section>
+    </div>
+  </main>
+
+  <footer>
+    Built with FastAPI • Tick interval: {SCHEDULE_SECONDS}s
+  </footer>
+
+  <script>
+    document.getElementById('tf_chip').textContent = "{DEFAULT_TIMEFRAME}";
+  </script>
 </body>
 </html>
-"""
+""".replace("{SCHEDULE_SECONDS}", str(SCHEDULE_SECONDS)).replace("{DEFAULT_TIMEFRAME}", DEFAULT_TIMEFRAME)
+
 
 @app.get("/", response_class=HTMLResponse)
 def root():
