@@ -571,56 +571,53 @@ async def _exit_nanny(symbols: List[str], timeframe: str):
 # -----------------------------------------------------------------------------
 # Scan bridge
 # -----------------------------------------------------------------------------
-async def _scan_bridge(strat: str, req: Dict[str, Any], dry: bool = False) -> List[Dict[str, Any]]:
-    req = dict(req or {})
-    req.setdefault("strategy", strat)
-    req.setdefault("timeframe", req.get("tf") or DEFAULT_TIMEFRAME)
-    req.setdefault("limit", req.get("limit") or DEFAULT_LIMIT)
-    req.setdefault("notional", req.get("notional") or DEFAULT_NOTIONAL)
+async def _scan_bridge(strat: str, req: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """
+    Bridge a single strategy scan into placed orders + attribution.
 
-    syms = req.get("symbols") or _CURRENT_SYMBOLS
-    if isinstance(syms, str):
-        syms = [s.strip() for s in syms.split(",") if s.strip()]
-    req["symbols"] = syms
-    req["dry"] = dry or (not TRADING_ENABLED)  # force dry if trading disabled
-    req["raw"] = dict(req)
-
-    sb = StrategyBook()
-    orders = sb.scan(req, {"one": {"timeframe": req["timeframe"], "symbols": syms, "notional": req["notional"]}})
-
-    # Basic guard: EMA/spread sanity for BUYs
+    - Calls adapter.scan(req) which loads strategies.c{1..6}.run_scan
+      If your strategies self-execute, this will still work; placed=[]
+    - If TRADING_ENABLED, submit returned intents via broker.submit_order
+    - Push any placed orders into the dashboard ring for attribution
+    - Returns the list of placed orders (or scan intents if dry-run)
+    """
     try:
-        bars_map = br.get_bars(req["symbols"], timeframe=req["timeframe"], limit=60) or {}
-    except Exception:
-        bars_map = {}
+        req2 = {
+            "strategy": strat,
+            "timeframe": req.get("timeframe") or DEFAULT_TIMEFRAME,
+            "limit": int(req.get("limit") or DEFAULT_LIMIT),
+            "notional": float(req.get("notional") or DEFAULT_NOTIONAL),
+            "symbols": req.get("symbols") or UNIVERSE[:],
+            "dry": (not TRADING_ENABLED),
+            "raw": req.get("raw") or {},
+        }
+        intents = _adapter.scan(req2, _contexts)
+        intents = intents or []
 
-    filtered: List[Dict[str, Any]] = []
-    for o in (orders or []):
-        side = (o.get("side") or o.get("order_side") or "").lower()
-        sym = _sym_to_slash(o.get("symbol") or "")
-        sname = (req.get("strategy") or "").lower()
-        closes = [
-            float(b.get("c") or b.get("close") or 0.0)
-            for b in (bars_map.get(sym) or [])
-            if float(b.get("c") or b.get("close") or 0.0) > 0
-        ]
-        px = float(o.get("price") or o.get("px") or 0.0)
-        if px <= 0 and closes:
-            px = closes[-1]
-        edge_bps_val = float(o.get("edge_bps") or o.get("edge") or 0.0)
-        spr_bps = _spread_bps(px)
-        ema_ok = _price_above_ema_fast(sym, req["timeframe"], closes)
-        if side == "buy":
-            if not ema_ok or edge_bps_val < GUARDS["min_edge_bps"] or edge_bps_val < GUARDS["min_edge_vs_spread_x"] * spr_bps:
-                log.info("guard: drop open %s by %s (ema_ok=%s edge=%.2f spread=%.2f)", sym, sname, ema_ok, edge_bps_val, spr_bps)
-                continue
-        filtered.append(o)
+        placed: List[Dict[str, Any]] = []
+        if TRADING_ENABLED:
+            for o in intents:
+                try:
+                    sym = _sym_to_slash(o.get("symbol",""))
+                    side = (o.get("side","") or "").lower()
+                    if side not in ("buy","sell"):
+                        continue
+                    cid  = o.get("client_order_id") or f"{strat}-{int(time.time())}-{sym.replace('/','')}"
+                    notional = float(o.get("notional") or req2["notional"])
+                    br.submit_order(symbol=sym, side=side, notional=notional, client_order_id=cid)
+                    placed.append({**o, "symbol": sym, "client_order_id": cid})
+                except Exception:
+                    log.exception("submit_order failed for %s", strat)
 
-    if not filtered:
+        # Attribution: prefer placed if any; otherwise (dry) use intents
+        to_push = placed if placed else intents
+        if to_push:
+            _push_orders(strat, to_push)
+
+        return to_push
+    except Exception as e:
+        log.exception("_scan_bridge error for %s", strat)
         return []
-    if isinstance(filtered, dict):
-        return filtered.get("orders") or filtered.get("placed") or []
-    return list(filtered)
 
 # -----------------------------------------------------------------------------
 # Background scheduler

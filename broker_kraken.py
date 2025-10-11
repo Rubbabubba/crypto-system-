@@ -1,181 +1,201 @@
-# broker_kraken.py
-"""
-Kraken broker adapter:
-- Public OHLC bars (already working)
-- Market orders by notional (opt-in via KRAKEN_TRADING=1)
-- Tiny helpers for account/positions parity
+# broker_kraken.py — COMPLETE Kraken adapter for this app
+import os, time, hmac, hashlib, base64, requests, urllib.parse as up
+from typing import Dict, Any, List, Tuple, Iterable
+from strategies.symbol_map import KRAKEN_PAIR_MAP, to_kraken, tf_to_kraken
 
-ENV:
-  BROKER=kraken
-  KRAKEN_API=https://api.kraken.com    (optional; default shown)
-  KRAKEN_KEY=...                       (required for trading)
-  KRAKEN_SECRET=...                    (required for trading; base64 as given by Kraken)
-  KRAKEN_TRADING=1                     (ONLY when you’re ready to send live orders)
+KRAKEN = os.getenv("KRAKEN_BASE", "https://api.kraken.com")
+KEY     = os.getenv("KRAKEN_KEY", os.getenv("KRAKEN_API_KEY",""))
+SECRET  = os.getenv("KRAKEN_SECRET", os.getenv("KRAKEN_API_SECRET",""))
 
-NOTE: Order placement converts notional→volume using latest price, snaps to lot
-      precision, and enforces Kraken’s ordermin when available.
-"""
+# Build inverse map for pretty symbols, e.g., XBTUSD -> BTC/USD
+_INV = {v:k for k,v in KRAKEN_PAIR_MAP.items()}
 
-from __future__ import annotations
-import os, time, hmac, hashlib, base64
-from typing import Dict, List, Any, Tuple
+def from_kraken(pair: str) -> str:
+    """Best-effort inverse mapping from Kraken pair to UI symbol."""
+    if not pair:
+        return pair
+    if pair in _INV:
+        return _INV[pair]
+    # Heuristic: 'ETHUSD' -> 'ETH/USD'
+    if "/" not in pair and len(pair) >= 6 and pair.endswith("USD"):
+        return pair[:-3] + "/USD"
+    return pair
 
-import requests
+def _raise_for_api_error(j: Dict[str,Any]):
+    if j is None:
+        raise RuntimeError("Kraken: empty response")
+    if isinstance(j, dict) and j.get("error"):
+        raise RuntimeError(f"Kraken error: {j['error']}")
 
-from strategies.symbol_map import to_kraken, tf_to_kraken
-
-# ---------- Config / Session ----------
-KRAKEN_API = os.getenv("KRAKEN_API", "https://api.kraken.com")
-KRAKEN_KEY = os.getenv("KRAKEN_KEY", "")
-KRAKEN_SECRET = os.getenv("KRAKEN_SECRET", "")
-KRAKEN_TRADING = os.getenv("KRAKEN_TRADING", "0") == "1"
-
-SESSION = requests.Session()
-SESSION.headers.update({"User-Agent": "crypto-system/kraken-adapter"})
-
-def _http_public(path: str, params: Dict[str, Any] | None = None) -> Any:
-    r = SESSION.get(f"{KRAKEN_API}{path}", params=params, timeout=15)
+def _public(path: str, params: Dict[str, Any]) -> Dict[str, Any]:
+    url = f"{KRAKEN}{path}"
+    r = requests.get(url, params=params, timeout=15)
     r.raise_for_status()
-    data = r.json()
-    if data.get("error"):
-        raise RuntimeError(f"Kraken error: {data['error']}")
-    return data["result"]
+    j = r.json()
+    _raise_for_api_error(j)
+    return j.get("result") or {}
 
-def _http_private(path: str, data: Dict[str, Any]) -> Any:
-    if not (KRAKEN_KEY and KRAKEN_SECRET):
-        raise RuntimeError("Kraken trading requires KRAKEN_KEY and KRAKEN_SECRET")
-    url = f"{KRAKEN_API}{path}"
-    nonce = str(int(time.time() * 1000))
-    payload = {"nonce": nonce, **data}
+def _sign(path: str, data: Dict[str, Any]) -> Dict[str,str]:
+    """Kraken auth: API-Key; API-Sign = HMAC-SHA512(secret, path + SHA256(nonce+postdata))"""
+    postdata = up.urlencode(data)
+    encoded = (str(data["nonce"]) + postdata).encode()
+    message = path.encode() + hashlib.sha256(encoded).digest()
+    mac = hmac.new(base64.b64decode(SECRET), message, hashlib.sha512)
+    return {"API-Key": KEY, "API-Sign": base64.b64encode(mac.digest()).decode()}
 
-    # Build message for signature
-    postdata = "&".join(f"{k}={v}" for k, v in payload.items())
-    message = (nonce + postdata).encode()
-    sha256 = hashlib.sha256(message).digest()
-    secret = base64.b64decode(KRAKEN_SECRET)
-    mac = hmac.new(secret, path.encode() + sha256, hashlib.sha512)
-    sig = base64.b64encode(mac.digest()).decode()
-
-    headers = {
-        "API-Key": KRAKEN_KEY,
-        "API-Sign": sig,
-        "Content-Type": "application/x-www-form-urlencoded",
-    }
-    r = SESSION.post(url, data=payload, headers=headers, timeout=15)
+def _private(path: str, data: Dict[str, Any]) -> Dict[str, Any]:
+    url = f"{KRAKEN}{path}"
+    payload = {"nonce": int(time.time()*1000), **(data or {})}
+    headers = _sign(path, payload)
+    r = requests.post(url, data=payload, headers=headers, timeout=20)
     r.raise_for_status()
-    data = r.json()
-    if data.get("error"):
-        raise RuntimeError(f"Kraken error: {data['error']}")
-    return data["result"]
+    j = r.json()
+    _raise_for_api_error(j)
+    return j.get("result") or {}
 
-# ---------- Bars (OHLC) ----------
-
-def get_bars(symbols: List[str], timeframe: str, limit: int) -> Dict[str, List[Dict[str, Any]]]:
+# ---------------------------------------------------------------------------
+# Market data
+# ---------------------------------------------------------------------------
+def get_bars(symbol: str, timeframe: str = "5min", limit: int = 200) -> List[Dict[str, Any]]:
+    """Return list of bar dicts: {t,o,h,l,c,v,vw} using Kraken /OHLC."""
+    pair = to_kraken(symbol)
     interval = tf_to_kraken(timeframe)
-    out: Dict[str, List[Dict[str, Any]]] = {}
-    for sym in symbols:
-        kpair = to_kraken(sym)  # e.g., BTC/USD -> XBTUSD
-        result = _http_public("/0/public/OHLC", {"pair": kpair, "interval": interval})
-        ohlc_key = next(iter(result.keys()))
-        rows = result[ohlc_key]
-        bars = []
-        for row in rows[-limit:]:
-            t, o, h, l, c, vwap, vol, cnt = row
-            bars.append({"t": int(t), "o": float(o), "h": float(h), "l": float(l), "c": float(c), "v": float(vol)})
-        out[sym] = bars
+    res = _public("/0/public/OHLC", {"pair": pair, "interval": interval})
+    # result has { "<pair>":[[time, open, high, low, close, vwap, volume, count], ...] }
+    rows = None
+    for k, v in res.items():
+        # Kraken sometimes wraps pair differently, take first array found
+        if isinstance(v, list):
+            rows = v
+            break
+    if not rows:
+        return []
+    out = []
+    for row in rows[-limit:]:
+        t,o,h,l,c,vw,vol,_ = row
+        out.append({
+            "t": int(t),
+            "o": float(o),
+            "h": float(h),
+            "l": float(l),
+            "c": float(c),
+            "v": float(vol),
+            "vw": float(vw) if vw not in (None,"") else float(c),
+        })
     return out
 
-# ---------- Ticker / Pair meta ----------
+def last_trade_map(symbols: Iterable[str]):
+    """Return { 'BTC/USD': {'price': 12345.67}, ... } via /Ticker."""
+    if isinstance(symbols, str):
+        symbols = [symbols]
+    pairs = [to_kraken(s) for s in symbols]
+    res = _public("/0/public/Ticker", {"pair": ",".join(pairs)})
+    out = {}
+    for k, v in res.items():
+        price = float((v.get("c") or ["0"])[0])
+        ui = from_kraken(k)
+        out[ui] = {"price": price}
+    return out
 
-def _get_last_price_alt(altname: str) -> float:
-    res = _http_public("/0/public/Ticker", {"pair": altname})
-    k = next(iter(res.keys()))
-    last = float(res[k]["c"][0])  # last trade price
-    return last
+def last_price(symbol: str) -> float:
+    return (last_trade_map([symbol]).get(symbol) or {}).get("price", 0.0)
 
-def _get_pair_meta_alt(altname: str) -> Tuple[int, float | None]:
-    """
-    Returns (lot_decimals, ordermin) for altname (e.g., XBTUSD).
-    ordermin may be None if Kraken doesn’t provide it for the pair.
-    """
-    res = _http_public("/0/public/AssetPairs", None)
-    # Search by altname or by key
-    for key, meta in res.items():
-        if (meta.get("altname") or "").upper() == altname.upper() or key.upper() == altname.upper():
-            lot_decimals = int(meta.get("lot_decimals", 8))
-            # Kraken sometimes provides "ordermin" (string) in pair info; if absent, None
-            ordermin = meta.get("ordermin")
-            try:
-                ordermin_f = float(ordermin) if ordermin is not None else None
-            except Exception:
-                ordermin_f = None
-            return lot_decimals, ordermin_f
-    return 8, None
+# ---------------------------------------------------------------------------
+# Trading
+# ---------------------------------------------------------------------------
+def _cid_to_userref(cid: str) -> int:
+    # Kraken userref must be 32-bit signed int; derive deterministically
+    if not cid:
+        return int(time.time())
+    h = hashlib.sha256(cid.encode()).digest()
+    n = int.from_bytes(h[:4], "big") & 0x7FFFFFFF
+    return n or int(time.time())
 
-def _snap_volume(vol: float, lot_decimals: int) -> float:
-    fmt = "{:0." + str(lot_decimals) + "f}"
-    snapped = float(fmt.format(vol))
-    # Avoid formatting to 0 if min positive value is needed
-    return snapped
-
-# ---------- Orders ----------
-
-def place_order(symbol: str, side: str, notional: float, client_order_id: str,
-                time_in_force: str = "GTC", type: str = "market") -> Dict[str, Any]:
-    """
-    Market order by notional USD. Converts to base 'volume' using last price.
-    - Only executes if KRAKEN_TRADING=1
-    - Uses AddOrder private endpoint
-    - Sets 'userref' to your client_order_id (Kraken int; we hash to a 31-bit int)
-    """
-    if not KRAKEN_TRADING:
-        raise RuntimeError("Kraken trading disabled (set KRAKEN_TRADING=1 to enable)")
-
-    if type.lower() != "market":
-        raise ValueError("Only market orders are supported in this adapter.")
-    s = side.lower()
-    if s not in ("buy", "sell"):
-        raise ValueError("side must be 'buy' or 'sell'")
-
-    alt = to_kraken(symbol)             # e.g., XBTUSD
-    price = _get_last_price_alt(alt)    # USD per base
-    lot_decimals, ordermin = _get_pair_meta_alt(alt)
-
-    if price <= 0:
-        raise RuntimeError(f"Invalid price for {alt}: {price}")
-
-    volume = notional / price
-    volume = _snap_volume(volume, lot_decimals)
-
-    if ordermin is not None and volume < ordermin:
-        raise RuntimeError(f"Volume {volume} below Kraken ordermin {ordermin} for {alt}. "
-                           f"Increase notional or choose a cheaper asset.")
-
-    # Kraken's 'userref' must be 32-bit signed int. Make a stable small int from client_order_id.
-    userref = abs(hash(client_order_id)) % 2147483647
-
-    payload = {
-        "pair": alt,
-        "type": s,                # buy/sell
+def place_order(symbol: str, side: str, notional: float, client_order_id: str = "") -> Dict[str, Any]:
+    """Market order by notional (USD). Computes volume using last price."""
+    side = side.lower()
+    assert side in ("buy","sell"), "side must be buy/sell"
+    pair = to_kraken(symbol)
+    px = last_price(symbol)
+    if px <= 0:
+        # fallback: small notional
+        px = 1.0
+    volume = max(notional / px, 1e-6)
+    data = {
+        "pair": pair,
+        "type": side,
         "ordertype": "market",
-        "volume": str(volume),    # as string
-        "userref": userref,
-        # TIF: Kraken supports 'timeinforce': GTC/IOC/GTD; keep GTC by default.
-        "timeinforce": "GTC" if (time_in_force or "").upper() == "GTC" else "IOC",
-        # Optional: "validate": True   # dry-run on Kraken side (no fill); set if you want.
+        "volume": f"{volume:.8f}",
+        "userref": _cid_to_userref(client_order_id),
+        "oflags": "viqc",  # volume in quote currency calc at cost
     }
-    res = _http_private("/0/private/AddOrder", payload)
-    return {"broker": "kraken", "pair": alt, "side": s, "notional": notional, "volume": volume, "result": res}
-
-# ---------- Parity stubs ----------
-
-def get_positions() -> Dict[str, Any]:
-    # Full positions would require parsing private ledgers/balances.
-    # Keep empty for parity with your app's use.
-    return {}
-
-def get_account() -> Dict[str, Any]:
+    res = _private("/0/private/AddOrder", data)
     return {
-        "broker": "kraken",
-        "trading_enabled": KRAKEN_TRADING and bool(KRAKEN_KEY and KRAKEN_SECRET),
+        "ok": True,
+        "txid": (res.get("txid") or [None])[0],
+        "descr": res.get("descr"),
+        "client_order_id": client_order_id,
+        "symbol": symbol,
+        "side": side,
+        "notional": notional,
     }
+
+# Alias used by app optional enhancement
+def submit_order(**kwargs):
+    return place_order(kwargs.get("symbol"), kwargs.get("side"), float(kwargs.get("notional", 0)), kwargs.get("client_order_id",""))
+
+def list_orders(status: str = "all", limit: int = 100) -> List[Dict[str, Any]]:
+    """Return mixed open+closed orders in a common shape the app expects."""
+    items: List[Dict[str, Any]] = []
+    if status in ("all","open"):
+        oo = _private("/0/private/OpenOrders", {})
+        for _, o in (oo.get("open") or {}).items():
+            d = o.get("descr", {})
+            items.append({
+                "id": o.get("userref") or o.get("refid"),
+                "symbol": from_kraken(d.get("pair","")),
+                "side": d.get("type","").lower(),
+                "status": "open",
+                "submitted_at": o.get("opentm"),
+                "price": float(d.get("price","0") or 0),
+                "filled_qty": 0.0,
+                "filled_avg_price": 0.0,
+                "client_order_id": o.get("userref") or "",
+                "notional": 0.0,
+            })
+    if status in ("all","closed"):
+        co = _private("/0/private/ClosedOrders", {"trades": True})
+        for _, o in (co.get("closed") or {}).items():
+            d = o.get("descr", {})
+            items.append({
+                "id": o.get("userref") or o.get("refid"),
+                "symbol": from_kraken(d.get("pair","")),
+                "side": d.get("type","").lower(),
+                "status": "filled" if o.get("status") == "closed" else (o.get("status") or ""),
+                "filled_at": o.get("closetm"),
+                "price": float(o.get("price","0") or 0),
+                "filled_qty": float(o.get("vol_exec","0") or 0),
+                "filled_avg_price": float(o.get("price","0") or 0),
+                "client_order_id": o.get("userref") or "",
+                "notional": 0.0,
+            })
+    return items[:limit]
+
+def list_positions() -> List[Dict[str, Any]]:
+    """Approximate position list built from balances; app tracks realized P&L elsewhere."""
+    bals = _private("/0/private/Balance", {}) or {}
+    out: List[Dict[str, Any]] = []
+    for sym, amt in bals.items():
+        if sym in ("ZUSD", "USD") or sym.endswith(".S"):
+            continue
+        qty = float(amt or 0)
+        if qty <= 0:
+            continue
+        base = sym.replace("X","").replace("Z","")
+        pair = f"{base}USD"
+        out.append({
+            "symbol": from_kraken(pair),
+            "qty": qty,
+            "avg_entry_price": 0.0,
+        })
+    return out
