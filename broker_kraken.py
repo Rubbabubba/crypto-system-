@@ -95,16 +95,35 @@ def get_bars(symbol: str, timeframe: str = "5min", limit: int = 200) -> List[Dic
     return out
 
 def last_trade_map(symbols: Iterable[str]):
-    """Return { 'BTC/USD': {'price': 12345.67}, ... } via /Ticker."""
+    """Return { 'BTC/USD': {'price': 12345.67}, ... } via /Ticker.
+    Robust to unknown/invalid pairs; queries one-by-one to avoid whole-call failure.
+    """
     if isinstance(symbols, str):
         symbols = [symbols]
-    pairs = [to_kraken(s) for s in symbols]
-    res = _public("/0/public/Ticker", {"pair": ",".join(pairs)})
+    # Map and dedupe
+    pairs = []
+    seen = set()
+    for s in symbols:
+        if not s:
+            continue
+        p = to_kraken(s)
+        if not p or p in seen:
+            continue
+        seen.add(p)
+        pairs.append(p)
+
     out = {}
-    for k, v in res.items():
-        price = float((v.get("c") or ["0"])[0])
-        ui = from_kraken(k)
-        out[ui] = {"price": price}
+    for p in pairs:
+        try:
+            res = _public("/0/public/Ticker", {"pair": p})
+            for k, v in (res or {}).items():
+                price = float((v.get("c") or ["0"])[0])
+                ui = from_kraken(k)
+                if price > 0:
+                    out[ui] = {"price": price}
+        except Exception:
+            # Unknown asset pair or transient error — skip
+            continue
     return out
 
 def last_price(symbol: str) -> float:

@@ -313,7 +313,18 @@ def pnl_summary():
 # -----------------------------------------------------------------------------
 # Scan bridge
 # -----------------------------------------------------------------------------
-async def _scan_bridge(strat: str, req: Dict[str, Any], dry: bool = False) -> List[Dict[str, Any]]:
+# --- REPLACE the function header + initial normalization lines ---
+async def _scan_bridge(strat: str, req: Dict[str, Any], *args, **kwargs) -> List[Dict[str, Any]]:
+    """
+    Bridge a strategy scan into placed orders + attribution.
+    Accepts 'dry' via keyword or positional; forces dry when TRADING_ENABLED is False.
+    """
+    # Accept dry either as kwarg or first positional
+    dry_arg = kwargs.get("dry", None)
+    if dry_arg is None and args:
+        dry_arg = bool(args[0])
+    is_dry = bool(dry_arg) or (not TRADING_ENABLED)
+
     # normalize basic request
     req = dict(req or {})
     req.setdefault("strategy", strat)
