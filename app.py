@@ -69,6 +69,26 @@ def _extract_strategy_from_order(o: dict) -> str:
             return v
     return "unknown"
 
+DEFAULT_STRAT_PARAMS = {
+    # c1: VWAP pullback + EMA gate (buy pullback above EMA, exit on loss of condition)
+    "c1": {"ema_n": 20, "vwap_pull": 0.0020, "min_vol": 0.0},
+    # c2: Trend-following EMA(50) with soft exit
+    "c2": {"ema_n": 50, "exit_k": 0.997, "min_atr": 0.0},
+    # c3: Channel breakout (55) with failure exit
+    "c3": {"ch_n": 55, "break_k": 1.0005, "fail_k": 0.997, "min_atr": 0.0},
+    # c4: EMA(12/26) momentum with ATR spacing (light guard)
+    "c4": {"ema_fast": 12, "ema_slow": 26, "atr_k": 2.0, "min_atr": 0.0},
+    # c5: Band/HH breakout with quick exit
+    "c5": {"band_n": 20, "band_k": 1.0005, "exit_k": 0.998, "min_atr": 0.0},
+    # c6: Single EMA trend with soft exit
+    "c6": {"ema_n": 34, "exit_k": 0.998, "min_atr": 0.0},
+}
+
+DEFAULT_TIMEFRAME  = os.getenv("DEFAULT_TIMEFRAME", DEFAULT_TIMEFRAME)
+DEFAULT_LIMIT      = int(os.getenv("DEFAULT_LIMIT", DEFAULT_LIMIT))
+DEFAULT_NOTIONAL   = float(os.getenv("DEFAULT_NOTIONAL", DEFAULT_NOTIONAL))
+
+
 # -----------------------------------------------------------------------------
 # Environment & Logging
 # -----------------------------------------------------------------------------
@@ -571,36 +591,41 @@ async def _exit_nanny(symbols: List[str], timeframe: str):
 # -----------------------------------------------------------------------------
 # Scan bridge
 # -----------------------------------------------------------------------------
-async def _scan_bridge(strat: str, req: Dict[str, Any]) -> List[Dict[str, Any]]:
+async def _scan_bridge(strat: str, req: Dict[str, Any], dry: Optional[bool]=None, **kwargs) -> List[Dict[str, Any]]:
     """
     Bridge a single strategy scan into placed orders + attribution.
 
-    - Calls adapter.scan(req) which loads strategies.c{1..6}.run_scan
-      If your strategies self-execute, this will still work; placed=[]
-    - If TRADING_ENABLED, submit returned intents via broker.submit_order
-    - Push any placed orders into the dashboard ring for attribution
-    - Returns the list of placed orders (or scan intents if dry-run)
+    Accepts 'dry' kwarg from the scheduler (ignored if TRADING_ENABLED is controlling).
+    Merges DEFAULT_STRAT_PARAMS[strat] with req['raw'] so tuned defaults are always applied
+    without changing strategy files. No dashboard style changes.
     """
     try:
+        # Merge tuned defaults with ad-hoc per-call raw params
+        raw_cfg = {**(DEFAULT_STRAT_PARAMS.get(strat, {}) or {}), **(req.get("raw") or {})}
+
+        # Respect system-wide trading enablement; allow scheduler to pass dry but don't require it
+        is_dry = (dry if dry is not None else (not TRADING_ENABLED))
+
         req2 = {
-            "strategy": strat,
+            "strategy":  strat,
             "timeframe": req.get("timeframe") or DEFAULT_TIMEFRAME,
-            "limit": int(req.get("limit") or DEFAULT_LIMIT),
-            "notional": float(req.get("notional") or DEFAULT_NOTIONAL),
-            "symbols": req.get("symbols") or UNIVERSE[:],
-            "dry": (not TRADING_ENABLED),
-            "raw": req.get("raw") or {},
+            "limit":     int(req.get("limit") or DEFAULT_LIMIT),
+            "notional":  float(req.get("notional") or DEFAULT_NOTIONAL),
+            "symbols":   req.get("symbols") or UNIVERSE[:],
+            "dry":       is_dry,
+            "raw":       raw_cfg,
         }
-        intents = _adapter.scan(req2, _contexts)
-        intents = intents or []
+
+        # Let the adapter load strategies.c{1..6}.run_scan
+        intents = _adapter.scan(req2, _contexts) or []
 
         placed: List[Dict[str, Any]] = []
-        if TRADING_ENABLED:
+        if TRADING_ENABLED and not is_dry:
             for o in intents:
                 try:
                     sym = _sym_to_slash(o.get("symbol",""))
                     side = (o.get("side","") or "").lower()
-                    if side not in ("buy","sell"):
+                    if side not in ("buy","sell"):  # guard
                         continue
                     cid  = o.get("client_order_id") or f"{strat}-{int(time.time())}-{sym.replace('/','')}"
                     notional = float(o.get("notional") or req2["notional"])
@@ -609,13 +634,13 @@ async def _scan_bridge(strat: str, req: Dict[str, Any]) -> List[Dict[str, Any]]:
                 except Exception:
                     log.exception("submit_order failed for %s", strat)
 
-        # Attribution: prefer placed if any; otherwise (dry) use intents
+        # Attribution: prefer placed (live) else use intents (dry)
         to_push = placed if placed else intents
         if to_push:
             _push_orders(strat, to_push)
 
         return to_push
-    except Exception as e:
+    except Exception:
         log.exception("_scan_bridge error for %s", strat)
         return []
 
