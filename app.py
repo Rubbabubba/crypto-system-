@@ -16,111 +16,155 @@ import asyncio
 import csv
 import io
 import json
-import logging
+import math
 import os
+import random
+import statistics as stats
+import sys
 import time
-import importlib
 from collections import defaultdict, deque
-from datetime import datetime, timedelta, timezone
-from functools import lru_cache
-from math import isfinite
-from statistics import median
-from typing import Any, Dict, List, Optional
+from dataclasses import dataclass
+from datetime import datetime, timezone, timedelta
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
-from fastapi import FastAPI, HTTPException, Query
-from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, RedirectResponse
-
-# ---------- Small helpers ----------
-def _now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
-
-def _parse_ts_any(ts: Optional[str]) -> Optional[datetime]:
-    if not ts:
-        return None
-    try:
-        return datetime.fromisoformat(ts.replace("Z", "+00:00")).astimezone(timezone.utc)
-    except Exception:
-        return None
-
-def _order_is_fill_like(o: dict) -> bool:
-    st = (o.get("status") or "").lower()
-    fq = float(o.get("filled_qty") or 0.0)
-    fp = float(o.get("filled_avg_price") or 0.0)
-    return (st in ("filled", "partially_filled", "done")) or (fq > 0 and fp > 0)
-
-def _sym_to_slash(s: str) -> str:
-    if not s:
-        return s
-    s = s.upper()
-    return s if "/" in s else (s[:-3] + "/" + s[-3:] if len(s) > 3 else s)
-
-def _extract_strategy_from_order(o: dict) -> str:
-    s = (o.get("strategy") or "").strip().lower()
-    if s:
-        return s
-    coid = (o.get("client_order_id") or o.get("clientOrderId") or "").strip()
-    if coid:
-        token = coid.split("-")[0].strip().lower()
-        if token:
-            return token
-    for k in ("tag", "subtag", "strategy_tag", "algo"):
-        v = (o.get(k) or "").strip().lower()
-        if v:
-            return v
-    return "unknown"
-
-DEFAULT_STRAT_PARAMS = {
-    # c1: VWAP pullback + EMA gate (buy pullback above EMA, exit on loss of condition)
-    "c1": {"ema_n": 20, "vwap_pull": 0.0020, "min_vol": 0.0},
-    # c2: Trend-following EMA(50) with soft exit
-    "c2": {"ema_n": 50, "exit_k": 0.997, "min_atr": 0.0},
-    # c3: Channel breakout (55) with failure exit
-    "c3": {"ch_n": 55, "break_k": 1.0005, "fail_k": 0.997, "min_atr": 0.0},
-    # c4: EMA(12/26) momentum with ATR spacing (light guard)
-    "c4": {"ema_fast": 12, "ema_slow": 26, "atr_k": 2.0, "min_atr": 0.0},
-    # c5: Band/HH breakout with quick exit
-    "c5": {"band_n": 20, "band_k": 1.0005, "exit_k": 0.998, "min_atr": 0.0},
-    # c6: Single EMA trend with soft exit
-    "c6": {"ema_n": 34, "exit_k": 0.998, "min_atr": 0.0},
-}
-
-DEFAULT_TIMEFRAME  = os.getenv("DEFAULT_TIMEFRAME", DEFAULT_TIMEFRAME)
-DEFAULT_LIMIT      = int(os.getenv("DEFAULT_LIMIT", DEFAULT_LIMIT))
-DEFAULT_NOTIONAL   = float(os.getenv("DEFAULT_NOTIONAL", DEFAULT_NOTIONAL))
-
+import pandas as pd  # type: ignore
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
+from pydantic import BaseModel
 
 # -----------------------------------------------------------------------------
-# Environment & Logging
+# Logging
 # -----------------------------------------------------------------------------
-LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
-logging.basicConfig(level=LOG_LEVEL, format="%(asctime)s %(levelname)s:app:%(message)s")
+import logging
+
+logging.basicConfig(
+    level=os.getenv("LOG_LEVEL", "INFO"),
+    format="%(asctime)s %(levelname)s:%(name)s:%(message)s",
+)
 log = logging.getLogger("app")
 
-APP_VERSION = os.getenv("APP_VERSION", "2025.10.11-crypto-v3g")
-TRADING_ENABLED_BASE = os.getenv("TRADING_ENABLED", "1").lower() in ("1", "true")
-SCHEDULE_SECONDS = int(os.getenv("SCHEDULE_SECONDS", os.getenv("SCHEDULER_INTERVAL_SEC", "60")))
-DEFAULT_LIMIT = int(os.getenv("DEFAULT_LIMIT", "300"))
+# -----------------------------------------------------------------------------
+# Broker selection (Kraken-first)
+# -----------------------------------------------------------------------------
+BROKER = os.getenv("BROKER", "kraken").lower()
+USING_KRAKEN = BROKER == "kraken" or (
+    os.getenv("KRAKEN_KEY") and os.getenv("KRAKEN_SECRET")
+)
+if USING_KRAKEN:
+    import broker_kraken as br  # your Kraken adapter
+    ACTIVE_BROKER_MODULE = "broker_kraken"
+else:
+    import broker as br  # Alpaca adapter (legacy)
+    ACTIVE_BROKER_MODULE = "broker"
+
+# Live trading enablement – broker-specific
+TRADING_ENABLED_BASE = os.getenv("TRADING_ENABLED", "1") in ("1", "true", "True")
+if USING_KRAKEN:
+    TRADING_ENABLED = TRADING_ENABLED_BASE and (os.getenv("KRAKEN_TRADING", "0") in ("1", "true", "True"))
+else:
+    TRADING_ENABLED = TRADING_ENABLED_BASE and (os.getenv("ALPACA_TRADING", "0") in ("1", "true", "True"))
+
+# -----------------------------------------------------------------------------
+# Globals & defaults
+# -----------------------------------------------------------------------------
+APP_VERSION = os.getenv("APP_VERSION", "2025.10.06-baseline-a")
+SERVICE_NAME = os.getenv("SERVICE_NAME", "Crypto System")
+
+# Safe, non-self-referential defaults (avoid NameError)
 DEFAULT_TIMEFRAME = os.getenv("DEFAULT_TIMEFRAME", "5Min")
+DEFAULT_LIMIT = int(os.getenv("DEFAULT_LIMIT", "300"))
 DEFAULT_NOTIONAL = float(os.getenv("DEFAULT_NOTIONAL", os.getenv("ORDER_NOTIONAL", "25")))
-STRATEGIES = [s.strip() for s in os.getenv("STRATEGY_LIST", "c1,c2,c3,c4,c5,c6").split(",") if s.strip()]
 
-_default_symbols_env = [s.strip().upper() for s in os.getenv("DEFAULT_SYMBOLS", "").split(",") if s.strip()]
+DEFAULT_UNIVERSE = os.getenv(
+    "DEFAULT_UNIVERSE",
+    "BTC/USD,ETH/USD,SOL/USD,ADA/USD,DOGE/USD,XRP/USD,AVAX/USD,LTC/USD,LINK/USD,DOT/USD,MATIC/USD,BCH/USD"
+)
 
-# Guards (unchanged from your baseline)
+SCHEDULER_INTERVAL_SEC = int(os.getenv("SCHEDULER_INTERVAL_SEC", "60"))
+RECENT_ORDERS_LIMIT = int(os.getenv("RECENT_ORDERS_LIMIT", "200"))
+MAX_ORDERS_RING = int(os.getenv("MAX_ORDERS_RING", "1500"))
+
+# -----------------------------------------------------------------------------
+# Strategy book adapter
+# -----------------------------------------------------------------------------
+from strategy_book import StrategyBook  # local helper that dispatches to c1..c6
+
+# Active strategies
+STRATEGY_LIST = os.getenv("STRATEGY_LIST", "c1,c2,c3,c4,c5,c6")
+ACTIVE_STRATEGIES = [s.strip() for s in STRATEGY_LIST.split(",") if s.strip()]
+
+# Symbol universe
+_CURRENT_SYMBOLS: List[str] = [s.strip() for s in DEFAULT_UNIVERSE.split(",") if s.strip()]
+
+# -----------------------------------------------------------------------------
+# Presentation helpers / math
+# -----------------------------------------------------------------------------
+def _fmt(n: Any) -> str:
+    try:
+        f = float(n)
+    except Exception:
+        return str(n)
+    if abs(f) >= 1000:
+        return f"{f:,.2f}"
+    if abs(f) >= 1:
+        return f"{f:.2f}"
+    return f"{f:.6f}"
+
+def _pct(a: float, b: float) -> float:
+    if b == 0:
+        return 0.0
+    return 100.0 * (a / b - 1.0)
+
+def _sym_to_slash(s: str) -> str:
+    s = (s or "").replace("-", "/").replace("_", "/").upper()
+    if "/" not in s and len(s) > 3 and s.endswith("USD"):
+        return f"{s[:-3]}/USD"
+    return s
+
+def _median(xs: List[float]) -> float:
+    xs = [x for x in xs if x is not None]
+    return stats.median(xs) if xs else 0.0
+
+def _spread_bps(px: float, best_bid: Optional[float]=None, best_ask: Optional[float]=None) -> float:
+    # best-effort spread estimate using last price if no book available
+    if best_bid and best_ask and best_ask > 0 and best_bid > 0:
+        return 1e4 * (best_ask - best_bid) / ((best_ask + best_bid) / 2.0)
+    if px <= 0:
+        return 0.0
+    # assume 10 bps typical crypto spread if unknown (tiny)
+    return 10.0
+
+def _price_above_ema_fast(symbol: str, timeframe: str, closes: List[float]) -> bool:
+    # super light EMA(20) check for buy guard
+    if len(closes) < 20:
+        return True
+    k = 2.0 / (20.0 + 1.0)
+    ema = closes[-20]
+    for v in closes[-19:]:
+        ema = v * k + ema * (1.0 - k)
+    last = closes[-1]
+    return last >= ema
+
+# -----------------------------------------------------------------------------
+# Risk & guard rails
+# -----------------------------------------------------------------------------
 GUARDS = {
-    "enable": True,
-    "cooldown_bars_after_loss": 6,
-    "max_closes_per_symbol_per_hour": 4,
-    "max_consecutive_losses_per_strategy": 3,
-    "consec_lookback_hours": 2,
-    "min_edge_bps": 5.0,
-    "min_edge_vs_spread_x": 2.0,
-    "ema_fast": 20,
-    "ema_slow": 50,
+    "min_edge_bps": 4.0,
+    "min_edge_vs_spread_x": 1.2,
     "breakeven_trigger_bps": 8.0,
     "time_bail_bars": 8,
     "tp_target_bps": 12.0,
     "no_cross_exit": True,
+}
+
+# ---- Tuned per-strategy default params (merged into each scan call) ----
+DEFAULT_STRAT_PARAMS = {
+    "c1": {"ema_n": 20, "vwap_pull": 0.0020, "min_vol": 0.0},
+    "c2": {"ema_n": 50, "exit_k": 0.997, "min_atr": 0.0},
+    "c3": {"ch_n": 55, "break_k": 1.0005, "fail_k": 0.997, "min_atr": 0.0},
+    "c4": {"ema_fast": 12, "ema_slow": 26, "atr_k": 2.0, "min_atr": 0.0},
+    "c5": {"band_n": 20, "band_k": 1.0005, "exit_k": 0.998, "min_atr": 0.0},
+    "c6": {"ema_n": 34, "exit_k": 0.998, "min_atr": 0.0},
 }
 
 _DISABLED_STRATS: set[str] = set()
@@ -134,520 +178,220 @@ def _daykey() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
 def _roll_day_if_needed():
-    global _LAST_DAY, _DAILY_PNL, _DAILY_TOTAL, _DISABLED_STRATS
-    dk = _daykey()
-    if _LAST_DAY != dk:
-        _LAST_DAY = dk
-        _DAILY_PNL.clear()
+    global _LAST_DAY, _DAILY_PNL, _DAILY_TOTAL
+    k = _daykey()
+    if _LAST_DAY != k:
+        _DAILY_PNL = defaultdict(float)
         _DAILY_TOTAL = 0.0
-        _DISABLED_STRATS.clear()
-
-# --- EMA / PRICE UTILITIES ---------------------------------------------------
-def _tf_seconds(tf: str) -> int:
-    t = tf.lower()
-    if t in ("1min", "1m"): return 60
-    if t in ("5min", "5m"): return 300
-    if t in ("15min", "15m"): return 900
-    if t in ("1h", "60min"): return 3600
-    return 300
-
-@lru_cache(maxsize=4096)
-def _ema(series_key: tuple, prices: tuple[float, ...], period: int) -> float:
-    k = 2.0 / (period + 1.0)
-    ema = prices[0]
-    for p in prices[1:]:
-        ema = p * k + ema * (1 - k)
-    return ema
-
-def ema_value(symbol: str, timeframe: str, closes: List[float], period: int) -> float:
-    if not closes:
-        return float("nan")
-    key = (symbol, timeframe, len(closes), period)
-    return _ema(key, tuple(closes), period)
-
-def _price_above_ema_fast(symbol: str, timeframe: str, closes: List[float]) -> bool:
-    try:
-        ema = ema_value(symbol, timeframe, closes, GUARDS["ema_fast"])
-        last = closes[-1] if closes else float("nan")
-        return isfinite(ema) and isfinite(last) and (last >= ema)
-    except Exception:
-        return True  # fail-open
-
-def _bps(pct: float) -> float:
-    return pct * 1e4
-
-def _spread_bps(last: float, bid: float = None, ask: float = None) -> float:
-    if bid and ask and bid > 0 and ask > bid:
-        mid = 0.5 * (bid + ask)
-        return _bps((ask - bid) / mid)
-    return 4.0
+        _LAST_DAY = k
+        log.info("Rolled P&L day to %s", k)
 
 # -----------------------------------------------------------------------------
-# Broker switch (Alpaca vs Kraken) — strong default: Kraken
+# App
 # -----------------------------------------------------------------------------
-def _select_broker() -> str:
-    env_choice = (os.getenv("BROKER") or "").strip().lower()
-    if env_choice in ("alpaca", "kraken"):
-        return env_choice
-    # Auto-detect Kraken if keys/flags present; otherwise default to Kraken
-    if os.getenv("KRAKEN_API_KEY") or os.getenv("KRAKEN_TRADING", "0").lower() in ("1", "true"):
-        return "kraken"
-    return "kraken"
+app = FastAPI(title=SERVICE_NAME)
 
-BROKER = _select_broker()
-if BROKER == "kraken":
-    import broker_kraken as br  # your Kraken adapter
-else:
-    import broker as br         # Alpaca adapter (kept for compatibility)
+# -----------------------------------------------------------------------------
+# In-memory rings
+# -----------------------------------------------------------------------------
+_orders_ring: deque = deque(maxlen=MAX_ORDERS_RING)  # orders and intents for dashboard
+_attribution: Dict[str, float] = defaultdict(float)  # by strategy
+_equity_cache: Dict[str, float] = {}  # last prices per symbol
 
-# Broker-specific live flag
-if BROKER == "kraken":
-    _broker_live_flag = os.getenv("KRAKEN_TRADING", "0").lower() in ("1", "true")
-else:
-    _broker_live_flag = os.getenv("ALPACA_TRADING", "0").lower() in ("1", "true")
-
-TRADING_ENABLED = bool(TRADING_ENABLED_BASE and _broker_live_flag)
-
-BROKER_INFO = {
-    "selected": BROKER,
-    "module": getattr(br, "__name__", "unknown"),
-    "trading_enabled_base": TRADING_ENABLED_BASE,
-    "broker_live_flag": _broker_live_flag,
-    "trading_enabled_final": TRADING_ENABLED,
-}
-
+# -----------------------------------------------------------------------------
+# Startup banner
+# -----------------------------------------------------------------------------
 log.info(
-    "Broker selected: %s (module=%s) trading_enabled_final=%s",
-    BROKER, BROKER_INFO["module"], TRADING_ENABLED
+    "Startup: version=%s broker=%s module=%s trading_enabled_base=%s trading_enabled_final=%s",
+    APP_VERSION, ("kraken" if USING_KRAKEN else "alpaca"), ACTIVE_BROKER_MODULE, TRADING_ENABLED_BASE, TRADING_ENABLED
 )
 
 # -----------------------------------------------------------------------------
-# Symbol Universe
+# Routes
 # -----------------------------------------------------------------------------
-_CURRENT_SYMBOLS: List[str] = []
+@app.get("/healthz")
+def healthz():
+    return {"ok": True, "version": APP_VERSION, "time": datetime.now(timezone.utc).isoformat()}
 
-def _builtin_candidates() -> List[str]:
-    base = [
-        "BTC/USD","ETH/USD","SOL/USD","DOGE/USD","ADA/USD","AVAX/USD","LTC/USD",
-        "BCH/USD","LINK/USD","DOT/USD","MATIC/USD","XRP/USD","TRX/USD","ATOM/USD",
-        "FIL/USD","NEAR/USD","APT/USD","ARB/USD","OP/USD","ETC/USD","ALGO/USD",
-        "SUI/USD","AAVE/USD","UNI/USD","GRT/USD"
-    ]
-    extra = [s.strip().upper() for s in os.getenv("CANDIDATE_SYMBOLS","").split(",") if s.strip()]
-    excl = set([s.strip().upper() for s in os.getenv("EXCLUDE_SYMBOLS","").split(",") if s.strip()])
-    out = [s for s in (base + extra) if s not in excl]
-    seen = set(); final=[]
-    for s in out:
-        if s not in seen:
-            final.append(s); seen.add(s)
-    return final
-
-def _try_import_marketcrypto():
-    try:
-        return importlib.import_module("services.market_crypto")
-    except Exception:
-        try:
-            return importlib.import_module("market_crypto")
-        except Exception:
-            return None
-
-def _build_universe_from_bars(timeframe: str, limit: int, max_symbols: int = 24) -> List[str]:
-    candidates = _builtin_candidates()
-    mod = _try_import_marketcrypto()
-    if not mod:
-        log.warning("Universe: services.market_crypto not available; using candidates as-is.")
-        return candidates[:max_symbols]
-
-    try:
-        MarketCrypto = getattr(mod, "MarketCrypto")
-        mc = MarketCrypto.from_env()
-
-        # Try universe.py if present
-        try:
-            import universe as uni
-            cfg_cls = getattr(uni, "UniverseConfig", None)
-            builder_cls = getattr(uni, "UniverseBuilder", None)
-            if cfg_cls and builder_cls:
-                cfg = cfg_cls()
-                builder = builder_cls(cfg)
-                frames = mc.candles(candidates, timeframe=timeframe, limit=min(limit, 600)) or {}
-
-                class _Cache:
-                    def __init__(self, _frames): self._f = _frames
-                    def rows(self, sym, tf):
-                        df = self._f.get(sym) or None
-                        return int(getattr(df, "shape", [0,0])[0]) if df is not None else 0
-
-                builder.refresh_from_cache_like_source(candidates, _Cache(frames))
-                if getattr(builder, "symbols", None):
-                    return builder.symbols[:max_symbols]
-        except Exception:
-            pass
-
-        # Fallback: row-count filter
-        frames = mc.candles(candidates, timeframe=timeframe, limit=min(limit, 600)) or {}
-        rows_ok = []
-        for s, df in (frames or {}).items():
-            try:
-                n = int(getattr(df, "shape", [0,0])[0] or 0)
-                if n >= max(150, int(limit*0.9)):
-                    rows_ok.append(s)
-            except Exception:
-                pass
-        if not rows_ok:
-            log.warning("Universe: no symbols passed rows filter; falling back to candidates.")
-            return candidates[:max_symbols]
-        return rows_ok[:max_symbols]
-    except Exception as e:
-        log.exception("Universe build failed; using candidates. %s", e)
-        return candidates[:max_symbols]
-
-def _load_universe_initial() -> List[str]:
-    if _default_symbols_env:
-        return _default_symbols_env
-    return _build_universe_from_bars(DEFAULT_TIMEFRAME, DEFAULT_LIMIT)
-
-def _set_current_symbols(syms: List[str]):
-    global _CURRENT_SYMBOLS
-    _CURRENT_SYMBOLS = [s.strip().upper() for s in syms if s and isinstance(s, str)]
-
-# -----------------------------------------------------------------------------
-# Strategy adapter
-# -----------------------------------------------------------------------------
-class RealStrategiesAdapter:
-    def __init__(self):
-        self._mods: Dict[str, Any] = {}
-
-    def _get_mod(self, name: str):
-        if name in self._mods:
-            return self._mods[name]
-        try:
-            mod = importlib.import_module(f"strategies.{name}")
-            log.info("adapter: imported strategies.%s", name)
-        except Exception:
-            mod = importlib.import_module(name)
-            log.info("adapter: imported %s (top-level)", name)
-        self._mods[name] = mod
-        return mod
-
-    def reload(self, name: str) -> bool:
-        if name in self._mods:
-            try:
-                self._mods[name] = importlib.reload(self._mods[name])
-                log.info("adapter: reloaded %s", name)
-                return True
-            except Exception as e:
-                log.exception("adapter: reload failed for %s: %s", name, e)
-                return False
-        return True
-
-    def scan(self, req: Dict[str, Any], _contexts: Dict[str, Any]) -> List[Dict[str, Any]]:
-        strat = (req.get("strategy") or "").lower()
-        if not strat:
-            log.warning("adapter: missing 'strategy' in req")
-            return []
-        tf = req.get("timeframe") or DEFAULT_TIMEFRAME
-        lim = int(req.get("limit") or DEFAULT_LIMIT)
-        notional = float(req.get("notional") or DEFAULT_NOTIONAL)
-        symbols = req.get("symbols") or []
-        if isinstance(symbols, str):
-            symbols = [s.strip() for s in symbols.split(",") if s.strip()]
-        else:
-            symbols = [s.strip() for s in symbols]
-        dry = bool(req.get("dry", False))
-        raw = req.get("raw") or {}
-
-        try:
-            mod = self._get_mod(strat)
-            result = mod.run_scan(symbols, tf, lim, notional, dry, raw)
-
-            orders: List[Dict[str, Any]] = []
-            if isinstance(result, dict):
-                if isinstance(result.get("placed"), list):
-                    orders = result["placed"]
-                elif isinstance(result.get("orders"), list):
-                    orders = result["orders"]
-            elif isinstance(result, list):
-                orders = result
-            log.info("adapter: %s produced %d order(s)", strat, len(orders))
-            return orders or []
-        except Exception as e:
-            log.exception("adapter: scan failed for %s: %s", strat, e)
-            return []
-
-class StrategyBook:
-    def __init__(self):
-        self._impl = RealStrategiesAdapter()
-    def scan(self, req: Dict[str, Any], contexts: Optional[Dict[str, Any]] = None):
-        return self._impl.scan(req, contexts or {})
-
-# --- Position/PnL state ------------------------------------------------------
-_positions_state: Dict[str, Dict[str, float]] = {}
-_positions_cache: Dict[str, Dict[str, float]] = {}
-
-def _get_last_price(symbol_slash: str) -> float:
-    try:
-        pmap = br.last_trade_map([symbol_slash])
-        return float(pmap.get(symbol_slash, {}).get("price") or 0.0)
-    except Exception:
-        return 0.0
-
-def _normalize_order(o: dict) -> dict:
-    coid = o.get("client_order_id") or o.get("clientOrderId") or o.get("client_orderid") or ""
-    oid = o.get("id") or o.get("order_id") or coid or ""
-    raw_sym = o.get("symbol") or o.get("Symbol") or o.get("asset_symbol") or ""
-    sym = _sym_to_slash(raw_sym)
-    side = (o.get("side") or o.get("Side") or o.get("order_side") or "").lower()
-    status = (o.get("status") or o.get("Status") or "").lower()
-
-    qty = o.get("filled_qty") or o.get("qty") or o.get("quantity") or o.get("size") or o.get("filled_quantity") or 0
-    price = o.get("filled_avg_price") or o.get("price") or o.get("limit_price") or o.get("avg_price") or 0
-    notional = o.get("notional") or o.get("notional_value") or 0
-
-    try: qty = float(qty)
-    except Exception: qty = 0.0
-    try: price = float(price)
-    except Exception: price = 0.0
-    try: notional = float(notional)
-    except Exception: notional = 0.0
-
-    if price <= 0:
-        price = _get_last_price(sym)
-    if qty <= 0 and notional and price:
-        qty = round(notional / max(price, 1e-9), 8)
-
-    ts = (
-        o.get("filled_at")
-        or o.get("updated_at")
-        or o.get("submitted_at")
-        or o.get("created_at")
-        or o.get("timestamp")
-        or _now_iso()
-    )
-
-    strategy = (
-        o.get("strategy") or _extract_strategy_from_order(o) or o.get("tag") or o.get("subtag") or "unknown"
-    ).lower()
-
-    pnl = o.get("pnl") or 0.0
-    try: pnl = float(pnl)
-    except Exception: pnl = 0.0
-
+@app.get("/diag/broker")
+def diag_broker():
     return {
-        "id": oid,
-        "symbol": sym,
-        "side": side,
-        "qty": qty,
-        "price": price,
-        "strategy": strategy,
-        "pnl": pnl,
-        "time": ts,
-        "client_order_id": coid,
-        "status": status,
-        "notional": notional,
+        "ok": True,
+        "info": {
+            "selected": ("kraken" if USING_KRAKEN else "alpaca"),
+            "module": ACTIVE_BROKER_MODULE,
+            "trading_enabled_base": TRADING_ENABLED_BASE,
+            "broker_live_flag": os.getenv("KRAKEN_TRADING", "0") if USING_KRAKEN else os.getenv("ALPACA_TRADING", "0"),
+            "trading_enabled_final": TRADING_ENABLED,
+        },
+        "probe": {"BTC/USD": 1},
     }
 
-def _apply_realized_pnl(row: dict) -> float:
-    sym = row.get("symbol")
-    side = (row.get("side") or "").lower()
-    qty = float(row.get("qty") or 0)
-    price = float(row.get("price") or 0)
-    if qty <= 0 or price <= 0:
-        return 0.0
-    pos = _positions_state.setdefault(sym, {"qty": 0.0, "avg_price": 0.0})
-    realized = 0.0
-    if side == "buy":
-        new_qty = pos["qty"] + qty
-        if new_qty > 0:
-            pos["avg_price"] = ((pos["qty"] * pos["avg_price"]) + (qty * price)) / new_qty
-        pos["qty"] = new_qty
-    elif side == "sell":
-        sell_qty = min(qty, max(pos["qty"], 0.0))
-        if sell_qty > 0:
-            realized = (price - pos["avg_price"]) * sell_qty
-            pos["qty"] = pos["qty"] - sell_qty
-    return realized
+@app.get("/universe")
+def get_universe():
+    return {"symbols": _CURRENT_SYMBOLS, "count": len(_CURRENT_SYMBOLS)}
 
-def _recalc_equity() -> float:
-    if not _positions_state:
-        return 0.0
-    syms = [s for s, p in _positions_state.items() if p.get("qty", 0) > 0]
+@app.post("/universe/set")
+async def set_universe(req: Dict[str, Any]):
+    syms = req.get("symbols") or []
+    if isinstance(syms, str):
+        syms = [s.strip() for s in syms.split(",") if s.strip()]
     if not syms:
-        return 0.0
-    try:
-        pmap = br.last_trade_map(syms)
-    except Exception:
-        pmap = {}
-    eq = 0.0
-    for s, p in _positions_state.items():
-        q = float(p.get("qty") or 0)
-        if q <= 0:
-            continue
-        last = float((pmap.get(s, {}) or {}).get("price") or 0.0)
-        if last > 0:
-            eq += q * last
-    return eq
+        raise HTTPException(400, "no symbols")
+    global _CURRENT_SYMBOLS
+    _CURRENT_SYMBOLS = syms
+    return {"ok": True, "count": len(_CURRENT_SYMBOLS)}
+
+@app.get("/version")
+def version():
+    return {"version": APP_VERSION}
+
+@app.get("/config")
+def config():
+    return {
+        "DEFAULT_TIMEFRAME": DEFAULT_TIMEFRAME,
+        "DEFAULT_LIMIT": DEFAULT_LIMIT,
+        "DEFAULT_NOTIONAL": DEFAULT_NOTIONAL,
+        "STRATEGY_LIST": ACTIVE_STRATEGIES,
+        "TRADING_ENABLED": TRADING_ENABLED,
+        "BROKER": ("kraken" if USING_KRAKEN else "alpaca"),
+    }
 
 # -----------------------------------------------------------------------------
-# App + state
+# P&L + attribution
 # -----------------------------------------------------------------------------
-app = FastAPI(title="Crypto System")
-
-# Universe at startup
-def _load_symbols_on_boot():
-    syms = _load_universe_initial()
-    _set_current_symbols(syms)
-
-_load_symbols_on_boot()
-
-# Ring buffer for recent orders/events
-ORDERS_RING_CAP = int(os.getenv("ORDERS_RING_CAP", "1000"))
-_orders_ring: deque = deque(maxlen=max(100, ORDERS_RING_CAP))
-
-_attribution: Dict[str, Any] = {"by_strategy": {}, "updated_at": None}
-_summary: Dict[str, Any] = {"equity": 0.0, "pnl_day": 0.0, "pnl_week": 0.0, "pnl_month": 0.0, "updated_at": None}
-
-# ---- Strategy runtime toggles ----
-ACTIVE_STRATEGIES = set(STRATEGIES)
-
-def _push_orders(orders: List[Dict[str, Any]]):
-    global _orders_ring, _attribution, _summary
-    if not orders:
-        ts = _now_iso()
-        _summary["updated_at"] = ts
-        _attribution["updated_at"] = ts
-        return
-    realized_total = 0.0
-    for o in orders:
-        row = _normalize_order(o)
-        try:
-            r = _apply_realized_pnl(row)
-        except Exception:
-            r = 0.0
-        row["pnl"] = float(row.get("pnl") or 0.0) + float(r or 0.0)
-        realized_total += float(r or 0.0)
-        row["ts"] = time.time()
-        _orders_ring.append(row)
-        strat = (row.get("strategy") or "unknown").lower()
-        _attribution["by_strategy"][strat] = _attribution["by_strategy"].get(strat, 0.0) + float(r or 0.0)
-    ts = _now_iso()
-    _attribution["updated_at"] = ts
-    _summary["updated_at"] = ts
-    _summary["pnl_day"] = float(_summary.get("pnl_day") or 0.0) + realized_total
+def _update_equity(symbols: Iterable[str]) -> None:
     try:
-        _summary["equity"] = _recalc_equity()
+        mp = br.last_trade_map(list(symbols))
+        for k, v in (mp or {}).items():
+            _equity_cache[k] = float(v.get("price") or 0.0)
     except Exception:
-        pass
+        log.exception("equity update failed")
 
-async def _exit_nanny(symbols: List[str], timeframe: str):
+def _push_orders(strategy: str, orders: List[Dict[str, Any]]) -> None:
+    ts = datetime.now(timezone.utc).isoformat()
+    total_notional = 0.0
+    for o in (orders or []):
+        o2 = dict(o)
+        o2["strategy"] = strategy
+        o2["ts"] = ts
+        _orders_ring.append(o2)
+        total_notional += float(o2.get("notional") or 0.0)
+    if total_notional:
+        _attribution[strategy] += total_notional
+
+@app.get("/orders/recent")
+def orders_recent(limit: int = 50):
+    items = list(_orders_ring)[-limit:]
+    return list(reversed(items))
+
+@app.get("/orders/attribution")
+def orders_attr():
+    return {"by_strategy": dict(_attribution), "total_notional": sum(_attribution.values())}
+
+@app.get("/pnl/summary")
+def pnl_summary():
+    # Best-effort equity calc from last price * approx position qty (if any)
     try:
-        bars_map = br.get_bars(symbols, timeframe=timeframe, limit=max(GUARDS["ema_slow"], 60)) or {}
-        last_trade_map = br.last_trade_map(symbols) or {}
+        poss = br.list_positions() or []
     except Exception:
-        bars_map, last_trade_map = {}, {}
-    for sym, pos in list(_positions_state.items()):
-        qty = float(pos.get("qty") or 0.0)
-        if qty <= 0:
-            continue
+        poss = []
+    symbols = [p.get("symbol") for p in poss if p.get("symbol")]
+    _update_equity(symbols)
+    equity = 0.0
+    for p in poss:
+        sym = p.get("symbol"); qty = float(p.get("qty") or 0.0)
+        px = _equity_cache.get(sym, 0.0)
+        equity += qty * px
+    return {
+        "equity": equity,
+        "day": _DAILY_TOTAL,
+        "by_strategy": dict(_DAILY_PNL),
+        "ts": datetime.now(timezone.utc).isoformat(),
+    }
+
+# -----------------------------------------------------------------------------
+# Scan bridge
+# -----------------------------------------------------------------------------
+async def _scan_bridge(strat: str, req: Dict[str, Any], dry: bool = False) -> List[Dict[str, Any]]:
+    # normalize basic request
+    req = dict(req or {})
+    req.setdefault("strategy", strat)
+    req.setdefault("timeframe", req.get("tf") or DEFAULT_TIMEFRAME)
+    req.setdefault("limit", req.get("limit") or DEFAULT_LIMIT)
+    req.setdefault("notional", req.get("notional") or DEFAULT_NOTIONAL)
+
+    syms = req.get("symbols") or _CURRENT_SYMBOLS
+    if isinstance(syms, str):
+        syms = [s.strip() for s in syms.split(",") if s.strip()]
+    req["symbols"] = syms
+
+    # merge tuned defaults into raw; allow req['raw'] to override defaults
+    raw_in = dict(req.get("raw") or {})
+    raw_merged = dict(DEFAULT_STRAT_PARAMS.get(strat, {}))
+    raw_merged.update(raw_in)
+    req["raw"] = raw_merged
+
+    # force dry if trading disabled
+    is_dry = dry or (not TRADING_ENABLED)
+
+    sb = StrategyBook()
+    orders = sb.scan(req, {"one": {"timeframe": req["timeframe"], "symbols": syms, "notional": req["notional"]}})
+
+    # Basic guard: EMA/spread sanity for BUYs
+    try:
+        bars_map = br.get_bars(req["symbols"], timeframe=req["timeframe"], limit=60) or {}
+    except Exception:
+        bars_map = {}
+
+    filtered: List[Dict[str, Any]] = []
+    for o in (orders or []):
+        side = (o.get("side") or o.get("order_side") or "").lower()
+        sym = _sym_to_slash(o.get("symbol") or "")
+        sname = (req.get("strategy") or "").lower()
         closes = [
             float(b.get("c") or b.get("close") or 0.0)
             for b in (bars_map.get(sym) or [])
             if float(b.get("c") or b.get("close") or 0.0) > 0
         ]
-        if not closes:
-            continue
-        last = float((last_trade_map.get(sym, {}) or {}).get("price") or closes[-1] or 0.0)
-        if last <= 0:
-            continue
-        entry = float(pos.get("avg_price") or 0.0)
-        if entry <= 0:
-            continue
-        up_bps = _bps((last - entry) / entry)
-
-        # Take profit
-        if up_bps >= GUARDS["tp_target_bps"] and TRADING_ENABLED:
-            try:
-                coid = f"nanny-tp-{sym.replace('/','')}-{int(time.time())}"
-                br.submit_order(symbol=sym, side="sell", notional=min(DEFAULT_NOTIONAL, qty * last), client_order_id=coid)
-                log.info("exit_nanny: TP sell placed for %s", sym)
+        px = float(o.get("price") or o.get("px") or 0.0)
+        if px <= 0 and closes:
+            px = closes[-1]
+        edge_bps_val = float(o.get("edge_bps") or o.get("edge") or 0.0)
+        spr_bps = _spread_bps(px)
+        ema_ok = _price_above_ema_fast(sym, req["timeframe"], closes)
+        if side == "buy":
+            if not ema_ok or edge_bps_val < GUARDS["min_edge_bps"] or edge_bps_val < GUARDS["min_edge_vs_spread_x"] * spr_bps:
+                log.info("guard: drop open %s by %s (ema_ok=%s edge=%.2f spread=%.2f)", sym, sname, ema_ok, edge_bps_val, spr_bps)
                 continue
-            except Exception:
-                log.exception("exit_nanny TP submit failed")
+        filtered.append({**o, "symbol": sym, "side": side})
 
-        # No-cross exit below slow EMA
-        try:
-            slow_ema = ema_value(sym, timeframe, closes, GUARDS["ema_slow"])
-            crossed = isfinite(slow_ema) and (last < slow_ema)
-        except Exception:
-            crossed = False
-        if crossed and TRADING_ENABLED:
-            try:
-                coid = f"nanny-x-{sym.replace('/','')}-{int(time.time())}"
-                br.submit_order(symbol=sym, side="sell", notional=min(DEFAULT_NOTIONAL, qty * last), client_order_id=coid)
-                log.info("exit_nanny: no-cross sell placed for %s", sym)
-            except Exception:
-                log.exception("exit_nanny no-cross submit failed")
-
-# -----------------------------------------------------------------------------
-# Scan bridge
-# -----------------------------------------------------------------------------
-async def _scan_bridge(strat: str, req: Dict[str, Any], dry: Optional[bool]=None, **kwargs) -> List[Dict[str, Any]]:
-    """
-    Bridge a single strategy scan into placed orders + attribution.
-
-    Accepts 'dry' kwarg from the scheduler (ignored if TRADING_ENABLED is controlling).
-    Merges DEFAULT_STRAT_PARAMS[strat] with req['raw'] so tuned defaults are always applied
-    without changing strategy files. No dashboard style changes.
-    """
-    try:
-        # Merge tuned defaults with ad-hoc per-call raw params
-        raw_cfg = {**(DEFAULT_STRAT_PARAMS.get(strat, {}) or {}), **(req.get("raw") or {})}
-
-        # Respect system-wide trading enablement; allow scheduler to pass dry but don't require it
-        is_dry = (dry if dry is not None else (not TRADING_ENABLED))
-
-        req2 = {
-            "strategy":  strat,
-            "timeframe": req.get("timeframe") or DEFAULT_TIMEFRAME,
-            "limit":     int(req.get("limit") or DEFAULT_LIMIT),
-            "notional":  float(req.get("notional") or DEFAULT_NOTIONAL),
-            "symbols":   req.get("symbols") or UNIVERSE[:],
-            "dry":       is_dry,
-            "raw":       raw_cfg,
-        }
-
-        # Let the adapter load strategies.c{1..6}.run_scan
-        intents = _adapter.scan(req2, _contexts) or []
-
-        placed: List[Dict[str, Any]] = []
-        if TRADING_ENABLED and not is_dry:
-            for o in intents:
-                try:
-                    sym = _sym_to_slash(o.get("symbol",""))
-                    side = (o.get("side","") or "").lower()
-                    if side not in ("buy","sell"):  # guard
-                        continue
-                    cid  = o.get("client_order_id") or f"{strat}-{int(time.time())}-{sym.replace('/','')}"
-                    notional = float(o.get("notional") or req2["notional"])
-                    br.submit_order(symbol=sym, side=side, notional=notional, client_order_id=cid)
-                    placed.append({**o, "symbol": sym, "client_order_id": cid})
-                except Exception:
-                    log.exception("submit_order failed for %s", strat)
-
-        # Attribution: prefer placed (live) else use intents (dry)
-        to_push = placed if placed else intents
-        if to_push:
-            _push_orders(strat, to_push)
-
-        return to_push
-    except Exception:
-        log.exception("_scan_bridge error for %s", strat)
+    if not filtered:
         return []
 
+    # Optional execution + attribution
+    placed: List[Dict[str, Any]] = []
+    if not is_dry:
+        for o in filtered:
+            try:
+                sym = _sym_to_slash(o.get("symbol") or "")
+                side = (o.get("side") or "").lower()
+                if side not in ("buy", "sell"):
+                    continue
+                cid = o.get("client_order_id") or f"{strat}-{int(time.time())}-{sym.replace('/','')}"
+                notional = float(o.get("notional") or req["notional"])
+                br.submit_order(symbol=sym, side=side, notional=notional, client_order_id=cid)
+                placed.append({**o, "client_order_id": cid})
+            except Exception:
+                log.exception("submit failed")
+    to_push = placed if (placed and not is_dry) else filtered
+    if to_push:
+        _push_orders(strat, to_push)
+    return to_push
+
 # -----------------------------------------------------------------------------
-# Background scheduler
+# Scheduler
 # -----------------------------------------------------------------------------
-_scheduler_task: Optional[asyncio.Task] = None
 _running = False
 
 async def _scheduler_loop():
@@ -665,528 +409,253 @@ async def _scheduler_loop():
                         strat,
                         {
                             "timeframe": DEFAULT_TIMEFRAME,
-                            "symbols": _CURRENT_SYMBOLS,
                             "limit": DEFAULT_LIMIT,
                             "notional": DEFAULT_NOTIONAL,
+                            "symbols": _CURRENT_SYMBOLS,
                         },
                         dry=dry_flag,
                     )
+                    if orders:
+                        log.info("scan %s → %d orders", strat, len(orders))
                 except Exception:
                     log.exception("scan error %s", strat)
-                    orders = []
-                try:
-                    _push_orders(orders)
-                except Exception:
-                    log.exception("push orders error")
-                try:
-                    await _exit_nanny(_CURRENT_SYMBOLS, DEFAULT_TIMEFRAME)
-                except Exception:
-                    log.exception("exit nanny failed")
-            log.info(
-                "Scheduler tick complete (dry=%d symbols=%d broker=%s) — sleeping %ss",
-                int(dry_flag), len(_CURRENT_SYMBOLS), BROKER, SCHEDULE_SECONDS
-            )
-            await asyncio.sleep(SCHEDULE_SECONDS)
+            log.info("Scheduler tick complete (dry=%s symbols=%d broker=%s) — sleeping %ss", int(dry_flag), len(_CURRENT_SYMBOLS), ("kraken" if USING_KRAKEN else "alpaca"), SCHEDULER_INTERVAL_SEC)
+            await asyncio.sleep(SCHEDULER_INTERVAL_SEC)
     finally:
         _running = False
 
-@app.on_event("startup")
-async def _startup():
-    global _scheduler_task
-    log.info(
-        "App startup (version=%s); broker=%s module=%s trading_enabled=%s; interval=%ss; strategies=%s; symbols=%d",
-        APP_VERSION, BROKER, BROKER_INFO["module"], TRADING_ENABLED, SCHEDULE_SECONDS,
-        ",".join(sorted(ACTIVE_STRATEGIES)), len(_CURRENT_SYMBOLS)
-    )
-    if _scheduler_task is None:
-        _scheduler_task = asyncio.create_task(_scheduler_loop())
+@app.post("/scheduler/start")
+async def scheduler_start():
+    if _running:
+        return {"ok": True, "running": True}
+    asyncio.create_task(_scheduler_loop())
+    return {"ok": True, "running": True}
 
-@app.on_event("shutdown")
-async def _shutdown():
-    global _running, _scheduler_task
-    log.info("Shutting down app; scheduler will stop.")
+@app.post("/scheduler/stop")
+async def scheduler_stop():
+    global _running
     _running = False
+    return {"ok": True, "running": False}
+
+# -----------------------------------------------------------------------------
+# Orders passthrough endpoints (for testing)
+# -----------------------------------------------------------------------------
+@app.post("/order/submit")
+async def order_submit(req: Dict[str, Any]):
+    sym = _sym_to_slash(req.get("symbol") or "")
+    side = (req.get("side") or "").lower()
+    cid = req.get("client_order_id") or f"manual-{int(time.time())}-{sym.replace('/','')}"
+    notional = float(req.get("notional") or DEFAULT_NOTIONAL)
+    if side not in ("buy", "sell"):
+        raise HTTPException(400, "side must be buy/sell")
+    if not sym:
+        raise HTTPException(400, "symbol required")
+    if not TRADING_ENABLED:
+        return {"ok": True, "dry": True, "message": "TRADING_ENABLED=0"}
     try:
-        if _scheduler_task:
-            await asyncio.wait_for(_scheduler_task, timeout=5.0)
-    except Exception:
-        pass
+        br.submit_order(symbol=sym, side=side, notional=notional, client_order_id=cid)
+        _push_orders("manual", [{"symbol": sym, "side": side, "notional": notional, "client_order_id": cid}])
+        return {"ok": True, "cid": cid}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/positions")
+def positions():
+    try:
+        return br.list_positions() or []
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/orders")
+def orders(status: str = "all", limit: int = 100):
+    try:
+        return br.list_orders(status=status, limit=limit) or []
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 # -----------------------------------------------------------------------------
 # Dashboard HTML
 # -----------------------------------------------------------------------------
-_DASHBOARD_HTML = """
+DASHBOARD_HTML = f"""
 <!doctype html>
 <html lang="en">
 <head>
-  <meta charset="utf-8">
-  <title>Crypto System Dashboard</title>
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <style>
-    :root{
-      --bg:#0b1220; --panel:#111a2b; --ink:#e6edf3; --muted:#a6b3c2;
-      --accent:#5dd4a3; --accent2:#66a3ff; --red:#ff6b6b; --chip:#1a2336; --chip-br:#26324a;
-    }
-    *{box-sizing:border-box}
-    body{ margin:0; font-family:system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial; background:linear-gradient(160deg,#0b1220 0%,#0e172a 100%); color:var(--ink);}
-    header{ padding:20px 24px; border-bottom:1px solid #16233b; display:flex; align-items:center; gap:12px }
-    .badge{ font-size:12px; background:var(--chip); border:1px solid var(--chip-br); color:var(--muted); padding:4px 8px; border-radius:999px;}
-    main{ padding:24px; max-width:1200px; margin:0 auto }
-    .grid{ display:grid; grid-template-columns:repeat(12,1fr); gap:16px }
-    .card{ background:var(--panel); border:1px solid #1a2740; border-radius:14px; padding:16px; box-shadow:0 10px 24px rgba(0,0,0,.2)}
-    .span-4{grid-column:span 4} .span-6{grid-column:span 6} .span-8{grid-column:span 8} .span-12{grid-column:span 12}
-    h1{font-size:18px;margin:0} .muted{color:var(--muted)} .row{display:flex;align-items:center;justify-content:space-between;gap:12px}
-    .kpi{font-size:28px;font-weight:700} .good{color:var(--accent)} .bad{color:var(--red)}
-    table{width:100%;border-collapse:collapse;font-size:14px} th,td{padding:8px;border-bottom:1px solid #1a2740;text-align:left} th{color:#9db0c9;font-weight:600}
-    .chips{display:flex;flex-wrap:wrap;gap:8px} .chip{ background:var(--chip); border:1px solid var(--chip-br); padding:6px 10px; border-radius:999px; font-size:12px; color:#c7d2e3 }
-    a.btn{ display:inline-block; padding:8px 12px; border-radius:10px; text-decoration:none; background:var(--accent2); color:#0b1220; font-weight:700; border:1px solid #2a3f6b }
-    footer{ padding:28px; color:var(--muted); text-align:center }
-    @media (max-width: 900px){ .span-4,.span-6,.span-8{grid-column:span 12} }
-    code{ background:#0d1628; border:1px solid #1a2740; padding:2px 6px; border-radius:6px }
-  </style>
-  <script>
-    async function loadSummary(){
-      const r = await fetch('/pnl/summary'); const d = await r.json();
-      document.getElementById('eq').textContent = Number(d.equity || 0).toFixed(2);
-      document.getElementById('pnl_day').textContent = Number(d.pnl_day || 0).toFixed(2);
-      document.getElementById('pnl_week').textContent = Number(d.pnl_week || 0).toFixed(2);
-      document.getElementById('pnl_month').textContent = Number(d.pnl_month || 0).toFixed(2);
-      document.getElementById('updated').textContent = d.updated_at ? new Date(d.updated_at).toLocaleString() : '-';
-    }
-    async function loadAttribution(){
-      const r = await fetch('/orders/attribution'); const d = await r.json();
-      const tbody = document.getElementById('attr_body'); tbody.innerHTML = '';
-      if (d.by_strategy){ for (const [k,v] of Object.entries(d.by_strategy)){
-          const tr = document.createElement('tr'); tr.innerHTML = `<td>${k}</td><td>${Number(v).toFixed(2)}</td>`; tbody.appendChild(tr);
-      }}
-      document.getElementById('attr_updated').textContent = d.updated_at ? new Date(d.updated_at).toLocaleString() : '-';
-    }
-    async function loadOrders(){
-      const r = await fetch('/orders/recent?limit=50'); const d = await r.json();
-      const tbody = document.getElementById('orders_body'); tbody.innerHTML = '';
-      (d.orders || []).forEach(o => {
-        const tr = document.createElement('tr');
-        tr.innerHTML = `
-          <td>${o.id ?? ''}</td>
-          <td>${o.symbol ?? ''}</td>
-          <td>${o.side ?? ''}</td>
-          <td>${o.qty ?? ''}</td>
-          <td>${o.px ?? ''}</td>
-          <td>${o.strategy ?? ''}</td>
-          <td>${o.pnl ?? 0}</td>
-          <td>${o.ts ? new Date(o.ts*1000).toLocaleString() : ''}</td>
-        `;
-        tbody.appendChild(tr);
-      });
-    }
-    async function loadUniverse(){
-      const r = await fetch('/universe'); const d = await r.json();
-      document.getElementById('sym_count').textContent = (d.symbols || []).length;
-    }
-    async function refreshAll(){ await Promise.all([loadSummary(), loadAttribution(), loadOrders(), loadUniverse()]); }
-    setInterval(refreshAll, 15000); window.addEventListener('load', refreshAll);
-  </script>
+<meta charset="utf-8"/>
+<title>{SERVICE_NAME} — Dashboard</title>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<style>
+body {{ font-family: -apple-system, Segoe UI, Roboto, Arial, sans-serif; background:#0b0d10; color:#e6edf3; margin:0; }}
+.header {{ display:flex; align-items:center; justify-content:space-between; padding:12px 16px; border-bottom:1px solid #222; }}
+.badge {{ padding:3px 8px; border-radius:12px; font-size:12px; }}
+.badge.kraken {{ background:#163; color:#b5f5b5; }}
+.badge.alpaca {{ background:#322; color:#f5b5b5; }}
+.card {{ background:#11161a; border:1px solid #1e242c; border-radius:10px; padding:12px; margin:12px; }}
+.grid {{ display:grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); grid-gap:12px; }}
+.table {{ width:100%; border-collapse: collapse; }}
+.table th, .table td {{ border-bottom:1px solid #1e242c; padding:6px 8px; text-align:left; font-size:13px; }}
+.mono {{ font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }}
+.subtle {{ color:#9fb0c0; font-size:12px; }}
+h2 {{ margin:0 0 8px 0; font-size:16px; }}
+.small {{ font-size:12px; }}
+.green {{ color:#6bdc6b; }}
+.red {{ color:#ff6b6b; }}
+</style>
+<script>
+async function fetchJSON(url) {{
+  const r = await fetch(url);
+  return await r.json();
+}}
+async function refresh() {{
+  try {{
+    const [health, cfg, uni, summary, attrib, recent] = await Promise.all([
+      fetchJSON('/healthz'),
+      fetchJSON('/config'),
+      fetchJSON('/universe'),
+      fetchJSON('/pnl/summary'),
+      fetchJSON('/orders/attribution'),
+      fetchJSON('/orders/recent?limit=50'),
+    ]);
+    document.getElementById('ver').textContent = health.version;
+    document.getElementById('ts').textContent = new Date(health.time).toLocaleString();
+    const broker = cfg.BROKER;
+    document.getElementById('broker').textContent = broker;
+    document.getElementById('broker').className = 'badge ' + (broker === 'kraken' ? 'kraken' : 'alpaca');
+    document.getElementById('tf').textContent = cfg.DEFAULT_TIMEFRAME;
+    document.getElementById('limit').textContent = cfg.DEFAULT_LIMIT;
+    document.getElementById('notional').textContent = cfg.DEFAULT_NOTIONAL;
+    document.getElementById('strats').textContent = cfg.STRATEGY_LIST.join(', ');
+    document.getElementById('symbols').textContent = uni.symbols.join(', ');
+    document.getElementById('equity').textContent = (summary.equity||0).toFixed(2);
+    document.getElementById('day').textContent = (summary.day||0).toFixed(2);
+    const tbodyA = document.getElementById('attrib');
+    tbodyA.innerHTML = '';
+    Object.entries(attrib.by_strategy || {{}}).forEach(([k,v]) => {{
+      const tr = document.createElement('tr');
+      tr.innerHTML = `<td>${{k}}</td><td class="mono">${{v.toFixed(2)}}</td>`;
+      tbodyA.appendChild(tr);
+    }});
+    const tbodyR = document.getElementById('recent');
+    tbodyR.innerHTML = '';
+    (recent || []).forEach(o => {{
+      const tr = document.createElement('tr');
+      const pn = (o.side==='buy' ? '+' : '-') + (o.notional||0);
+      tr.innerHTML = `<td class="mono">${{o.ts||''}}</td><td>${{o.strategy||''}}</td><td>${{o.symbol||''}}</td><td>${{o.side||''}}</td><td class="mono">${{(o.notional||0).toFixed(2)}}</td><td class="small mono">${{o.client_order_id||''}}</td>`;
+      tbodyR.appendChild(tr);
+    }});
+  }} catch (e) {{
+    console.error(e);
+  }}
+}}
+setInterval(refresh, 5000);
+window.addEventListener('load', refresh);
+</script>
 </head>
 <body>
-  <header class="row">
-    <h1>Crypto System</h1>
-    <span class="badge">Broker: <code>""" + BROKER + """</code></span>
-    <span class="badge">Scheduler: <code>active</code></span>
-    <div style="margin-left:auto" class="chips">
-      <span class="chip">TF: <code id="tf_chip">auto</code></span>
-      <span class="chip">Tick: <code>""" + str(SCHEDULE_SECONDS) + """s</code></span>
-      <span class="chip">Symbols: <code id="sym_count">0</code></span>
-    </div>
-  </header>
-
-  <main>
-    <div class="grid">
-      <section class="card span-8">
-        <div class="row" style="margin-bottom:8px">
-          <h2 style="margin:0;font-size:16px">P&L Summary</h2>
-          <a class="btn" href="#" onclick="refreshAll();return false;">Refresh</a>
-        </div>
-        <div class="grid" style="grid-template-columns:repeat(12,1fr);gap:12px">
-          <div class="span-4"><div class="muted">Equity</div><div class="kpi" id="eq">0.00</div></div>
-          <div class="span-4"><div class="muted">PnL (Day)</div><div class="kpi good" id="pnl_day">0.00</div></div>
-          <div class="span-4"><div class="muted">PnL (Week)</div><div class="kpi" id="pnl_week">0.00</div></div>
-          <div class="span-4"><div class="muted">PnL (Month)</div><div class="kpi" id="pnl_month">0.00</div></div>
-          <div class="span-8"><div class="muted">Last Updated</div><div id="updated" class="kpi" style="font-size:16px">-</div></div>
-        </div>
-      </section>
-
-      <section class="card span-4">
-        <div class="row" style="margin-bottom:8px"><h2 style="margin:0;font-size:16px">Attribution</h2></div>
-        <table><thead><tr><th>Strategy</th><th>PnL</th></tr></thead><tbody id="attr_body"></tbody></table>
-        <div class="muted" style="margin-top:8px">Updated: <span id="attr_updated">-</span></div>
-      </section>
-
-      <section class="card span-12">
-        <div class="row" style="margin-bottom:8px"><h2 style="margin:0;font-size:16px">Recent Orders</h2></div>
-        <table>
-          <thead><tr><th>ID</th><th>Symbol</th><th>Side</th><th>Qty</th><th>Price</th><th>Strategy</th><th>PnL</th><th>Time</th></tr></thead>
-          <tbody id="orders_body"></tbody>
-        </table>
-      </section>
-    </div>
-  </main>
-
-  <footer>Built with FastAPI • Tick interval: """ + str(SCHEDULE_SECONDS) + """s</footer>
-  <script>document.getElementById('tf_chip').textContent = '""" + DEFAULT_TIMEFRAME + """';</script>
+<div class="header">
+  <div>
+    <div class="small subtle">{SERVICE_NAME} · v<span id="ver">-</span></div>
+    <div class="small subtle">Last update: <span id="ts">-</span></div>
+  </div>
+  <div class="badge {('kraken' if USING_KRAKEN else 'alpaca')}" id="broker">{('kraken' if USING_KRAKEN else 'alpaca')}</div>
+</div>
+<div class="grid">
+  <div class="card">
+    <h2>Config</h2>
+    <div class="small">TF: <span id="tf" class="mono">-</span> · Limit: <span id="limit" class="mono">-</span> · Notional: <span id="notional" class="mono">-</span></div>
+    <div class="small">Strategies: <span id="strats" class="mono">-</span></div>
+    <div class="small">Symbols: <span id="symbols" class="mono">-</span></div>
+  </div>
+  <div class="card">
+    <h2>Equity & Day P&L</h2>
+    <div>Equity: <span class="mono green" id="equity">0.00</span></div>
+    <div>Day P&L: <span class="mono" id="day">0.00</span></div>
+  </div>
+  <div class="card">
+    <h2>Attribution</h2>
+    <table class="table">
+      <thead><tr><th>Strategy</th><th>Notional</th></tr></thead>
+      <tbody id="attrib"></tbody>
+    </table>
+  </div>
+  <div class="card" style="grid-column:1/-1">
+    <h2>Recent Orders</h2>
+    <table class="table">
+      <thead><tr><th>Time</th><th>Strategy</th><th>Symbol</th><th>Side</th><th>Notional</th><th>Client ID</th></tr></thead>
+      <tbody id="recent"></tbody>
+    </table>
+  </div>
+</div>
 </body>
 </html>
 """
 
+@app.get("/", response_class=HTMLResponse)
+def root():
+    return HTMLResponse(content=DASHBOARD_HTML, status_code=200)
+
 # -----------------------------------------------------------------------------
-# Routes
+# Legacy/utility routes preserved
 # -----------------------------------------------------------------------------
-@app.get("/", include_in_schema=False)
-async def root():
-    return RedirectResponse("/dashboard", status_code=307)
+@app.get("/diag/ping")
+def ping():
+    return {"ok": True, "pong": int(time.time())}
 
-@app.get("/dashboard", response_class=HTMLResponse, include_in_schema=False)
-async def dashboard():
-    return HTMLResponse(_DASHBOARD_HTML)
-
-@app.get("/healthz", include_in_schema=False)
-def healthz():
-    return {"ok": True, "version": APP_VERSION, "time": _now_iso()}
-
-@app.get("/diag/broker", response_class=JSONResponse)
-def diag_broker():
-    # probe broker layer to make failures obvious
-    try:
-        probe = br.get_bars(["BTC/USD"], timeframe=DEFAULT_TIMEFRAME, limit=1) or {}
-        ok = True
-    except Exception as e:
-        probe = {"error": str(e)}
-        ok = False
-    return {
-        "ok": ok,
-        "info": BROKER_INFO,
-        "probe": {k: (len(v) if isinstance(v, list) else v) for k, v in (probe or {}).items()},
-    }
-
-# ---- Universe endpoints ----
-@app.get("/universe", response_class=JSONResponse)
-def get_universe():
-    return {"symbols": _CURRENT_SYMBOLS, "count": len(_CURRENT_SYMBOLS), "timeframe": DEFAULT_TIMEFRAME}
-
-@app.post("/universe/refresh", response_class=JSONResponse)
-def refresh_universe(max_symbols: int = 24):
-    syms = _build_universe_from_bars(DEFAULT_TIMEFRAME, DEFAULT_LIMIT, max_symbols=max_symbols)
-    _set_current_symbols(syms)
-    return {"ok": True, "symbols": _CURRENT_SYMBOLS, "count": len(_CURRENT_SYMBOLS)}
-
-# ---- Strategy management endpoints ----
-@app.get("/strategies", response_class=JSONResponse)
-def strategies_list():
-    names = sorted(set(STRATEGIES) | ACTIVE_STRATEGIES)
-    out = [{"name": n, "enabled": (n in ACTIVE_STRATEGIES)} for n in names]
-    return {"strategies": out}
-
-@app.post("/strategies/enable", response_class=JSONResponse)
-def strategies_enable(name: str):
-    ACTIVE_STRATEGIES.add(name)
-    return {"ok": True, "enabled": sorted(ACTIVE_STRATEGIES)}
-
-@app.post("/strategies/disable", response_class=JSONResponse)
-def strategies_disable(name: str):
-    ACTIVE_STRATEGIES.discard(name)
-    return {"ok": True, "enabled": sorted(ACTIVE_STRATEGIES)}
-
-@app.post("/strategies/reload", response_class=JSONResponse)
-def strategies_reload(name: str = ""):
-    sb = StrategyBook()
-    if name:
-        ok = sb._impl.reload(name)
-        return {"ok": ok, "reloaded": [name] if ok else []}
-    reloaded = []
-    for k in list(sb._impl._mods.keys()):
-        if sb._impl.reload(k):
-            reloaded.append(k)
-    return {"ok": True, "reloaded": reloaded}
-
-# ---- PnL & orders endpoints ----
-@app.get("/pnl/summary", response_class=JSONResponse)
-async def pnl_summary():
-    return JSONResponse(_summary)
-
-@app.get("/orders/recent", response_class=JSONResponse)
-async def orders_recent(limit: int = Query(100, ge=1, le=1000)):
-    items = list(_orders_ring)[-limit:] if _orders_ring else []
-    mapped = []
-    for o in items:
-        ts_iso = o.get("time") or ""
-        try:
-            ts_epoch = int(datetime.fromisoformat(ts_iso.replace("Z", "+00:00")).timestamp())
-        except Exception:
-            ts_epoch = int(o.get("ts") or time.time())
-        mapped.append(
-            {
-                "id": o.get("id"),
-                "symbol": o.get("symbol"),
-                "side": o.get("side"),
-                "qty": o.get("qty"),
-                "px": o.get("price") or o.get("px"),
-                "strategy": o.get("strategy"),
-                "pnl": o.get("pnl"),
-                "ts": ts_epoch,
-            }
-        )
-    return JSONResponse({"orders": mapped, "updated_at": datetime.now(timezone.utc).isoformat()})
-
-@app.get("/orders/attribution", response_class=JSONResponse)
-async def orders_attribution():
-    return JSONResponse(_attribution)
-
-# ---- Analytics & diagnostics ----
-@app.get("/analytics/trades", response_class=JSONResponse)
-def analytics_trades(hours: int = 168):
-    now = time.time()
-    cutoff = now - (hours * 3600)
-    items = [r for r in list(_orders_ring) if float(r.get("ts", now)) >= cutoff]
-    out = []
-    for r in items:
-        out.append({
-            "ts": float(r.get("ts", now)),
-            "strategy": (r.get("strategy") or "unknown").lower(),
-            "symbol": r.get("symbol") or r.get("sym") or "",
-            "side": r.get("side") or "",
-            "qty": r.get("qty") or r.get("quantity") or 0,
-            "notional": r.get("notional") or 0.0,
-            "pnl": float(r.get("pnl") or 0.0),
-            "closed": bool(r.get("closed") or False),
-        })
-    return JSONResponse({"ok": True, "count": len(out), "rows": out})
-
-@app.get("/analytics/trades.csv", response_class=PlainTextResponse)
-async def analytics_trades_csv(hours: int = 12):
-    orders = _fetch_filled_orders_last_hours(int(hours))
-    rows = [_normalize_trade_row(o) for o in orders]
-    buf = io.StringIO()
-    w = csv.DictWriter(
-        buf,
-        fieldnames=[
-            "time","strategy","symbol","side","qty","price","id","client_order_id","status","notional",
-        ],
-    )
-    w.writeheader()
-    for r in rows:
-        w.writerow(r)
-    return buf.getvalue()
-
-def _normalize_trade_row(o: dict) -> dict:
-    n = _normalize_order(o)
-    return {
-        "time": n.get("time"),
-        "strategy": n.get("strategy"),
-        "symbol": n.get("symbol"),
-        "side": n.get("side"),
-        "qty": n.get("qty"),
-        "price": n.get("price"),
-        "id": n.get("id"),
-        "client_order_id": n.get("client_order_id"),
-        "status": n.get("status"),
-        "notional": n.get("notional"),
-    }
-
-def _fetch_filled_orders_last_hours(hours: int) -> list:
-    since = datetime.now(timezone.utc) - timedelta(hours=hours)
-    raw = br.list_orders(status="all", limit=1000) or []
-    out = []
-    for o in raw:
-        if not _order_is_fill_like(o):
-            continue
-        t = _parse_ts_any(
-            o.get("filled_at") or o.get("updated_at") or o.get("submitted_at") or o.get("created_at")
-        )
-        if t and t >= since:
-            out.append(o)
-    out.sort(
-        key=lambda r: _parse_ts_any(
-            r.get("filled_at") or r.get("updated_at") or r.get("submitted_at") or r.get("created_at")
-        ) or datetime.min.replace(tzinfo=timezone.utc)
-    )
-    return out
-
-@app.get("/diag/orders_raw")
-async def diag_orders_raw(status: str = "all", limit: int = 25):
-    data = br.list_orders(status=status, limit=limit) or []
-    return {"status": status, "limit": limit, "orders": data}
-
-@app.get("/diag/bars")
-async def diag_bars(symbols: str = "", tf: str = "", limit: int = 360):
-    syms = [s.strip().upper() for s in (symbols or ",".join(_CURRENT_SYMBOLS)).split(",") if s.strip()]
-    bars = br.get_bars(syms, timeframe=(tf or DEFAULT_TIMEFRAME), limit=int(limit))
-    return {
-        "timeframe": (tf or DEFAULT_TIMEFRAME),
-        "limit": limit,
-        "counts": {k: len(v) for k, v in bars.items()},
-        "keys": list(bars.keys())
-    }
-
-@app.get("/diag/imports")
-async def diag_imports():
-    out = {}
-    for name in sorted(set(STRATEGIES) | ACTIVE_STRATEGIES):
-        try:
-            try:
-                importlib.import_module(f"strategies.{name}")
-                out[name] = f"ok: strategies.{name}"
-            except Exception:
-                importlib.import_module(name)
-                out[name] = f"ok: top-level {name}"
-        except Exception as e:
-            out[name] = f"ERROR: {e}"
-    return out
-
-@app.get("/diag/scan")
-async def diag_scan(
-    strategy: str,
-    symbols: str = "",
-    tf: Optional[str] = None,
-    limit: Optional[int] = None,
-    notional: Optional[float] = None,
-    dry: int = 1,
-):
-    tf = tf or DEFAULT_TIMEFRAME
-    limit = limit or DEFAULT_LIMIT
-    notional = notional or DEFAULT_NOTIONAL
-    syms = [s.strip() for s in (symbols or ",".join(_CURRENT_SYMBOLS)).split(",") if s.strip()]
-    req = {
-        "strategy": strategy,
-        "timeframe": tf,
-        "limit": limit,
-        "notional": notional,
-        "symbols": syms,
-        "dry": bool(dry),
-        "raw": {}
-    }
-    sb = StrategyBook()
-    orders = sb.scan(req, {"one": {"timeframe": tf, "symbols": syms, "notional": notional}})
-    return {"args": req, "orders_count": len(orders or []), "orders": orders}
-
-@app.get("/diag/alpaca")
-async def diag_alpaca():
-    # Kept for compatibility; may fail when BROKER=kraken (that’s OK).
-    try:
-        pos = br.list_positions()
-        bars = br.get_bars(["BTC/USD", "ETH/USD"], timeframe=DEFAULT_TIMEFRAME, limit=3)
-        return {
-            "positions_len": len(pos if isinstance(pos, list) else []),
-            "bars_keys": list(bars.keys()),
-            "bars_len_each": {k: len(v) for k, v in bars.items()},
-        }
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-@app.get("/metrics/fliptest", response_class=JSONResponse)
-def metrics_fliptest(hours: int = 168):
-    now = time.time(); cutoff = now - hours*3600
-    rows = [r for r in list(_orders_ring) if float(r.get("ts", now)) >= cutoff]
-    per = defaultdict(list)
-    for r in rows:
-        per[(r.get("strategy") or "unknown").lower()].append(float(r.get("pnl") or 0.0))
-    out = {}
-    for sid, pnl in per.items():
-        n = len(pnl)
-        gp = sum(x for x in pnl if x > 0); gl = -sum(x for x in pnl if x < 0)
-        pf = (gp / gl) if gl > 0 else (float("inf") if gp > 0 else 0.0)
-        gp_r = sum(-x for x in pnl if x < 0); gl_r = -sum(-x for x in pnl if -x < 0)
-        pf_r = (gp_r / gl_r) if gl_r > 0 else (float("inf") if gp_r > 0 else 0.0)
-        out[sid] = {"N": n, "PF": round(pf, 3), "Expectancy": round((sum(pnl)/n) if n else 0.0, 4),
-                    "PF_rev": round(pf_r, 3), "Expectancy_rev": round(((-sum(pnl))/n) if n else 0.0, 4)}
-    return JSONResponse({"ok": True, "data": out})
-
-@app.get("/metrics/scorecard", response_class=JSONResponse)
-def metrics_scorecard(hours: int = 168, last_n_trades: int = 0):
-    now = time.time()
-    rows = list(_orders_ring)
-    if hours and hours > 0:
-        cutoff = now - (hours * 3600)
-        rows = [r for r in rows if float(r.get("ts", now)) >= cutoff]
-    per = defaultdict(list)
-    for r in rows:
-        sid = (r.get("strategy") or "unknown").lower()
-        per[sid].append(r)
-    if last_n_trades and last_n_trades > 0:
-        per = {k: v[-last_n_trades:] for k, v in per.items()}
-    out = {}
-    for sid, items in per.items():
-        pnl = [float(x.get("pnl") or 0.0) for x in items if x.get("pnl") is not None]
-        n = len(items)
-        wins = sum(1 for x in pnl if x > 0)
-        losses = sum(1 for x in pnl if x < 0)
-        gp = sum(x for x in pnl if x > 0); gl = -sum(x for x in pnl if x < 0)
-        net = gp - gl
-        win_rate = (wins / max(wins + losses, 1)) if (wins + losses) else 0.0
-        exp = (net / n) if n else 0.0
-        med = median(pnl) if pnl else 0.0
-        pf = (gp / gl) if gl > 0 else (float("inf") if gp > 0 else 0.0)
-        # running drawdown
-        cum = 0.0; peak = 0.0; maxdd = 0.0
-        for x in pnl:
-            cum += x; peak = max(peak, cum); maxdd = min(maxdd, cum - peak)
-        out[sid] = {
-            "trades": n, "wins": wins, "losses": losses, "win_rate": round(win_rate, 4),
-            "gross_pnl": round(gp, 2), "fees": 0.0, "net_pnl": round(net, 2),
-            "avg_ret": 0.0, "std_ret": 0.0, "sharpe_like": 0.0,
-            "median_pnl": round(med, 2), "max_drawdown": round(maxdd, 2),
-        }
-    return JSONResponse({"ok": True, "data": out, "count_strategies": len(out)})
-
-@app.post("/init/positions")
-def init_positions():
-    """
-    Initialize the in-memory positions cache from the active broker.
-    Works with both Alpaca and Kraken. If the broker doesn't support positions,
-    falls back to empty positions.
-    """
-    global _positions_cache
-    try:
-        getpos = getattr(br, "get_positions", None)
-        raw_positions = getpos() if callable(getpos) else []
-
-        positions = {}
-        for p in (raw_positions or []):
-            sym = (p.get("symbol") or p.get("Symbol") or p.get("pair") or "").upper()
-            if not sym:
-                continue
-            qty = p.get("qty") or p.get("quantity") or p.get("size") or 0
-            avg = p.get("avg_entry_price") or p.get("avg_price") or p.get("price") or 0
-            try: qty = float(qty)
-            except: qty = 0.0
-            try: avg = float(avg)
-            except: avg = 0.0
-            positions[sym] = {"qty": qty, "avg_price": avg}
-
-        _positions_cache = positions
-        return {"ok": True, "positions": positions}
-    except Exception as e:
-        log.exception("init/positions failed: %s", e)
-        raise HTTPException(status_code=500, detail=str(e))
+@app.get("/diag/routes")
+def routes_list():
+    routes = []
+    for r in app.router.routes:
+        routes.append({"path": getattr(r, "path", None), "name": getattr(r, "name", None), "methods": list(getattr(r, "methods", []) or [])})
+    return routes
 
 @app.post("/init/backfill")
-async def init_backfill(days: Optional[int] = None, status: str = "closed"):
+async def init_backfill(req: Dict[str, Any]):
+    """
+    Best-effort "read recent" to warm attribution and equity.
+    """
     try:
-        lookback_days = int(days or os.getenv("INIT_BACKFILL_DAYS", "7"))
-        after = datetime.now(timezone.utc) - timedelta(days=lookback_days)
-        raws = br.list_orders(status=status, limit=1000) or []
+        limit = int(req.get("limit") or 50)
+        orders = br.list_orders(status="all", limit=limit) or []
+        _push_orders("backfill", orders)
+        symbols = list({o.get("symbol") for o in orders if o.get("symbol")})
+        _update_equity(symbols)
+        return {"ok": True, "considered": len(orders), "symbols": symbols}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/scan/once")
+async def scan_once(req: Dict[str, Any]):
+    try:
+        strat = (req.get("strategy") or ACTIVE_STRATEGIES[0]).lower()
+        orders = await _scan_bridge(strat, req, dry=(not TRADING_ENABLED))
+        return {"ok": True, "orders": orders}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/replay")
+async def replay(req: Dict[str, Any]):
+    """
+    Accepts a CSV of orders to push into ring for attribution testing.
+    """
+    try:
+        csv_text = req.get("csv") or ""
+        f = io.StringIO(csv_text)
+        rdr = csv.DictReader(f)
+        raws = list(rdr)
         selected = []
+        orders: List[Dict[str, Any]] = []
         for r in raws:
-            ts = r.get("filled_at") or r.get("updated_at") or r.get("submitted_at") or r.get("created_at")
-            when = _parse_ts_any(ts) if isinstance(ts, str) else None
-            if when and when >= after:
-                selected.append(r)
-        orders = []
-        for r in selected:
-            st = (r.get("status") or "").lower()
-            filled_px = float(r.get("filled_avg_price") or 0.0)
-            filled_qty = float(r.get("filled_qty") or 0.0)
-            if st in ("filled", "partially_filled", "done") or (filled_px > 0 and filled_qty > 0):
-                orders.append(r)
-        _push_orders(orders)
+            strat = (r.get("strategy") or "replay").lower()
+            sym = _sym_to_slash(r.get("symbol") or "")
+            side = (r.get("side") or "").lower()
+            notional = float(r.get("notional") or 0.0)
+            cid = r.get("client_order_id") or f"replay-{int(time.time())}-{sym.replace('/','')}"
+            if side not in ("buy", "sell") or not sym or notional <= 0:
+                continue
+            o = {"symbol": sym, "side": side, "notional": notional, "client_order_id": cid}
+            selected.append(o)
+            orders.append(o)
+        if orders:
+            _push_orders("replay", orders)
         return {"ok": True, "considered": len(raws), "selected": len(selected), "replayed": len(orders)}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
