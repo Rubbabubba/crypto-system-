@@ -2,13 +2,14 @@
 # -*- coding: utf-8 -*-
 """
 Crypto System – FastAPI service (Render-safe)
-Version: 2025.10.11-kraken-switch-b
+Version: 2025.10.11-crypto-v3g
 
-v3e adds:
-- Strategy runtime controls (/strategies, /strategies/enable, /disable, /reload)
-- Adapter .reload(name) support + scheduler uses ACTIVE_STRATEGIES set
-- Optional universe.py integration (UniverseBuilder) with cache-like adapter
-- Keeps v3d improvements: exit nanny client_order_id, multi-coin universe, guards, etc.
+What’s new in v3g vs baseline:
+- Strong broker selection (default Kraken; auto-detect via KRAKEN_*).
+- Live trading requires broker-specific flag (KRAKEN_TRADING=1).
+- New /diag/broker endpoint to prove we are NOT hitting Alpaca.
+- Loud startup logging; scheduler banner includes broker name.
+- Full dashboard HTML retained.
 """
 
 import asyncio
@@ -17,13 +18,6 @@ import io
 import json
 import logging
 import os
-
-# --- Broker selection (Alpaca vs Kraken) ---
-BROKER = os.getenv("BROKER","alpaca").lower()
-if BROKER == "kraken":
-    # using selected broker module as br_kraken as br
-else:
-    # using selected broker module as br
 import time
 import importlib
 from collections import defaultdict, deque
@@ -55,21 +49,24 @@ def _order_is_fill_like(o: dict) -> bool:
     return (st in ("filled", "partially_filled", "done")) or (fq > 0 and fp > 0)
 
 def _sym_to_slash(s: str) -> str:
-    if not s: return s
+    if not s:
+        return s
     s = s.upper()
-    # Accept already-slashed (BTC/USD) or plain (BTCUSD)
     return s if "/" in s else (s[:-3] + "/" + s[-3:] if len(s) > 3 else s)
 
 def _extract_strategy_from_order(o: dict) -> str:
     s = (o.get("strategy") or "").strip().lower()
-    if s: return s
+    if s:
+        return s
     coid = (o.get("client_order_id") or o.get("clientOrderId") or "").strip()
     if coid:
         token = coid.split("-")[0].strip().lower()
-        if token: return token
+        if token:
+            return token
     for k in ("tag", "subtag", "strategy_tag", "algo"):
         v = (o.get(k) or "").strip().lower()
-        if v: return v
+        if v:
+            return v
     return "unknown"
 
 # -----------------------------------------------------------------------------
@@ -79,18 +76,17 @@ LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 logging.basicConfig(level=LOG_LEVEL, format="%(asctime)s %(levelname)s:app:%(message)s")
 log = logging.getLogger("app")
 
-APP_VERSION = os.getenv("APP_VERSION", "2025.10.11-kraken-switch-b")
-TRADING_ENABLED = os.getenv("TRADING_ENABLED", "1") in ("1", "true", "True")
+APP_VERSION = os.getenv("APP_VERSION", "2025.10.11-crypto-v3g")
+TRADING_ENABLED_BASE = os.getenv("TRADING_ENABLED", "1").lower() in ("1", "true")
 SCHEDULE_SECONDS = int(os.getenv("SCHEDULE_SECONDS", os.getenv("SCHEDULER_INTERVAL_SEC", "60")))
 DEFAULT_LIMIT = int(os.getenv("DEFAULT_LIMIT", "300"))
 DEFAULT_TIMEFRAME = os.getenv("DEFAULT_TIMEFRAME", "5Min")
 DEFAULT_NOTIONAL = float(os.getenv("DEFAULT_NOTIONAL", os.getenv("ORDER_NOTIONAL", "25")))
 STRATEGIES = [s.strip() for s in os.getenv("STRATEGY_LIST", "c1,c2,c3,c4,c5,c6").split(",") if s.strip()]
 
-# If DEFAULT_SYMBOLS env is set, we honor it; else we’ll build a universe.
 _default_symbols_env = [s.strip().upper() for s in os.getenv("DEFAULT_SYMBOLS", "").split(",") if s.strip()]
 
-# Guards
+# Guards (unchanged from your baseline)
 GUARDS = {
     "enable": True,
     "cooldown_bars_after_loss": 6,
@@ -107,7 +103,6 @@ GUARDS = {
     "no_cross_exit": True,
 }
 
-# Daily stop scaffolding (optional; expand as needed)
 _DISABLED_STRATS: set[str] = set()
 _DAILY_PNL: dict[str, float] = defaultdict(float)
 _DAILY_TOTAL: float = 0.0
@@ -145,7 +140,8 @@ def _ema(series_key: tuple, prices: tuple[float, ...], period: int) -> float:
     return ema
 
 def ema_value(symbol: str, timeframe: str, closes: List[float], period: int) -> float:
-    if not closes: return float("nan")
+    if not closes:
+        return float("nan")
     key = (symbol, timeframe, len(closes), period)
     return _ema(key, tuple(closes), period)
 
@@ -167,13 +163,50 @@ def _spread_bps(last: float, bid: float = None, ask: float = None) -> float:
     return 4.0
 
 # -----------------------------------------------------------------------------
-# Symbol Universe (multi-coin) ------------------------------------------------
+# Broker switch (Alpaca vs Kraken) — strong default: Kraken
+# -----------------------------------------------------------------------------
+def _select_broker() -> str:
+    env_choice = (os.getenv("BROKER") or "").strip().lower()
+    if env_choice in ("alpaca", "kraken"):
+        return env_choice
+    # Auto-detect Kraken if keys/flags present; otherwise default to Kraken
+    if os.getenv("KRAKEN_API_KEY") or os.getenv("KRAKEN_TRADING", "0").lower() in ("1", "true"):
+        return "kraken"
+    return "kraken"
+
+BROKER = _select_broker()
+if BROKER == "kraken":
+    import broker_kraken as br  # your Kraken adapter
+else:
+    import broker as br         # Alpaca adapter (kept for compatibility)
+
+# Broker-specific live flag
+if BROKER == "kraken":
+    _broker_live_flag = os.getenv("KRAKEN_TRADING", "0").lower() in ("1", "true")
+else:
+    _broker_live_flag = os.getenv("ALPACA_TRADING", "0").lower() in ("1", "true")
+
+TRADING_ENABLED = bool(TRADING_ENABLED_BASE and _broker_live_flag)
+
+BROKER_INFO = {
+    "selected": BROKER,
+    "module": getattr(br, "__name__", "unknown"),
+    "trading_enabled_base": TRADING_ENABLED_BASE,
+    "broker_live_flag": _broker_live_flag,
+    "trading_enabled_final": TRADING_ENABLED,
+}
+
+log.info(
+    "Broker selected: %s (module=%s) trading_enabled_final=%s",
+    BROKER, BROKER_INFO["module"], TRADING_ENABLED
+)
+
+# -----------------------------------------------------------------------------
+# Symbol Universe
 # -----------------------------------------------------------------------------
 _CURRENT_SYMBOLS: List[str] = []
 
 def _builtin_candidates() -> List[str]:
-    # Focus on symbols commonly available on Alpaca Crypto.
-    # You can extend via CANDIDATE_SYMBOLS env.
     base = [
         "BTC/USD","ETH/USD","SOL/USD","DOGE/USD","ADA/USD","AVAX/USD","LTC/USD",
         "BCH/USD","LINK/USD","DOT/USD","MATIC/USD","XRP/USD","TRX/USD","ATOM/USD",
@@ -181,10 +214,8 @@ def _builtin_candidates() -> List[str]:
         "SUI/USD","AAVE/USD","UNI/USD","GRT/USD"
     ]
     extra = [s.strip().upper() for s in os.getenv("CANDIDATE_SYMBOLS","").split(",") if s.strip()]
-    # Allow removing with EXCLUDE_SYMBOLS
     excl = set([s.strip().upper() for s in os.getenv("EXCLUDE_SYMBOLS","").split(",") if s.strip()])
     out = [s for s in (base + extra) if s not in excl]
-    # Dedup & stable order
     seen = set(); final=[]
     for s in out:
         if s not in seen:
@@ -201,10 +232,6 @@ def _try_import_marketcrypto():
             return None
 
 def _build_universe_from_bars(timeframe: str, limit: int, max_symbols: int = 24) -> List[str]:
-    """
-    Pulls bars for a wide candidate set and keeps coins that returned enough rows.
-    Uses universe.py's UniverseBuilder if available; otherwise falls back to a bar-count filter.
-    """
     candidates = _builtin_candidates()
     mod = _try_import_marketcrypto()
     if not mod:
@@ -215,7 +242,7 @@ def _build_universe_from_bars(timeframe: str, limit: int, max_symbols: int = 24)
         MarketCrypto = getattr(mod, "MarketCrypto")
         mc = MarketCrypto.from_env()
 
-        # ----- Try universe.py integration first -----
+        # Try universe.py if present
         try:
             import universe as uni
             cfg_cls = getattr(uni, "UniverseConfig", None)
@@ -235,16 +262,15 @@ def _build_universe_from_bars(timeframe: str, limit: int, max_symbols: int = 24)
                 if getattr(builder, "symbols", None):
                     return builder.symbols[:max_symbols]
         except Exception:
-            # If universe.py isn't present or errors, fall through to bar-count filter
             pass
 
-        # ----- Fallback: simple row-count filter -----
+        # Fallback: row-count filter
         frames = mc.candles(candidates, timeframe=timeframe, limit=min(limit, 600)) or {}
         rows_ok = []
         for s, df in (frames or {}).items():
             try:
                 n = int(getattr(df, "shape", [0,0])[0] or 0)
-                if n >= max(150, int(limit*0.9)):  # enough history
+                if n >= max(150, int(limit*0.9)):
                     rows_ok.append(s)
             except Exception:
                 pass
@@ -273,18 +299,18 @@ class RealStrategiesAdapter:
         self._mods: Dict[str, Any] = {}
 
     def _get_mod(self, name: str):
-        if name in self._mods: return self._mods[name]
+        if name in self._mods:
+            return self._mods[name]
         try:
             mod = importlib.import_module(f"strategies.{name}")
             log.info("adapter: imported strategies.%s", name)
         except Exception:
-            mod = importlib.import_module(name)  # fallback if top-level
+            mod = importlib.import_module(name)
             log.info("adapter: imported %s (top-level)", name)
         self._mods[name] = mod
         return mod
 
     def reload(self, name: str) -> bool:
-        """Hot-reload a single strategy module if already imported."""
         if name in self._mods:
             try:
                 self._mods[name] = importlib.reload(self._mods[name])
@@ -293,7 +319,6 @@ class RealStrategiesAdapter:
             except Exception as e:
                 log.exception("adapter: reload failed for %s: %s", name, e)
                 return False
-        # If not imported yet, next scan will import it.
         return True
 
     def scan(self, req: Dict[str, Any], _contexts: Dict[str, Any]) -> List[Dict[str, Any]]:
@@ -314,7 +339,6 @@ class RealStrategiesAdapter:
 
         try:
             mod = self._get_mod(strat)
-            # Each strategy implements run_scan(symbols, timeframe, limit, notional, dry, raw)
             result = mod.run_scan(symbols, tf, lim, notional, dry, raw)
 
             orders: List[Dict[str, Any]] = []
@@ -338,11 +362,11 @@ class StrategyBook:
         return self._impl.scan(req, contexts or {})
 
 # --- Position/PnL state ------------------------------------------------------
-_positions_state: Dict[str, Dict[str, float]] = {}  # symbol -> {"qty": float, "avg_price": float}
+_positions_state: Dict[str, Dict[str, float]] = {}
+_positions_cache: Dict[str, Dict[str, float]] = {}
 
 def _get_last_price(symbol_slash: str) -> float:
     try:
-    # using selected broker module as br
         pmap = br.last_trade_map([symbol_slash])
         return float(pmap.get(symbol_slash, {}).get("price") or 0.0)
     except Exception:
@@ -367,8 +391,10 @@ def _normalize_order(o: dict) -> dict:
     try: notional = float(notional)
     except Exception: notional = 0.0
 
-    if price <= 0: price = _get_last_price(sym)
-    if qty <= 0 and notional and price: qty = round(notional / max(price,1e-9), 8)
+    if price <= 0:
+        price = _get_last_price(sym)
+    if qty <= 0 and notional and price:
+        qty = round(notional / max(price, 1e-9), 8)
 
     ts = (
         o.get("filled_at")
@@ -406,7 +432,8 @@ def _apply_realized_pnl(row: dict) -> float:
     side = (row.get("side") or "").lower()
     qty = float(row.get("qty") or 0)
     price = float(row.get("price") or 0)
-    if qty <= 0 or price <= 0: return 0.0
+    if qty <= 0 or price <= 0:
+        return 0.0
     pos = _positions_state.setdefault(sym, {"qty": 0.0, "avg_price": 0.0})
     realized = 0.0
     if side == "buy":
@@ -422,20 +449,23 @@ def _apply_realized_pnl(row: dict) -> float:
     return realized
 
 def _recalc_equity() -> float:
-    if not _positions_state: return 0.0
+    if not _positions_state:
+        return 0.0
     syms = [s for s, p in _positions_state.items() if p.get("qty", 0) > 0]
-    if not syms: return 0.0
+    if not syms:
+        return 0.0
     try:
-    # using selected broker module as br
         pmap = br.last_trade_map(syms)
     except Exception:
         pmap = {}
     eq = 0.0
     for s, p in _positions_state.items():
         q = float(p.get("qty") or 0)
-        if q <= 0: continue
+        if q <= 0:
+            continue
         last = float((pmap.get(s, {}) or {}).get("price") or 0.0)
-        if last > 0: eq += q * last
+        if last > 0:
+            eq += q * last
     return eq
 
 # -----------------------------------------------------------------------------
@@ -444,9 +474,13 @@ def _recalc_equity() -> float:
 app = FastAPI(title="Crypto System")
 
 # Universe at startup
-_set_current_symbols(_load_universe_initial())
+def _load_symbols_on_boot():
+    syms = _load_universe_initial()
+    _set_current_symbols(syms)
 
-# Ring buffer for recent orders/events (cap via env)
+_load_symbols_on_boot()
+
+# Ring buffer for recent orders/events
 ORDERS_RING_CAP = int(os.getenv("ORDERS_RING_CAP", "1000"))
 _orders_ring: deque = deque(maxlen=max(100, ORDERS_RING_CAP))
 
@@ -454,7 +488,7 @@ _attribution: Dict[str, Any] = {"by_strategy": {}, "updated_at": None}
 _summary: Dict[str, Any] = {"equity": 0.0, "pnl_day": 0.0, "pnl_week": 0.0, "pnl_month": 0.0, "updated_at": None}
 
 # ---- Strategy runtime toggles ----
-ACTIVE_STRATEGIES = set(STRATEGIES)  # scheduler reads from this at runtime
+ACTIVE_STRATEGIES = set(STRATEGIES)
 
 def _push_orders(orders: List[Dict[str, Any]]):
     global _orders_ring, _attribution, _summary
@@ -487,30 +521,32 @@ def _push_orders(orders: List[Dict[str, Any]]):
 
 async def _exit_nanny(symbols: List[str], timeframe: str):
     try:
-    # using selected broker module as br
         bars_map = br.get_bars(symbols, timeframe=timeframe, limit=max(GUARDS["ema_slow"], 60)) or {}
         last_trade_map = br.last_trade_map(symbols) or {}
     except Exception:
         bars_map, last_trade_map = {}, {}
     for sym, pos in list(_positions_state.items()):
         qty = float(pos.get("qty") or 0.0)
-        if qty <= 0: continue
+        if qty <= 0:
+            continue
         closes = [
             float(b.get("c") or b.get("close") or 0.0)
             for b in (bars_map.get(sym) or [])
             if float(b.get("c") or b.get("close") or 0.0) > 0
         ]
-        if not closes: continue
+        if not closes:
+            continue
         last = float((last_trade_map.get(sym, {}) or {}).get("price") or closes[-1] or 0.0)
-        if last <= 0: continue
+        if last <= 0:
+            continue
         entry = float(pos.get("avg_price") or 0.0)
-        if entry <= 0: continue
+        if entry <= 0:
+            continue
         up_bps = _bps((last - entry) / entry)
 
         # Take profit
         if up_bps >= GUARDS["tp_target_bps"] and TRADING_ENABLED:
             try:
-    # using selected broker module as br
                 coid = f"nanny-tp-{sym.replace('/','')}-{int(time.time())}"
                 br.submit_order(symbol=sym, side="sell", notional=min(DEFAULT_NOTIONAL, qty * last), client_order_id=coid)
                 log.info("exit_nanny: TP sell placed for %s", sym)
@@ -526,7 +562,6 @@ async def _exit_nanny(symbols: List[str], timeframe: str):
             crossed = False
         if crossed and TRADING_ENABLED:
             try:
-    # using selected broker module as br
                 coid = f"nanny-x-{sym.replace('/','')}-{int(time.time())}"
                 br.submit_order(symbol=sym, side="sell", notional=min(DEFAULT_NOTIONAL, qty * last), client_order_id=coid)
                 log.info("exit_nanny: no-cross sell placed for %s", sym)
@@ -547,7 +582,7 @@ async def _scan_bridge(strat: str, req: Dict[str, Any], dry: bool = False) -> Li
     if isinstance(syms, str):
         syms = [s.strip() for s in syms.split(",") if s.strip()]
     req["symbols"] = syms
-    req["dry"] = dry
+    req["dry"] = dry or (not TRADING_ENABLED)  # force dry if trading disabled
     req["raw"] = dict(req)
 
     sb = StrategyBook()
@@ -555,7 +590,6 @@ async def _scan_bridge(strat: str, req: Dict[str, Any], dry: bool = False) -> Li
 
     # Basic guard: EMA/spread sanity for BUYs
     try:
-    # using selected broker module as br
         bars_map = br.get_bars(req["symbols"], timeframe=req["timeframe"], limit=60) or {}
     except Exception:
         bars_map = {}
@@ -571,7 +605,8 @@ async def _scan_bridge(strat: str, req: Dict[str, Any], dry: bool = False) -> Li
             if float(b.get("c") or b.get("close") or 0.0) > 0
         ]
         px = float(o.get("price") or o.get("px") or 0.0)
-        if px <= 0 and closes: px = closes[-1]
+        if px <= 0 and closes:
+            px = closes[-1]
         edge_bps_val = float(o.get("edge_bps") or o.get("edge") or 0.0)
         spr_bps = _spread_bps(px)
         ema_ok = _price_above_ema_fast(sym, req["timeframe"], closes)
@@ -600,9 +635,8 @@ async def _scheduler_loop():
     try:
         while _running:
             _roll_day_if_needed()
-            # Use the runtime ACTIVE_STRATEGIES set
             for strat in list(ACTIVE_STRATEGIES):
-                if strat in _DISABLED_STRATS:  # daily-stop gating hook
+                if strat in _DISABLED_STRATS:
                     continue
                 try:
                     orders = await _scan_bridge(
@@ -626,7 +660,10 @@ async def _scheduler_loop():
                     await _exit_nanny(_CURRENT_SYMBOLS, DEFAULT_TIMEFRAME)
                 except Exception:
                     log.exception("exit nanny failed")
-            log.info("Scheduler tick complete (dry=%d symbols=%d) — sleeping %ss", int(dry_flag), len(_CURRENT_SYMBOLS), SCHEDULE_SECONDS)
+            log.info(
+                "Scheduler tick complete (dry=%d symbols=%d broker=%s) — sleeping %ss",
+                int(dry_flag), len(_CURRENT_SYMBOLS), BROKER, SCHEDULE_SECONDS
+            )
             await asyncio.sleep(SCHEDULE_SECONDS)
     finally:
         _running = False
@@ -634,7 +671,11 @@ async def _scheduler_loop():
 @app.on_event("startup")
 async def _startup():
     global _scheduler_task
-    log.info("App startup; scheduler interval is %ss; strategies=%s; symbols=%d", SCHEDULE_SECONDS, ",".join(sorted(ACTIVE_STRATEGIES)), len(_CURRENT_SYMBOLS))
+    log.info(
+        "App startup (version=%s); broker=%s module=%s trading_enabled=%s; interval=%ss; strategies=%s; symbols=%d",
+        APP_VERSION, BROKER, BROKER_INFO["module"], TRADING_ENABLED, SCHEDULE_SECONDS,
+        ",".join(sorted(ACTIVE_STRATEGIES)), len(_CURRENT_SYMBOLS)
+    )
     if _scheduler_task is None:
         _scheduler_task = asyncio.create_task(_scheduler_loop())
 
@@ -727,11 +768,11 @@ _DASHBOARD_HTML = """
 <body>
   <header class="row">
     <h1>Crypto System</h1>
-    <span class="badge">Live</span>
+    <span class="badge">Broker: <code>""" + BROKER + """</code></span>
     <span class="badge">Scheduler: <code>active</code></span>
     <div style="margin-left:auto" class="chips">
       <span class="chip">TF: <code id="tf_chip">auto</code></span>
-      <span class="chip">Tick: <code>{SCHEDULE_SECONDS}s</code></span>
+      <span class="chip">Tick: <code>""" + str(SCHEDULE_SECONDS) + """s</code></span>
       <span class="chip">Symbols: <code id="sym_count">0</code></span>
     </div>
   </header>
@@ -768,11 +809,11 @@ _DASHBOARD_HTML = """
     </div>
   </main>
 
-  <footer>Built with FastAPI • Tick interval: {SCHEDULE_SECONDS}s</footer>
-  <script>document.getElementById('tf_chip').textContent = "{DEFAULT_TIMEFRAME}";</script>
+  <footer>Built with FastAPI • Tick interval: """ + str(SCHEDULE_SECONDS) + """s</footer>
+  <script>document.getElementById('tf_chip').textContent = '""" + DEFAULT_TIMEFRAME + """';</script>
 </body>
 </html>
-""".replace("{SCHEDULE_SECONDS}", str(SCHEDULE_SECONDS)).replace("{DEFAULT_TIMEFRAME}", DEFAULT_TIMEFRAME)
+"""
 
 # -----------------------------------------------------------------------------
 # Routes
@@ -787,7 +828,22 @@ async def dashboard():
 
 @app.get("/healthz", include_in_schema=False)
 def healthz():
-    return {"ok": True, "version": APP_VERSION, "time": _now_iso(), "broker": BROKER}
+    return {"ok": True, "version": APP_VERSION, "time": _now_iso()}
+
+@app.get("/diag/broker", response_class=JSONResponse)
+def diag_broker():
+    # probe broker layer to make failures obvious
+    try:
+        probe = br.get_bars(["BTC/USD"], timeframe=DEFAULT_TIMEFRAME, limit=1) or {}
+        ok = True
+    except Exception as e:
+        probe = {"error": str(e)}
+        ok = False
+    return {
+        "ok": ok,
+        "info": BROKER_INFO,
+        "probe": {k: (len(v) if isinstance(v, list) else v) for k, v in (probe or {}).items()},
+    }
 
 # ---- Universe endpoints ----
 @app.get("/universe", response_class=JSONResponse)
@@ -894,20 +950,37 @@ async def analytics_trades_csv(hours: int = 12):
         ],
     )
     w.writeheader()
-    for r in rows: w.writerow(r)
+    for r in rows:
+        w.writerow(r)
     return buf.getvalue()
 
+def _normalize_trade_row(o: dict) -> dict:
+    n = _normalize_order(o)
+    return {
+        "time": n.get("time"),
+        "strategy": n.get("strategy"),
+        "symbol": n.get("symbol"),
+        "side": n.get("side"),
+        "qty": n.get("qty"),
+        "price": n.get("price"),
+        "id": n.get("id"),
+        "client_order_id": n.get("client_order_id"),
+        "status": n.get("status"),
+        "notional": n.get("notional"),
+    }
+
 def _fetch_filled_orders_last_hours(hours: int) -> list:
-    # using selected broker module as br
     since = datetime.now(timezone.utc) - timedelta(hours=hours)
     raw = br.list_orders(status="all", limit=1000) or []
     out = []
     for o in raw:
-        if not _order_is_fill_like(o): continue
+        if not _order_is_fill_like(o):
+            continue
         t = _parse_ts_any(
             o.get("filled_at") or o.get("updated_at") or o.get("submitted_at") or o.get("created_at")
         )
-        if t and t >= since: out.append(o)
+        if t and t >= since:
+            out.append(o)
     out.sort(
         key=lambda r: _parse_ts_any(
             r.get("filled_at") or r.get("updated_at") or r.get("submitted_at") or r.get("created_at")
@@ -917,16 +990,19 @@ def _fetch_filled_orders_last_hours(hours: int) -> list:
 
 @app.get("/diag/orders_raw")
 async def diag_orders_raw(status: str = "all", limit: int = 25):
-    # using selected broker module as br
     data = br.list_orders(status=status, limit=limit) or []
     return {"status": status, "limit": limit, "orders": data}
 
 @app.get("/diag/bars")
 async def diag_bars(symbols: str = "", tf: str = "", limit: int = 360):
-    # using selected broker module as br
     syms = [s.strip().upper() for s in (symbols or ",".join(_CURRENT_SYMBOLS)).split(",") if s.strip()]
     bars = br.get_bars(syms, timeframe=(tf or DEFAULT_TIMEFRAME), limit=int(limit))
-    return {"timeframe": (tf or DEFAULT_TIMEFRAME), "limit": limit, "counts": {k: len(v) for k, v in bars.items()}, "keys": list(bars.keys())}
+    return {
+        "timeframe": (tf or DEFAULT_TIMEFRAME),
+        "limit": limit,
+        "counts": {k: len(v) for k, v in bars.items()},
+        "keys": list(bars.keys())
+    }
 
 @app.get("/diag/imports")
 async def diag_imports():
@@ -956,15 +1032,23 @@ async def diag_scan(
     limit = limit or DEFAULT_LIMIT
     notional = notional or DEFAULT_NOTIONAL
     syms = [s.strip() for s in (symbols or ",".join(_CURRENT_SYMBOLS)).split(",") if s.strip()]
-    req = {"strategy": strategy, "timeframe": tf, "limit": limit, "notional": notional, "symbols": syms, "dry": bool(dry), "raw": {}}
+    req = {
+        "strategy": strategy,
+        "timeframe": tf,
+        "limit": limit,
+        "notional": notional,
+        "symbols": syms,
+        "dry": bool(dry),
+        "raw": {}
+    }
     sb = StrategyBook()
     orders = sb.scan(req, {"one": {"timeframe": tf, "symbols": syms, "notional": notional}})
     return {"args": req, "orders_count": len(orders or []), "orders": orders}
 
 @app.get("/diag/alpaca")
 async def diag_alpaca():
+    # Kept for compatibility; may fail when BROKER=kraken (that’s OK).
     try:
-    # using selected broker module as br
         pos = br.list_positions()
         bars = br.get_bars(["BTC/USD", "ETH/USD"], timeframe=DEFAULT_TIMEFRAME, limit=3)
         return {
@@ -1018,7 +1102,7 @@ def metrics_scorecard(hours: int = 168, last_n_trades: int = 0):
         exp = (net / n) if n else 0.0
         med = median(pnl) if pnl else 0.0
         pf = (gp / gl) if gl > 0 else (float("inf") if gp > 0 else 0.0)
-        # simple running drawdown
+        # running drawdown
         cum = 0.0; peak = 0.0; maxdd = 0.0
         for x in pnl:
             cum += x; peak = max(peak, cum); maxdd = min(maxdd, cum - peak)
@@ -1031,31 +1115,39 @@ def metrics_scorecard(hours: int = 168, last_n_trades: int = 0):
     return JSONResponse({"ok": True, "data": out, "count_strategies": len(out)})
 
 @app.post("/init/positions")
-async def init_positions():
+def init_positions():
+    """
+    Initialize the in-memory positions cache from the active broker.
+    Works with both Alpaca and Kraken. If the broker doesn't support positions,
+    falls back to empty positions.
+    """
+    global _positions_cache
     try:
-    # using selected broker module as br
-        pos = br.list_positions() or []
-        global _positions_state
-        _positions_state = {}
-        for p in pos:
-            sym = _sym_to_slash(p.get("symbol") or p.get("Symbol") or "")
-            try:
-                qty = float(p.get("qty") or p.get("quantity") or p.get("qty_available") or p.get("size") or p.get("Qty") or 0.0)
-            except Exception:
-                qty = 0.0
-            avg = float(p.get("avg_entry_price") or p.get("average_entry_price") or p.get("avg_price") or 0.0)
-            if sym and qty and avg:
-                _positions_state[sym] = {"qty": qty, "avg_price": avg}
-        _summary["equity"] = _recalc_equity()
-        ts = _now_iso(); _summary["updated_at"] = ts; _attribution["updated_at"] = ts
-        return {"ok": True, "positions": _positions_state}
+        getpos = getattr(br, "get_positions", None)
+        raw_positions = getpos() if callable(getpos) else []
+
+        positions = {}
+        for p in (raw_positions or []):
+            sym = (p.get("symbol") or p.get("Symbol") or p.get("pair") or "").upper()
+            if not sym:
+                continue
+            qty = p.get("qty") or p.get("quantity") or p.get("size") or 0
+            avg = p.get("avg_entry_price") or p.get("avg_price") or p.get("price") or 0
+            try: qty = float(qty)
+            except: qty = 0.0
+            try: avg = float(avg)
+            except: avg = 0.0
+            positions[sym] = {"qty": qty, "avg_price": avg}
+
+        _positions_cache = positions
+        return {"ok": True, "positions": positions}
     except Exception as e:
+        log.exception("init/positions failed: %s", e)
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/init/backfill")
 async def init_backfill(days: Optional[int] = None, status: str = "closed"):
     try:
-    # using selected broker module as br
         lookback_days = int(days or os.getenv("INIT_BACKFILL_DAYS", "7"))
         after = datetime.now(timezone.utc) - timedelta(days=lookback_days)
         raws = br.list_orders(status=status, limit=1000) or []
@@ -1063,7 +1155,8 @@ async def init_backfill(days: Optional[int] = None, status: str = "closed"):
         for r in raws:
             ts = r.get("filled_at") or r.get("updated_at") or r.get("submitted_at") or r.get("created_at")
             when = _parse_ts_any(ts) if isinstance(ts, str) else None
-            if when and when >= after: selected.append(r)
+            if when and when >= after:
+                selected.append(r)
         orders = []
         for r in selected:
             st = (r.get("status") or "").lower()
@@ -1082,5 +1175,8 @@ async def init_backfill(days: Optional[int] = None, status: str = "closed"):
 if __name__ == "__main__":
     import uvicorn  # type: ignore
     port = int(os.getenv("PORT", "10000"))
-    log.info("Launching Uvicorn on 0.0.0.0:%d (version %s)", port, APP_VERSION)
+    log.info(
+        "Launching Uvicorn on 0.0.0.0:%d (version %s, broker=%s, trading=%s)",
+        port, APP_VERSION, BROKER, TRADING_ENABLED
+    )
     uvicorn.run("app:app", host="0.0.0.0", port=port, reload=False, access_log=True)
