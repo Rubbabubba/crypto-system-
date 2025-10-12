@@ -165,27 +165,67 @@ def _userref(symbol: str, side: str, notional: float) -> int:
 # Public endpoints
 # -----------------------------------------------------------------------------
 def last_trade_map(symbols: List[str]) -> Dict[str, Dict[str, float]]:
+    """
+    Return { UI_SYMBOL: {"price": float} } for each requested symbol.
+    Resolves Kraken's multiple pair names (e.g., XXBTZUSD vs XBTUSD) robustly.
+    """
     if not symbols:
         return {}
-    pairs = [to_kraken(s) for s in symbols]
-    # Kraken ticker supports comma-delimited list in 'pair'
-    res = _pub("Ticker", {"pair": ",".join(pairs)}) or {}
-    out: Dict[str, Dict[str, float]] = {}
+    req_syms = [s.upper() for s in symbols]
+    # Build lookup of requested UI -> expected Kraken pair (altname)
+    want_pair = {ui: to_kraken(ui) for ui in req_syms}  # e.g. BTCUSD -> XBTUSD
+
+    # Call Kraken once with comma-joined pairs
+    pairs = ",".join(want_pair.values())
+    res = _pub("Ticker", {"pair": pairs}) or {}
+
+    out: Dict[str, Dict[str, float]] = {ui: {"price": 0.0} for ui in req_syms}
+
+    # First pass: ingest everything Kraken returned
+    # Keys can be altname (XBTUSD) or wsname/base form (XXBTZUSD). We'll parse both.
+    k_price: Dict[str, float] = {}
     for k, v in res.items():
-        ui = from_kraken(k)
         try:
-            price = float((v or {}).get("c", ["0"])[0])
+            px = float((v or {}).get("c", ["0"])[0])
         except Exception:
-            price = 0.0
-        out[ui] = {"price": price}
-    # Ensure all keys present
-    for s in symbols:
-        out.setdefault(s.upper(), {"price": float(out.get(s.upper(), {}).get("price", 0.0))})
+            px = 0.0
+        k_price[k.upper()] = px  # store under exact Kraken key
+
+    # Second pass: for each requested symbol, try multiple resolutions
+    for ui in req_syms:
+        target = want_pair[ui].upper()        # e.g., XBTUSD
+        px = 0.0
+
+        # A) exact altname key
+        if target in k_price:
+            px = k_price[target]
+        else:
+            # B) find any key that endswith(target) (handles XXBTZUSD vs XBTUSD)
+            for kk, vv in k_price.items():
+                if kk.endswith(target):
+                    px = vv
+                    break
+            # C) as a final fallback, try reverse-map on all keys (from_kraken)
+            if px == 0.0:
+                for kk, vv in k_price.items():
+                    try:
+                        ui_guess = from_kraken(kk).upper()
+                        if ui_guess == ui:
+                            px = vv
+                            break
+                    except Exception:
+                        continue
+
+        out[ui] = {"price": float(px or 0.0)}
+
     return out
 
 def last_price(symbol: str) -> float:
     mp = last_trade_map([symbol])
-    return float((mp.get(symbol.upper()) or {}).get("price", 0.0))
+    try:
+        return float((mp.get(symbol.upper()) or {}).get("price", 0.0))
+    except Exception:
+        return 0.0
 
 def get_bars(symbol: str, timeframe: str = "5Min", limit: int = 300) -> List[Dict[str, Any]]:
     """
