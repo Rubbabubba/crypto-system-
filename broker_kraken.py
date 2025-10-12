@@ -11,11 +11,7 @@ Public API used by app/strategies:
 - market_notional(symbol: str, side: "buy"|"sell", notional: float) -> dict
 - orders() -> Any
 - positions() -> list[dict]
-
-Key behaviors:
-- Robust mapping: handles Kraken keys like 'XXBTZUSD'/'XETHZUSD' and maps them to UI symbols 'BTCUSD'/'ETHUSD'
-- Rate-limit gate + retries/backoff for transient errors
-- Idempotency via userref for market orders
+- trades_history(count: int = 20) -> dict  # recent fills
 """
 
 from __future__ import annotations
@@ -47,7 +43,7 @@ except ModuleNotFoundError:
 # Config
 # ---------------------------------------------------------------------------
 API_BASE = os.getenv("KRAKEN_BASE", "https://api.kraken.com")
-TIMEOUT = float(os.getenv("KRAKEN_TIMEOUT", "10"))      # seconds
+TIMEOUT = float(os.getenv("KRAKEN_TIMEOUT", "10"))        # seconds
 MIN_DELAY = float(os.getenv("KRAKEN_MIN_DELAY", "0.35"))  # seconds between calls (simple gate)
 MAX_RETRIES = int(os.getenv("KRAKEN_MAX_RETRIES", "4"))
 BACKOFF_BASE = float(os.getenv("KRAKEN_BACKOFF_BASE", "0.8"))
@@ -149,30 +145,22 @@ def _priv(path: str, params: Dict[str, Any] | None = None) -> Dict[str, Any]:
 _KNOWN_QUOTES = ("USD", "USDT", "USDC", "EUR", "GBP", "JPY", "AUD", "CAD", "CHF")
 
 _BASE_MAP = {
-    "XBT": "BTC",
-    "XXBT": "BTC",
-    "ETH": "ETH",
-    "XETH": "ETH",
-    "ETC": "ETC",
-    "XETC": "ETC",
-    "XDG": "DOGE",
-    "DOGE": "DOGE",
-    "XRP": "XRP",
-    "XXRP": "XRP",
-    "LTC": "LTC",
-    "XLTC": "LTC",
-    "BCH": "BCH",
-    "XBCH": "BCH",
+    "XBT": "BTC", "XXBT": "BTC",
+    "ETH": "ETH", "XETH": "ETH",
+    "ETC": "ETC", "XETC": "ETC",
+    "XDG": "DOGE", "DOGE": "DOGE",
+    "XRP": "XRP", "XXRP": "XRP",
+    "LTC": "LTC", "XLTC": "LTC",
+    "BCH": "BCH", "XBCH": "BCH",
     "SOL": "SOL",
     "ADA": "ADA",
     "AVAX": "AVAX",
     "LINK": "LINK",
-    # add others as needed; unknowns fall through
+    # add more as needed
 }
 
 def _normalize_base(b: str) -> str:
     b = b.upper()
-    # strip a single leading X if present (Kraken convention for crypto)
     if len(b) > 1 and b[0] == "X":
         b2 = b[1:]
         if b2 in _BASE_MAP:
@@ -181,10 +169,8 @@ def _normalize_base(b: str) -> str:
 
 def _normalize_quote(q: str) -> str:
     q = q.upper()
-    # strip leading Z for fiat (Kraken convention)
     if len(q) > 1 and q[0] == "Z":
         q = q[1:]
-    # normalize to USD (your system expects USD)
     if q in ("USD", "USDT", "USDC"):
         return "USD"
     return q
@@ -196,15 +182,12 @@ def _kraken_key_to_ui_pair(k: str) -> Optional[str]:
     """
     K = k.upper()
     for q in _KNOWN_QUOTES:
-        # 1) handle 'Z'+fiat (Kraken fiat convention) FIRST
         if K.endswith("Z" + q):
             base = K[: -(len(q) + 1)]
             return _normalize_base(base) + _normalize_quote("Z" + q)
-        # 2) plain fiat suffix (e.g., 'XBTUSD')
         if K.endswith(q):
             base = K[: -len(q)]
             return _normalize_base(base) + _normalize_quote(q)
-    # 3) final fallback via symbol_map
     try:
         return from_kraken(k).upper()
     except Exception:
@@ -223,11 +206,9 @@ def last_trade_map(symbols: List[str]) -> Dict[str, Dict[str, float]]:
     req_syms = [s.upper() for s in symbols]
     want_pair = {ui: to_kraken(ui) for ui in req_syms}  # e.g., BTCUSD -> XBTUSD
 
-    # Kraken supports comma-joined pairs
     pairs = ",".join(want_pair.values())
     res = _pub("Ticker", {"pair": pairs}) or {}
 
-    # Ingest all returned keys → price
     k_price: Dict[str, float] = {}
     for k, v in res.items():
         try:
@@ -238,22 +219,17 @@ def last_trade_map(symbols: List[str]) -> Dict[str, Dict[str, float]]:
 
     out: Dict[str, Dict[str, float]] = {ui: {"price": 0.0} for ui in req_syms}
 
-    # Resolve for each requested UI symbol
     for ui in req_syms:
         target_alt = want_pair[ui].upper()  # e.g., XBTUSD
         px = None
-
-        # 1) exact altname key
         if target_alt in k_price:
             px = k_price[target_alt]
         else:
-            # 2) normalize every returned key to UI and compare
             for kk, vv in k_price.items():
                 ui_guess = _kraken_key_to_ui_pair(kk)
                 if ui_guess == ui:
                     px = vv
                     break
-
         out[ui] = {"price": float(px) if (px is not None and math.isfinite(px)) else 0.0}
 
     return out
@@ -275,7 +251,6 @@ def get_bars(symbol: str, timeframe: str = "5Min", limit: int = 300) -> List[Dic
     res = _pub("OHLC", {"pair": pair, "interval": interval}) or {}
 
     series = None
-    # Prefer exact altname key; fallback: any key that normalizes to our UI symbol
     ui_target = symbol.upper()
     for key, val in res.items():
         if not isinstance(val, list):
@@ -286,9 +261,7 @@ def get_bars(symbol: str, timeframe: str = "5Min", limit: int = 300) -> List[Dic
         ui_guess = _kraken_key_to_ui_pair(key)
         if ui_guess == ui_target:
             series = val
-            # don't break immediately; try to find exact altname first, else keep this
     if series is None:
-        # final fallback: pick the first list-looking value
         for key, val in res.items():
             if isinstance(val, list) and val and isinstance(val[0], list):
                 series = val
@@ -331,6 +304,7 @@ def market_notional(symbol: str, side: str, notional: float) -> Dict[str, Any]:
     """
     Market order by USD notional:
       volume(base) = notional(quote USD) / last_price
+    Returns: { pair, side, notional, volume, txid, descr, result }
     """
     side = side.lower().strip()
     if side not in ("buy", "sell"):
@@ -351,7 +325,24 @@ def market_notional(symbol: str, side: str, notional: float) -> Dict[str, Any]:
         "userref": str(_userref(ui, side, float(notional))),
     }
     res = _priv("AddOrder", payload)
-    return {"pair": pair, "side": side, "notional": float(notional), "volume": volume, "result": res}
+
+    txid = None
+    descr = None
+    try:
+        txid = (res.get("txid") or [None])[0]
+        descr = (res.get("descr") or {}).get("order")
+    except Exception:
+        pass
+
+    return {
+        "pair": pair,
+        "side": side,
+        "notional": float(notional),
+        "volume": volume,
+        "txid": txid,
+        "descr": descr,
+        "result": res,
+    }
 
 def orders() -> Any:
     try:
@@ -360,9 +351,14 @@ def orders() -> Any:
         return {"error": str(e)}
 
 def positions() -> List[Dict[str, Any]]:
+    """
+    Normalize Kraken balance keys:
+    - Strip '.F' suffix (e.g., 'SOL.F' -> 'SOL')
+    - Map 'XXBT'/'XBT'->'BTC', 'XETH'->'ETH', 'ZUSD'->'USD', etc.
+    """
     out: List[Dict[str, Any]] = []
     try:
-        bal = _priv("Balance", {})  # {"ZUSD":"123.45","XXBT":"0.01",...}
+        bal = _priv("Balance", {})  # {"ZUSD":"123.45","XXBT":"0.01","SOL.F":"0.12",...}
         for k, v in (bal or {}).items():
             try:
                 qty = float(v)
@@ -370,19 +366,51 @@ def positions() -> List[Dict[str, Any]]:
                 qty = 0.0
             if qty <= 0:
                 continue
-            asset = (
-                "USD" if k.upper() in ("ZUSD", "USD") else
-                "BTC" if k.upper() in ("XXBT", "XBT") else
-                "ETH" if k.upper() in ("XETH", "ETH") else
-                "SOL" if k.upper() == "SOL" else
-                "ADA" if k.upper() == "ADA" else
-                "DOGE" if k.upper() in ("XDG", "DOGE") else
-                "XRP" if k.upper() in ("XXRP", "XRP") else
-                "LTC" if k.upper() in ("XLTC", "LTC") else
-                "BCH" if k.upper() in ("XBCH", "BCH") else
-                k
-            )
+            asset = k.upper()
+            if asset.endswith(".F"):  # futures/ledger suffix seen for some assets
+                asset = asset[:-2]
+            # common maps
+            if asset in ("ZUSD", "USD"):
+                asset = "USD"
+            elif asset in ("XXBT", "XBT"):
+                asset = "BTC"
+            elif asset in ("XETH", "ETH"):
+                asset = "ETH"
+            elif asset in ("XDG", "DOGE"):
+                asset = "DOGE"
+            elif asset in ("XXRP", "XRP"):
+                asset = "XRP"
+            elif asset in ("XLTC", "LTC"):
+                asset = "LTC"
+            elif asset in ("XBCH", "BCH"):
+                asset = "BCH"
+            # pass-through for others like SOL, ADA, AVAX, LINK
             out.append({"asset": asset, "qty": qty})
     except Exception as e:
         out.append({"error": str(e)})
     return out
+
+def trades_history(count: int = 20) -> Dict[str, Any]:
+    """
+    Return recent trades (fills). Pass-through of Kraken's TradesHistory, normalized to a list.
+    """
+    try:
+        res = _priv("TradesHistory", {"type": "all", "ofs": 0})
+        trades = list((res.get("trades") or {}).items())  # [(txid, {...}), ...]
+        trades.sort(key=lambda kv: float(kv[1].get("time", 0)), reverse=True)
+        items = []
+        for tid, t in trades[: max(1, int(count))]:
+            items.append({
+                "txid": tid,
+                "pair": t.get("pair"),
+                "type": t.get("type"),
+                "ordertype": t.get("ordertype"),
+                "price": float(t.get("price", 0) or 0),
+                "vol": float(t.get("vol", 0) or 0),
+                "time": t.get("time"),
+                "fee": float(t.get("fee", 0) or 0),
+                "cost": float(t.get("cost", 0) or 0),
+            })
+        return {"ok": True, "trades": items}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}

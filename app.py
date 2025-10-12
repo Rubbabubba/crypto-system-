@@ -271,6 +271,14 @@ def orders():
         return {"ok": True, "orders": out}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+        
+@app.get("/fills")
+def fills():
+    try:
+        data = br.trades_history(20)
+        return {"ok": True, **data}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/order/market")
 async def order_market(request: Request):
@@ -365,6 +373,10 @@ svg.spark path.fill { fill:rgba(138,180,255,0.12); stroke:none; }
       <div>
         <button onclick="loadConfig()">GET /config</button>
         <a class="small" href="/config" target="_blank" rel="noopener">open</a>
+      </div>
+      <div>
+        <button onclick="callJson('/fills')">GET /fills</button>
+        <a class="small" href="/fills" target="_blank" rel="noopener">open</a>
       </div>
     </div>
     <hr/>
