@@ -30,11 +30,14 @@ import asyncio
 import os
 import sys
 import logging
+import threading, time
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, HTMLResponse
+
+
 
 # -----------------------------------------------------------------------------
 # Logging
@@ -703,45 +706,123 @@ def dashboard_alias():
 
 
 # -----------------------------------------------------------------------------
-# Simple scheduler (opt-in via env SCHED_ON=1)
+# Automatic strategy scheduler (opt-in via env SCHED_ON=1)
 # -----------------------------------------------------------------------------
 _RUNNING = False
 
+def _sched_config():
+    """
+    Read scheduler config from env on each pass so changes take effect without restart.
+    """
+    # strategies: explicit list or fall back to ACTIVE_STRATEGIES
+    raw = os.getenv("SCHED_STRATS", "")
+    strategies = [s.strip() for s in raw.split(",") if s.strip()] or list(ACTIVE_STRATEGIES)
+
+    timeframe = os.getenv("SCHED_TIMEFRAME", DEFAULT_TIMEFRAME)
+    try:
+        limit = int(os.getenv("SCHED_LIMIT", str(DEFAULT_LIMIT)))
+    except Exception:
+        limit = DEFAULT_LIMIT
+
+    try:
+        notional = float(os.getenv("SCHED_NOTIONAL", str(DEFAULT_NOTIONAL)))
+    except Exception:
+        notional = DEFAULT_NOTIONAL
+
+    try:
+        sleep_s = int(os.getenv("SCHED_SLEEP", "30"))  # default 30s
+    except Exception:
+        sleep_s = 30
+
+    dry_env = os.getenv("SCHED_DRY", "1").lower() in ("1", "true", "yes", "y")
+    trading_flags = (
+        os.getenv("TRADING_ENABLED", "0").lower() in ("1", "true", "yes", "y")
+        and os.getenv("KRAKEN_TRADING", "0").lower() in ("1", "true", "yes", "y")
+    )
+    # if trading flags are not both enabled, force dry regardless of SCHED_DRY
+    dry = dry_env or (not trading_flags)
+
+    return {
+        "strategies": strategies,
+        "timeframe": timeframe,
+        "limit": limit,
+        "notional": notional,
+        "sleep_s": sleep_s,
+        "dry": dry,
+        "trading_flags": trading_flags,
+    }
+
 async def _loop():
+    """
+    Runs forever (until /scheduler/stop). Each pass:
+      - reads latest env config
+      - scans allowed strategies over _CURRENT_SYMBOLS
+      - places live orders when dry=False (and trading flags allow)
+    """
     global _RUNNING
     _RUNNING = True
     log.info("Scheduler started (v%s, broker=%s)", APP_VERSION, ("kraken" if USING_KRAKEN else "alpaca"))
     try:
         while _RUNNING:
-            for strat in list(ACTIVE_STRATEGIES):
-                if strat in _DISABLED_STRATS:
-                    continue
+            cfg = _sched_config()
+            syms = list(_CURRENT_SYMBOLS)  # configured symbols (from /config/universe)
+            # only run strategies that are currently active and not explicitly disabled
+            run_strats = [s for s in cfg["strategies"] if s in ACTIVE_STRATEGIES and s not in _DISABLED_STRATS]
+
+            log.debug(
+                "Scheduler pass: strats=%s tf=%s limit=%s notional=%s dry=%s symbols=%s",
+                ",".join(run_strats), cfg["timeframe"], cfg["limit"], cfg["notional"], cfg["dry"], ",".join(syms)
+            )
+
+            for strat in run_strats:
+                if not _RUNNING:
+                    break
                 try:
                     await _scan_bridge(
                         strat,
-                        {"timeframe": DEFAULT_TIMEFRAME, "limit": DEFAULT_LIMIT, "notional": DEFAULT_NOTIONAL, "symbols": _CURRENT_SYMBOLS},
-                        dry=True,
+                        {
+                            "timeframe": cfg["timeframe"],
+                            "limit": cfg["limit"],
+                            "notional": cfg["notional"],
+                            "symbols": syms,
+                        },
+                        dry=cfg["dry"],
                     )
                 except Exception as e:
                     log.warning("Scheduler scan error (%s): %s", strat, e)
-            await asyncio.sleep(int(os.getenv("SCHED_SLEEP", "60")))
+
+            # sleep (interruptible by stop)
+            total = max(1, int(cfg["sleep_s"]))
+            for _ in range(total):
+                if not _RUNNING:
+                    break
+                await asyncio.sleep(1)
     finally:
         log.info("Scheduler stopped")
 
 @app.get("/scheduler/start")
 async def scheduler_start():
-    if os.getenv("SCHED_ON", "0") not in ("1", "true", "True"):
+    # Keep your original gate: require SCHED_ON to be enabled to start via API
+    if os.getenv("SCHED_ON", "0").lower() not in ("1", "true", "yes", "y"):
         return {"ok": False, "why": "SCHED_ON env not enabled"}
     if _RUNNING:
         return {"ok": True, "already": True}
     asyncio.create_task(_loop())
-    return {"ok": True, "started": True}
+    return {"ok": True, "started": True, "config": _sched_config()}
 
 @app.get("/scheduler/stop")
 async def scheduler_stop():
     global _RUNNING
     _RUNNING = False
     return {"ok": True, "stopping": True}
+    
+@app.on_event("startup")
+async def _maybe_autostart_scheduler():
+    if os.getenv("SCHED_ON", "0").lower() in ("1", "true", "yes", "y"):
+        # fire-and-forget; the loop itself reads env each pass
+        asyncio.create_task(_loop())
+        log.info("Scheduler autostart: enabled by SCHED_ON")
+
 
 # -----------------------------------------------------------------------------
 # Entrypoint
