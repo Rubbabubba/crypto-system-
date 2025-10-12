@@ -1,24 +1,42 @@
-# Dockerfile — production-ready for Render
+# Dockerfile — Crypto Trading Bots
+# Build: v2.0.0 (2025-10-11)
+
 FROM python:3.11-slim
 
+# ---- system setup ----
 ENV PYTHONDONTWRITEBYTECODE=1 \
-    PYTHONUNBUFFERED=1
+    PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1 \
+    PORT=10000 \
+    TZ=America/Chicago
+
+# Install minimal OS deps (certs, tzdata, build base for pandas/numpy wheels if needed)
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      ca-certificates tzdata curl \
+    && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
-# Install Python deps
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+# Copy only requirements first for better layer caching
+COPY requirements.txt /app/requirements.txt
 
-# Copy app source
-COPY . .
+# Install python deps
+RUN pip install --upgrade pip && \
+    pip install --no-cache-dir -r /app/requirements.txt
 
-# Render provides $PORT; default to 10000 locally
-ENV PORT=10000
+# Copy application code
+COPY . /app
+
+# Security: drop root
+RUN useradd -m runner && chown -R runner:runner /app
+USER runner
+
+# Expose service port
 EXPOSE 10000
 
-# Option A: uvicorn directly (simple & fine for Render)
-CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "%PORT%"]
+# Healthcheck (basic liveness; adjust path if needed)
+HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
+  CMD curl -fsS http://127.0.0.1:${PORT}/health || exit 1
 
-# Option B: gunicorn with uvicorn worker (comment Option A if you use this)
-# CMD ["gunicorn", "-k", "uvicorn.workers.UvicornWorker", "-w", "2", "-t", "120", "-b", "0.0.0.0:$PORT", "app:app"]
+# Default command
+CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "10000", "--access-log"]

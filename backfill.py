@@ -1,133 +1,132 @@
-# backfill.py
-import time
-import math
-import threading
-from typing import List, Dict, Tuple, Optional
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+backfill.py — Simple OHLC backfiller via active broker (Kraken-first)
+Build: v2.0.0 (2025-10-11, America/Chicago)
 
-# --- hook these to your existing storage/fetch code --------------------------
-# Required: you must have equivalents you use today in /diag and /scan.
-# Replace the bodies with your real implementations.
+Usage (examples)
+  python backfill.py --symbols BTCUSD,ETHUSD --timeframe 5Min --limit 1000
+  python backfill.py --symbols SOLUSD --timeframe 1H --limit 500 --outdir ./data
 
-def load_candles(symbol: str, timeframe: str) -> List[List[float]]:
-    """Return list of [ms, o, h, l, c, v] from your cache/DB (sorted asc)."""
-    # TODO: plug into your store (e.g., DB, Redis, parquet, etc.)
-    return []
+Notes
+- Uses br_router.get_bars(symbol, timeframe, limit) -> [{t,o,h,l,c,v}] newest last.
+- Appends/merges by timestamp, de-duplicating rows on 'ts'.
+- Timeframe is passed through to the adapter; Kraken adapter maps it to minutes.
+"""
 
-def save_candles(symbol: str, timeframe: str, rows: List[List[float]]) -> None:
-    """Upsert/merge into your store (dedupe by timestamp, then sort)."""
-    # TODO: plug into your store
-    pass
+from __future__ import annotations
 
-def fetch_ohlcv(symbol: str, timeframe: str, since_ms: int, limit: int) -> List[List[float]]:
-    """Fetch OHLCV from your data provider (exchange or vendor)."""
-    # TODO: plug into your provider (this is what /diag already uses)
-    return []
+__version__ = "2.0.0"
 
-# --- config via env or sane defaults -----------------------------------------
 import os
-SYMBOLS = os.getenv("SYMBOLS", "BTC/USD,ETH/USD,SOL/USD,DOGE/USD,XRP/USD,AVAX/USD,LINK/USD,BCH/USD,LTC/USD").split(",")
-NEED_5M = int(os.getenv("REQUIRED_BARS_5M", "300"))
-NEED_1M = int(os.getenv("REQUIRED_BARS_1M", "1500"))
-OVERSHOOT = float(os.getenv("OVERSHOOT_MULT", "2.0"))  # fetch extra to be safe
-PER_CALL = int(os.getenv("FETCH_PAGE_LIMIT", "1000"))   # provider hard limit
+import csv
+import argparse
+from typing import List, Dict, Any
+from datetime import datetime, timezone
+import pandas as pd
 
-BAR_MS = {"1Min": 60_000, "5Min": 300_000, "15Min": 900_000, "1m": 60_000, "5m": 300_000}
+# Route via broker router; Kraken preferred
+try:
+    import br_router as br
+except Exception:
+    import broker_kraken as br  # type: ignore
 
-def bar_ms(tf: str) -> int:
-    k = tf if tf in BAR_MS else tf.lower()
-    if k not in BAR_MS: raise ValueError(f"Unsupported timeframe {tf}")
-    return BAR_MS[k]
+UTC = timezone.utc
 
-def need_for(tf: str) -> int:
-    tfk = tf.lower()
-    if tfk in ("5m","5min"): return NEED_5M
-    if tfk in ("1m","1min"): return NEED_1M
-    # default: 5m
-    return NEED_5M
+def _ensure_outdir(path: str) -> None:
+    if path and not os.path.isdir(path):
+        os.makedirs(path, exist_ok=True)
 
-def fetch_paged(symbol: str, timeframe: str, since_ms: int, min_bars: int) -> List[List[float]]:
-    out: List[List[float]] = []
-    while len(out) < min_bars:
-        want = min(PER_CALL, max(1, min_bars - len(out)))
-        batch = fetch_ohlcv(symbol, timeframe, since_ms, want)
-        if not batch: break
-        out.extend(batch)
-        since_ms = batch[-1][0] + 1
-        time.sleep(0.05)  # gentle rate limit; adjust per provider
-    return out
-
-def merge_and_clean(existing: List[List[float]], new_rows: List[List[float]]) -> List[List[float]]:
-    """Keep last write wins per timestamp, sort asc, drop nonsense/NaNs."""
-    by_ts: Dict[int, List[float]] = { int(r[0]): r for r in existing }
-    for r in new_rows:
-        if len(r) >= 6:
-            by_ts[int(r[0])] = r
-    rows = [by_ts[k] for k in sorted(by_ts.keys())]
-    # drop obvious bad rows (zero time/negative)
-    rows = [r for r in rows if r and r[0] > 0]
-    return rows
-
-def ensure_bars(symbol: str, timeframe: str, require: Optional[int] = None) -> List[List[float]]:
-    need = require or need_for(timeframe)
-    have = load_candles(symbol, timeframe)
-    if len(have) >= need:
-        return have
-
-    # backfill just-in-time
-    lookback = int(bar_ms(timeframe) * need * OVERSHOOT)
-    since = int((have[0][0] if have else int(time.time()*1000)) - lookback)
-    fetched = fetch_paged(symbol, timeframe, since, min_bars=need)
-    merged = merge_and_clean(have, fetched)
-    save_candles(symbol, timeframe, merged)
-    return merged
-
-def resample_1m_to_5m(one_min_rows: List[List[float]]) -> List[List[float]]:
-    if not one_min_rows: return []
-    # Simple resampler without pandas (keeps deps small)
-    out: List[List[float]] = []
-    bucket_ms = bar_ms("5Min")
-    cur_bucket = None
-    o = h = l = c = v = None
-    for ts, O, H, L, C, V in one_min_rows:
-        b = (ts // bucket_ms) * bucket_ms
-        if cur_bucket is None or b != cur_bucket:
-            if cur_bucket is not None:
-                out.append([cur_bucket, o, h, l, c, v])
-            cur_bucket = b
-            o = O; h = H; l = L; c = C; v = V
-        else:
-            h = max(h, H); l = min(l, L); c = C; v = (v or 0) + (V or 0)
-    if cur_bucket is not None:
-        out.append([cur_bucket, o, h, l, c, v])
-    return out
-
-def ensure_bars_5m_via_1m(symbol: str, need_5m: int) -> List[List[float]]:
-    # fetch 1m bars then build 5m if native 5m is short
-    one_min = ensure_bars(symbol, "1Min", require=max(NEED_1M, need_5m*5))
-    five = resample_1m_to_5m(one_min)
-    if len(five) >= need_5m:
-        # optionally persist synthetic 5m to your cache for reuse:
-        save_candles(symbol, "5Min", five)
-    return five
-
-def startup_backfill(background=True):
-    def _run():
-        for tf in ("1Min","5Min"):
-            need = need_for(tf)
-            lookback_ms = int(bar_ms(tf) * need * OVERSHOOT)
-            since = int(time.time()*1000) - lookback_ms
-            for sym in SYMBOLS:
-                try:
-                    existing = load_candles(sym, tf)
-                    if len(existing) >= need:
-                        continue
-                    rows = fetch_paged(sym, tf, since, min_bars=need)
-                    merged = merge_and_clean(existing, rows)
-                    save_candles(sym, tf, merged)
-                    print(f"[backfill] {sym} {tf} have={len(merged)} need={need}")
-                except Exception as e:
-                    print(f"[backfill] WARN {sym} {tf} {e}")
-    if background:
-        threading.Thread(target=_run, daemon=True).start()
+def _bars_to_df(bars: List[dict]) -> pd.DataFrame:
+    if not bars:
+        return pd.DataFrame(columns=["ts","open","high","low","close","volume"])
+    df = pd.DataFrame(bars).copy()
+    # timestamp
+    if "t" in df.columns:
+        df["ts"] = pd.to_datetime(df["t"], unit="s", utc=True, errors="coerce")
+    elif "time" in df.columns:
+        df["ts"] = pd.to_datetime(df["time"], utc=True, errors="coerce")
     else:
-        _run()
+        df["ts"] = pd.to_datetime(df.index, utc=True, errors="coerce")
+    # columns
+    rename_map = {"o":"open","h":"high","l":"low","c":"close","v":"volume","vol":"volume"}
+    for k,v in rename_map.items():
+        if k in df and v not in df:
+            df[v] = df[k]
+    keep = ["ts","open","high","low","close","volume"]
+    df = df[keep].dropna(subset=["ts"]).sort_values("ts").reset_index(drop=True)
+    return df
+
+def _read_existing_csv(path: str) -> pd.DataFrame:
+    if not os.path.isfile(path):
+        return pd.DataFrame(columns=["ts","open","high","low","close","volume"])
+    try:
+        df = pd.read_csv(path, parse_dates=["ts"])
+        if "ts" not in df.columns:
+            return pd.DataFrame(columns=["ts","open","high","low","close","volume"])
+        return df
+    except Exception:
+        return pd.DataFrame(columns=["ts","open","high","low","close","volume"])
+
+def backfill_symbol(symbol: str, timeframe: str, limit: int, outdir: str) -> Dict[str, Any]:
+    """Fetch latest bars and append/merge to CSV."""
+    sym = symbol.upper().replace("/", "")
+    filename = f"{sym}_{timeframe}.csv"
+    outpath = os.path.join(outdir, filename)
+
+    try:
+        bars = br.get_bars(sym, timeframe=timeframe, limit=int(limit))
+        new_df = _bars_to_df(bars)
+    except Exception as e:
+        return {"symbol": sym, "timeframe": timeframe, "ok": False, "error": str(e)}
+
+    old_df = _read_existing_csv(outpath)
+    all_df = pd.concat([old_df, new_df], ignore_index=True)
+
+    # De-dup on ts; keep last occurrence (newest values)
+    if not all_df.empty:
+        all_df = all_df.drop_duplicates(subset=["ts"], keep="last").sort_values("ts")
+
+    _ensure_outdir(outdir)
+    all_df.to_csv(outpath, index=False)
+
+    return {
+        "symbol": sym,
+        "timeframe": timeframe,
+        "ok": True,
+        "rows_new": len(new_df),
+        "rows_total": len(all_df),
+        "file": outpath,
+    }
+
+def parse_symbols(arg: str) -> List[str]:
+    if not arg:
+        return []
+    parts = []
+    for chunk in arg.split(","):
+        chunk = chunk.strip()
+        if not chunk:
+            continue
+        parts.extend(chunk.split())
+    return [p.strip().upper().replace("/", "") for p in parts if p.strip()]
+
+def main():
+    ap = argparse.ArgumentParser(description="Backfill OHLC bars via active broker (Kraken-first).")
+    ap.add_argument("--symbols", required=True, help="Comma/space separated symbols (e.g., BTCUSD,ETHUSD)")
+    ap.add_argument("--timeframe", default="5Min", help="Timeframe (e.g., 1m,5Min,1H,4h,1d). Default: 5Min")
+    ap.add_argument("--limit", type=int, default=600, help="Number of recent bars to fetch. Default: 600")
+    ap.add_argument("--outdir", default="./data", help="Output directory for CSVs. Default: ./data")
+
+    args = ap.parse_args()
+    syms = parse_symbols(args.symbols)
+
+    results = []
+    for s in syms:
+        r = backfill_symbol(s, args.timeframe, args.limit, args.outdir)
+        results.append(r)
+        status = "OK" if r.get("ok") else "ERR"
+        print(f"[{status}] {s}@{args.timeframe} -> {r.get('file','')} (new {r.get('rows_new',0)}, total {r.get('rows_total',0)})"
+              + (f" | {r.get('error')}" if r.get("error") else ""))
+
+if __name__ == "__main__":
+    main()
