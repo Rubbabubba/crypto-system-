@@ -2,22 +2,20 @@
 # -*- coding: utf-8 -*-
 """
 broker_kraken.py — Kraken adapter
-Build: v2.0.0 (2025-10-11, America/Chicago)
+Build: v2.0.0 (2025-10-12, America/Chicago)
 
-Public API (used by app.py/strategies)
-- get_bars(symbol: str, timeframe: str = "5Min", limit: int = 300) -> List[dict{t,o,h,l,c,v}]
+Public API used by app/strategies:
+- get_bars(symbol: str, timeframe: str = "5Min", limit: int = 300) -> List[{t,o,h,l,c,v}]
 - last_price(symbol: str) -> float
-- last_trade_map(symbols: list[str]) -> dict[str, {"price": float}]
+- last_trade_map(symbols: list[str]) -> dict[UI_SYMBOL, {"price": float}]
 - market_notional(symbol: str, side: "buy"|"sell", notional: float) -> dict
-- orders() -> dict | list
+- orders() -> Any
 - positions() -> list[dict]
 
-Notes
-- Requires env: KRAKEN_KEY, KRAKEN_SECRET for private endpoints
-- Timeframes map via symbol_map.tf_to_kraken()
-- Symbols map via symbol_map.to_kraken() / from_kraken()
-- Idempotency: userref ensures “at-most-once” semantics on replays
-- Basic rate-limit gate + retries with exponential backoff for transient errors
+Key behaviors:
+- Robust mapping: handles Kraken keys like 'XXBTZUSD'/'XETHZUSD' and maps them to UI symbols 'BTCUSD'/'ETHUSD'
+- Rate-limit gate + retries/backoff for transient errors
+- Idempotency via userref for market orders
 """
 
 from __future__ import annotations
@@ -35,17 +33,24 @@ from typing import Any, Dict, List, Optional
 
 import requests
 
-from symbol_map import to_kraken, from_kraken, tf_to_kraken
+# ---------------------------------------------------------------------------
+# Robust local import of symbol_map helpers (works in flat or packaged repo)
+# ---------------------------------------------------------------------------
+try:
+    from symbol_map import to_kraken, from_kraken, tf_to_kraken
+except ModuleNotFoundError:
+    import sys
+    sys.path.append(os.path.dirname(os.path.abspath(__file__)))
+    from symbol_map import to_kraken, from_kraken, tf_to_kraken  # type: ignore
 
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 # Config
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 API_BASE = os.getenv("KRAKEN_BASE", "https://api.kraken.com")
-TIMEOUT = float(os.getenv("KRAKEN_TIMEOUT", "10"))  # seconds
-# conservative gate; Kraken uses "weights" but 0.35s pause avoids most 429s
-MIN_DELAY = float(os.getenv("KRAKEN_MIN_DELAY", "0.35"))
+TIMEOUT = float(os.getenv("KRAKEN_TIMEOUT", "10"))      # seconds
+MIN_DELAY = float(os.getenv("KRAKEN_MIN_DELAY", "0.35"))  # seconds between calls (simple gate)
 MAX_RETRIES = int(os.getenv("KRAKEN_MAX_RETRIES", "4"))
-BACKOFF_BASE = float(os.getenv("KRAKEN_BACKOFF_BASE", "0.8"))  # seconds
+BACKOFF_BASE = float(os.getenv("KRAKEN_BACKOFF_BASE", "0.8"))
 
 API_KEY = os.getenv("KRAKEN_KEY", "")
 API_SECRET = os.getenv("KRAKEN_SECRET", "")
@@ -54,9 +59,9 @@ SESSION = requests.Session()
 _GATE_LOCK = threading.Lock()
 _LAST_CALL = 0.0
 
-# -----------------------------------------------------------------------------
-# Helpers
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Rate gate
+# ---------------------------------------------------------------------------
 def _rate_gate():
     global _LAST_CALL
     with _GATE_LOCK:
@@ -66,19 +71,21 @@ def _rate_gate():
             time.sleep(wait)
         _LAST_CALL = time.time()
 
+# ---------------------------------------------------------------------------
+# HTTP helpers
+# ---------------------------------------------------------------------------
 def _pub(path: str, params: Dict[str, Any] | None = None) -> Dict[str, Any]:
     url = f"{API_BASE}/0/public/{path}"
     for attempt in range(MAX_RETRIES):
         try:
             _rate_gate()
             r = SESSION.get(url, params=params or {}, timeout=TIMEOUT)
-            if r.status_code == 429:  # rate limited
+            if r.status_code == 429:
                 time.sleep(BACKOFF_BASE * (2 ** attempt))
                 continue
             r.raise_for_status()
             data = r.json()
             if data.get("error"):
-                # Kraken error codes are strings like "EGeneral:Internal error"
                 if attempt < MAX_RETRIES - 1:
                     time.sleep(BACKOFF_BASE * (2 ** attempt))
                     continue
@@ -92,15 +99,9 @@ def _pub(path: str, params: Dict[str, Any] | None = None) -> Dict[str, Any]:
     return {}
 
 def _sign(urlpath: str, data: Dict[str, Any]) -> Dict[str, str]:
-    """
-    Kraken private signature.
-    urlpath starts with '/0/private/...'
-    """
     postdata = "&".join(f"{k}={data[k]}" for k in data)
-    # nonce + hash
     message = (str(data["nonce"]) + postdata).encode()
     sha256 = hashlib.sha256(message).digest()
-    # sign
     mac = hmac.new(base64.b64decode(API_SECRET), urlpath.encode() + sha256, hashlib.sha512)
     sig = base64.b64encode(mac.digest()).decode()
     return {"API-Key": API_KEY, "API-Sign": sig}
@@ -114,7 +115,6 @@ def _priv(path: str, params: Dict[str, Any] | None = None) -> Dict[str, Any]:
         try:
             _rate_gate()
             payload = dict(params or {})
-            # Kraken requires a monotonically increasing nonce
             payload["nonce"] = str(int(time.time() * 1000))
             headers = _sign(urlpath, payload)
             r = SESSION.post(url, data=payload, headers=headers, timeout=TIMEOUT)
@@ -124,17 +124,13 @@ def _priv(path: str, params: Dict[str, Any] | None = None) -> Dict[str, Any]:
             r.raise_for_status()
             data = r.json()
             if data.get("error"):
-                # transient/internal/rate-limit -> retry
                 errtxt = ";".join(data["error"])
-                transient = any(
-                    code in errtxt
-                    for code in (
-                        "EGeneral:Internal error",
-                        "EAPI:Rate limit exceeded",
-                        "EService:Unavailable",
-                        "EService:Timeout",
-                    )
-                )
+                transient = any(code in errtxt for code in (
+                    "EGeneral:Internal error",
+                    "EAPI:Rate limit exceeded",
+                    "EService:Unavailable",
+                    "EService:Timeout",
+                ))
                 if transient and attempt < MAX_RETRIES - 1:
                     time.sleep(BACKOFF_BASE * (2 ** attempt))
                     continue
@@ -147,76 +143,118 @@ def _priv(path: str, params: Dict[str, Any] | None = None) -> Dict[str, Any]:
             raise RuntimeError(f"HTTP private error: {e}") from e
     return {}
 
-def _round_qty(q: float) -> float:
-    # 8 decimals is generally safe; real precision is per-asset (could enhance later)
-    return float(f"{q:.8f}")
+# ---------------------------------------------------------------------------
+# Kraken key → UI symbol heuristics (for robustness)
+# ---------------------------------------------------------------------------
+_KNOWN_QUOTES = ("USD", "USDT", "USDC", "EUR", "GBP", "JPY", "AUD", "CAD", "CHF")
 
-def _userref(symbol: str, side: str, notional: float) -> int:
-    """
-    Stable-ish idempotency key: hash of (symbol, side, notional, minute-slot).
-    Kraken userref accepts signed 32-bit ints; constrain via modulo.
-    """
-    minute = int(time.time() // 60)
-    h = hash((symbol.upper(), side.lower(), round(float(notional), 4), minute))
-    # fit to 31-bit signed range
-    return int(h & 0x7FFFFFFF)
+_BASE_MAP = {
+    "XBT": "BTC",
+    "XXBT": "BTC",
+    "ETH": "ETH",
+    "XETH": "ETH",
+    "ETC": "ETC",
+    "XETC": "ETC",
+    "XDG": "DOGE",
+    "DOGE": "DOGE",
+    "XRP": "XRP",
+    "XXRP": "XRP",
+    "LTC": "LTC",
+    "XLTC": "LTC",
+    "BCH": "BCH",
+    "XBCH": "BCH",
+    "SOL": "SOL",
+    "ADA": "ADA",
+    "AVAX": "AVAX",
+    "LINK": "LINK",
+    # add others as needed; unknowns fall through
+}
 
-# -----------------------------------------------------------------------------
+def _normalize_base(b: str) -> str:
+    b = b.upper()
+    # strip a single leading X if present (Kraken convention for crypto)
+    if len(b) > 1 and b[0] == "X":
+        b2 = b[1:]
+        if b2 in _BASE_MAP:
+            return _BASE_MAP[b2]
+    return _BASE_MAP.get(b, b)
+
+def _normalize_quote(q: str) -> str:
+    q = q.upper()
+    # strip leading Z for fiat (Kraken convention)
+    if len(q) > 1 and q[0] == "Z":
+        q = q[1:]
+    # normalize to USD (your system expects USD)
+    if q in ("USD", "USDT", "USDC"):
+        return "USD"
+    return q
+
+def _kraken_key_to_ui_pair(k: str) -> Optional[str]:
+    """
+    Convert Kraken dictionary key (like 'XXBTZUSD' or 'XBTUSD') into UI pair 'BTCUSD'.
+    Heuristic: detect known quote suffix (with optional leading Z), remainder is base (with optional leading X).
+    """
+    K = k.upper()
+    for q in _KNOWN_QUOTES:
+        if K.endswith(q):
+            base = K[: -len(q)]
+            return _normalize_base(base) + _normalize_quote(q)
+        # handle 'Z' prefix on fiat (e.g., XXBTZUSD)
+        if K.endswith("Z" + q):
+            base = K[: -(len(q) + 1)]
+            return _normalize_base(base) + _normalize_quote("Z" + q)
+    # If nothing matched, try symbol_map.from_kraken
+    try:
+        ui = from_kraken(k).upper()
+        return ui
+    except Exception:
+        return None
+
+# ---------------------------------------------------------------------------
 # Public endpoints
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 def last_trade_map(symbols: List[str]) -> Dict[str, Dict[str, float]]:
     """
     Return { UI_SYMBOL: {"price": float} } for each requested symbol.
-    Resolves Kraken's multiple pair names (e.g., XXBTZUSD vs XBTUSD) robustly.
+    Works even if Kraken responds with keys like 'XXBTZUSD' by normalizing them.
     """
     if not symbols:
         return {}
     req_syms = [s.upper() for s in symbols]
-    # Build lookup of requested UI -> expected Kraken pair (altname)
-    want_pair = {ui: to_kraken(ui) for ui in req_syms}  # e.g. BTCUSD -> XBTUSD
+    want_pair = {ui: to_kraken(ui) for ui in req_syms}  # e.g., BTCUSD -> XBTUSD
 
-    # Call Kraken once with comma-joined pairs
+    # Kraken supports comma-joined pairs
     pairs = ",".join(want_pair.values())
     res = _pub("Ticker", {"pair": pairs}) or {}
 
-    out: Dict[str, Dict[str, float]] = {ui: {"price": 0.0} for ui in req_syms}
-
-    # First pass: ingest everything Kraken returned
-    # Keys can be altname (XBTUSD) or wsname/base form (XXBTZUSD). We'll parse both.
+    # Ingest all returned keys → price
     k_price: Dict[str, float] = {}
     for k, v in res.items():
         try:
             px = float((v or {}).get("c", ["0"])[0])
         except Exception:
             px = 0.0
-        k_price[k.upper()] = px  # store under exact Kraken key
+        k_price[k.upper()] = px
 
-    # Second pass: for each requested symbol, try multiple resolutions
+    out: Dict[str, Dict[str, float]] = {ui: {"price": 0.0} for ui in req_syms}
+
+    # Resolve for each requested UI symbol
     for ui in req_syms:
-        target = want_pair[ui].upper()        # e.g., XBTUSD
-        px = 0.0
+        target_alt = want_pair[ui].upper()  # e.g., XBTUSD
+        px = None
 
-        # A) exact altname key
-        if target in k_price:
-            px = k_price[target]
+        # 1) exact altname key
+        if target_alt in k_price:
+            px = k_price[target_alt]
         else:
-            # B) find any key that endswith(target) (handles XXBTZUSD vs XBTUSD)
+            # 2) normalize every returned key to UI and compare
             for kk, vv in k_price.items():
-                if kk.endswith(target):
+                ui_guess = _kraken_key_to_ui_pair(kk)
+                if ui_guess == ui:
                     px = vv
                     break
-            # C) as a final fallback, try reverse-map on all keys (from_kraken)
-            if px == 0.0:
-                for kk, vv in k_price.items():
-                    try:
-                        ui_guess = from_kraken(kk).upper()
-                        if ui_guess == ui:
-                            px = vv
-                            break
-                    except Exception:
-                        continue
 
-        out[ui] = {"price": float(px or 0.0)}
+        out[ui] = {"price": float(px) if (px is not None and math.isfinite(px)) else 0.0}
 
     return out
 
@@ -230,39 +268,59 @@ def last_price(symbol: str) -> float:
 def get_bars(symbol: str, timeframe: str = "5Min", limit: int = 300) -> List[Dict[str, Any]]:
     """
     Returns list of bars: [{t,o,h,l,c,v}] (epoch seconds; newest last)
+    Robustly selects the right series even if Kraken uses 'XXBTZUSD' keys.
     """
-    pair = to_kraken(symbol)
-    interval = int(tf_to_kraken(timeframe) or 5)  # minutes
+    pair = to_kraken(symbol)                   # e.g., BTCUSD -> XBTUSD
+    interval = int(tf_to_kraken(timeframe) or 5)
     res = _pub("OHLC", {"pair": pair, "interval": interval}) or {}
+
     series = None
-    # Kraken returns { "XBTUSD": [ [ts, open, high, low, close, vwap, volume, count], ... ] }
+    # Prefer exact altname key; fallback: any key that normalizes to our UI symbol
+    ui_target = symbol.upper()
     for key, val in res.items():
-        # pick the array matching our pair; sometimes key is altname like "XXBTZUSD" vs "XBTUSD"
-        if key.upper().endswith(pair.upper()) or key.upper() == pair.upper():
+        if not isinstance(val, list):
+            continue
+        if key.upper() == pair.upper():
             series = val
             break
-        # fallback to first list-looking value
-        if series is None and isinstance(val, list) and val and isinstance(val[0], list):
+        ui_guess = _kraken_key_to_ui_pair(key)
+        if ui_guess == ui_target:
             series = val
+            # don't break immediately; try to find exact altname first, else keep this
+    if series is None:
+        # final fallback: pick the first list-looking value
+        for key, val in res.items():
+            if isinstance(val, list) and val and isinstance(val[0], list):
+                series = val
+                break
+
     if not series:
         return []
-    # Kraken’s series sometimes includes the last (still-open) candle; we’ll keep it
+
     out: List[Dict[str, Any]] = []
     for row in series[-int(limit):]:
         try:
             t = int(row[0])
             o = float(row[1]); h = float(row[2]); l = float(row[3]); c = float(row[4])
-            v = float(row[6])  # row[6] is "volume" in base units
+            v = float(row[6])  # base volume
             out.append({"t": t, "o": o, "h": h, "l": l, "c": c, "v": v})
         except Exception:
             continue
-    # Ascending by time
+
     out.sort(key=lambda x: x["t"])
     return out
 
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 # Private endpoints
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+def _round_qty(q: float) -> float:
+    return float(f"{q:.8f}")
+
+def _userref(symbol: str, side: str, notional: float) -> int:
+    minute = int(time.time() // 60)
+    h = hash((symbol.upper(), side.lower(), round(float(notional), 4), minute))
+    return int(h & 0x7FFFFFFF)
+
 def _ensure_price(symbol: str) -> float:
     p = last_price(symbol)
     if not p or not math.isfinite(p) or p <= 0:
@@ -272,11 +330,12 @@ def _ensure_price(symbol: str) -> float:
 def market_notional(symbol: str, side: str, notional: float) -> Dict[str, Any]:
     """
     Market order by USD notional:
-      volume(base) = notional(quote USD) / last_price(quote)
+      volume(base) = notional(quote USD) / last_price
     """
     side = side.lower().strip()
     if side not in ("buy", "sell"):
         raise ValueError("side must be 'buy' or 'sell'")
+
     ui = symbol.upper()
     pair = to_kraken(ui)
     px = _ensure_price(ui)
@@ -290,30 +349,17 @@ def market_notional(symbol: str, side: str, notional: float) -> Dict[str, Any]:
         "ordertype": "market",
         "volume": f"{volume:.8f}",
         "userref": str(_userref(ui, side, float(notional))),
-        # Optional flags: "viqc" (volume in quote) not supported on spot; we compute volume ourselves
-        # "timeinforce": "IOC" / "GTC" could be added; Kraken defaults are fine for market
     }
     res = _priv("AddOrder", payload)
-    # Typical response: {"descr":{"order":"buy 0.0001 XBTUSD market"}, "txid":["OXXXXXXXXX"]}
     return {"pair": pair, "side": side, "notional": float(notional), "volume": volume, "result": res}
 
 def orders() -> Any:
-    """
-    Open orders snapshot (pass-through of Kraken shape with minimal normalization).
-    """
     try:
-        res = _priv("OpenOrders", {})
-        # res: {"open": {"OXXXX":{"descr":{...},"vol":"...","vol_exec":"...","status":"open",...}}, "count":1}
-        return res
+        return _priv("OpenOrders", {})
     except Exception as e:
         return {"error": str(e)}
 
 def positions() -> List[Dict[str, Any]]:
-    """
-    Kraken spot doesn't expose 'positions' like futures; we emulate spot “holdings”
-    via open orders is not correct. Return empty or balances if needed.
-    For now, return balances for core assets as a convenience.
-    """
     out: List[Dict[str, Any]] = []
     try:
         bal = _priv("Balance", {})  # {"ZUSD":"123.45","XXBT":"0.01",...}
@@ -324,11 +370,16 @@ def positions() -> List[Dict[str, Any]]:
                 qty = 0.0
             if qty <= 0:
                 continue
-            # Map a few common Kraken asset codes to UI-ish tickers
             asset = (
-                "USD" if k.upper().endswith("USD") or k.upper() == "ZUSD" else
+                "USD" if k.upper() in ("ZUSD", "USD") else
                 "BTC" if k.upper() in ("XXBT", "XBT") else
                 "ETH" if k.upper() in ("XETH", "ETH") else
+                "SOL" if k.upper() == "SOL" else
+                "ADA" if k.upper() == "ADA" else
+                "DOGE" if k.upper() in ("XDG", "DOGE") else
+                "XRP" if k.upper() in ("XXRP", "XRP") else
+                "LTC" if k.upper() in ("XLTC", "LTC") else
+                "BCH" if k.upper() in ("XBCH", "BCH") else
                 k
             )
             out.append({"asset": asset, "qty": qty})
