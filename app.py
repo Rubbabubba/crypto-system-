@@ -137,6 +137,7 @@ def health():
         "version": APP_VERSION,
         "broker": ("kraken" if USING_KRAKEN else "alpaca"),
         "trading": TRADING_ENABLED,
+        "scheduler_running": _RUNNING,   # <— add this line
         "time": utc_now(),
         "symbols": _CURRENT_SYMBOLS,
         "strategies": ACTIVE_STRATEGIES,
@@ -769,9 +770,9 @@ async def _loop():
             # only run strategies that are currently active and not explicitly disabled
             run_strats = [s for s in cfg["strategies"] if s in ACTIVE_STRATEGIES and s not in _DISABLED_STRATS]
 
-            log.debug(
-                "Scheduler pass: strats=%s tf=%s limit=%s notional=%s dry=%s symbols=%s",
-                ",".join(run_strats), cfg["timeframe"], cfg["limit"], cfg["notional"], cfg["dry"], ",".join(syms)
+            log.info(
+                 "Scheduler pass: strats=%s tf=%s limit=%s notional=%s dry=%s symbols=%s",
+                 ",".join(run_strats), cfg["timeframe"], cfg["limit"], cfg["notional"], cfg["dry"], ",".join(syms)
             )
 
             for strat in run_strats:
@@ -815,6 +816,10 @@ async def scheduler_stop():
     global _RUNNING
     _RUNNING = False
     return {"ok": True, "stopping": True}
+    
+@app.get("/scheduler/status")
+async def scheduler_status():
+    return {"ok": True, "running": _RUNNING, "config": _sched_config()}
     
 @app.on_event("startup")
 async def _maybe_autostart_scheduler():
