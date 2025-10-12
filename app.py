@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Crypto System – FastAPI service (Render-safe)
-Build: v2.0.0 (2025-10-11)
+Crypto System – FastAPI service (Render/Kraken)
+Build: v2.0.0 (2025-10-12)
 
 Routes
 - GET  /                     -> Dashboard
-- GET  /health               -> Service health
+- GET  /dashboard            -> alias
+- GET  /health               -> Service health (+ scheduler_running)
 - GET  /diag/broker          -> Active broker diagnostics
 - GET  /version              -> App version
 - GET  /config               -> Defaults, symbols, strategies, params
@@ -15,29 +16,43 @@ Routes
 - GET  /price/{symbol}       -> Last price
 - GET  /positions            -> Spot positions summary
 - GET  /orders               -> Open orders
-- POST /order/market         -> Place market order by notional
-- GET  /scheduler/start      -> Start dry-run scheduler loop (requires SCHED_ON=1)
-- GET  /scheduler/stop       -> Stop scheduler loop
+- GET  /fills                -> Recent fills (via broker)
+- POST /order/market         -> Place market order by notional (USD)
+Scheduler
+- GET  /scheduler/start      -> Start loop (requires SCHED_ON=1)
+- GET  /scheduler/stop       -> Stop loop
+- GET  /scheduler/status     -> status + live config
+Journal & PnL
+- POST /journal/sync         -> sync journal with fills (by txid)
+- GET  /journal              -> list journal rows
+- GET  /pnl/summary          -> total + per-strategy + per-symbol P&L
+- GET  /pnl/strategies       -> per-strategy P&L
+- GET  /pnl/symbols          -> per-symbol P&L
 
 Notes (v2.0.0)
-- Demo StrategyBook removed; app dispatches directly to strategies c1..c6.
-- Kraken-first broker routing; Alpaca remains legacy fallback via 'broker'.
-- Dashboard HTML expanded with live calls, symbol/strategy pickers, and actions.
+- Kraken-first broker routing; Alpaca remains legacy fallback.
+- HTML dashboard extended with live price table + sparklines and a small P&L card.
+- No HTML functionality removed; all existing routes kept.
 """
+
+from __future__ import annotations
+
 __version__ = "2.0.0"
 
 import asyncio
 import os
 import sys
+import json
+import math
 import logging
-import threading, time
+import threading
+import time
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, TypedDict
 
-from fastapi import FastAPI, HTTPException, Request
+import pandas as pd
+from fastapi import FastAPI, HTTPException, Request, Body
 from fastapi.responses import JSONResponse, HTMLResponse
-
-
 
 # -----------------------------------------------------------------------------
 # Logging
@@ -77,6 +92,7 @@ SERVICE_NAME = os.getenv("SERVICE_NAME", "Crypto System")
 
 DEFAULT_TIMEFRAME = os.getenv("DEFAULT_TIMEFRAME", "5Min")
 DEFAULT_LIMIT = int(os.getenv("DEFAULT_LIMIT", "300"))
+# Per-order notional (USD). For scheduler override use SCHED_NOTIONAL.
 DEFAULT_NOTIONAL = float(os.getenv("DEFAULT_NOTIONAL", os.getenv("ORDER_NOTIONAL", "25")))
 
 # Symbol universe
@@ -84,9 +100,9 @@ try:
     from universe import load_universe_from_env
     _CURRENT_SYMBOLS = load_universe_from_env()
 except Exception:
-    _CURRENT_SYMBOLS = ["BTCUSD", "ETHUSD", "SOLUSD", "ADAUSD", "DOGEUSD"]
+    _CURRENT_SYMBOLS = ["BTCUSD", "ETHUSD", "SOLUSD", "DOGEUSD", "XRPUSD", "AVAXUSD", "LINKUSD", "BCHUSD", "LTCUSD"]
 
-# Strategy defaults (optimized params to retain)
+# Strategy defaults (optimized params retained)
 DEFAULT_STRAT_PARAMS: Dict[str, Dict[str, Any]] = {
     "c1": {"ema_n": 20, "vwap_pull": 0.0020, "min_vol": 0.0},
     "c2": {"ema_n": 50, "exit_k": 0.997, "min_atr": 0.0},
@@ -96,7 +112,7 @@ DEFAULT_STRAT_PARAMS: Dict[str, Dict[str, Any]] = {
     "c6": {"atr_n": 14, "atr_mult": 1.2, "ema_n": 20, "exit_k": 0.997, "min_vol": 0.0},
 }
 ACTIVE_STRATEGIES = list(DEFAULT_STRAT_PARAMS.keys())
-_DISABLED_STRATS = set()
+_DISABLED_STRATS: set[str] = set()
 
 # -----------------------------------------------------------------------------
 # Import strategies and build dispatcher
@@ -124,11 +140,20 @@ def _merge_raw(strat: str, raw_in: Optional[Dict[str, Any]]) -> Dict[str, Any]:
         base.update({k: raw_in[k] for k in raw_in})
     return base
 
+def _to_list(x: Any) -> List[str]:
+    if x is None: return []
+    if isinstance(x, list): return [str(s).upper() for s in x]
+    if isinstance(x, str): return [s.strip().upper() for s in x.split(",") if s.strip()]
+    return [str(x).upper()]
+
 # -----------------------------------------------------------------------------
 # FastAPI app
 # -----------------------------------------------------------------------------
 app = FastAPI(title=SERVICE_NAME, version=APP_VERSION)
 
+# -----------------------------------------------------------------------------
+# Core info routes
+# -----------------------------------------------------------------------------
 @app.get("/health")
 def health():
     return {
@@ -137,7 +162,7 @@ def health():
         "version": APP_VERSION,
         "broker": ("kraken" if USING_KRAKEN else "alpaca"),
         "trading": TRADING_ENABLED,
-        "scheduler_running": _RUNNING,   # <— add this line
+        "scheduler_running": _RUNNING,
         "time": utc_now(),
         "symbols": _CURRENT_SYMBOLS,
         "strategies": ACTIVE_STRATEGIES,
@@ -149,7 +174,7 @@ def diag_broker():
 
 @app.get("/version")
 def version():
-    return {"version": APP_VERSION}
+    return {"version": APP_VERSION, "time": utc_now()}
 
 @app.get("/config")
 def config():
@@ -163,92 +188,86 @@ def config():
     }
 
 # -----------------------------------------------------------------------------
-# Request model
+# Scan bridge — dispatch to the chosen strategy module
 # -----------------------------------------------------------------------------
-from pydantic import BaseModel
-from typing import TypedDict
-
-class ScanRequestModel(BaseModel):
-    symbols: Optional[List[str]] = None
-    timeframe: Optional[str] = None
-    limit: Optional[int] = None
-    notional: Optional[float] = None
-    raw: Optional[Dict[str, Any]] = None
-    dry: Optional[bool] = None
-
-class ScanRequest(TypedDict, total=False):
-    strategy: str
+class ScanRequestModel(TypedDict, total=False):
+    symbols: List[str]
     timeframe: str
     limit: int
     notional: float
-    symbols: List[str]
     raw: Dict[str, Any]
+    dry: bool
 
-# -----------------------------------------------------------------------------
-# Scan bridge — dispatch to the chosen strategy module
-# -----------------------------------------------------------------------------
-async def _scan_bridge(strat: str, req: Dict[str, Any], *args, **kwargs) -> List[Dict[str, Any]]:
-    dry_arg = kwargs.get("dry", None)
-    if dry_arg is None and args:
-        dry_arg = bool(args[0])
-    is_dry = bool(dry_arg) or (not TRADING_ENABLED)
-
-    req = dict(req or {})
+async def _scan_bridge(strat: str, req: Dict[str, Any], *, dry: Optional[bool] = None) -> Dict[str, Any]:
     strat = (strat or "").lower()
-    if strat not in STRAT_DISPATCH:
+    fn = STRAT_DISPATCH.get(strat)
+    if not fn:
         raise HTTPException(status_code=400, detail=f"Unknown strategy '{strat}'")
 
-    req.setdefault("strategy", strat)
-    req.setdefault("timeframe", req.get("tf") or DEFAULT_TIMEFRAME)
-    req.setdefault("limit", req.get("limit") or DEFAULT_LIMIT)
-    req.setdefault("notional", req.get("notional") or DEFAULT_NOTIONAL)
+    is_dry = bool(dry) if dry is not None else (not TRADING_ENABLED)
 
-    syms = req.get("symbols") or _CURRENT_SYMBOLS
-    if isinstance(syms, str):
-        syms = [s.strip() for s in syms.split(",") if s.strip()]
-    syms = [s.upper() for s in syms]
-    req["symbols"] = syms
+    timeframe = req.get("timeframe") or DEFAULT_TIMEFRAME
+    limit = int(req.get("limit") or DEFAULT_LIMIT)
+    notional = float(req.get("notional") or DEFAULT_NOTIONAL)
+    symbols = _to_list(req.get("symbols")) or _CURRENT_SYMBOLS
+    raw = _merge_raw(strat, dict(req.get("raw") or {}))
+    ctx = {"timeframe": timeframe, "symbols": symbols, "notional": notional}
 
-    req["raw"] = _merge_raw(strat, dict(req.get("raw") or {}))
-    ctx = {"timeframe": req["timeframe"], "symbols": syms, "notional": req["notional"]}
-
-    orders = STRAT_DISPATCH[strat](req, ctx) or []
+    # Strategy returns [{"symbol","side",...}]
+    orders = fn({"strategy": strat, "timeframe": timeframe, "limit": limit, "notional": notional, "symbols": symbols, "raw": raw}, ctx) or []
 
     placed: List[Dict[str, Any]] = []
-    for o in orders:
-        sym = (o.get("symbol") or syms[0]).upper()
-        side = (o.get("side") or "buy").lower()
-        notional = float(o.get("notional") or req["notional"])
-        if is_dry:
-            placed.append({**o, "symbol": sym, "side": side, "notional": notional, "dry": True})
-            continue
-        try:
-            res = br.market_notional(sym, side, notional)
-            placed.append({**o, "symbol": sym, "side": side, "notional": notional, "order": res})
-        except Exception as e:
-            placed.append({**o, "symbol": sym, "side": side, "notional": notional, "error": str(e)})
-    return placed
+    if not is_dry:
+        for o in orders:
+            sym = (o.get("symbol") or symbols[0]).upper()
+            side = (o.get("side") or "buy").lower()
+            notional_o = float(o.get("notional") or notional)
+            try:
+                res = br.market_notional(sym, side, notional_o)
+                placed.append({**o, "symbol": sym, "side": side, "notional": notional_o, "order": res})
+                # journal attribution
+                try:
+                    _journal_append({
+                        "ts": int(time.time()),
+                        "symbol": sym, "side": side, "notional": notional_o,
+                        "strategy": strat, "txid": res.get("txid"), "descr": res.get("descr"),
+                        "price": None, "vol": None, "fee": None, "cost": None, "filled_ts": None,
+                    })
+                except Exception as je:
+                    log.warning("journal add failed: %s", je)
+            except Exception as e:
+                placed.append({**o, "symbol": sym, "side": side, "notional": notional_o, "error": str(e)})
+    else:
+        # dry run echoes actionable intents
+        for o in orders:
+            sym = (o.get("symbol") or symbols[0]).upper()
+            side = (o.get("side") or "buy").lower()
+            notional_o = float(o.get("notional") or notional)
+            placed.append({**o, "symbol": sym, "side": side, "notional": notional_o, "dry": True})
 
-# -----------------------------------------------------------------------------
-# Routes
-# -----------------------------------------------------------------------------
+    return {"ok": True, "orders": orders, "placed": placed, "strategy": strat, "version": APP_VERSION, "time": utc_now()}
+
 @app.post("/scan/{strategy}")
-async def scan(strategy: str, model: ScanRequestModel):
+async def scan(strategy: str, model: Dict[str, Any] = Body(...)):
     try:
-        body = model.model_dump() if model else {}
-        orders = await _scan_bridge(strategy, body, dry=(body.get("dry") in (True, 1, "1", "true", "True")))
-        return {"ok": True, "orders": orders, "strategy": strategy, "version": APP_VERSION, "time": utc_now()}
+        body = dict(model or {})
+        is_dry = body.get("dry")
+        res = await _scan_bridge(strategy, body, dry=(is_dry in (True, 1, "1", "true", "True")))
+        return res
     except HTTPException:
         raise
     except Exception as e:
         log.exception("scan error")
         raise HTTPException(status_code=500, detail=str(e))
 
+# -----------------------------------------------------------------------------
+# Market data & account
+# -----------------------------------------------------------------------------
 @app.get("/bars/{symbol}")
 def bars(symbol: str, timeframe: str = DEFAULT_TIMEFRAME, limit: int = 200):
     try:
-        out = br.get_bars(symbol.upper(), timeframe=timeframe, limit=limit)
-        return {"ok": True, "symbol": symbol.upper(), "timeframe": timeframe, "limit": limit, "bars": out}
+        out = br.get_bars(symbol.upper(), timeframe=timeframe, limit=int(limit))
+        return {"ok": True, "symbol": symbol.upper(), "timeframe": timeframe, "limit": int(limit), "bars": out}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -256,7 +275,7 @@ def bars(symbol: str, timeframe: str = DEFAULT_TIMEFRAME, limit: int = 200):
 def price(symbol: str):
     try:
         p = br.last_price(symbol.upper())
-        return {"ok": True, "symbol": symbol.upper(), "price": p}
+        return {"ok": True, "symbol": symbol.upper(), "price": float(p)}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -275,11 +294,11 @@ def orders():
         return {"ok": True, "orders": out}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
-        
+
 @app.get("/fills")
 def fills():
     try:
-        data = br.trades_history(20)
+        data = br.trades_history(50)
         return {"ok": True, **data}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -294,12 +313,23 @@ async def order_market(request: Request):
         if not TRADING_ENABLED:
             return {"ok": True, "dry": True, "symbol": symbol, "side": side, "notional": notional}
         res = br.market_notional(symbol, side, notional)
+        # journal manual
+        try:
+            _journal_append({
+                "ts": int(time.time()),
+                "symbol": symbol, "side": side, "notional": notional,
+                "strategy": "manual", "txid": res.get("txid"), "descr": res.get("descr"),
+                "price": None, "vol": None, "fee": None, "cost": None, "filled_ts": None,
+            })
+        except Exception as je:
+            log.warning("journal add (manual) failed: %s", je)
         return {"ok": True, "order": res}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 # -----------------------------------------------------------------------------
-# Dashboard HTML (expanded; placeholders replaced at runtime)
+# Dashboard HTML (placeholders replaced at runtime; no f-strings)
+# Adds a small P&L card using /pnl/summary
 # -----------------------------------------------------------------------------
 DASHBOARD_HTML = """
 <!doctype html>
@@ -334,10 +364,11 @@ pre { background:#0b1117; padding:10px; border-radius:8px; overflow:auto; }
 .mono { font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace; }
 .small { font-size:12px; color:var(--muted); }
 hr { border:none; border-top:1px solid var(--border); margin:8px 0; }
-svg.spark { width:120px; height:28px; }
+svg.spark { width:120px; height:28; }
 svg.spark path.line { fill:none; stroke:var(--accent); stroke-width:1.5; }
 svg.spark rect.bg { fill:#0b1117; }
 svg.spark path.fill { fill:rgba(138,180,255,0.12); stroke:none; }
+.good { color: var(--ok); } .bad { color: var(--err); }
 </style>
 </head>
 <body>
@@ -378,9 +409,17 @@ svg.spark path.fill { fill:rgba(138,180,255,0.12); stroke:none; }
         <button onclick="loadConfig()">GET /config</button>
         <a class="small" href="/config" target="_blank" rel="noopener">open</a>
       </div>
+
+      <div>Fills</div>
       <div>
         <button onclick="callJson('/fills')">GET /fills</button>
         <a class="small" href="/fills" target="_blank" rel="noopener">open</a>
+      </div>
+
+      <div>Scheduler</div>
+      <div>
+        <button onclick="callJson('/scheduler/status')">GET /scheduler/status</button>
+        <a class="small" href="/scheduler/status" target="_blank" rel="noopener">open</a>
       </div>
     </div>
     <hr/>
@@ -498,9 +537,27 @@ svg.spark path.fill { fill:rgba(138,180,255,0.12); stroke:none; }
     <div style="display:flex; gap:8px;">
       <button onclick="callJson('/scheduler/start')">/scheduler/start</button>
       <button onclick="callJson('/scheduler/stop')">/scheduler/stop</button>
+      <button onclick="callJson('/scheduler/status')">/scheduler/status</button>
     </div>
     <hr/>
     <pre id="sched_out" class="mono small">// scheduler responses here</pre>
+  </div>
+
+  <div class="card">
+    <h2>P&amp;L</h2>
+    <div class="small">Realized + Unrealized (MTM) with fees; live from /pnl/summary</div>
+    <div id="pnl_time" class="small"></div>
+    <table class="table" id="pnl_strat_tbl">
+      <thead><tr><th>Strategy</th><th>Realized</th><th>Unrealized</th><th>Fees</th><th>Equity</th></tr></thead>
+      <tbody></tbody>
+    </table>
+    <div class="small" style="margin-top:6px;">Total: <span id="pnl_total" class="mono"></span></div>
+    <div style="margin-top:8px;">
+      <button onclick="refreshPNL()">Refresh P&amp;L</button>
+      <button onclick="callJson('/journal/sync')">Sync Fills</button>
+      <a class="small" href="/pnl/summary" target="_blank" rel="noopener">open</a>
+      <a class="small" href="/journal" target="_blank" rel="noopener">journal</a>
+    </div>
   </div>
 
   <div class="card">
@@ -542,6 +599,7 @@ async function callJson(path) {
 
 async function loadConfig() { return await callJson('/config'); }
 
+/* Quick scan */
 async function runScan() {
   const strat = document.getElementById('scan_strat').value;
   const tf = document.getElementById('scan_tf').value;
@@ -562,6 +620,7 @@ async function runScan() {
   }
 }
 
+/* Bars & price */
 async function fetchBars() {
   const sym = document.getElementById('bars_sym').value;
   const tf = document.getElementById('bars_tf').value;
@@ -666,6 +725,7 @@ window.addEventListener('load', async () => {
   await loadConfig();
   await refreshPrices(true);
   setInterval(refreshPrices, 30000);
+  setInterval(refreshPNL, 30000);
 });
 
 /* Orders */
@@ -681,6 +741,33 @@ async function placeOrder() {
     println('console', `[${nowISO()}] POST /order/market\\n` + JSON.stringify(j, null, 2));
   } catch (e) {
     println('console', `[${nowISO()}] ERROR POST /order/market: ` + e);
+  }
+}
+
+/* P&L card */
+function fmt(x){ const v = Number(x||0); const s = (v>=0?'+':''); return s + (Math.round(v*100)/100).toFixed(2); }
+async function refreshPNL() {
+  try {
+    const r = await fetch('/pnl/summary');
+    const j = await r.json();
+    const tbody = document.querySelector('#pnl_strat_tbl tbody');
+    tbody.innerHTML = '';
+    (j.per_strategy || []).forEach(row => {
+      const tr = document.createElement('tr');
+      tr.innerHTML = `<td>${row.strategy}</td>`
+        + `<td class="mono ${row.realized>=0?'good':'bad'}">${fmt(row.realized)}</td>`
+        + `<td class="mono ${row.unrealized>=0?'good':'bad'}">${fmt(row.unrealized)}</td>`
+        + `<td class="mono">${fmt(-row.fees)}</td>`
+        + `<td class="mono ${row.equity>=0?'good':'bad'}">${fmt(row.equity)}</td>`;
+      tbody.appendChild(tr);
+    });
+    const t = j.total || {};
+    document.getElementById('pnl_total').textContent =
+      `Realized ${fmt(t.realized)}  |  Unrealized ${fmt(t.unrealized)}  |  Fees ${fmt(-(t.fees||0))}  |  Equity ${fmt(t.equity)}`;
+    document.getElementById('pnl_time').textContent = 'As of ' + (j.time || new Date().toISOString());
+    println('console', `[${nowISO()}] GET /pnl/summary\\n` + JSON.stringify(j, null, 2));
+  } catch (e) {
+    println('console', `[${nowISO()}] ERROR /pnl/summary: ` + e);
   }
 }
 </script>
@@ -700,111 +787,64 @@ def root():
         .replace("{BROKER_TEXT}", broker_text)
     )
     return HTMLResponse(content=html, status_code=200)
-    
+
 @app.get("/dashboard", response_class=HTMLResponse)
 def dashboard_alias():
     return root()
 
-
 # -----------------------------------------------------------------------------
-# Automatic strategy scheduler (opt-in via env SCHED_ON=1)
+# Scheduler (auto, env-driven; INFO logs per pass)
 # -----------------------------------------------------------------------------
 _RUNNING = False
 
-def _sched_config():
-    """
-    Read scheduler config from env on each pass so changes take effect without restart.
-    """
-    # strategies: explicit list or fall back to ACTIVE_STRATEGIES
+def _sched_config() -> Dict[str, Any]:
     raw = os.getenv("SCHED_STRATS", "")
-    strategies = [s.strip() for s in raw.split(",") if s.strip()] or list(ACTIVE_STRATEGIES)
-
+    strategies = [s.strip().lower() for s in raw.split(",") if s.strip()] or [s.lower() for s in ACTIVE_STRATEGIES]
     timeframe = os.getenv("SCHED_TIMEFRAME", DEFAULT_TIMEFRAME)
-    try:
-        limit = int(os.getenv("SCHED_LIMIT", str(DEFAULT_LIMIT)))
-    except Exception:
-        limit = DEFAULT_LIMIT
-
-    try:
-        notional = float(os.getenv("SCHED_NOTIONAL", str(DEFAULT_NOTIONAL)))
-    except Exception:
-        notional = DEFAULT_NOTIONAL
-
-    try:
-        sleep_s = int(os.getenv("SCHED_SLEEP", "30"))  # default 30s
-    except Exception:
-        sleep_s = 30
-
+    try: limit = int(os.getenv("SCHED_LIMIT", str(DEFAULT_LIMIT)))
+    except: limit = DEFAULT_LIMIT
+    try: notional = float(os.getenv("SCHED_NOTIONAL", str(DEFAULT_NOTIONAL)))
+    except: notional = DEFAULT_NOTIONAL
+    try: sleep_s = int(os.getenv("SCHED_SLEEP", "30"))
+    except: sleep_s = 30
     dry_env = os.getenv("SCHED_DRY", "1").lower() in ("1", "true", "yes", "y")
-    trading_flags = (
-        os.getenv("TRADING_ENABLED", "0").lower() in ("1", "true", "yes", "y")
-        and os.getenv("KRAKEN_TRADING", "0").lower() in ("1", "true", "yes", "y")
-    )
-    # if trading flags are not both enabled, force dry regardless of SCHED_DRY
+    trading_flags = TRADING_ENABLED and (os.getenv("KRAKEN_TRADING", "0").lower() in ("1","true","yes","y"))
     dry = dry_env or (not trading_flags)
-
     return {
-        "strategies": strategies,
-        "timeframe": timeframe,
-        "limit": limit,
-        "notional": notional,
-        "sleep_s": sleep_s,
-        "dry": dry,
-        "trading_flags": trading_flags,
+        "strategies": strategies, "timeframe": timeframe, "limit": limit, "notional": notional,
+        "sleep_s": sleep_s, "dry": dry, "trading_flags": trading_flags
     }
 
 async def _loop():
-    """
-    Runs forever (until /scheduler/stop). Each pass:
-      - reads latest env config
-      - scans allowed strategies over _CURRENT_SYMBOLS
-      - places live orders when dry=False (and trading flags allow)
-    """
     global _RUNNING
     _RUNNING = True
     log.info("Scheduler started (v%s, broker=%s)", APP_VERSION, ("kraken" if USING_KRAKEN else "alpaca"))
     try:
         while _RUNNING:
             cfg = _sched_config()
-            syms = list(_CURRENT_SYMBOLS)  # configured symbols (from /config/universe)
-            # only run strategies that are currently active and not explicitly disabled
-            run_strats = [s for s in cfg["strategies"] if s in ACTIVE_STRATEGIES and s not in _DISABLED_STRATS]
-
-            log.info(
-                 "Scheduler pass: strats=%s tf=%s limit=%s notional=%s dry=%s symbols=%s",
-                 ",".join(run_strats), cfg["timeframe"], cfg["limit"], cfg["notional"], cfg["dry"], ",".join(syms)
-            )
-
+            syms = list(_CURRENT_SYMBOLS)
+            run_strats = [s for s in cfg["strategies"] if s in [x.lower() for x in ACTIVE_STRATEGIES] and s not in [x.lower() for x in _DISABLED_STRATS]]
+            log.info("Scheduler pass: strats=%s tf=%s limit=%s notional=%s dry=%s symbols=%s",
+                     ",".join(run_strats), cfg["timeframe"], cfg["limit"], cfg["notional"], cfg["dry"], ",".join(syms))
             for strat in run_strats:
-                if not _RUNNING:
-                    break
+                if not _RUNNING: break
                 try:
-                    await _scan_bridge(
-                        strat,
-                        {
-                            "timeframe": cfg["timeframe"],
-                            "limit": cfg["limit"],
-                            "notional": cfg["notional"],
-                            "symbols": syms,
-                        },
-                        dry=cfg["dry"],
-                    )
+                    await _scan_bridge(strat, {
+                        "timeframe": cfg["timeframe"], "limit": cfg["limit"],
+                        "notional": cfg["notional"], "symbols": syms
+                    }, dry=cfg["dry"])
                 except Exception as e:
                     log.warning("Scheduler scan error (%s): %s", strat, e)
-
-            # sleep (interruptible by stop)
             total = max(1, int(cfg["sleep_s"]))
             for _ in range(total):
-                if not _RUNNING:
-                    break
+                if not _RUNNING: break
                 await asyncio.sleep(1)
     finally:
         log.info("Scheduler stopped")
 
 @app.get("/scheduler/start")
 async def scheduler_start():
-    # Keep your original gate: require SCHED_ON to be enabled to start via API
-    if os.getenv("SCHED_ON", "0").lower() not in ("1", "true", "yes", "y"):
+    if os.getenv("SCHED_ON", "0").lower() not in ("1","true","yes","y"):
         return {"ok": False, "why": "SCHED_ON env not enabled"}
     if _RUNNING:
         return {"ok": True, "already": True}
@@ -816,18 +856,204 @@ async def scheduler_stop():
     global _RUNNING
     _RUNNING = False
     return {"ok": True, "stopping": True}
-    
+
 @app.get("/scheduler/status")
 async def scheduler_status():
     return {"ok": True, "running": _RUNNING, "config": _sched_config()}
-    
+
 @app.on_event("startup")
 async def _maybe_autostart_scheduler():
-    if os.getenv("SCHED_ON", "0").lower() in ("1", "true", "yes", "y"):
-        # fire-and-forget; the loop itself reads env each pass
+    if os.getenv("SCHED_ON", "0").lower() in ("1","true","yes","y"):
         asyncio.create_task(_loop())
         log.info("Scheduler autostart: enabled by SCHED_ON")
 
+# -----------------------------------------------------------------------------
+# Journal & P&L
+# -----------------------------------------------------------------------------
+_JOURNAL_LOCK = threading.Lock()
+_JOURNAL_PATH = os.getenv("JOURNAL_PATH", "./journal_v2.jsonl")
+_JOURNAL: List[Dict[str, Any]] = []
+
+def _journal_load():
+    global _JOURNAL
+    try:
+        rows = []
+        with open(_JOURNAL_PATH, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line: continue
+                rows.append(json.loads(line))
+        with _JOURNAL_LOCK:
+            _JOURNAL = rows
+        log.info("journal: loaded %d rows", len(rows))
+    except FileNotFoundError:
+        pass
+    except Exception as e:
+        log.warning("journal load error: %s", e)
+
+def _journal_append(row: dict):
+    with _JOURNAL_LOCK:
+        _JOURNAL.append(row)
+        try:
+            with open(_JOURNAL_PATH, "a", encoding="utf-8") as f:
+                f.write(json.dumps(row, separators=(",", ":")) + "\n")
+        except Exception as e:
+            log.warning("journal persist error: %s", e)
+
+@app.on_event("startup")
+async def _journal_on_start():
+    _journal_load()
+
+def _sync_journal_with_fills(max_trades: int = 200) -> dict:
+    try:
+        fills = br.trades_history(max_trades)
+        if not fills.get("ok"):
+            return {"ok": False, "error": fills.get("error", "unknown")}
+        by_txid = {t["txid"]: t for t in fills.get("trades", []) if t.get("txid")}
+        updated = 0
+        with _JOURNAL_LOCK:
+            for row in _JOURNAL:
+                tx = row.get("txid")
+                if tx and tx in by_txid:
+                    t = by_txid[tx]
+                    sym_guess = t.get("pair") or ""
+                    try:
+                        from symbol_map import from_kraken as _from
+                        sym_ui = (_from(sym_guess) or sym_guess).upper()
+                    except Exception:
+                        sym_ui = sym_guess.upper()
+                    row["symbol"] = row.get("symbol") or sym_ui
+                    row["price"] = float(t.get("price") or 0.0)
+                    row["vol"] = float(t.get("vol") or 0.0)
+                    row["fee"] = float(t.get("fee") or 0.0)
+                    row["cost"] = float(t.get("cost") or 0.0)
+                    row["filled_ts"] = float(t.get("time") or 0.0)
+                    updated += 1
+        return {"ok": True, "updated": updated, "count": len(_JOURNAL)}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+@app.post("/journal/sync")
+def journal_sync():
+    return _sync_journal_with_fills(200)
+
+@app.get("/journal")
+def journal_list(limit: int = 100):
+    with _JOURNAL_LOCK:
+        rows = list(_JOURNAL[-int(limit):])
+    return {"ok": True, "rows": rows, "count": len(_JOURNAL)}
+
+def _prices_for(symbols: List[str]) -> Dict[str, float]:
+    out: Dict[str, float] = {}
+    for s in symbols:
+        try:
+            out[s] = float(br.last_price(s))
+        except Exception:
+            out[s] = 0.0
+    return out
+
+def _pnl_calc(now_prices: Dict[str, float]) -> Dict[str, Any]:
+    from collections import defaultdict, deque
+    with _JOURNAL_LOCK:
+        trades = [r for r in _JOURNAL if r.get("price") and r.get("vol")]
+    trades.sort(key=lambda r: r.get("filled_ts") or r.get("ts") or 0)
+
+    lots = defaultdict(lambda: deque())  # (strategy,symbol) -> deque of [qty, cost_px]
+    stats = defaultdict(lambda: {"realized": 0.0, "fees": 0.0, "qty": 0.0, "avg_cost": 0.0})
+
+    for r in trades:
+        strat = r.get("strategy") or "unknown"
+        sym = (r.get("symbol") or "").upper()
+        side = r.get("side")
+        px = float(r.get("price") or 0.0)
+        vol = float(r.get("vol") or 0.0)
+        fee = float(r.get("fee") or 0.0)
+        key = (strat, sym)
+        if side == "buy":
+            lots[key].append([vol, px])
+            st = stats[key]
+            st["qty"] += vol
+            prev_qty = max(1e-9, st["qty"] - vol)
+            st["avg_cost"] = ((st["avg_cost"] * prev_qty) + px * vol) / max(1e-9, st["qty"])
+            st["fees"] += fee
+        elif side == "sell":
+            remain = vol
+            realized = 0.0
+            while remain > 1e-12 and lots[key]:
+                q, cpx = lots[key][0]
+                take = min(q, remain)
+                realized += (px - cpx) * take
+                q -= take; remain -= take
+                if q <= 1e-12: lots[key].popleft()
+                else: lots[key][0][0] = q
+            st = stats[key]
+            st["qty"] -= vol
+            st["realized"] += realized
+            st["fees"] += fee
+
+    out_strat, out_sym = {}, {}
+    total = {"realized": 0.0, "unrealized": 0.0, "fees": 0.0, "equity": 0.0}
+    for key, st in stats.items():
+        strat, sym = key
+        mkt = float(now_prices.get(sym) or 0.0)
+        unreal = 0.0
+        if mkt > 0 and lots[key]:
+            for q, cpx in lots[key]:
+                unreal += (mkt - cpx) * q
+        equity = st["realized"] + unreal - st["fees"]
+
+        # aggregate per-strategy
+        srow = out_strat.get(strat, {"strategy": strat, "realized": 0.0, "unrealized": 0.0, "fees": 0.0, "equity": 0.0})
+        srow["realized"] += st["realized"]; srow["unrealized"] += unreal; srow["fees"] += st["fees"]; srow["equity"] += equity
+        out_strat[strat] = srow
+
+        # aggregate per-symbol
+        yrow = out_sym.get(sym, {"symbol": sym, "realized": 0.0, "unrealized": 0.0, "fees": 0.0, "equity": 0.0})
+        yrow["realized"] += st["realized"]; yrow["unrealized"] += unreal; yrow["fees"] += st["fees"]; yrow["equity"] += equity
+        out_sym[sym] = yrow
+
+        total["realized"] += st["realized"]; total["unrealized"] += unreal; total["fees"] += st["fees"]; total["equity"] += equity
+
+    return {
+        "ok": True,
+        "time": utc_now(),
+        "total": total,
+        "per_strategy": sorted(out_strat.values(), key=lambda r: r["equity"], reverse=True),
+        "per_symbol": sorted(out_sym.values(), key=lambda r: r["equity"], reverse=True),
+    }
+
+@app.get("/pnl/summary")
+def pnl_summary():
+    try:
+        # collect symbols that appear in journal; fallback to configured symbols
+        with _JOURNAL_LOCK:
+            syms = sorted({(r.get("symbol") or "").upper() for r in _JOURNAL if r.get("symbol")}) or list(_CURRENT_SYMBOLS)
+        prices = _prices_for(syms)
+        return _pnl_calc(prices)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/pnl/strategies")
+def pnl_strategies():
+    return pnl_summary().get("per_strategy", [])
+
+@app.get("/pnl/symbols")
+def pnl_symbols():
+    return pnl_summary().get("per_symbol", [])
+
+@app.post("/pnl/reset")
+def pnl_reset():
+    try:
+        with _JOURNAL_LOCK:
+            _JOURNAL.clear()
+        try:
+            if os.path.exists(_JOURNAL_PATH):
+                os.remove(_JOURNAL_PATH)
+        except Exception:
+            pass
+        return {"ok": True}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 # -----------------------------------------------------------------------------
 # Entrypoint
@@ -837,6 +1063,6 @@ if __name__ == "__main__":
     port = int(os.getenv("PORT", "10000"))
     log.info(
         "Launching Uvicorn on 0.0.0.0:%d (version %s, broker=%s, trading=%s)",
-        port, APP_VERSION, ("kraken" if USING_KRAKEN else "alpaca"), TRADING_ENABLED
+        port, __version__, ("kraken" if USING_KRAKEN else "alpaca"), TRADING_ENABLED
     )
     uvicorn.run("app:app", host="0.0.0.0", port=port, reload=False, access_log=True)
