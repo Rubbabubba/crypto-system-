@@ -297,35 +297,35 @@ DASHBOARD_HTML = """
 <title>{SERVICE_NAME} — Dashboard</title>
 <meta name="viewport" content="width=device-width, initial-scale=1"/>
 <style>
-:root {{
+:root {
   --bg:#0b0d10; --card:#11161a; --ink:#e6edf3; --muted:#9fb0c0; --border:#1e242c;
   --accent:#8ab4ff; --ok:#6bdc6b; --warn:#ffcf5a; --err:#ff7d7d;
-}}
-* {{ box-sizing:border-box; }}
-body {{ font-family:-apple-system,Segoe UI,Roboto,Arial,sans-serif; background:var(--bg); color:var(--ink); margin:0; }}
-.header {{ display:flex; align-items:center; justify-content:space-between; padding:12px 16px; border-bottom:1px solid #222; }}
-.badge {{ padding:3px 8px; border-radius:12px; font-size:12px; border:1px solid var(--border); background:#0f141a; }}
-.badge.kraken {{ background:#163; color:#b5f5b5; border-color:#1e5033; }}
-.badge.alpaca {{ background:#322; color:#f5b5b5; border-color:#503333; }}
-.grid {{ display:grid; grid-template-columns: repeat(auto-fit, minmax(330px, 1fr)); grid-gap:12px; padding:12px; }}
-.card {{ background:var(--card); border:1px solid var(--border); border-radius:10px; padding:12px; }}
-h2 {{ margin:0 0 8px 0; font-size:16px; }}
-label {{ font-size:12px; color:var(--muted); }}
-input, select, button, textarea {{ font:inherit; background:#0b1117; color:var(--ink); border:1px solid var(--border); border-radius:8px; padding:8px; }}
-button {{ cursor:pointer; }}
-a {{ color:var(--accent); text-decoration:none; }}
-a:hover {{ text-decoration:underline; }}
-pre {{ background:#0b1117; padding:10px; border-radius:8px; overflow:auto; }}
-.table {{ width:100%; border-collapse:collapse; font-size:13px; }}
-.table th, .table td {{ border-bottom:1px solid var(--border); padding:6px 8px; text-align:left; vertical-align:middle; }}
-.kv {{ display:grid; grid-template-columns:160px 1fr; grid-gap:6px; font-size:13px; }}
-.mono {{ font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace; }}
-.small {{ font-size:12px; color:var(--muted); }}
-hr {{ border:none; border-top:1px solid var(--border); margin:8px 0; }}
-svg.spark {{ width:120px; height:28px; }}
-svg.spark path.line {{ fill:none; stroke:var(--accent); stroke-width:1.5; }}
-svg.spark rect.bg {{ fill:#0b1117; }}
-svg.spark path.fill {{ fill:rgba(138,180,255,0.12); stroke:none; }}
+}
+* { box-sizing:border-box; }
+body { font-family:-apple-system,Segoe UI,Roboto,Arial,sans-serif; background:var(--bg); color:var(--ink); margin:0; }
+.header { display:flex; align-items:center; justify-content:space-between; padding:12px 16px; border-bottom:1px solid #222; }
+.badge { padding:3px 8px; border-radius:12px; font-size:12px; border:1px solid var(--border); background:#0f141a; }
+.badge.kraken { background:#163; color:#b5f5b5; border-color:#1e5033; }
+.badge.alpaca { background:#322; color:#f5b5b5; border-color:#503333; }
+.grid { display:grid; grid-template-columns: repeat(auto-fit, minmax(330px, 1fr)); grid-gap:12px; padding:12px; }
+.card { background:var(--card); border:1px solid var(--border); border-radius:10px; padding:12px; }
+h2 { margin:0 0 8px 0; font-size:16px; }
+label { font-size:12px; color:var(--muted); }
+input, select, button, textarea { font:inherit; background:#0b1117; color:var(--ink); border:1px solid var(--border); border-radius:8px; padding:8px; }
+button { cursor:pointer; }
+a { color:var(--accent); text-decoration:none; margin-left:8px; }
+a:hover { text-decoration:underline; }
+pre { background:#0b1117; padding:10px; border-radius:8px; overflow:auto; }
+.table { width:100%; border-collapse:collapse; font-size:13px; }
+.table th, .table td { border-bottom:1px solid var(--border); padding:6px 8px; text-align:left; vertical-align:middle; }
+.kv { display:grid; grid-template-columns:160px 1fr; grid-gap:6px; font-size:13px; align-items:center; }
+.mono { font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace; }
+.small { font-size:12px; color:var(--muted); }
+hr { border:none; border-top:1px solid var(--border); margin:8px 0; }
+svg.spark { width:120px; height:28px; }
+svg.spark path.line { fill:none; stroke:var(--accent); stroke-width:1.5; }
+svg.spark rect.bg { fill:#0b1117; }
+svg.spark path.fill { fill:rgba(138,180,255,0.12); stroke:none; }
 </style>
 </head>
 <body>
@@ -343,10 +343,29 @@ svg.spark path.fill {{ fill:rgba(138,180,255,0.12); stroke:none; }}
   <div class="card">
     <h2>Service</h2>
     <div class="kv">
-      <div>Health</div><div><button onclick="callJson('/health')">GET /health</button></div>
-      <div>Broker</div><div><button onclick="callJson('/diag/broker')">GET /diag/broker</button></div>
-      <div>Version</div><div><button onclick="callJson('/version')">GET /version</button></div>
-      <div>Config</div><div><button onclick="loadConfig()">GET /config</button></div>
+      <div>Health</div>
+      <div>
+        <button onclick="callJson('/health')">GET /health</button>
+        <a class="small" href="/health" target="_blank" rel="noopener">open</a>
+      </div>
+
+      <div>Broker</div>
+      <div>
+        <button onclick="callJson('/diag/broker')">GET /diag/broker</button>
+        <a class="small" href="/diag/broker" target="_blank" rel="noopener">open</a>
+      </div>
+
+      <div>Version</div>
+      <div>
+        <button onclick="callJson('/version')">GET /version</button>
+        <a class="small" href="/version" target="_blank" rel="noopener">open</a>
+      </div>
+
+      <div>Config</div>
+      <div>
+        <button onclick="loadConfig()">GET /config</button>
+        <a class="small" href="/config" target="_blank" rel="noopener">open</a>
+      </div>
     </div>
     <hr/>
     <div class="small">Symbols: <span id="cfg_symbols" class="mono"></span></div>
@@ -380,14 +399,13 @@ svg.spark path.fill {{ fill:rgba(138,180,255,0.12); stroke:none; }}
         <input id="scan_limit" value="300"/>
       </div>
       <div style="display:flex; align-items:flex-end;">
-        <button onclick="runScan()">POST /scan/&lt;strat&gt;</button>
+        <button onclick="runScan()">POST /scan&lt;strat&gt;</button>
       </div>
     </div>
     <hr/>
     <pre id="scan_out" class="mono small">// orders will appear here</pre>
   </div>
 
-  <!-- Live Prices with Sparklines -->
   <div class="card">
     <h2>Live Prices <span class="small">(30s auto-refresh)</span></h2>
     <div class="small">From /price/&lt;symbol&gt; for each configured symbol.</div>
@@ -395,9 +413,7 @@ svg.spark path.fill {{ fill:rgba(138,180,255,0.12); stroke:none; }}
       <thead>
         <tr><th>Symbol</th><th>Price</th><th>Spark</th><th>Updated</th></tr>
       </thead>
-      <tbody id="px_tbody">
-        <!-- rows inserted dynamically -->
-      </tbody>
+      <tbody id="px_tbody"></tbody>
     </table>
     <div style="margin-top:8px;">
       <button onclick="refreshPrices(true)">Refresh now</button>
@@ -420,14 +436,18 @@ svg.spark path.fill {{ fill:rgba(138,180,255,0.12); stroke:none; }}
         <input id="bars_limit" value="60"/>
       </div>
       <div style="display:flex; align-items:flex-end;">
-        <button onclick="fetchBars()">GET /bars/&lt;symbol&gt;</button>
+        <button onclick="fetchBars()">GET /bars&lt;symbol&gt;</button>
+        <a class="small" href="/bars/BTCUSD?timeframe=5Min&limit=60" target="_blank" rel="noopener">open</a>
       </div>
     </div>
     <hr/>
     <div style="display:flex; gap:8px;">
-      <button onclick="fetchPrice()">GET /price/&lt;symbol&gt;</button>
+      <button onclick="fetchPrice()">GET /price&lt;symbol&gt;</button>
+      <a class="small" href="/price/BTCUSD" target="_blank" rel="noopener">open</a>
       <button onclick="callJson('/orders')">GET /orders</button>
+      <a class="small" href="/orders" target="_blank" rel="noopener">open</a>
       <button onclick="callJson('/positions')">GET /positions</button>
+      <a class="small" href="/positions" target="_blank" rel="noopener">open</a>
     </div>
     <hr/>
     <pre id="bars_out" class="mono small">// bars/prices will appear here</pre>
@@ -435,7 +455,7 @@ svg.spark path.fill {{ fill:rgba(138,180,255,0.12); stroke:none; }}
 
   <div class="card">
     <h2>Place Market Order</h2>
-    <div class="small">Live trading must be enabled (see <span class="mono">TRADING_ENABLED</span> and broker-specific flags).</div>
+    <div class="small">Live trading must be enabled (TRADING_ENABLED & KRAKEN_TRADING).</div>
     <div style="display:grid; grid-template-columns:1fr 1fr; grid-gap:8px; margin-top:6px;">
       <div>
         <label>Symbol</label>
@@ -475,185 +495,178 @@ svg.spark path.fill {{ fill:rgba(138,180,255,0.12); stroke:none; }}
 </div>
 
 <script>
-function nowISO() {{ return new Date().toISOString(); }}
-function setNow() {{ document.getElementById('now').textContent = nowISO(); }}
+function nowISO() { return new Date().toISOString(); }
+function setNow() { document.getElementById('now').textContent = nowISO(); }
 setNow(); setInterval(setNow, 1000);
 
-function println(id, txt) {{
+function println(id, txt) {
   const el = document.getElementById(id);
   el.textContent = (el.textContent ? el.textContent + "\\n" : "") + txt;
   el.scrollTop = el.scrollHeight;
-}}
+}
 
-async function callJson(path) {{
-  try {{
+async function callJson(path) {
+  try {
     const r = await fetch(path);
     const j = await r.json();
     println('console', `[${nowISO()}] GET ${path}\\n` + JSON.stringify(j, null, 2));
-    if (path === '/config') {{
+    if (path === '/config') {
       document.getElementById('cfg_symbols').textContent = (j.SYMBOLS || []).join(',');
       document.getElementById('cfg_strats').textContent = (j.STRATEGIES || []).join(',');
       buildPriceRows(j.SYMBOLS || []);
-    }}
-    if (path.startsWith('/scheduler')) {{
+    }
+    if (path.startsWith('/scheduler')) {
       document.getElementById('sched_out').textContent = JSON.stringify(j, null, 2);
-    }}
+    }
     return j;
-  }} catch (e) {{
+  } catch (e) {
     println('console', `[${nowISO()}] ERROR GET ${path}: ` + e);
-  }}
-}}
+  }
+}
 
-async function loadConfig() {{ return await callJson('/config'); }}
+async function loadConfig() { return await callJson('/config'); }
 
-async function runScan() {{
+async function runScan() {
   const strat = document.getElementById('scan_strat').value;
   const tf = document.getElementById('scan_tf').value;
   const syms = document.getElementById('scan_syms').value || document.getElementById('cfg_symbols').textContent;
   const notional = parseFloat(document.getElementById('scan_notional').value || '25');
   const limit = parseInt(document.getElementById('scan_limit').value || '300');
-  const body = {{
+  const body = {
     symbols: (syms ? syms.split(',').map(s => s.trim()).filter(Boolean) : []),
     timeframe: tf, limit: limit, notional: notional, dry: true
-  }};
-  try {{
-    const r = await fetch(`/scan/${{strat}}`, {{ method:'POST', headers:{{'Content-Type':'application/json'}}, body: JSON.stringify(body) }});
+  };
+  try {
+    const r = await fetch(`/scan/${strat}`, { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body) });
     const j = await r.json();
     document.getElementById('scan_out').textContent = JSON.stringify(j, null, 2);
-    println('console', `[${nowISO()}] POST /scan/${{strat}}\\n` + JSON.stringify(j, null, 2));
-  }} catch (e) {{
-    println('console', `[${nowISO()}] ERROR POST /scan/${{strat}}: ` + e);
-  }}
-}}
+    println('console', `[${nowISO()}] POST /scan/${strat}\\n` + JSON.stringify(j, null, 2));
+  } catch (e) {
+    println('console', `[${nowISO()}] ERROR POST /scan/${strat}: ` + e);
+  }
+}
 
-async function fetchBars() {{
+async function fetchBars() {
   const sym = document.getElementById('bars_sym').value;
   const tf = document.getElementById('bars_tf').value;
   const limit = document.getElementById('bars_limit').value;
-  try {{
-    const r = await fetch(`/bars/${{sym}}?timeframe=${{encodeURIComponent(tf)}}&limit=${{encodeURIComponent(limit)}}`);
+  try {
+    const r = await fetch(`/bars/${sym}?timeframe=${encodeURIComponent(tf)}&limit=${encodeURIComponent(limit)}`);
     const j = await r.json();
     document.getElementById('bars_out').textContent = JSON.stringify(j, null, 2);
-    println('console', `[${nowISO()}] GET /bars/${{sym}}\\n` + JSON.stringify(j, null, 2));
-  }} catch (e) {{
-    println('console', `[${nowISO()}] ERROR GET /bars/${{sym}}: ` + e);
-  }}
-}}
+    println('console', `[${nowISO()}] GET /bars/${sym}\\n` + JSON.stringify(j, null, 2));
+  } catch (e) {
+    println('console', `[${nowISO()}] ERROR GET /bars/${sym}: ` + e);
+  }
+}
 
-async function fetchPrice() {{
+async function fetchPrice() {
   const sym = document.getElementById('bars_sym').value;
-  try {{
-    const r = await fetch(`/price/${{sym}}`);
+  try {
+    const r = await fetch(`/price/${sym}`);
     const j = await r.json();
     document.getElementById('bars_out').textContent = JSON.stringify(j, null, 2);
-    println('console', `[${nowISO()}] GET /price/${{sym}}\\n` + JSON.stringify(j, null, 2));
-  }} catch (e) {{
-    println('console', `[${nowISO()}] ERROR GET /price/${{sym}}: ` + e);
-  }}
-}}
+    println('console', `[${nowISO()}] GET /price/${sym}\\n` + JSON.stringify(j, null, 2));
+  } catch (e) {
+    println('console', `[${nowISO()}] ERROR GET /price/${sym}: ` + e);
+  }
+}
 
-/* ---------- Live Prices + Sparklines ---------- */
+/* Live Prices + Sparklines */
 let PX_SYMBOLS = [];
-const PX_SERIES = {{}};   // symbol -> array of numbers
-const MAX_POINTS = 50;    // keep last 50 ticks (≈25 min at 30s)
+const PX_SERIES = {};   // symbol -> array of numbers
+const MAX_POINTS = 50;  // ≈25 min at 30s
 
-function buildPriceRows(symbols) {{
+function buildPriceRows(symbols) {
   PX_SYMBOLS = (symbols || []).map(s => String(s).toUpperCase());
   const tbody = document.getElementById('px_tbody');
   tbody.innerHTML = '';
-  PX_SYMBOLS.forEach(sym => {{
+  PX_SYMBOLS.forEach(sym => {
     PX_SERIES[sym] = PX_SERIES[sym] || [];
     const tr = document.createElement('tr');
     tr.innerHTML =
-      `<td class="mono">${{sym}}</td>` +
-      `<td id="px_${{sym}}" class="mono">—</td>` +
-      `<td><svg class="spark" viewBox="0 0 120 28" id="px_svg_${{sym}}">` +
+      `<td class="mono">${sym}</td>` +
+      `<td id="px_${sym}" class="mono">—</td>` +
+      `<td><svg class="spark" viewBox="0 0 120 28" id="px_svg_${sym}">` +
       `<rect class="bg" x="0" y="0" width="120" height="28"></rect>` +
-      `<path class="fill" id="px_fill_${{sym}}" d=""></path>` +
-      `<path class="line" id="px_line_${{sym}}" d=""></path>` +
+      `<path class="fill" id="px_fill_${sym}" d=""></path>` +
+      `<path class="line" id="px_line_${sym}" d=""></path>` +
       `</svg></td>` +
-      `<td id="px_t_${{sym}}" class="small">—</td>`;
+      `<td id="px_t_${sym}" class="small">—</td>`;
     tbody.appendChild(tr);
-  }});
-}}
+  });
+}
 
-function computePath(points, w=120, h=28, pad=2) {{
-  if (!points || points.length === 0) return {{ line:'', fill:'' }};
+function computePath(points, w=120, h=28, pad=2) {
+  if (!points || points.length === 0) return { line:'', fill:'' };
   const n = points.length;
   const min = Math.min.apply(null, points);
   const max = Math.max.apply(null, points);
   const rng = (max - min) || 1e-9;
   const innerW = w - pad*2;
   const innerH = h - pad*2;
-
-  // map index -> x, price -> y (invert y for svg)
   const x = i => pad + (i/(n-1))*innerW;
   const y = v => pad + innerH - ((v - min)/rng)*innerH;
-
   let d = `M ${x(0).toFixed(2)} ${y(points[0]).toFixed(2)}`;
   for (let i = 1; i < n; i++) d += ` L ${x(i).toFixed(2)} ${y(points[i]).toFixed(2)}`;
-
-  // area fill path
-  let df = d + ` L ${x(n-1).toFixed(2)} ${ (h-pad).toFixed(2) } L ${x(0).toFixed(2)} ${ (h-pad).toFixed(2) } Z`;
-  return {{ line: d, fill: df }};
+  let df = d + ` L ${x(n-1).toFixed(2)} ${(h-pad).toFixed(2)} L ${x(0).toFixed(2)} ${(h-pad).toFixed(2)} Z`;
+  return { line: d, fill: df };
 }
 
-function renderSparkline(sym) {{
+function renderSparkline(sym) {
   const pts = PX_SERIES[sym] || [];
-  const {{ line, fill }} = computePath(pts);
-  const lineEl = document.getElementById(`px_line_${{sym}}`);
-  const fillEl = document.getElementById(`px_fill_${{sym}}`);
+  const { line, fill } = computePath(pts);
+  const lineEl = document.getElementById(`px_line_${sym}`);
+  const fillEl = document.getElementById(`px_fill_${sym}`);
   if (lineEl) lineEl.setAttribute('d', line || '');
   if (fillEl) fillEl.setAttribute('d', fill || '');
 }
 
-async function refreshPrices(forceLog) {{
-  if (!PX_SYMBOLS.length) {{
-    await loadConfig(); // also builds rows
-  }}
-  for (const sym of PX_SYMBOLS) {{
-    try {{
-      const r = await fetch(`/price/${{sym}}`);
+async function refreshPrices(forceLog) {
+  if (!PX_SYMBOLS.length) {
+    await loadConfig();
+  }
+  for (const sym of PX_SYMBOLS) {
+    try {
+      const r = await fetch(`/price/${sym}`);
       const j = await r.json();
       const px = (j && j.price != null) ? Number(j.price) : null;
-      if (px != null && isFinite(px)) {{
-        // update series
+      if (px != null && isFinite(px)) {
         const arr = (PX_SERIES[sym] = (PX_SERIES[sym] || []));
         arr.push(px);
         if (arr.length > MAX_POINTS) arr.splice(0, arr.length - MAX_POINTS);
         renderSparkline(sym);
-      }}
-      document.getElementById(`px_${{sym}}`).textContent = (px == null ? '—' : String(px));
-      document.getElementById(`px_t_${{sym}}`).textContent = nowISO();
+      }
+      document.getElementById(`px_${sym}`).textContent = (px == null ? '—' : String(px));
+      document.getElementById(`px_t_${sym}`).textContent = nowISO();
       if (forceLog) println('console', `[${nowISO()}] price ${sym} -> ${px}`);
-    }} catch (e) {{
+    } catch (e) {
       println('console', `[${nowISO()}] ERROR price ${sym}: ` + e);
-    }}
-  }}
-}}
+    }
+  }
+}
 
-// initial config + first price pull, then every 30s
-window.addEventListener('load', async () => {{
-  await loadConfig();           // builds rows
-  await refreshPrices(true);    // first pull
+window.addEventListener('load', async () => {
+  await loadConfig();
+  await refreshPrices(true);
   setInterval(refreshPrices, 30000);
-}});
+});
 
-/* ---------- Orders ---------- */
-async function placeOrder() {{
+/* Orders */
+async function placeOrder() {
   const sym = document.getElementById('ord_sym').value;
   const side = document.getElementById('ord_side').value;
   const notional = parseFloat(document.getElementById('ord_notional').value || '25');
-  const body = {{ symbol: sym, side: side, notional: notional }};
-  try {{
-    const r = await fetch('/order/market', {{ method:'POST', headers:{{'Content-Type':'application/json'}}, body: JSON.stringify(body) }});
+  const body = { symbol: sym, side: side, notional: notional };
+  try {
+    const r = await fetch('/order/market', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body) });
     const j = await r.json();
     document.getElementById('ord_out').textContent = JSON.stringify(j, null, 2);
     println('console', `[${nowISO()}] POST /order/market\\n` + JSON.stringify(j, null, 2));
-  }} catch (e) {{
+  } catch (e) {
     println('console', `[${nowISO()}] ERROR POST /order/market: ` + e);
-  }}
-}}
+  }
+}
 </script>
 </body>
 </html>
@@ -671,6 +684,11 @@ def root():
         .replace("{BROKER_TEXT}", broker_text)
     )
     return HTMLResponse(content=html, status_code=200)
+    
+@app.get("/dashboard", response_class=HTMLResponse)
+def dashboard_alias():
+    return root()
+
 
 # -----------------------------------------------------------------------------
 # Simple scheduler (opt-in via env SCHED_ON=1)
