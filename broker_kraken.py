@@ -191,22 +191,22 @@ def _normalize_quote(q: str) -> str:
 
 def _kraken_key_to_ui_pair(k: str) -> Optional[str]:
     """
-    Convert Kraken dictionary key (like 'XXBTZUSD' or 'XBTUSD') into UI pair 'BTCUSD'.
-    Heuristic: detect known quote suffix (with optional leading Z), remainder is base (with optional leading X).
+    Convert Kraken key (e.g., 'XXBTZUSD' or 'XETHZUSD' or 'XBTUSD') to UI 'BTCUSD'/'ETHUSD'.
+    IMPORTANT: check 'Z'+fiat suffix BEFORE plain fiat to handle '...ZUSD' correctly.
     """
     K = k.upper()
     for q in _KNOWN_QUOTES:
-        if K.endswith(q):
-            base = K[: -len(q)]
-            return _normalize_base(base) + _normalize_quote(q)
-        # handle 'Z' prefix on fiat (e.g., XXBTZUSD)
+        # 1) handle 'Z'+fiat (Kraken fiat convention) FIRST
         if K.endswith("Z" + q):
             base = K[: -(len(q) + 1)]
             return _normalize_base(base) + _normalize_quote("Z" + q)
-    # If nothing matched, try symbol_map.from_kraken
+        # 2) plain fiat suffix (e.g., 'XBTUSD')
+        if K.endswith(q):
+            base = K[: -len(q)]
+            return _normalize_base(base) + _normalize_quote(q)
+    # 3) final fallback via symbol_map
     try:
-        ui = from_kraken(k).upper()
-        return ui
+        return from_kraken(k).upper()
     except Exception:
         return None
 
