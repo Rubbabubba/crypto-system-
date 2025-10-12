@@ -1,57 +1,61 @@
-# strategies/c2.py
-import os, math
-from typing import List
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+c2.py — EMA trend w/ trailing exit
+Build: v2.0.0 (2025-10-11)
+
+Goal
+- Go long when close > EMA(n). Trail out when close < EMA * EXIT_K.
+
+Optimized defaults
+- ema_n = 50
+- exit_k = 0.997   # ~0.3% below EMA triggers exit
+"""
+__version__ = "2.0.0"
+
+from typing import Any, Dict, List
+import time
+
 try:
     import br_router as br
 except Exception:
-    from strategies import br_router as br
-from strategies import utils_volatility as uv
+    import broker_kraken as br  # type: ignore
 
 STRAT = "c2"
-VER   = os.getenv("C2_VER", "v2.0")
 
-def _ema(vals, n):
+def _ema(vals, n: int):
     if n <= 1 or len(vals) < n: return None
     k = 2.0/(n+1.0); e = vals[0]
-    for v in vals[1:]: e = v*k + e*(1-k)
+    for v in vals[1:]:
+        e = v*k + e*(1.0-k)
     return e
 
-def _pos_for(symbol: str):
-    sym = symbol.replace("/", "")
-    pos = br.list_positions() or []
-    for p in pos:
-        if p.get("symbol","").replace("/","") == sym:
-            return float(p.get("qty",0.0) or 0.0), float(p.get("avg_entry_price",0.0) or 0.0)
-    return 0.0, 0.0
+def _mk(symbol: str, side: str, notional: float) -> Dict[str, Any]:
+    ts = int(time.time())
+    return {"symbol": symbol, "side": side, "notional": float(notional), "strategy": STRAT, "id": f"{STRAT}:{symbol}:{side}:{ts}", "ts": ts}
 
-def run_scan(symbols: List[str], timeframe: str, limit: int, notional: float, dry: bool, raw: dict) -> None:
-    N_EMA   = int(raw.get("ema_n", 50))
-    EXIT_K  = float(raw.get("exit_k", 0.997))
-    MIN_ATR = float(raw.get("min_atr", 0.0))
+def scan(req: Dict[str, Any], ctx: Dict[str, Any]) -> List[Dict[str, Any]]:
+    syms: List[str] = [s.upper() for s in (req.get("symbols") or [])]
+    tf = req.get("timeframe") or "5Min"
+    limit = int(req.get("limit") or 300)
+    notional = float(req.get("notional") or 25.0)
+    raw = dict(req.get("raw") or {})
+    ema_n = int(raw.get("ema_n", 50))
+    exit_k = float(raw.get("exit_k", 0.997))
 
-    for sym in symbols:
-        bars = br.get_bars(sym, timeframe, limit) or []
-        if len(bars) < max(60, N_EMA): 
+    out: List[Dict[str, Any]] = []
+    for sym in syms:
+        bars = br.get_bars(sym, timeframe=tf, limit=limit)
+        if not bars or len(bars) < ema_n: continue
+        c = [b["c"] for b in bars]
+        last = c[-1]
+        ema = _ema(c, ema_n)
+        if ema is None: continue
+
+        if last > ema:
+            out.append(_mk(sym, "buy", notional))
             continue
-        closes = [b["c"] for b in bars]
-        atr = uv.atr_from_bars(bars, 14)
-        if atr < MIN_ATR:
+        if last < ema * exit_k:
+            out.append(_mk(sym, "sell", notional))
             continue
-
-        ema = _ema(closes[-N_EMA:], N_EMA)
-        if ema is None:
-            continue
-        last = closes[-1]
-
-        have, avg = _pos_for(sym)
-        symclean = sym.replace("/", "").lower()
-
-        if have <= 1e-12 and last > ema:
-            cid = f"{STRAT}-{VER}-buy-{symclean}"
-            br.place_order(sym, "buy", notional, cid)
-            return
-
-        if have > 1e-12 and last < ema * EXIT_K:
-            cid = f"{STRAT}-{VER}-sell-{symclean}"
-            br.place_order(sym, "sell", notional, cid)
-            return
+    return out
