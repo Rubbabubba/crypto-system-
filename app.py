@@ -5,34 +5,37 @@ Crypto System – FastAPI service (Render/Kraken)
 Build: v2.0.0 (2025-10-12)
 
 Routes
-- GET  /                     -> Dashboard
-- GET  /dashboard            -> alias
+- GET  /                     -> Dashboard (HTML)
+- GET  /dashboard            -> alias to /
 - GET  /health               -> Service health (+ scheduler_running)
 - GET  /diag/broker          -> Active broker diagnostics
 - GET  /version              -> App version
-- GET  /config               -> Defaults, symbols, strategies, params
-- POST /scan/{strategy}      -> Run a scan for c1..c6; optional dry=true
+- GET  /config               -> Defaults, symbols, strategies, params, sizing
+- POST /scan/{strategy}      -> Run scan for c1..c6; dry flag supported
 - GET  /bars/{symbol}        -> Recent bars
 - GET  /price/{symbol}       -> Last price
-- GET  /positions            -> Spot positions summary
+- GET  /positions            -> Spot positions snapshot
 - GET  /orders               -> Open orders
 - GET  /fills                -> Recent fills (via broker)
 - POST /order/market         -> Place market order by notional (USD)
+
 Scheduler
 - GET  /scheduler/start      -> Start loop (requires SCHED_ON=1)
 - GET  /scheduler/stop       -> Stop loop
-- GET  /scheduler/status     -> status + live config
+- GET  /scheduler/status     -> status + live config (incl. dynamic sizing)
+
 Journal & PnL
-- POST /journal/sync         -> sync journal with fills (by txid)
+- POST /journal/sync         -> sync journal rows with fills by txid
+- POST /reconcile/fills      -> alias to /journal/sync
 - GET  /journal              -> list journal rows
-- GET  /pnl/summary          -> total + per-strategy + per-symbol P&L
+- GET  /pnl/summary          -> total + per-strategy + per-symbol P&L (realized+unrealized+fees+equity)
 - GET  /pnl/strategies       -> per-strategy P&L
 - GET  /pnl/symbols          -> per-symbol P&L
+- POST /pnl/reset            -> clear local journal (careful!)
 
-Notes (v2.0.0)
-- Kraken-first broker routing; Alpaca remains legacy fallback.
-- HTML dashboard extended with live price table + sparklines and a small P&L card.
-- No HTML functionality removed; all existing routes kept.
+Notes
+- Kraken-first broker routing; Alpaca remains legacy fallback if present.
+- HTML dashboard extended with small P&L card; no existing functionality removed.
 """
 
 from __future__ import annotations
@@ -43,7 +46,6 @@ import asyncio
 import os
 import sys
 import json
-import math
 import logging
 import threading
 import time
@@ -74,7 +76,8 @@ if USING_KRAKEN:
     import broker_kraken as br  # Kraken adapter
     ACTIVE_BROKER_MODULE = "broker_kraken"
 else:
-    import broker as br  # Alpaca adapter (legacy)
+    # legacy fallback if present in your repo
+    import broker as br  # type: ignore
     ACTIVE_BROKER_MODULE = "broker"
 
 # Live trading enablement – broker-specific flag
@@ -92,8 +95,18 @@ SERVICE_NAME = os.getenv("SERVICE_NAME", "Crypto System")
 
 DEFAULT_TIMEFRAME = os.getenv("DEFAULT_TIMEFRAME", "5Min")
 DEFAULT_LIMIT = int(os.getenv("DEFAULT_LIMIT", "300"))
-# Per-order notional (USD). For scheduler override use SCHED_NOTIONAL.
+
+# Per-order notional (USD). Scheduler can override via SCHED_NOTIONAL or dynamic sizing.
 DEFAULT_NOTIONAL = float(os.getenv("DEFAULT_NOTIONAL", os.getenv("ORDER_NOTIONAL", "25")))
+
+# ---- Risk-based dynamic sizing (defaults are conservative) ----
+# Percent of account equity to allocate per trade (e.g., 0.05 = 5%)
+RISK_PCT = float(os.getenv("RISK_PCT", "0.05"))
+# Notional guardrails (USD)
+NOTIONAL_MIN = float(os.getenv("NOTIONAL_MIN", "25"))
+NOTIONAL_MAX = float(os.getenv("NOTIONAL_MAX", "250"))
+# Scheduler: if enabled, compute notional each pass from equity
+SCHED_AUTO_SIZE = os.getenv("SCHED_AUTO_SIZE", "1").lower() in ("1", "true", "yes", "y")
 
 # Symbol universe
 try:
@@ -182,10 +195,59 @@ def config():
         "DEFAULT_TIMEFRAME": DEFAULT_TIMEFRAME,
         "DEFAULT_LIMIT": DEFAULT_LIMIT,
         "DEFAULT_NOTIONAL": DEFAULT_NOTIONAL,
+        "SIZING": {
+            "RISK_PCT": RISK_PCT,
+            "NOTIONAL_MIN": NOTIONAL_MIN,
+            "NOTIONAL_MAX": NOTIONAL_MAX,
+            "SCHED_AUTO_SIZE": SCHED_AUTO_SIZE,
+        },
         "SYMBOLS": _CURRENT_SYMBOLS,
         "STRATEGIES": ACTIVE_STRATEGIES,
         "PARAMS": DEFAULT_STRAT_PARAMS,
     }
+
+# -----------------------------------------------------------------------------
+# Equity & sizing helpers
+# -----------------------------------------------------------------------------
+def _normalize_asset_code(asset: str) -> str:
+    if not asset:
+        return ""
+    base = asset.split(".")[0].upper()
+    if base in ("XBT", "XXBT"):  # Kraken BTC codes
+        return "BTC"
+    if base.startswith("X") and len(base) in (3, 4):
+        return base[1:]
+    return base
+
+def _account_equity_usd() -> float:
+    try:
+        pos = br.positions()  # [{'asset':'USD','qty':...}, {'asset':'SOL.F','qty':...}, ...]
+    except Exception:
+        return 0.0
+    base_to_sym = {s[:-3].upper(): s for s in _CURRENT_SYMBOLS if s.upper().endswith("USD") and len(s) > 3}
+    cash_usd = 0.0
+    equity = 0.0
+    for p in (pos or []):
+        asset = str(p.get("asset") or "").upper()
+        qty = float(p.get("qty") or 0.0)
+        if asset == "USD":
+            cash_usd += qty
+            continue
+        base = _normalize_asset_code(asset)
+        sym = base_to_sym.get(base)
+        if not sym or qty == 0.0:
+            continue
+        try:
+            px = float(br.last_price(sym))
+        except Exception:
+            px = 0.0
+        equity += qty * px
+    return cash_usd + equity
+
+def _sized_notional_from_equity(equity_usd: float) -> float:
+    raw = float(equity_usd) * float(RISK_PCT)
+    sized = max(NOTIONAL_MIN, min(NOTIONAL_MAX, raw))
+    return round(sized, 2)
 
 # -----------------------------------------------------------------------------
 # Scan bridge — dispatch to the chosen strategy module
@@ -213,7 +275,7 @@ async def _scan_bridge(strat: str, req: Dict[str, Any], *, dry: Optional[bool] =
     raw = _merge_raw(strat, dict(req.get("raw") or {}))
     ctx = {"timeframe": timeframe, "symbols": symbols, "notional": notional}
 
-    # Strategy returns [{"symbol","side",...}]
+    # Strategy returns actionable intents: [{"symbol","side","notional",...}]
     orders = fn({"strategy": strat, "timeframe": timeframe, "limit": limit, "notional": notional, "symbols": symbols, "raw": raw}, ctx) or []
 
     placed: List[Dict[str, Any]] = []
@@ -225,7 +287,7 @@ async def _scan_bridge(strat: str, req: Dict[str, Any], *, dry: Optional[bool] =
             try:
                 res = br.market_notional(sym, side, notional_o)
                 placed.append({**o, "symbol": sym, "side": side, "notional": notional_o, "order": res})
-                # journal attribution
+                # journal attribution (order submit time; fills hydrated later)
                 try:
                     _journal_append({
                         "ts": int(time.time()),
@@ -238,7 +300,6 @@ async def _scan_bridge(strat: str, req: Dict[str, Any], *, dry: Optional[bool] =
             except Exception as e:
                 placed.append({**o, "symbol": sym, "side": side, "notional": notional_o, "error": str(e)})
     else:
-        # dry run echoes actionable intents
         for o in orders:
             sym = (o.get("symbol") or symbols[0]).upper()
             side = (o.get("side") or "buy").lower()
@@ -269,7 +330,7 @@ def bars(symbol: str, timeframe: str = DEFAULT_TIMEFRAME, limit: int = 200):
         out = br.get_bars(symbol.upper(), timeframe=timeframe, limit=int(limit))
         return {"ok": True, "symbol": symbol.upper(), "timeframe": timeframe, "limit": int(limit), "bars": out}
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail:str(e))
 
 @app.get("/price/{symbol}")
 def price(symbol: str):
@@ -277,7 +338,7 @@ def price(symbol: str):
         p = br.last_price(symbol.upper())
         return {"ok": True, "symbol": symbol.upper(), "price": float(p)}
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail:str(e))
 
 @app.get("/positions")
 def positions():
@@ -285,7 +346,7 @@ def positions():
         pos = br.positions()
         return {"ok": True, "positions": pos}
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail:str(e))
 
 @app.get("/orders")
 def orders():
@@ -293,15 +354,15 @@ def orders():
         out = br.orders()
         return {"ok": True, "orders": out}
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail:str(e))
 
 @app.get("/fills")
 def fills():
     try:
-        data = br.trades_history(50)
+        data = br.trades_history(50)  # standardized shape: {'ok':True,'trades':[...]}
         return {"ok": True, **data}
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail:str(e))
 
 @app.post("/order/market")
 async def order_market(request: Request):
@@ -313,7 +374,7 @@ async def order_market(request: Request):
         if not TRADING_ENABLED:
             return {"ok": True, "dry": True, "symbol": symbol, "side": side, "notional": notional}
         res = br.market_notional(symbol, side, notional)
-        # journal manual
+        # journal attribution for manual orders
         try:
             _journal_append({
                 "ts": int(time.time()),
@@ -325,11 +386,10 @@ async def order_market(request: Request):
             log.warning("journal add (manual) failed: %s", je)
         return {"ok": True, "order": res}
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail:str(e))
 
 # -----------------------------------------------------------------------------
-# Dashboard HTML (placeholders replaced at runtime; no f-strings)
-# Adds a small P&L card using /pnl/summary
+# Dashboard HTML (includes small P&L card)
 # -----------------------------------------------------------------------------
 DASHBOARD_HTML = """
 <!doctype html>
