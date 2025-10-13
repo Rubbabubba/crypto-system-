@@ -333,7 +333,7 @@ def positions():
         pos = br.positions()
         return {"ok": True, "positions": pos}
     except Exception as e:
-        raise HTTPException(status_code=500, detail:str(e))
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/orders")
 def orders():
@@ -341,7 +341,7 @@ def orders():
         out = br.orders()
         return {"ok": True, "orders": out}
     except Exception as e:
-        raise HTTPException(status_code=500, detail:str(e))
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/fills")
 def fills():
@@ -349,7 +349,7 @@ def fills():
         data = br.trades_history(200)
         return {"ok": True, **data}
     except Exception as e:
-        raise HTTPException(status_code=500, detail:str(e))
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/order/market")
 async def order_market(request: Request):
@@ -372,7 +372,7 @@ async def order_market(request: Request):
             log.warning("journal add (manual) failed: %s", je)
         return {"ok": True, "order": res}
     except Exception as e:
-        raise HTTPException(status_code=500, detail:str(e))
+        raise HTTPException(status_code=500, detail=str(e))
 
 # -----------------------------------------------------------------------------
 # Dashboard HTML (with small P&L card)
