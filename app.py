@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 Crypto System – FastAPI service (Render/Kraken)
-Build: v2.0.0 (2025-10-12)
+Build: v2.0.0
 
 Routes
 - GET  /                     -> Dashboard
@@ -18,21 +18,20 @@ Routes
 - GET  /orders               -> Open orders
 - GET  /fills                -> Recent fills (via broker)
 - POST /order/market         -> Place market order by notional (USD)
+
 Scheduler
 - GET  /scheduler/start      -> Start loop (requires SCHED_ON=1)
 - GET  /scheduler/stop       -> Stop loop
-- GET  /scheduler/status     -> status + live config
+- GET  /scheduler/status     -> status + live config (includes dynamic notional if enabled)
+
 Journal & PnL
-- POST /journal/sync         -> sync journal with fills (by txid)
+- POST /journal/sync         -> sync journal JSONL with Kraken fills by txid
+- POST /reconcile/fills      -> alias of /journal/sync (for convenience)
 - GET  /journal              -> list journal rows
-- GET  /pnl/summary          -> total + per-strategy + per-symbol P&L
+- GET  /pnl/summary          -> total + per-strategy + per-symbol P&L (realized, unrealized, fees, equity)
 - GET  /pnl/strategies       -> per-strategy P&L
 - GET  /pnl/symbols          -> per-symbol P&L
-
-Notes (v2.0.0)
-- Kraken-first broker routing; Alpaca remains legacy fallback.
-- HTML dashboard extended with live price table + sparklines and a small P&L card.
-- No HTML functionality removed; all existing routes kept.
+- POST /pnl/reset            -> clear journal (dangerous; use carefully)
 """
 
 from __future__ import annotations
@@ -43,13 +42,12 @@ import asyncio
 import os
 import sys
 import json
-import math
 import logging
 import threading
 import time
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, TypedDict
-from pathlib import Path
+
 import pandas as pd
 from fastapi import FastAPI, HTTPException, Request, Body
 from fastapi.responses import JSONResponse, HTMLResponse
@@ -92,8 +90,13 @@ SERVICE_NAME = os.getenv("SERVICE_NAME", "Crypto System")
 
 DEFAULT_TIMEFRAME = os.getenv("DEFAULT_TIMEFRAME", "5Min")
 DEFAULT_LIMIT = int(os.getenv("DEFAULT_LIMIT", "300"))
-# Per-order notional (USD). For scheduler override use SCHED_NOTIONAL.
 DEFAULT_NOTIONAL = float(os.getenv("DEFAULT_NOTIONAL", os.getenv("ORDER_NOTIONAL", "25")))
+
+# ---- Risk-based dynamic sizing (safe defaults) ----
+RISK_PCT = float(os.getenv("RISK_PCT", "0.05"))          # 5% of equity
+NOTIONAL_MIN = float(os.getenv("NOTIONAL_MIN", "25"))    # clamp floor
+NOTIONAL_MAX = float(os.getenv("NOTIONAL_MAX", "250"))   # clamp cap
+SCHED_AUTO_SIZE = os.getenv("SCHED_AUTO_SIZE", "1").lower() in ("1","true","yes","y")
 
 # Symbol universe
 try:
@@ -145,24 +148,46 @@ def _to_list(x: Any) -> List[str]:
     if isinstance(x, list): return [str(s).upper() for s in x]
     if isinstance(x, str): return [s.strip().upper() for s in x.split(",") if s.strip()]
     return [str(x).upper()]
-    
-JOURNAL_PATH = Path(os.getenv("JOURNAL_PATH", "journal.json"))
 
-def _load_journal():
-    if not JOURNAL_PATH.exists():
-        return {"ok": True, "rows": [], "count": 0}
+def _normalize_asset_code(asset: str) -> str:
+    if not asset:
+        return ""
+    base = asset.split(".")[0].upper()
+    if base in ("XBT", "XXBT"):
+        return "BTC"
+    if base.startswith("X") and len(base) in (3,4):
+        return base[1:]
+    return base
+
+def _account_equity_usd() -> float:
     try:
-        import json
-        j = json.loads(JOURNAL_PATH.read_text())
-        rows = j.get("rows", [])
-        return {"ok": True, "rows": rows, "count": len(rows)}
-    except Exception as e:
-        return {"ok": False, "why": f"read journal: {e}", "rows": [], "count": 0}
+        pos = br.positions()  # [{'asset': 'USD', 'qty': ...}, {'asset':'SOL.F','qty':...}, ...]
+    except Exception:
+        return 0.0
+    base_to_sym = {s[:-3].upper(): s for s in _CURRENT_SYMBOLS if s.upper().endswith("USD") and len(s) > 3}
+    cash_usd = 0.0
+    equity = 0.0
+    for p in (pos or []):
+        asset = str(p.get("asset") or "").upper()
+        qty = float(p.get("qty") or 0.0)
+        if asset == "USD":
+            cash_usd += qty
+            continue
+        base = _normalize_asset_code(asset)
+        sym = base_to_sym.get(base)
+        if not sym or qty == 0.0:
+            continue
+        try:
+            px = float(br.last_price(sym))
+        except Exception:
+            px = 0.0
+        equity += qty * px
+    return cash_usd + equity
 
-def _save_journal(rows):
-    import json
-    out = {"ok": True, "rows": rows, "count": len(rows)}
-    JOURNAL_PATH.write_text(json.dumps(out))
+def _sized_notional_from_equity(equity_usd: float) -> float:
+    raw = float(equity_usd) * float(RISK_PCT)
+    sized = max(NOTIONAL_MIN, min(NOTIONAL_MAX, raw))
+    return round(sized, 2)
 
 # -----------------------------------------------------------------------------
 # FastAPI app
@@ -200,13 +225,19 @@ def config():
         "DEFAULT_TIMEFRAME": DEFAULT_TIMEFRAME,
         "DEFAULT_LIMIT": DEFAULT_LIMIT,
         "DEFAULT_NOTIONAL": DEFAULT_NOTIONAL,
+        "SIZING": {
+            "RISK_PCT": RISK_PCT,
+            "NOTIONAL_MIN": NOTIONAL_MIN,
+            "NOTIONAL_MAX": NOTIONAL_MAX,
+            "SCHED_AUTO_SIZE": SCHED_AUTO_SIZE,
+        },
         "SYMBOLS": _CURRENT_SYMBOLS,
         "STRATEGIES": ACTIVE_STRATEGIES,
         "PARAMS": DEFAULT_STRAT_PARAMS,
     }
 
 # -----------------------------------------------------------------------------
-# Scan bridge — dispatch to the chosen strategy module
+# Scan bridge — dispatch to strategy module
 # -----------------------------------------------------------------------------
 class ScanRequestModel(TypedDict, total=False):
     symbols: List[str]
@@ -231,7 +262,7 @@ async def _scan_bridge(strat: str, req: Dict[str, Any], *, dry: Optional[bool] =
     raw = _merge_raw(strat, dict(req.get("raw") or {}))
     ctx = {"timeframe": timeframe, "symbols": symbols, "notional": notional}
 
-    # Strategy returns [{"symbol","side",...}]
+    # Strategy returns actionable intents [{"symbol","side",...}]
     orders = fn({"strategy": strat, "timeframe": timeframe, "limit": limit, "notional": notional, "symbols": symbols, "raw": raw}, ctx) or []
 
     placed: List[Dict[str, Any]] = []
@@ -243,7 +274,7 @@ async def _scan_bridge(strat: str, req: Dict[str, Any], *, dry: Optional[bool] =
             try:
                 res = br.market_notional(sym, side, notional_o)
                 placed.append({**o, "symbol": sym, "side": side, "notional": notional_o, "order": res})
-                # journal attribution
+                # journal attribution (txid may be present immediately; fills synced later)
                 try:
                     _journal_append({
                         "ts": int(time.time()),
@@ -256,7 +287,6 @@ async def _scan_bridge(strat: str, req: Dict[str, Any], *, dry: Optional[bool] =
             except Exception as e:
                 placed.append({**o, "symbol": sym, "side": side, "notional": notional_o, "error": str(e)})
     else:
-        # dry run echoes actionable intents
         for o in orders:
             sym = (o.get("symbol") or symbols[0]).upper()
             side = (o.get("side") or "buy").lower()
@@ -303,7 +333,7 @@ def positions():
         pos = br.positions()
         return {"ok": True, "positions": pos}
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail:str(e))
 
 @app.get("/orders")
 def orders():
@@ -311,15 +341,15 @@ def orders():
         out = br.orders()
         return {"ok": True, "orders": out}
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail:str(e))
 
 @app.get("/fills")
 def fills():
     try:
-        data = br.trades_history(50)
+        data = br.trades_history(200)
         return {"ok": True, **data}
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail:str(e))
 
 @app.post("/order/market")
 async def order_market(request: Request):
@@ -331,7 +361,6 @@ async def order_market(request: Request):
         if not TRADING_ENABLED:
             return {"ok": True, "dry": True, "symbol": symbol, "side": side, "notional": notional}
         res = br.market_notional(symbol, side, notional)
-        # journal manual
         try:
             _journal_append({
                 "ts": int(time.time()),
@@ -343,141 +372,10 @@ async def order_market(request: Request):
             log.warning("journal add (manual) failed: %s", je)
         return {"ok": True, "order": res}
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-        
-@app.post("/reconcile/fills")
-async def reconcile_fills():
-    """
-    Backfill journal rows that are missing price/vol/fee/cost using Kraken trades history.
-    Matches by txid. Idempotent.
-    """
-    j = _load_journal()
-    if not j.get("ok"):
-        return j
-
-    rows = j["rows"]
-    # Build lookup of txids that need hydration
-    wanted = {r["txid"] for r in rows if r.get("txid") and (r.get("price") is None or r.get("vol") is None)}
-    if not wanted:
-        return {"ok": True, "updated": 0, "why": "no missing fills"}
-
-    try:
-        # Ask broker for recent fills; must include price, vol, fee, cost, time, pair, txid
-        fills = br.fills()  # you already have this; returns list of dicts
-    except Exception as e:
-        return {"ok": False, "why": f"broker fills error: {e}"}
-
-    by_txid = {f.get("txid"): f for f in fills if f.get("txid")}
-    updated = 0
-    for r in rows:
-        tx = r.get("txid")
-        if not tx or tx not in wanted:
-            continue
-        f = by_txid.get(tx)
-        if not f:
-            continue
-        # Normalize and copy into journal row
-        r["price"] = float(f.get("price") or 0.0)
-        r["vol"]   = float(f.get("vol")   or 0.0)
-        r["fee"]   = float(f.get("fee")   or 0.0)
-        r["cost"]  = float(f.get("cost")  or 0.0)
-        r["filled_ts"] = int(f.get("time") or time.time())
-        updated += 1
-
-    if updated:
-        _save_journal(rows)
-    return {"ok": True, "updated": updated}
-    
-@app.get("/pnl")
-async def pnl_summary():
-    """
-    Compute realized P&L per strategy and overall, using FIFO matching per (strategy, symbol).
-    Requires journal rows to have price/vol/fee/cost.
-    """
-    j = _load_journal()
-    if not j.get("ok"):
-        return j
-    rows = [r for r in j["rows"] if r.get("price") is not None and r.get("vol") is not None]
-
-    # Group by (strategy, symbol), then FIFO match buys to sells
-    from collections import defaultdict, deque
-
-    groups = defaultdict(list)
-    for r in rows:
-        key = (r.get("strategy","?"), r.get("symbol","?"))
-        groups[key].append(r)
-    # sort by filled_ts/ts for stable matching
-    for key in groups:
-        groups[key].sort(key=lambda x: (x.get("filled_ts") or x.get("ts") or 0))
-
-    report = {}
-    total_real = 0.0
-    total_fees = 0.0
-    total_trades = 0
-    total_wins = 0
-
-    for key, gr in groups.items():
-        buys = deque()
-        realized = 0.0
-        fees = 0.0
-        wins = 0
-        trades = 0
-
-        for r in gr:
-            side = r.get("side")
-            price = float(r["price"])
-            vol   = float(r["vol"])
-            fee   = float(r.get("fee") or 0.0)
-            cost  = float(r.get("cost") or 0.0)
-            ts    = r.get("filled_ts") or r.get("ts") or 0
-            if side == "buy":
-                buys.append({"px": price, "vol": vol, "fee": fee, "ts": ts})
-            elif side == "sell":
-                # match against open buys FIFO
-                sell_vol = vol
-                sell_px  = price
-                trade_pnl = 0.0
-                while sell_vol > 1e-12 and buys:
-                    lot = buys[0]
-                    use = min(sell_vol, lot["vol"])
-                    trade_pnl += (sell_px - lot["px"]) * use
-                    lot["vol"] -= use
-                    sell_vol  -= use
-                    if lot["vol"] <= 1e-12:
-                        buys.popleft()
-                # realized P&L for this sell (fees subtract)
-                realized += trade_pnl - fee
-                trades += 1
-                if trade_pnl > 0:
-                    wins += 1
-            # accumulate fees always
-            fees += fee
-
-        strat, sym = key
-        report.setdefault(strat, [])
-        report[strat].append({
-            "symbol": sym,
-            "realized": round(realized, 2),
-            "fees": round(fees, 2),
-            "trades": trades,
-            "win_rate": (round(100.0 * wins / trades, 1) if trades else 0.0),
-        })
-        total_real += realized
-        total_fees += fees
-        total_trades += trades
-        total_wins += wins
-
-    overall = {
-        "realized": round(total_real, 2),
-        "fees": round(total_fees, 2),
-        "trades": total_trades,
-        "win_rate": (round(100.0 * total_wins / total_trades, 1) if total_trades else 0.0),
-    }
-    return {"ok": True, "by_strategy": report, "overall": overall}
+        raise HTTPException(status_code=500, detail:str(e))
 
 # -----------------------------------------------------------------------------
-# Dashboard HTML (placeholders replaced at runtime; no f-strings)
-# Adds a small P&L card using /pnl/summary
+# Dashboard HTML (with small P&L card)
 # -----------------------------------------------------------------------------
 DASHBOARD_HTML = """
 <!doctype html>
@@ -691,7 +589,7 @@ svg.spark path.fill { fill:rgba(138,180,255,0.12); stroke:none; }
     <pre id="sched_out" class="mono small">// scheduler responses here</pre>
   </div>
 
-  <div class="card">
+  <div class="card" id="pnlCard">
     <h2>P&amp;L</h2>
     <div class="small">Realized + Unrealized (MTM) with fees; live from /pnl/summary</div>
     <div id="pnl_time" class="small"></div>
@@ -768,32 +666,6 @@ async function runScan() {
   }
 }
 
-async function refreshPnl() {
-  try {
-    const r = await fetch('/pnl');
-    const j = await r.json();
-    if (!j.ok) return;
-    const o = j.overall || {};
-    const by = j.by_strategy || {};
-    let rows = '';
-    for (const strat of Object.keys(by).sort()) {
-      const realized = by[strat].reduce((a,b)=>a+(b.realized||0),0);
-      const fees = by[strat].reduce((a,b)=>a+(b.fees||0),0);
-      rows += `<tr><td>${strat.toUpperCase()}</td><td>$${realized.toFixed(2)}</td><td>$${fees.toFixed(2)}</td></tr>`;
-    }
-    const html = `
-      <div class="card">
-        <h3>P&L (Realized)</h3>
-        <p><b>Total:</b> $${(o.realized||0).toFixed(2)} &nbsp; <b>Fees:</b> $${(o.fees||0).toFixed(2)} &nbsp; <b>Win%:</b> ${(o.win_rate||0).toFixed(1)}%</p>
-        <table><thead><tr><th>Strategy</th><th>P&L</th><th>Fees</th></tr></thead><tbody>${rows}</tbody></table>
-      </div>`;
-    document.getElementById('pnlCard').innerHTML = html;
-  } catch (e) { /* ignore */ }
-}
-setInterval(refreshPnl, 5000);
-refreshPnl();
-
-
 /* Bars & price */
 async function fetchBars() {
   const sym = document.getElementById('bars_sym').value;
@@ -823,8 +695,8 @@ async function fetchPrice() {
 
 /* Live Prices + Sparklines */
 let PX_SYMBOLS = [];
-const PX_SERIES = {};   // symbol -> array of numbers
-const MAX_POINTS = 50;  // ≈25 min at 30s
+const PX_SERIES = {};
+const MAX_POINTS = 50;
 
 function buildPriceRows(symbols) {
   PX_SYMBOLS = (symbols || []).map(s => String(s).toUpperCase());
@@ -967,7 +839,7 @@ def dashboard_alias():
     return root()
 
 # -----------------------------------------------------------------------------
-# Scheduler (auto, env-driven; INFO logs per pass)
+# Scheduler (auto, env-driven; dynamic sizing optional)
 # -----------------------------------------------------------------------------
 _RUNNING = False
 
@@ -985,8 +857,13 @@ def _sched_config() -> Dict[str, Any]:
     trading_flags = TRADING_ENABLED and (os.getenv("KRAKEN_TRADING", "0").lower() in ("1","true","yes","y"))
     dry = dry_env or (not trading_flags)
     return {
-        "strategies": strategies, "timeframe": timeframe, "limit": limit, "notional": notional,
-        "sleep_s": sleep_s, "dry": dry, "trading_flags": trading_flags
+        "strategies": strategies,
+        "timeframe": timeframe,
+        "limit": limit,
+        "notional": notional,
+        "sleep_s": sleep_s,
+        "dry": dry,
+        "trading_flags": trading_flags
     }
 
 async def _loop():
@@ -996,6 +873,15 @@ async def _loop():
     try:
         while _RUNNING:
             cfg = _sched_config()
+            if SCHED_AUTO_SIZE:
+                try:
+                    eq = _account_equity_usd()
+                    dyn_notional = _sized_notional_from_equity(eq)
+                    cfg["notional"] = dyn_notional
+                    log.info("Sizing: equity=%.2f USD, risk_pct=%.4f -> notional=%.2f (%.2f..%.2f)",
+                             eq, RISK_PCT, dyn_notional, NOTIONAL_MIN, NOTIONAL_MAX)
+                except Exception as e:
+                    log.warning("Sizing error; using static notional %.2f: %s", cfg["notional"], e)
             syms = list(_CURRENT_SYMBOLS)
             run_strats = [s for s in cfg["strategies"] if s in [x.lower() for x in ACTIVE_STRATEGIES] and s not in [x.lower() for x in _DISABLED_STRATS]]
             log.info("Scheduler pass: strats=%s tf=%s limit=%s notional=%s dry=%s symbols=%s",
@@ -1021,7 +907,7 @@ async def scheduler_start():
     if os.getenv("SCHED_ON", "0").lower() not in ("1","true","yes","y"):
         return {"ok": False, "why": "SCHED_ON env not enabled"}
     if _RUNNING:
-        return {"ok": True, "already": True}
+        return {"ok": True, "already": True, "config": _sched_config()}
     asyncio.create_task(_loop())
     return {"ok": True, "started": True, "config": _sched_config()}
 
@@ -1042,7 +928,7 @@ async def _maybe_autostart_scheduler():
         log.info("Scheduler autostart: enabled by SCHED_ON")
 
 # -----------------------------------------------------------------------------
-# Journal & P&L
+# Journal & P&L (JSONL journal_v2.jsonl)
 # -----------------------------------------------------------------------------
 _JOURNAL_LOCK = threading.Lock()
 _JOURNAL_PATH = os.getenv("JOURNAL_PATH", "./journal_v2.jsonl")
@@ -1059,7 +945,7 @@ def _journal_load():
                 rows.append(json.loads(line))
         with _JOURNAL_LOCK:
             _JOURNAL = rows
-        log.info("journal: loaded %d rows", len(rows))
+        log.info("journal: loaded %d rows from %s", len(rows), _JOURNAL_PATH)
     except FileNotFoundError:
         pass
     except Exception as e:
@@ -1078,7 +964,7 @@ def _journal_append(row: dict):
 async def _journal_on_start():
     _journal_load()
 
-def _sync_journal_with_fills(max_trades: int = 200) -> dict:
+def _sync_journal_with_fills(max_trades: int = 400) -> dict:
     try:
         fills = br.trades_history(max_trades)
         if not fills.get("ok"):
@@ -1103,16 +989,29 @@ def _sync_journal_with_fills(max_trades: int = 200) -> dict:
                     row["cost"] = float(t.get("cost") or 0.0)
                     row["filled_ts"] = float(t.get("time") or 0.0)
                     updated += 1
+        if updated:
+            # persist whole file
+            try:
+                with open(_JOURNAL_PATH, "w", encoding="utf-8") as f:
+                    for r in _JOURNAL:
+                        f.write(json.dumps(r, separators=(",", ":")) + "\n")
+            except Exception as pe:
+                log.warning("journal rewrite error: %s", pe)
         return {"ok": True, "updated": updated, "count": len(_JOURNAL)}
     except Exception as e:
         return {"ok": False, "error": str(e)}
 
 @app.post("/journal/sync")
 def journal_sync():
-    return _sync_journal_with_fills(200)
+    return _sync_journal_with_fills(400)
+
+# alias for convenience (you used this)
+@app.post("/reconcile/fills")
+def reconcile_fills_alias():
+    return _sync_journal_with_fills(400)
 
 @app.get("/journal")
-def journal_list(limit: int = 100):
+def journal_list(limit: int = 200):
     with _JOURNAL_LOCK:
         rows = list(_JOURNAL[-int(limit):])
     return {"ok": True, "rows": rows, "count": len(_JOURNAL)}
@@ -1176,12 +1075,10 @@ def _pnl_calc(now_prices: Dict[str, float]) -> Dict[str, Any]:
                 unreal += (mkt - cpx) * q
         equity = st["realized"] + unreal - st["fees"]
 
-        # aggregate per-strategy
         srow = out_strat.get(strat, {"strategy": strat, "realized": 0.0, "unrealized": 0.0, "fees": 0.0, "equity": 0.0})
         srow["realized"] += st["realized"]; srow["unrealized"] += unreal; srow["fees"] += st["fees"]; srow["equity"] += equity
         out_strat[strat] = srow
 
-        # aggregate per-symbol
         yrow = out_sym.get(sym, {"symbol": sym, "realized": 0.0, "unrealized": 0.0, "fees": 0.0, "equity": 0.0})
         yrow["realized"] += st["realized"]; yrow["unrealized"] += unreal; yrow["fees"] += st["fees"]; yrow["equity"] += equity
         out_sym[sym] = yrow
@@ -1199,21 +1096,26 @@ def _pnl_calc(now_prices: Dict[str, float]) -> Dict[str, Any]:
 @app.get("/pnl/summary")
 def pnl_summary():
     try:
-        # collect symbols that appear in journal; fallback to configured symbols
         with _JOURNAL_LOCK:
             syms = sorted({(r.get("symbol") or "").upper() for r in _JOURNAL if r.get("symbol")}) or list(_CURRENT_SYMBOLS)
         prices = _prices_for(syms)
         return _pnl_calc(prices)
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail:str(e))
 
 @app.get("/pnl/strategies")
 def pnl_strategies():
-    return pnl_summary().get("per_strategy", [])
+    try:
+        return pnl_summary().get("per_strategy", [])
+    except Exception as e:
+        raise HTTPException(status_code=500, detail:str(e))
 
 @app.get("/pnl/symbols")
 def pnl_symbols():
-    return pnl_summary().get("per_symbol", [])
+    try:
+        return pnl_summary().get("per_symbol", [])
+    except Exception as e:
+        raise HTTPException(status_code=500, detail:str(e))
 
 @app.post("/pnl/reset")
 def pnl_reset():
@@ -1227,7 +1129,7 @@ def pnl_reset():
             pass
         return {"ok": True}
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail:str(e))
 
 # -----------------------------------------------------------------------------
 # Entrypoint
