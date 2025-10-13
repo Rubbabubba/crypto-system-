@@ -1101,21 +1101,21 @@ def pnl_summary():
         prices = _prices_for(syms)
         return _pnl_calc(prices)
     except Exception as e:
-        raise HTTPException(status_code=500, detail:str(e))
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/pnl/strategies")
 def pnl_strategies():
     try:
         return pnl_summary().get("per_strategy", [])
     except Exception as e:
-        raise HTTPException(status_code=500, detail:str(e))
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/pnl/symbols")
 def pnl_symbols():
     try:
         return pnl_summary().get("per_symbol", [])
     except Exception as e:
-        raise HTTPException(status_code=500, detail:str(e))
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/pnl/reset")
 def pnl_reset():
@@ -1129,7 +1129,7 @@ def pnl_reset():
             pass
         return {"ok": True}
     except Exception as e:
-        raise HTTPException(status_code=500, detail:str(e))
+        raise HTTPException(status_code=500, detail=str(e))
 
 # -----------------------------------------------------------------------------
 # Entrypoint
