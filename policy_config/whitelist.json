@@ -1,0 +1,28 @@
+{
+  "c3": [
+    "BTCUSD",
+    "ETHUSD",
+    "SOLUSD"
+  ],
+  "c1": [
+    "ADAUSD",
+    "XRPUSD",
+    "DOGEUSD",
+    "LTCUSD"
+  ],
+  "c2": [
+    "BTCUSD",
+    "ETHUSD"
+  ],
+  "c4": [
+    "SOLUSD",
+    "ADAUSD"
+  ],
+  "c5": [
+    "LTCUSD",
+    "BCHUSD"
+  ],
+  "c6": [
+    "ONE_EXPERIMENTAL_ALT"
+  ]
+}
