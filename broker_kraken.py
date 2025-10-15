@@ -1,3 +1,5 @@
+import logging
+from policy.guard import note_trade_event
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
@@ -414,3 +416,18 @@ def trades_history(count: int = 20) -> Dict[str, Any]:
         return {"ok": True, "trades": items}
     except Exception as e:
         return {"ok": False, "error": str(e)}
+
+logger = logging.getLogger(__name__)
+
+
+def _policy_claim(strategy: str, symbol: str):
+    try:
+        note_trade_event("claim", strategy=strategy, symbol=symbol)
+    except Exception as e:
+        logger.debug(f"[policy] claim hook failed: {e}")
+
+def _policy_release(strategy: str, symbol: str):
+    try:
+        note_trade_event("release", strategy=strategy, symbol=symbol)
+    except Exception as e:
+        logger.debug(f"[policy] release hook failed: {e}")

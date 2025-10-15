@@ -1,3 +1,5 @@
+import logging
+from policy.guard import guard_allows, note_trade_event
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
@@ -35,3 +37,18 @@ if USE_KRAKEN:
 else:
     from broker import *  # Alpaca fallback; must exist if selected  # noqa: F401,F403
     ACTIVE_BROKER_MODULE = "broker"
+
+logger = logging.getLogger(__name__)
+
+
+def place_order_guarded(*args, **kwargs):
+    from policy.guard import guard_allows
+    strategy = kwargs.get('strategy')
+    symbol = kwargs.get('symbol')
+    expected_move_pct = kwargs.get('expected_move_pct')
+    atr_pct = kwargs.get('atr_pct')
+    ok, reason = guard_allows(strategy, symbol, expected_move_pct, atr_pct)
+    if not ok:
+        logger.info(f"[guard] blocked {strategy} {symbol}: {reason}")
+        return {'ok': False, 'reason': f'guard_block:{reason}'}
+    return place_order(*args, **kwargs)

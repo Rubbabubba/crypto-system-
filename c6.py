@@ -1,70 +1,82 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-"""
-c6.py — ATR-trend with EMA filter
-Build: v2.0.0 (2025-10-11)
-
-Goal
-- Favor longs when close > EMA(n), but insist on “enough motion” using ATR(n).
-- Exit when price loses EMA or momentum cools.
-
-Optimized defaults
-- atr_n = 14
-- atr_mult = 1.2     # used as a soft threshold vs EMA distance
-- ema_n = 20
-- exit_k = 0.997     # ~0.3% below EMA exits
-"""
-__version__ = "2.0.0"
-
-from typing import Any, Dict, List
-import time
-
+import logging
+from policy.guard import guard_allows, note_trade_event
+# strategies/c6.py
+import os
 try:
     import br_router as br
 except Exception:
-    import broker_kraken as br  # type: ignore
-
-from utils_volatility import atr_from_bars
+    from strategies import br_router as br
+from strategies import utils_volatility as uv
 
 STRAT = "c6"
+VER   = os.getenv("C6_VER", "v2.0")
 
-def _ema(vals, n: int):
+def _ema(vals, n):
     if n<=1 or len(vals)<n: return None
-    k = 2.0/(n+1.0); e = vals[0]
-    for v in vals[1:]: e = v*k + e*(1.0-k)
+    k=2.0/(n+1.0); e=vals[0]
+    for v in vals[1:]: e=v*k+e*(1-k)
     return e
 
-def _mk(symbol: str, side: str, notional: float) -> Dict[str, Any]:
-    ts = int(time.time())
-    return {"symbol": symbol, "side": side, "notional": float(notional), "strategy": STRAT, "id": f"{STRAT}:{symbol}:{side}:{ts}", "ts": ts}
+def _pos_for(symbol):
+    sym = symbol.replace("/", "")
+    pos = br.list_positions() or []
+    for p in pos:
+        if p.get("symbol","").replace("/","") == sym:
+            return float(p.get("qty",0.0) or 0.0), float(p.get("avg_entry_price",0.0) or 0.0)
+    return 0.0, 0.0
 
-def scan(req: Dict[str, Any], ctx: Dict[str, Any]) -> List[Dict[str, Any]]:
-    syms: List[str] = [s.upper() for s in (req.get("symbols") or [])]
-    tf = req.get("timeframe") or "5Min"
-    limit = int(req.get("limit") or 300)
-    notional = float(req.get("notional") or 25.0)
-    raw = dict(req.get("raw") or {})
-    atr_n = int(raw.get("atr_n", 14))
-    atr_mult = float(raw.get("atr_mult", 1.2))
-    ema_n = int(raw.get("ema_n", 20))
-    exit_k = float(raw.get("exit_k", 0.997))
+def run_scan(symbols, timeframe, limit, notional, dry, raw):
+    N_EMA   = int(raw.get("ema_n", 34))
+    EXIT_K  = float(raw.get("exit_k", 0.998))
+    MIN_ATR = float(raw.get("min_atr", 0.0))
 
-    out: List[Dict[str, Any]] = []
-    for sym in syms:
-        bars = br.get_bars(sym, timeframe=tf, limit=max(limit, ema_n+atr_n+2))
-        if not bars or len(bars) < max(ema_n, atr_n)+1: continue
-        c = [b["c"] for b in bars]
-        last = c[-1]
-        ema = _ema(c, ema_n)
-        if ema is None: continue
-
-        atr = atr_from_bars(bars, n=atr_n, return_series=False) or 0.0
-        strong_enough = (last - ema) > (atr_mult * atr / 10.0)
-
-        if last > ema and strong_enough:
-            out.append(_mk(sym, "buy", notional))
+    for sym in symbols:
+        bars = br.get_bars(sym, timeframe, limit) or []
+        if len(bars) < max(40, N_EMA):
             continue
-        if last < ema * exit_k:
-            out.append(_mk(sym, "sell", notional))
+
+        atr = uv.atr_from_bars(bars, 14)
+        if atr < MIN_ATR:
             continue
-    return out
+
+        closes = [b["c"] for b in bars]
+        last = closes[-1]
+        ema  = _ema(closes[-N_EMA:], N_EMA)
+        if ema is None:
+            continue
+
+        have, avg = _pos_for(sym)
+        symclean = sym.replace("/", "").lower()
+
+        if have <= 1e-12 and last > ema:
+            cid = f"{STRAT}-{VER}-buy-{symclean}"
+            br.place_order(sym, "buy", notional, cid)
+            return
+
+        if have > 1e-12 and last < ema * EXIT_K:
+            cid = f"{STRAT}-{VER}-sell-{symclean}"
+            br.place_order(sym, "sell", notional, cid)
+            return
+
+logger = logging.getLogger(__name__)
+
+
+def guarded_place(symbol, expected_move_pct=None, atr_pct=None):
+    ok, reason = guard_allows(strategy="c6", symbol=symbol, expected_move_pct=expected_move_pct, atr_pct=atr_pct)
+    if not ok:
+        logger.info(f"[guard] c6 blocked {symbol}: {reason}")
+        return False
+    return True
+
+
+def policy_claim(symbol):
+    try:
+        note_trade_event("claim", strategy="c6", symbol=symbol)
+    except Exception as e:
+        logger.debug(f"[policy] c6 claim failed: {e}")
+
+def policy_release(symbol):
+    try:
+        note_trade_event("release", strategy="c6", symbol=symbol)
+    except Exception as e:
+        logger.debug(f"[policy] c6 release failed: {e}")
