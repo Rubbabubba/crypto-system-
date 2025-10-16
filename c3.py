@@ -19,8 +19,8 @@ try:
 except Exception as e:
     logger.debug(f"[c3] vol_filter import skipped: {e}")
 
-CONFIG = {{"enabled": True, "name": "c3", "version": 1}}
-META   = {{"id": "c3", "display": "C3", "group": "default"}}
+CONFIG = {"enabled": True, "name": "c3", "version": 1}
+META   = {"id": "c3", "display": "C3", "group": "default"}
 
 def guarded_place(symbol, expected_move_pct=None, atr_pct=None):
     ok, reason = guard_allows(strategy="c3", symbol=symbol,
