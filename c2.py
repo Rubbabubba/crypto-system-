@@ -1,15 +1,11 @@
-from policy.guard import guard_allows, note_trade_event
-import logging
-logger = logging.getLogger(__name__)
-
 # strategies/c2.py
 import os, math
 from typing import List
 try:
     import br_router as br
 except Exception:
-    from strategies import br_router as br
-from strategies import utils_volatility as uv
+import br_router as br
+import utils_volatility as uv
 
 STRAT = "c2"
 VER   = os.getenv("C2_VER", "v2.0")
@@ -59,24 +55,3 @@ def run_scan(symbols: List[str], timeframe: str, limit: int, notional: float, dr
             cid = f"{STRAT}-{VER}-sell-{symclean}"
             br.place_order(sym, "sell", notional, cid)
             return
-
-
-def guarded_place(symbol, expected_move_pct=None, atr_pct=None):
-    ok, reason = guard_allows(strategy="c2", symbol=symbol,
-                              expected_move_pct=expected_move_pct, atr_pct=atr_pct)
-    if not ok:
-        logger.info(f"[guard] c2 blocked {symbol}: {reason}")
-        return False
-    return True
-
-def policy_claim(symbol):
-    try:
-        note_trade_event("claim", strategy="c2", symbol=symbol)
-    except Exception as e:
-        logger.debug(f"[policy] c2 claim failed: {e}")
-
-def policy_release(symbol):
-    try:
-        note_trade_event("release", strategy="c2", symbol=symbol)
-    except Exception as e:
-        logger.debug(f"[policy] c2 release failed: {e}")

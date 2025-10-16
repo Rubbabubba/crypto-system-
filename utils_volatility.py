@@ -1,160 +1,136 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-"""
-utils_volatility.py — ATR & volatility helpers
-Build: v2.0.0 (2025-10-11, America/Chicago)
+# strategies/utils_volatility.py
+# Volatility gate for C1–C6 (ATR > K * median(ATR))
+# Uses existing broker.get_bars() patched by backtest_c1_c6.py
 
-Supports:
-- Bars as list[dict]: [{t,o,h,l,c,v}] (epoch seconds in 't', floats in o/h/l/c/v)
-- Bars as pandas.DataFrame with columns: ['open','high','low','close','volume'] (ts index or 'ts'/'t' column)
+import os
+from typing import List, Dict, Tuple
+import math
 
-Public API
-- to_df(bars) -> pd.DataFrame
-- true_range_df(df) -> pd.Series
-- atr_series_from_df(df, n=14) -> pd.Series
-- atr_from_bars(bars, n=14, return_series=False) -> float | pd.Series
-- hl2_series(df) -> pd.Series
-"""
+try:
+    # works after backtest patches add these to sys.path
+    import broker as br
+except Exception:
+    # if strategies.broker is the path
+import broker as br
 
-from __future__ import annotations
+# ---------- small numeric utils ----------
+def _sma(xs, n):
+    if n <= 0 or len(xs) < n:
+        return None
+    return sum(xs[-n:]) / n
 
-__version__ = "2.0.0"
+def _median(xs):
+    n = len(xs)
+    if n == 0:
+        return None
+    xs2 = sorted(xs)
+    mid = n // 2
+    if n % 2 == 1:
+        return xs2[mid]
+    return 0.5 * (xs2[mid - 1] + xs2[mid])
 
-from typing import Any, Iterable, Union
-import pandas as pd
-import numpy as np
+def _true_range(h, l, pc):
+    return max(h - l, abs(h - pc), abs(l - pc))
 
-__all__ = [
-    "to_df",
-    "true_range_df",
-    "atr_series_from_df",
-    "atr_from_bars",
-    "hl2_series",
-]
+def _atr_sma(highs, lows, closes, atr_len: int) -> List[float]:
+    """Simple ATR using SMA of True Range (not Wilder's), sufficient for gating."""
+    if len(closes) < atr_len + 1:
+        return []
+    trs = []
+    for i in range(1, len(closes)):
+        trs.append(_true_range(highs[i], lows[i], closes[i - 1]))
+    # trs length == len(closes) - 1
+    atr = []
+    win = []
+    for tr in trs:
+        win.append(tr)
+        if len(win) > atr_len:
+            win.pop(0)
+        if len(win) == atr_len:
+            atr.append(sum(win) / atr_len)
+        else:
+            atr.append(float("nan"))
+    # pad to align with closes length
+    pad = [float("nan")]
+    return pad + atr  # length == len(closes)
 
-# -----------------------------------------------------------------------------
-# Normalization
-# -----------------------------------------------------------------------------
-def to_df(bars: Union[pd.DataFrame, Iterable[dict]]) -> pd.DataFrame:
+# ---------- public API ----------
+def is_tradeable(
+    symbol: str,
+    timeframe: str,
+    limit: int,
+    atr_len: int = None,
+    median_len: int = None,
+    k: float = None,
+) -> Tuple[bool, Dict]:
     """
-    Convert bars into a normalized DataFrame with UTC timestamp index and columns:
-    ['open','high','low','close','volume']
+    Returns (ok, info) where ok==True means pass volatility gate.
+    Gate: ATR_now > k * median(ATR_last_median_len)
     """
-    if isinstance(bars, pd.DataFrame):
-        df = bars.copy()
-        # time column inference
-        if "ts" in df.columns:
-            idx = pd.to_datetime(df["ts"], utc=True, errors="coerce")
-            df = df.drop(columns=[c for c in ["ts", "t", "time"] if c in df.columns])
-            df.index = idx
-        elif "t" in df.columns:
-            idx = pd.to_datetime(df["t"], unit="s", utc=True, errors="coerce")
-            df = df.drop(columns=[c for c in ["ts", "t", "time"] if c in df.columns])
-            df.index = idx
-        elif "time" in df.columns:
-            idx = pd.to_datetime(df["time"], utc=True, errors="coerce")
-            df = df.drop(columns=[c for c in ["ts", "t", "time"] if c in df.columns])
-            df.index = idx
-        elif not isinstance(df.index, pd.DatetimeIndex):
-            # try to coerce index
-            df.index = pd.to_datetime(df.index, utc=True, errors="coerce")
+    # env defaults
+    atr_len = int(os.getenv("VOL_ATR_LEN", atr_len or 14))
+    median_len = int(os.getenv("VOL_MEDIAN_LEN", median_len or 20))
+    k = float(os.getenv("VOL_K", k if k is not None else 1.0))
+    verbose = os.getenv("VOL_VERBOSE", "0") == "1"
 
-        # rename o/h/l/c/v if present
-        rename_map = {"o":"open","h":"high","l":"low","c":"close","v":"volume","vol":"volume"}
-        df = df.rename(columns={k: v for k, v in rename_map.items() if k in df.columns})
+    # fetch bars (already patched by backtester)
+    data = br.get_bars(symbol, timeframe=timeframe, limit=max(limit, atr_len + median_len + 5))
+    bars = data.get(symbol, []) if isinstance(data, dict) else data
+    if not bars or len(bars) < atr_len + median_len + 2:
+        info = {"reason": "insufficient_bars", "bars": len(bars), "need": atr_len + median_len + 2}
+        if verbose:
+            print(f"[VOL] {symbol} insufficient bars: {info}")
+        return False, info
 
-        # ensure columns
-        for col in ["open","high","low","close","volume"]:
-            if col not in df.columns:
-                df[col] = np.nan
+    highs = [float(b["h"]) for b in bars]
+    lows = [float(b["l"]) for b in bars]
+    closes = [float(b["c"]) for b in bars]
 
-        return df[["open","high","low","close","volume"]].sort_index()
+    atr_series = _atr_sma(highs, lows, closes, atr_len=atr_len)
+    # ensure we have enough good ATR values
+    good_atr = [x for x in atr_series if not (x is None or math.isnan(x))]
+    if len(good_atr) < median_len + 1:
+        info = {"reason": "insufficient_atr", "atr_points": len(good_atr), "need": median_len + 1}
+        if verbose:
+            print(f"[VOL] {symbol} insufficient ATR: {info}")
+        return False, info
 
-    # Iterable[dict]
-    rows = list(bars or [])
-    if not rows:
-        return pd.DataFrame(columns=["open","high","low","close","volume"])
+    atr_now = good_atr[-1]
+    base_slice = good_atr[-(median_len+1):-1]  # last M ATRs excluding current
+    atr_median = _median(base_slice)
 
-    df = pd.DataFrame(rows)
-    # timestamps
-    if "ts" in df.columns:
-        idx = pd.to_datetime(df["ts"], utc=True, errors="coerce")
-    elif "t" in df.columns:
-        idx = pd.to_datetime(df["t"], unit="s", utc=True, errors="coerce")
-    elif "time" in df.columns:
-        idx = pd.to_datetime(df["time"], utc=True, errors="coerce")
-    else:
-        idx = pd.to_datetime(df.index, utc=True, errors="coerce")
+    threshold = (k * atr_median) if atr_median is not None else None
+    ok = (atr_now is not None and atr_median is not None and atr_now > threshold)
 
-    df.index = idx
-    # rename
-    rename_map = {"o":"open","h":"high","l":"low","c":"close","v":"volume","vol":"volume"}
-    df = df.rename(columns={k: v for k, v in rename_map.items() if k in df.columns})
+    info = {
+        "atr_len": atr_len,
+        "median_len": median_len,
+        "k": k,
+        "atr_now": round(atr_now, 8) if atr_now is not None else None,
+        "atr_median": round(atr_median, 8) if atr_median is not None else None,
+        "threshold": round(threshold, 8) if threshold is not None else None,
+        "pass": bool(ok),
+    }
+    if verbose:
+        tag = "PASS" if ok else "FAIL"
+        print(f"[VOL {tag}] {symbol} atr_now={info['atr_now']} > k*med={info['threshold']}? k={k} (len={atr_len},M={median_len})")
 
-    for col in ["open","high","low","close","volume"]:
-        if col not in df.columns:
-            df[col] = np.nan
-
-    return df[["open","high","low","close","volume"]].sort_index()
+    return ok, info
 
 
-# -----------------------------------------------------------------------------
-# Core calculations
-# -----------------------------------------------------------------------------
-def true_range_df(df: pd.DataFrame) -> pd.Series:
+def gate_all(
+    symbols: List[str],
+    timeframe: str,
+    limit: int,
+    atr_len: int = None,
+    median_len: int = None,
+    k: float = None,
+) -> Dict[str, Dict]:
     """
-    Wilder's True Range as a Series aligned to df.index.
-    TR = max( high - low, abs(high - prev_close), abs(low - prev_close) )
+    Check gate for each symbol. Returns dict[symbol] = {"pass": bool, ...diagnostics}
     """
-    if df is None or df.empty:
-        return pd.Series(dtype=float)
-
-    high = df["high"].astype(float)
-    low = df["low"].astype(float)
-    close = df["close"].astype(float)
-
-    prev_close = close.shift(1)
-    tr1 = (high - low).abs()
-    tr2 = (high - prev_close).abs()
-    tr3 = (low - prev_close).abs()
-
-    tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
-    return tr
-
-
-def atr_series_from_df(df: pd.DataFrame, n: int = 14) -> pd.Series:
-    """
-    Wilder's ATR(n) as a Series (RMA of TR over window n).
-    """
-    if df is None or df.empty:
-        return pd.Series(dtype=float)
-
-    n = max(int(n), 1)
-    tr = true_range_df(df)
-
-    # Wilder's RMA: initial value = mean(TR[0:n]), then recursive smoothing
-    atr = tr.ewm(alpha=1.0/n, adjust=False, min_periods=n).mean()
-    return atr
-
-
-def atr_from_bars(bars: Union[pd.DataFrame, Iterable[dict]], n: int = 14, return_series: bool = False) -> Union[float, pd.Series]:
-    """
-    Convenience wrapper:
-    - Accepts list-of-dicts or DataFrame.
-    - Computes ATR(n) series; returns the last value by default, or the full Series when return_series=True.
-    """
-    df = to_df(bars)
-    if df.empty:
-        return pd.Series(dtype=float) if return_series else float("nan")
-
-    atr = atr_series_from_df(df, n=n)
-    return atr if return_series else (float(atr.iloc[-1]) if len(atr) else float("nan"))
-
-
-def hl2_series(df: pd.DataFrame) -> pd.Series:
-    """
-    (high + low) / 2 as a Series.
-    """
-    if df is None or df.empty:
-        return pd.Series(dtype=float)
-    return (df["high"].astype(float) + df["low"].astype(float)) / 2.0
+    out = {}
+    for sym in symbols:
+        ok, info = is_tradeable(sym, timeframe, limit, atr_len=atr_len, median_len=median_len, k=k)
+        out[sym] = {"pass": ok, **info}
+    return out

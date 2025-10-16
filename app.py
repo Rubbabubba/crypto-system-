@@ -40,7 +40,6 @@ __version__ = "2.0.0"
 
 import asyncio
 import os
-os.environ.setdefault('POLICY_CFG_DIR','policy_config')
 import sys
 import json
 import logging

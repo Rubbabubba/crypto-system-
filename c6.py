@@ -1,14 +1,10 @@
-from policy.guard import guard_allows, note_trade_event
-import logging
-logger = logging.getLogger(__name__)
-
 # strategies/c6.py
 import os
 try:
     import br_router as br
 except Exception:
-    from strategies import br_router as br
-from strategies import utils_volatility as uv
+import br_router as br
+import utils_volatility as uv
 
 STRAT = "c6"
 VER   = os.getenv("C6_VER", "v2.0")
@@ -59,24 +55,3 @@ def run_scan(symbols, timeframe, limit, notional, dry, raw):
             cid = f"{STRAT}-{VER}-sell-{symclean}"
             br.place_order(sym, "sell", notional, cid)
             return
-
-
-def guarded_place(symbol, expected_move_pct=None, atr_pct=None):
-    ok, reason = guard_allows(strategy="c6", symbol=symbol,
-                              expected_move_pct=expected_move_pct, atr_pct=atr_pct)
-    if not ok:
-        logger.info(f"[guard] c6 blocked {symbol}: {reason}")
-        return False
-    return True
-
-def policy_claim(symbol):
-    try:
-        note_trade_event("claim", strategy="c6", symbol=symbol)
-    except Exception as e:
-        logger.debug(f"[policy] c6 claim failed: {e}")
-
-def policy_release(symbol):
-    try:
-        note_trade_event("release", strategy="c6", symbol=symbol)
-    except Exception as e:
-        logger.debug(f"[policy] c6 release failed: {e}")
