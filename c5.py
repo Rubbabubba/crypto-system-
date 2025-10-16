@@ -43,3 +43,7 @@ def scan(*args, **kwargs):
         "signals": [],
         "message": "placeholder scan; no-op"
     }
+
+# Strategy metadata for app schedulers that expect dict-like attributes
+CONFIG = {"enabled": True, "name": "c5", "version": 1}
+META = {"id": "c5", "display": "C5", "group": "default"}
