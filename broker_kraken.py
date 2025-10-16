@@ -1,5 +1,9 @@
-import logging
+from __future__ import annotations
+
 from policy.guard import note_trade_event
+import logging
+logger = logging.getLogger(__name__)
+
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
@@ -15,8 +19,6 @@ Public API used by app/strategies:
 - positions() -> list[dict]
 - trades_history(count: int = 20) -> dict  # recent fills
 """
-
-from __future__ import annotations
 
 __version__ = "2.0.0"
 
@@ -416,8 +418,6 @@ def trades_history(count: int = 20) -> Dict[str, Any]:
         return {"ok": True, "trades": items}
     except Exception as e:
         return {"ok": False, "error": str(e)}
-
-logger = logging.getLogger(__name__)
 
 
 def _policy_claim(strategy: str, symbol: str):

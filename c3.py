@@ -1,5 +1,7 @@
-import logging
 from policy.guard import guard_allows, note_trade_event
+import logging
+logger = logging.getLogger(__name__)
+
 # strategies/c3.py
 import os
 try:
@@ -59,16 +61,14 @@ def run_scan(symbols, timeframe, limit, notional, dry, raw):
             br.place_order(sym, "sell", notional, cid)
             return
 
-logger = logging.getLogger(__name__)
-
 
 def guarded_place(symbol, expected_move_pct=None, atr_pct=None):
-    ok, reason = guard_allows(strategy="c3", symbol=symbol, expected_move_pct=expected_move_pct, atr_pct=atr_pct)
+    ok, reason = guard_allows(strategy="c3", symbol=symbol,
+                              expected_move_pct=expected_move_pct, atr_pct=atr_pct)
     if not ok:
         logger.info(f"[guard] c3 blocked {symbol}: {reason}")
         return False
     return True
-
 
 def policy_claim(symbol):
     try:
