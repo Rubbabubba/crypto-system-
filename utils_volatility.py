@@ -1,136 +1,215 @@
-# strategies/utils_volatility.py
-# Volatility gate for C1–C6 (ATR > K * median(ATR))
-# Uses existing broker.get_bars() patched by backtest_c1_c6.py
+# utils_volatility.py — full replacement (drop-in safe)
+from __future__ import annotations
 
-import os
-from typing import List, Dict, Tuple
-import math
+import logging
+from typing import Optional, Literal
 
+import numpy as np
+import pandas as pd
+
+logger = logging.getLogger(__name__)
+
+# Optional broker import (never fatal)
 try:
-    # works after backtest patches add these to sys.path
-    import broker as br
-except Exception:
-    # if strategies.broker is the path
-import broker as br
+    import broker as br  # if you have a local broker helper module
+except Exception as e:
+    logger.debug(f"[utils_volatility] broker import skipped: {e}")
+    br = None
 
-# ---------- small numeric utils ----------
-def _sma(xs, n):
-    if n <= 0 or len(xs) < n:
-        return None
-    return sum(xs[-n:]) / n
 
-def _median(xs):
-    n = len(xs)
-    if n == 0:
-        return None
-    xs2 = sorted(xs)
-    mid = n // 2
-    if n % 2 == 1:
-        return xs2[mid]
-    return 0.5 * (xs2[mid - 1] + xs2[mid])
+# -----------------------------
+# Basic indicators & utilities
+# -----------------------------
 
-def _true_range(h, l, pc):
-    return max(h - l, abs(h - pc), abs(l - pc))
+def sma(series: pd.Series, window: int) -> pd.Series:
+    """Simple Moving Average."""
+    s = _to_series(series)
+    return s.rolling(window=window, min_periods=window).mean()
 
-def _atr_sma(highs, lows, closes, atr_len: int) -> List[float]:
-    """Simple ATR using SMA of True Range (not Wilder's), sufficient for gating."""
-    if len(closes) < atr_len + 1:
-        return []
-    trs = []
-    for i in range(1, len(closes)):
-        trs.append(_true_range(highs[i], lows[i], closes[i - 1]))
-    # trs length == len(closes) - 1
-    atr = []
-    win = []
-    for tr in trs:
-        win.append(tr)
-        if len(win) > atr_len:
-            win.pop(0)
-        if len(win) == atr_len:
-            atr.append(sum(win) / atr_len)
-        else:
-            atr.append(float("nan"))
-    # pad to align with closes length
-    pad = [float("nan")]
-    return pad + atr  # length == len(closes)
 
-# ---------- public API ----------
-def is_tradeable(
-    symbol: str,
-    timeframe: str,
-    limit: int,
-    atr_len: int = None,
-    median_len: int = None,
-    k: float = None,
-) -> Tuple[bool, Dict]:
+def ema(series: pd.Series, span: int) -> pd.Series:
+    """Exponential Moving Average (alpha=2/(span+1))."""
+    s = _to_series(series)
+    return s.ewm(span=span, adjust=False, min_periods=span).mean()
+
+
+def rsi(series: pd.Series, period: int = 14) -> pd.Series:
+    """Wilder's RSI, period in bars."""
+    s = _to_series(series)
+    delta = s.diff()
+    up = delta.clip(lower=0.0)
+    down = -delta.clip(upper=0.0)
+
+    # Wilder's smoothing via ewm(alpha=1/period)
+    gain = up.ewm(alpha=1 / period, adjust=False, min_periods=period).mean()
+    loss = down.ewm(alpha=1 / period, adjust=False, min_periods=period).mean()
+
+    rs = gain / loss.replace(0.0, np.nan)
+    out = 100.0 - (100.0 / (1.0 + rs))
+    return out.fillna(50.0)
+
+
+def pct_change(series: pd.Series) -> pd.Series:
+    """Percent change in % units."""
+    s = _to_series(series)
+    return s.pct_change() * 100.0
+
+
+# -----------------------------
+# True Range, ATR, ATR percent
+# -----------------------------
+
+def true_range(high: pd.Series, low: pd.Series, close: pd.Series) -> pd.Series:
+    """True range series from H, L, C (C is current close; previous close is close.shift(1))."""
+    h = _to_series(high)
+    l = _to_series(low)
+    c_prev = _to_series(close).shift(1)
+
+    tr1 = h - l
+    tr2 = (h - c_prev).abs()
+    tr3 = (l - c_prev).abs()
+
+    tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+    return tr
+
+
+def atr(
+    df: pd.DataFrame,
+    period: int = 14,
+    method: Literal["ema", "sma"] = "ema",
+    hi_col: str = "high",
+    lo_col: str = "low",
+    cl_col: str = "close",
+) -> pd.Series:
     """
-    Returns (ok, info) where ok==True means pass volatility gate.
-    Gate: ATR_now > k * median(ATR_last_median_len)
+    Average True Range (Wilder-style by default using EMA).
+    Expects df with columns: high, low, close (name overrideable).
     """
-    # env defaults
-    atr_len = int(os.getenv("VOL_ATR_LEN", atr_len or 14))
-    median_len = int(os.getenv("VOL_MEDIAN_LEN", median_len or 20))
-    k = float(os.getenv("VOL_K", k if k is not None else 1.0))
-    verbose = os.getenv("VOL_VERBOSE", "0") == "1"
-
-    # fetch bars (already patched by backtester)
-    data = br.get_bars(symbol, timeframe=timeframe, limit=max(limit, atr_len + median_len + 5))
-    bars = data.get(symbol, []) if isinstance(data, dict) else data
-    if not bars or len(bars) < atr_len + median_len + 2:
-        info = {"reason": "insufficient_bars", "bars": len(bars), "need": atr_len + median_len + 2}
-        if verbose:
-            print(f"[VOL] {symbol} insufficient bars: {info}")
-        return False, info
-
-    highs = [float(b["h"]) for b in bars]
-    lows = [float(b["l"]) for b in bars]
-    closes = [float(b["c"]) for b in bars]
-
-    atr_series = _atr_sma(highs, lows, closes, atr_len=atr_len)
-    # ensure we have enough good ATR values
-    good_atr = [x for x in atr_series if not (x is None or math.isnan(x))]
-    if len(good_atr) < median_len + 1:
-        info = {"reason": "insufficient_atr", "atr_points": len(good_atr), "need": median_len + 1}
-        if verbose:
-            print(f"[VOL] {symbol} insufficient ATR: {info}")
-        return False, info
-
-    atr_now = good_atr[-1]
-    base_slice = good_atr[-(median_len+1):-1]  # last M ATRs excluding current
-    atr_median = _median(base_slice)
-
-    threshold = (k * atr_median) if atr_median is not None else None
-    ok = (atr_now is not None and atr_median is not None and atr_now > threshold)
-
-    info = {
-        "atr_len": atr_len,
-        "median_len": median_len,
-        "k": k,
-        "atr_now": round(atr_now, 8) if atr_now is not None else None,
-        "atr_median": round(atr_median, 8) if atr_median is not None else None,
-        "threshold": round(threshold, 8) if threshold is not None else None,
-        "pass": bool(ok),
-    }
-    if verbose:
-        tag = "PASS" if ok else "FAIL"
-        print(f"[VOL {tag}] {symbol} atr_now={info['atr_now']} > k*med={info['threshold']}? k={k} (len={atr_len},M={median_len})")
-
-    return ok, info
-
-
-def gate_all(
-    symbols: List[str],
-    timeframe: str,
-    limit: int,
-    atr_len: int = None,
-    median_len: int = None,
-    k: float = None,
-) -> Dict[str, Dict]:
-    """
-    Check gate for each symbol. Returns dict[symbol] = {"pass": bool, ...diagnostics}
-    """
-    out = {}
-    for sym in symbols:
-        ok, info = is_tradeable(sym, timeframe, limit, atr_len=atr_len, median_len=median_len, k=k)
-        out[sym] = {"pass": ok, **info}
+    _require_cols(df, [hi_col, lo_col, cl_col], name="atr")
+    tr = true_range(df[hi_col], df[lo_col], df[cl_col])
+    if method == "ema":
+        out = tr.ewm(alpha=1 / period, adjust=False, min_periods=period).mean()
+    else:
+        out = tr.rolling(window=period, min_periods=period).mean()
     return out
+
+
+def atr_pct(
+    df: pd.DataFrame,
+    period: int = 14,
+    method: Literal["ema", "sma"] = "ema",
+    hi_col: str = "high",
+    lo_col: str = "low",
+    cl_col: str = "close",
+) -> pd.Series:
+    """
+    ATR as a percent of price (close), i.e., 100 * ATR / close.
+    """
+    _require_cols(df, [hi_col, lo_col, cl_col], name="atr_pct")
+    a = atr(df, period=period, method=method, hi_col=hi_col, lo_col=lo_col, cl_col=cl_col)
+    return (a / df[cl_col].replace(0.0, np.nan)) * 100.0
+
+
+# -----------------------------
+# Rolling volatility (stdev)
+# -----------------------------
+
+def rolling_vol(
+    series: pd.Series,
+    window: int = 20,
+    pct_inputs: bool = False,
+    annualize: bool = False,
+    periods_per_year: int = 365,  # daily by default; set 365*24 for hourly
+) -> pd.Series:
+    """
+    Rolling volatility (standard deviation). If pct_inputs=False, converts to % via pct_change first.
+    If annualize=True, multiplies by sqrt(periods_per_year).
+    """
+    s = _to_series(series)
+    returns = s if pct_inputs else s.pct_change() * 100.0
+    vol = returns.rolling(window=window, min_periods=window).std()
+    if annualize:
+        vol = vol * np.sqrt(periods_per_year)
+    return vol
+
+
+# -----------------------------
+# Expected move helpers
+# -----------------------------
+
+def expected_move_from_atr_pct(atr_pct_value: float, k: float = 1.0) -> float:
+    """
+    Turn an ATR% into a single-trade expected move in % (linear scale).
+    For quick guards, k=1.0 is fine; you can tune k from backtests.
+    """
+    try:
+        return float(atr_pct_value) * float(k)
+    except Exception:
+        return np.nan
+
+
+def edge_vs_fee_ok(
+    expected_move_pct: Optional[float],
+    fee_rate_pct: float = 0.26,
+    multiple: float = 3.0,
+) -> bool:
+    """
+    Fee guard: require expected_move_pct >= multiple * fee_rate_pct.
+    If expected_move_pct is None, returns True (skip check).
+    """
+    if expected_move_pct is None:
+        return True
+    try:
+        return float(expected_move_pct) >= (float(multiple) * float(fee_rate_pct))
+    except Exception:
+        return False
+
+
+# -----------------------------
+# Convenience wrappers used by strategies (non-IO)
+# -----------------------------
+
+def get_atr_pct(
+    df: pd.DataFrame,
+    period: int = 14,
+    method: Literal["ema", "sma"] = "ema",
+    hi_col: str = "high",
+    lo_col: str = "low",
+    cl_col: str = "close",
+) -> float:
+    """
+    Returns the latest ATR% value from a dataframe of OHLC.
+    """
+    series = atr_pct(df, period=period, method=method, hi_col=hi_col, lo_col=lo_col, cl_col=cl_col)
+    try:
+        return float(series.iloc[-1])
+    except Exception:
+        return np.nan
+
+
+def last(series: pd.Series, default: float = np.nan) -> float:
+    """Return the last value of a Series as float."""
+    try:
+        return float(_to_series(series).iloc[-1])
+    except Exception:
+        return default
+
+
+# -----------------------------
+# Internal helpers
+# -----------------------------
+
+def _to_series(x) -> pd.Series:
+    if isinstance(x, pd.Series):
+        return x
+    if isinstance(x, (list, tuple, np.ndarray)):
+        return pd.Series(x)
+    # If scalar, broadcast to length-1 series
+    return pd.Series([x])
+
+
+def _require_cols(df: pd.DataFrame, cols: list[str], name: str = ""):
+    missing = [c for c in cols if c not in df.columns]
+    if missing:
+        raise KeyError(f"[utils_volatility.{name}] missing columns: {missing}. "
+                       f"Have: {list(df.columns)}")
