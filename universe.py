@@ -26,3 +26,21 @@ class UniverseBuilder:
             if r1 >= self.cfg.min_rows_1m and r5 >= self.cfg.min_rows_5m:
                 rows_ok.append(s)
         self.symbols = rows_ok[: self.cfg.max_symbols]
+
+
+# ---- added helper for app.py ----
+from __future__ import annotations
+import os
+
+def load_universe_from_env(default=None):
+    """
+    Read SYMBOLS env var like 'BTCUSD,ETHUSD,SOLUSD' and return list.
+    Falls back to default list if unset/empty.
+    """
+    if default is None:
+        default = ["BTCUSD","ETHUSD","SOLUSD","DOGEUSD","XRPUSD","AVAXUSD","LINKUSD","BCHUSD","LTCUSD"]
+    raw = os.getenv("SYMBOLS", "").strip()
+    if not raw:
+        return default
+    syms = [s.strip().upper() for s in raw.replace(";",",").split(",") if s.strip()]
+    return syms or default

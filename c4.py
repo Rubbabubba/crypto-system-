@@ -1,46 +1,58 @@
 from __future__ import annotations
-
 import logging
 logger = logging.getLogger(__name__)
 
-try:
-    from policy.guard import guard_allows, note_trade_event
-except Exception as e:
-    logger.debug(f"[policy] guard import skipped: {e}")
-    def guard_allows(*args, **kwargs): return (True, "ok")
-    def note_trade_event(*args, **kwargs): pass
+from guard import guard_allows, note_trade_event  # local guard module
+import broker_kraken as br
+import pandas as pd
+from book import StrategyBook, ScanRequest
 
-try:
-    import utils_volatility as uv
-except Exception as e:
-    logger.debug(f"[c4] utils_volatility import skipped: {e}")
-try:
-    import vol_filter as vf
-except Exception as e:
-    logger.debug(f"[c4] vol_filter import skipped: {e}")
+STRAT_ID = "c4"
 
-CONFIG = {"enabled": True, "name": "c4", "version": 1}
-META   = {"id": "c4", "display": "C4", "group": "default"}
+def _to_df(rows):
+    if not rows:
+        return None
+    df = pd.DataFrame(rows)
+    df.rename(columns={"t":"time","o":"open","h":"high","l":"low","c":"close","v":"volume"}, inplace=True)
+    return df
 
-def guarded_place(symbol, expected_move_pct=None, atr_pct=None):
-    ok, reason = guard_allows(strategy="c4", symbol=symbol,
-                              expected_move_pct=expected_move_pct, atr_pct=atr_pct)
-    if not ok:
-        logger.info(f"[guard] c4 blocked {{symbol}}: {{reason}}")
-        return False
-    return True
-
-def policy_claim(symbol):
-    try: note_trade_event("claim", strategy="c4", symbol=symbol)
-    except Exception as e: logger.debug(f"[policy] c4 claim failed: {e}")
-
-def policy_release(symbol):
-    try: note_trade_event("release", strategy="c4", symbol=symbol)
-    except Exception as e: logger.debug(f"[policy] c4 release failed: {e}")
+def _ctx_for(symbol: str, tf: str, limit: int):
+    one = br.get_bars(symbol, timeframe="1Min", limit=max(300, limit*5))
+    five = br.get_bars(symbol, timeframe=tf,      limit=limit)
+    return {
+        "one":  _to_df(one).to_dict(orient="list") if one else None,
+        "five": _to_df(five).to_dict(orient="list") if five else None,
+    }
 
 def scan(req: dict, ctx: dict):
-    """Return a LIST of order intents.
-    Placeholder returns [] so the scheduler won't error when iterating orders.
     """
-    logger.info("[c4] scan() placeholder called; returning empty list.")
-    return []
+    Build contexts, run StrategyBook for c4, filter with guard, and emit order intents.
+    req: {timeframe, limit, symbols, notional}
+    ctx: includes scheduler-level defaults (symbols, notional)
+    """
+    tf       = str(req.get("timeframe") or "5Min")
+    limit    = int(req.get("limit") or 300)
+    symbols  = [s.upper() for s in (req.get("symbols") or ctx.get("symbols") or [])]
+    notional = float(req.get("notional") or ctx.get("notional") or 25.0)
+
+    book = StrategyBook(topk=2, min_score=0.10, risk_target_usd=notional, atr_stop_mult=1.0)
+    sreq = ScanRequest(strat=STRAT_ID, timeframe=tf, limit=limit, topk=2, min_score=0.10, notional=notional)
+
+    contexts = { sym: _ctx_for(sym, tf, limit) for sym in symbols }
+    results = book.scan(sreq, contexts)
+
+    intents = []
+    for r in results:
+        if not r.selected or r.action not in ("buy","sell") or r.notional <= 0:
+            continue
+        expected_move_pct = r.atr_pct  # simple proxy; replace with model score later
+        ok, reason = guard_allows(strategy=STRAT_ID, symbol=r.symbol, expected_move_pct=expected_move_pct, atr_pct=r.atr_pct)
+        if not ok:
+            logger.info("[guard] %s blocked %s: %s", STRAT_ID, r.symbol, reason)
+            continue
+        intents.append({
+            "symbol":  r.symbol,
+            "side":    "buy" if r.action == "buy" else "sell",
+            "notional": min(notional, r.notional)
+        })
+    return intents
