@@ -83,3 +83,36 @@ def tf_to_kraken(tf: str) -> int:
     k = tf.strip().lower()
     return _TF_ALIASES.get(k, _TF_ALIASES.get(k.replace("min", "m"), 5))
     
+# --- Added: reverse mapping from Kraken pair -> UI symbol ---
+def from_kraken(pair: str) -> str:
+    """Convert a Kraken pair string (e.g., 'XBTUSD', 'BTCUSD', 'SOLUSD', 'XXBTZUSD')
+    to UI form 'BASE/QUOTE'. Tries inverse of KRAKEN_PAIR_MAP first; then heuristics."""
+    if not pair:
+        return pair
+
+    p = str(pair).strip().upper().replace(":", "").replace("/", "")
+    # Prefer inverse of declared map if available
+    try:
+        inv = {v.upper(): k.upper() for k, v in KRAKEN_PAIR_MAP.items()}
+        if p in inv:
+            return inv[p]
+    except Exception:
+        pass
+
+    # Kraken legacy prefixes: 'X' for base, 'Z' for quote (e.g., 'XXBTZUSD')
+    p = p.replace("XXBT", "XBT")  # normalize doubled X
+    p = p.replace("XBT", "BTC")   # UI prefers BTC
+    p = p.replace("XETH", "ETH").replace("ZUSD", "USD").replace("ZEUR", "EUR").replace("ZUSDT", "USDT")
+
+    # If still in compact form like 'BTCUSD', split last 3/4 chars as quote
+    if len(p) >= 6:
+        # Try common 4-letter quotes first
+        for q in ("USDT","USDC","DAI","BUSD"):
+            if p.endswith(q):
+                base = p[:-len(q)]
+                return f"{base}/{q}"
+        # Fallback to 3-letter quotes
+        base, quote = p[:-3], p[-3:]
+        return f"{base}/{quote}"
+
+    return pair
