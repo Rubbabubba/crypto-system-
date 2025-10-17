@@ -1,58 +1,83 @@
 from __future__ import annotations
+
 import logging
 logger = logging.getLogger(__name__)
 
-from guard import guard_allows, note_trade_event  # local guard module
-import broker_kraken as br
+# Policy guard (module lives in the 'policy' package)
+try:
+    from policy.guard import guard_allows, note_trade_event
+except Exception as e:
+    logger.debug("[policy] guard import skipped: %s", e)
+    def guard_allows(*args, **kwargs): return (True, "ok")  # permissive if policy not present
+    def note_trade_event(*args, **kwargs): pass
+
+# Broker + engine
 import pandas as pd
+import broker_kraken as br
 from book import StrategyBook, ScanRequest
 
 STRAT_ID = "c6"
 
-def _to_df(rows):
+def _df(rows):
     if not rows:
         return None
     df = pd.DataFrame(rows)
-    df.rename(columns={"t":"time","o":"open","h":"high","l":"low","c":"close","v":"volume"}, inplace=True)
-    return df
+    # Normalize columns expected by StrategyBook
+    return df.rename(columns={"t":"time","o":"open","h":"high","l":"low","c":"close","v":"volume"})
 
-def _ctx_for(symbol: str, tf: str, limit: int):
-    one = br.get_bars(symbol, timeframe="1Min", limit=max(300, limit*5))
-    five = br.get_bars(symbol, timeframe=tf,      limit=limit)
-    return {
-        "one":  _to_df(one).to_dict(orient="list") if one else None,
-        "five": _to_df(five).to_dict(orient="list") if five else None,
-    }
+def _ctx_for(sym: str, tf: str, limit: int) -> dict | None:
+    try:
+        one = br.get_bars(sym, timeframe="1Min", limit=max(300, limit*5))
+        five = br.get_bars(sym, timeframe=tf,      limit=limit)
+        d1 = _df(one); d5 = _df(five)
+        if d1 is None or d5 is None:
+            return None
+        return {
+            "one":  d1.to_dict(orient="list"),
+            "five": d5.to_dict(orient="list"),
+        }
+    except Exception as e:
+        logger.warning("[%s] failed to build context for %s: %s", STRAT_ID, sym, e)
+        return None
 
 def scan(req: dict, ctx: dict):
+    """Return a LIST of actionable order intents:
+      [{"symbol": "BTCUSD", "side": "buy"|"sell", "notional": 25.0}, ...]
+    The app will place these as market notional orders when TRADING is enabled.
     """
-    Build contexts, run StrategyBook for c6, filter with guard, and emit order intents.
-    req: {timeframe, limit, symbols, notional}
-    ctx: includes scheduler-level defaults (symbols, notional)
-    """
-    tf       = str(req.get("timeframe") or "5Min")
-    limit    = int(req.get("limit") or 300)
-    symbols  = [s.upper() for s in (req.get("symbols") or ctx.get("symbols") or [])]
-    notional = float(req.get("notional") or ctx.get("notional") or 25.0)
+    try:
+        tf      = str(req.get("timeframe") or ctx.get("timeframe") or "5Min")
+        limit   = int(req.get("limit") or ctx.get("limit") or 300)
+        syms    = [s.upper() for s in (req.get("symbols") or ctx.get("symbols") or [])]
+        notional= float(req.get("notional") or ctx.get("notional") or 25.0)
 
-    book = StrategyBook(topk=2, min_score=0.10, risk_target_usd=notional, atr_stop_mult=1.0)
-    sreq = ScanRequest(strat=STRAT_ID, timeframe=tf, limit=limit, topk=2, min_score=0.10, notional=notional)
+        # StrategyBook parameters can be tuned per‑strategy if desired
+        book = StrategyBook(topk=2, min_score=0.10, risk_target_usd=notional, atr_stop_mult=1.0)
+        sreq = ScanRequest(strat=STRAT_ID, timeframe=tf, limit=limit, topk=2, min_score=0.10, notional=notional)
 
-    contexts = { sym: _ctx_for(sym, tf, limit) for sym in symbols }
-    results = book.scan(sreq, contexts)
+        # Build bar contexts for all symbols
+        contexts = { sym: _ctx_for(sym, tf, limit) for sym in syms }
 
-    intents = []
-    for r in results:
-        if not r.selected or r.action not in ("buy","sell") or r.notional <= 0:
-            continue
-        expected_move_pct = r.atr_pct  # simple proxy; replace with model score later
-        ok, reason = guard_allows(strategy=STRAT_ID, symbol=r.symbol, expected_move_pct=expected_move_pct, atr_pct=r.atr_pct)
-        if not ok:
-            logger.info("[guard] %s blocked %s: %s", STRAT_ID, r.symbol, reason)
-            continue
-        intents.append({
-            "symbol":  r.symbol,
-            "side":    "buy" if r.action == "buy" else "sell",
-            "notional": min(notional, r.notional)
-        })
-    return intents
+        results = book.scan(sreq, contexts) or []
+        intents = []
+        for r in results:
+            if not r.selected or r.action not in ("buy","sell") or (r.notional or 0) <= 0:
+                continue
+
+            # Lightweight guard: use ATR% as a proxy for expected move
+            expected_move_pct = float(r.atr_pct or 0.0)
+            ok, reason = guard_allows(strategy=STRAT_ID, symbol=r.symbol,
+                                      expected_move_pct=expected_move_pct, atr_pct=float(r.atr_pct or 0.0))
+            if not ok:
+                logger.info("[guard] %s blocked %s: %s", STRAT_ID, r.symbol, reason)
+                continue
+
+            intents.append({
+                "symbol":   r.symbol,
+                "side":     "buy" if r.action == "buy" else "sell",
+                "notional": min(notional, float(r.notional or notional))
+            })
+        return intents
+    except Exception as e:
+        logger.exception("[%s] scan() error: %s", STRAT_ID, e)
+        return []

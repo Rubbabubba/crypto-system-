@@ -27,20 +27,17 @@ class UniverseBuilder:
                 rows_ok.append(s)
         self.symbols = rows_ok[: self.cfg.max_symbols]
 
-
-# ---- added helper for app.py ----
-from __future__ import annotations
+# --- Simple env‑driven universe loader used by app.py
 import os
-
-def load_universe_from_env(default=None):
-    """
-    Read SYMBOLS env var like 'BTCUSD,ETHUSD,SOLUSD' and return list.
-    Falls back to default list if unset/empty.
-    """
-    if default is None:
-        default = ["BTCUSD","ETHUSD","SOLUSD","DOGEUSD","XRPUSD","AVAXUSD","LINKUSD","BCHUSD","LTCUSD"]
-    raw = os.getenv("SYMBOLS", "").strip()
+def load_universe_from_env(defaults: list[str] | None = None) -> list[str]:
+    """Reads SYMBOLS env var like 'BTCUSD,ETHUSD,SOLUSD'.
+    Falls back to `defaults` (if provided) or an empty list."""
+    raw = os.getenv("SYMBOLS","{}").strip()
     if not raw:
-        return default
-    syms = [s.strip().upper() for s in raw.replace(";",",").split(",") if s.strip()]
-    return syms or default
+        return list(defaults or [])
+    out = [s.strip().upper() for s in raw.split(",") if s.strip()]
+    seen = set(); uniq = []
+    for s in out:
+        if s not in seen:
+            uniq.append(s); seen.add(s)
+    return uniq
