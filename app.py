@@ -1142,3 +1142,14 @@ if __name__ == "__main__":
         port, __version__, ("kraken" if USING_KRAKEN else "alpaca"), TRADING_ENABLED
     )
     uvicorn.run("app:app", host="0.0.0.0", port=port, reload=False, access_log=True)
+
+
+@app.get("/price/{base}/{quote}")
+def price_slash(base: str, quote: str):
+    try:
+        symbol = f"{base}{quote}".upper().replace("USDT","USD")
+        p = br.last_price(symbol)
+        return {"ok": True, "symbol": symbol, "price": float(p)}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
