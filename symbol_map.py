@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-# Basic map; extend as needed
+# UI -> Kraken pair map (extend as needed)
 KRAKEN_PAIR_MAP = {
     "BTC/USD": "XBTUSD",
     "ETH/USD": "ETHUSD",
@@ -14,51 +14,55 @@ KRAKEN_PAIR_MAP = {
 
 def to_kraken(pair: str) -> str:
     """
-    Convert UI 'BASE/QUOTE' or compact 'BTCUSD' into Kraken's pair symbol.
+    Convert UI pair to Kraken pair. Accepts 'BTC/USD' or 'BTCUSD' and returns the Kraken pair code.
     """
-    if not pair:
-        return pair
-    p = pair.replace(" ", "").replace(":", "/").upper()
-    if "/" not in p and len(p) >= 6:
-        # compact like BTCUSD
-        return p.replace("BTC", "XBT")
-    ui = p.replace("BTC", "XBT")
-    return KRAKEN_PAIR_MAP.get(ui.title().replace("/", "/"), ui.replace("/", ""))
+    s = str(pair or "").upper().replace(" ", "")
+    if "/" not in s and len(s) >= 6:
+        # inject slash before USD/USDT if missing, e.g., BTCUSD -> BTC/USD
+        if s.endswith("USD"):
+            s = s[:-3] + "/" + s[-3:]
+        elif s.endswith("USDT"):
+            s = s[:-4] + "/" + s[-4:]
+    return KRAKEN_PAIR_MAP.get(s, s.replace("/", ""))  # default: strip slash
 
 def from_kraken(pair: str) -> str:
     """
-    Convert Kraken pair strings (XBTUSD, ETHUSD, XXBTZUSD) to UI 'BASE/QUOTE' (BTC/USD).
+    Convert Kraken pair back to a UI symbol (best-effort).
     """
-    if not pair:
-        return pair
-    p = str(pair).strip().upper().replace(":", "").replace("/", "")
-    inv = {v.upper(): k.upper() for k, v in KRAKEN_PAIR_MAP.items()}
-    if p in inv:
-        return inv[p]
-    # Kraken legacy prefixes (X for base, Z for quote)
-    p = p.replace("XXBT", "XBT")
-    p = p.replace("XETH", "ETH").replace("ZUSD", "USD").replace("ZEUR", "EUR").replace("ZUSDT", "USDT")
-    p = p.replace("XBT", "BTC")
-    # Try 4-letter quote first
-    for q in ("USDT", "USDC", "DAI", "BUSD"):
-        if p.endswith(q):
-            base = p[:-len(q)]
-            return f"{base}/{q}"
-    # Fallback to 3-letter split
-    if len(p) >= 6:
-        return f"{p[:-3]}/{p[-3:]}"
-    return pair
+    p = str(pair or "").upper()
+    rev = {v: k for k, v in KRAKEN_PAIR_MAP.items()}
+    return rev.get(p, p)
 
 def tf_to_kraken(tf: str) -> str:
     """
-    Map common timeframe strings to Kraken API codes.
+    Map common timeframe strings to Kraken API 'interval' numbers (as strings).
+    Accepts: '1Min','5Min','15Min','1m','5m','15m','60','1h','4h','1d','1440'.
     """
+    s = str(tf or "").strip()
+    s = s.replace("Minute", "Min")
+    s_low = s.lower()
+    if s_low.endswith("min"):
+        try:
+            n = int(s_low[:-3])
+            s_low = f"{n}m"
+        except Exception:
+            pass
     m = {
         "1m": "1",
         "5m": "5",
         "15m": "15",
+        "30m": "30",
+        "45m": "45",
         "1h": "60",
+        "2h": "120",
         "4h": "240",
         "1d": "1440",
+        "7d": "10080",
     }
-    return m.get(str(tf).lower(), str(tf))
+    if s_low in m:
+        return m[s_low]
+    try:
+        int(s_low)
+        return s_low
+    except Exception:
+        return s

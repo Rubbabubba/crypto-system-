@@ -2,7 +2,6 @@ from __future__ import annotations
 import logging
 logger = logging.getLogger(__name__)
 
-# Policy guard (policy/guard.py)
 try:
     from policy.guard import guard_allows, note_trade_event
 except Exception as e:
@@ -16,34 +15,24 @@ from book import StrategyBook, ScanRequest
 
 STRAT_ID = "c3"
 
-_TF_MAP = {
-    "1min": "1m", "1m": "1m", "1": "1",
-    "5min": "5m", "5m": "5m", "5": "5",
-    "15min": "15m", "15m": "15m", "15": "15",
-    "1h": "1h", "60": "60",
-    "4h": "4h", "240": "240",
-    "1d": "1d", "1440": "1440",
-}
-def _norm_tf(tf: str) -> str:
-    tf = str(tf or "").strip()
-    # Common FastAPI/env styles -> compact styles
-    tf = tf.replace("Minute","Min").replace("min","Min")
-    if tf.lower().endswith("min"):
-        # e.g., "5Min" -> "5m"
-        try:
-            n = int(tf[:-3])
-            return f"{n}m"
-        except Exception:
-            pass
-    return _TF_MAP.get(tf.lower(), tf.lower())
-
 def _df(rows):
     if not rows:
         return None
     df = pd.DataFrame(rows)
     return df.rename(columns={"t":"time","o":"open","h":"high","l":"low","c":"close","v":"volume"})
 
-def _ctx_for(sym: str, tf: str, limit: int) -> dict | None:
+def _norm_tf(tf: str) -> str:
+    s = str(tf or "").strip().replace("Minute","Min")
+    if s.lower().endswith("min"):
+        try:
+            n = int(s[:-3])
+            return f"{n}m"
+        except Exception:
+            pass
+    table = {"1min":"1m","1m":"1m","5min":"5m","5m":"5m","15min":"15m","15m":"15m","30min":"30m","30m":"30m","1h":"1h","4h":"4h","1d":"1d"}
+    return table.get(s.lower(), s.lower())
+
+def _ctx_for(sym: str, tf: str, limit: int):
     try:
         tf_norm = _norm_tf(tf) or "5m"
         one = br.get_bars(sym, timeframe="1m", limit=max(300, limit*5))
