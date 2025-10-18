@@ -1,71 +1,8 @@
 {
-  "c1": [
-    "ADAUSD",
-    "XRPUSD",
-    "DOGEUSD",
-    "LTCUSD",
-    "BTCUSD",
-    "ETHUSD",
-    "SOLUSD",
-    "AVAXUSD",
-    "LINKUSD",
-    "BCHUSD"
-  ],
-  "c2": [
-    "BTCUSD",
-    "ETHUSD",
-    "SOLUSD",
-    "DOGEUSD",
-    "XRPUSD",
-    "AVAXUSD",
-    "LINKUSD",
-    "BCHUSD",
-    "LTCUSD"
-  ],
-  "c3": [
-    "BTCUSD",
-    "ETHUSD",
-    "SOLUSD",
-    "DOGEUSD",
-    "XRPUSD",
-    "AVAXUSD",
-    "LINKUSD",
-    "BCHUSD",
-    "LTCUSD"
-  ],
-  "c4": [
-    "SOLUSD",
-    "ADAUSD",
-    "BTCUSD",
-    "ETHUSD",
-    "DOGEUSD",
-    "XRPUSD",
-    "AVAXUSD",
-    "LINKUSD",
-    "BCHUSD",
-    "LTCUSD"
-  ],
-  "c5": [
-    "LTCUSD",
-    "BCHUSD",
-    "BTCUSD",
-    "ETHUSD",
-    "SOLUSD",
-    "DOGEUSD",
-    "XRPUSD",
-    "AVAXUSD",
-    "LINKUSD"
-  ],
-  "c6": [
-    "ONE_EXPERIMENTAL_ALT",
-    "BTCUSD",
-    "ETHUSD",
-    "SOLUSD",
-    "DOGEUSD",
-    "XRPUSD",
-    "AVAXUSD",
-    "LINKUSD",
-    "BCHUSD",
-    "LTCUSD"
-  ]
+  "c1": ["BTC/USD","ETH/USD","SOL/USD","LINK/USD"],
+  "c2": ["BTC/USD","ETH/USD","SOL/USD","LINK/USD"],
+  "c3": ["BTC/USD","ETH/USD","SOL/USD","LINK/USD"],
+  "c4": ["BTC/USD","ETH/USD","SOL/USD","LINK/USD"],
+  "c5": ["BTC/USD","ETH/USD","SOL/USD","LINK/USD"],
+  "c6": ["BTC/USD","ETH/USD","SOL/USD","LINK/USD"]
 }
