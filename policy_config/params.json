@@ -1,0 +1,8 @@
+{
+  "c1": { "ema_n": 20, "vwap_pull": 0.002, "min_vol": 0 },
+  "c2": { "ema_n": 50, "exit_k": 0.998, "min_atr": 50 },
+  "c3": { "ch_n": 55, "break_k": 1.0008, "fail_k": 0.997, "min_atr": 50 },
+  "c4": { "ema_fast": 12, "ema_slow": 26, "sig": 9, "atr_n": 14, "atr_mult": 1.2, "min_vol": 0 },
+  "c5": { "lookback": 20, "band_k": 1.001, "exit_k": 0.999, "min_vol": 0 },
+  "c6": { "atr_n": 14, "atr_mult": 1.2, "ema_n": 20, "exit_k": 0.997, "min_vol": 0 }
+}
