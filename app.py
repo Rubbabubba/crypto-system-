@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+from __future__ import annotations
 from pathlib import Path
+
 """
 Crypto System – FastAPI service (Render/Kraken)
 Build: v2.0.0
@@ -34,8 +36,6 @@ Journal & PnL
 - GET  /pnl/symbols          -> per-symbol P&L
 - POST /pnl/reset            -> clear journal (dangerous; use carefully)
 """
-
-from __future__ import annotations
 
 __version__ = "2.0.0"
 
@@ -1143,14 +1143,3 @@ if __name__ == "__main__":
         port, __version__, ("kraken" if USING_KRAKEN else "alpaca"), TRADING_ENABLED
     )
     uvicorn.run("app:app", host="0.0.0.0", port=port, reload=False, access_log=True)
-
-
-@app.get("/price/{base}/{quote}")
-def price_slash(base: str, quote: str):
-    try:
-        symbol = f"{base}{quote}".upper().replace("USDT","USD")
-        p = br.last_price(symbol)
-        return {"ok": True, "symbol": symbol, "price": float(p)}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
