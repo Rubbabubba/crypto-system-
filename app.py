@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+from pathlib import Path
 """
 Crypto System – FastAPI service (Render/Kraken)
 Build: v2.0.0
@@ -40,8 +41,6 @@ __version__ = "2.0.0"
 
 import asyncio
 import os
-
-POLICY_CFG_DIR = os.getenv("POLICY_CFG_DIR", str(Path(__file__).parent / "policy_config"))
 import sys
 import json
 import logging
@@ -49,7 +48,6 @@ import threading
 import time
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, TypedDict
-from pathlib import Path
 
 import pandas as pd
 from fastapi import FastAPI, HTTPException, Request, Body
@@ -1009,12 +1007,6 @@ def journal_sync():
     return _sync_journal_with_fills(400)
 
 # alias for convenience (you used this)
-# Convenience alias for UIs that mistakenly call GET
-@app.get("/journal/sync")
-async def journal_sync_get():
-    payload = SyncPayload()
-    return await journal_sync(payload)
-
 @app.post("/reconcile/fills")
 def reconcile_fills_alias():
     return _sync_journal_with_fills(400)
@@ -1151,3 +1143,14 @@ if __name__ == "__main__":
         port, __version__, ("kraken" if USING_KRAKEN else "alpaca"), TRADING_ENABLED
     )
     uvicorn.run("app:app", host="0.0.0.0", port=port, reload=False, access_log=True)
+
+
+@app.get("/price/{base}/{quote}")
+def price_slash(base: str, quote: str):
+    try:
+        symbol = f"{base}{quote}".upper().replace("USDT","USD")
+        p = br.last_price(symbol)
+        return {"ok": True, "symbol": symbol, "price": float(p)}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
