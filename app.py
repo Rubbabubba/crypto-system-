@@ -3,73 +3,88 @@ from __future__ import annotations
 
 import os
 import json
-import math
-import time
 from pathlib import Path
-from typing import Dict, List, Tuple, Any
+from datetime import datetime, timezone
+from typing import Dict, List, Tuple, Any, Optional
 
 import requests
 from fastapi import FastAPI, Request
-from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
+from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 
-# --------------------------------------------------------------------------------------
-# Configuration & Policy files (kept under ./policy_config unless POLICY_CFG_DIR is set)
-# --------------------------------------------------------------------------------------
-
 POLICY_CFG_DIR = os.getenv("POLICY_CFG_DIR", str(Path(__file__).parent / "policy_config"))
-WINDOWS_PATH   = Path(POLICY_CFG_DIR) / "windows.json"
-WL_PATH        = Path(POLICY_CFG_DIR) / "whitelist.json"
-BL_PATH        = Path(POLICY_CFG_DIR) / "blacklist.json"
+PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL")
 
-def _load_json(path: Path, default: Any) -> Any:
+def _load_json_file(p: Path) -> Any:
+    if not p.exists():
+        return None
     try:
-        if path.exists():
-            return json.loads(path.read_text(encoding="utf-8"))
-    except Exception as e:
-        print(f"[policy] failed to read {path}: {e}")
-    return default
+        with p.open("r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return None
 
-def _get_config() -> Dict[str, Any]:
-    """
-    Fetch /config from this service to avoid relying on globals.
-    The app already exposes GET /config; we reuse it.
-    """
-    base = os.getenv("PUBLIC_BASE_URL", "http://127.0.0.1:10000")
-    try:
-        r = requests.get(f"{base}/config", timeout=3)
-        r.raise_for_status()
-        return r.json()
-    except Exception as e:
-        print(f"[policy] /config fetch failed: {e}")
-        # last-resort defaults so /policy/eligible still responds
-        return {
-            "SYMBOLS": ["BTC/USD","ETH/USD","SOL/USD","DOGE/USD","XRP/USD","AVAX/USD","LINK/USD","BCH/USD","LTC/USD"],
-            "STRATEGIES": ["c1","c2","c3","c4","c5","c6"]
-        }
+def load_policy(policy_dir: str | Path) -> Dict[str, Any]:
+    d = Path(policy_dir)
+    return {
+        "whitelist": _load_json_file(d / "whitelist.json") or {},
+        "blacklist": _load_json_file(d / "blacklist.json") or {},
+        "windows":   _load_json_file(d / "windows.json") or {},
+    }
 
-def _now_utc():
-    import datetime as _dt
-    return _dt.datetime.utcnow()
+def _now_utc() -> datetime:
+    return datetime.now(timezone.utc)
 
-def _inside_window(win: Dict[str, Any], now) -> bool:
-    # Example window schema: {"days":[1,2,3,4,5], "hours":[14,15,16], "tz":"UTC"}
-    days  = win.get("days")   # 0=Mon .. 6=Sun
-    hours = win.get("hours")
-    if days is not None and (now.weekday() not in days):
-        return False
-    if hours is not None and (now.hour not in hours):
-        return False
+_DOW_MAP = {"Mon":0,"Tue":1,"Wed":2,"Thu":3,"Fri":4,"Sat":5,"Sun":6}
+
+def _in_window(now: datetime, window: Dict[str, Any]) -> bool:
+    if not window:
+        return True
+    if "days" in window:
+        dow = now.weekday()
+        allowed_days = {_DOW_MAP.get(d, -1) for d in window["days"]}
+        if dow not in allowed_days:
+            return False
+    if "hours" in window:
+        if now.hour not in set(window["hours"]):
+            return False
     return True
 
-def _guard_reason(ok: bool, reason: str) -> str:
-    return reason if not ok else "ok"
+def guard_allows(strategy: str, symbol: str, policy: Dict[str, Any], now: Optional[datetime] = None):
+    now = now or _now_utc()
+    wl = policy.get("whitelist") or {}
+    bl = policy.get("blacklist") or {}
+    win = policy.get("windows") or {}
 
-# --------------------------------------------------------------------------------------
-# FastAPI app
-# --------------------------------------------------------------------------------------
+    sym_norm = symbol.replace("-", "/").replace("\\", "/")
 
-app = FastAPI(title="Crypto System", version="1.0.0")
+    bl_syms = set((bl.get("symbols") or []))
+    bl_strats = set((bl.get("strategies") or []))
+    if sym_norm in bl_syms:
+        return False, "blacklist_symbol"
+    if strategy in bl_strats:
+        return False, "blacklist_strategy"
+
+    wl_syms = set((wl.get("symbols") or []))
+    wl_strats = set((wl.get("strategies") or []))
+    if wl and wl_syms and sym_norm not in wl_syms:
+        return False, "not_in_symbol_whitelist"
+    if wl and wl_strats and strategy not in wl_strats:
+        return False, "not_in_strategy_whitelist"
+
+    sym_win = (win.get("symbols") or {}).get(sym_norm) or {}
+    if sym_win and not _in_window(now, sym_win):
+        reason = f"outside_window hour={now.hour:02d} dow={['Mon','Tue','Wed','Thu','Fri','Sat','Sun'][now.weekday()]}"
+        return False, reason
+
+    strat_win = (win.get("strategies") or {}).get(strategy) or {}
+    if strat_win and not _in_window(now, strat_win):
+        reason = f"outside_window hour={now.hour:02d} dow={['Mon','Tue','Wed','Thu','Fri','Sat','Sun'][now.weekday()]}"
+        return False, reason
+
+    return True, ""
+
+app = FastAPI(title="Crypto System")
 
 app.add_middleware(
     CORSMiddleware,
@@ -78,189 +93,178 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# --------------------------------------------------------------------------------------
-# New: /policy/eligible (kept same path)
-# --------------------------------------------------------------------------------------
+def _base_url_from_request(request: Request) -> str:
+    if PUBLIC_BASE_URL:
+        return PUBLIC_BASE_URL.rstrip("/")
+    return str(request.base_url).rstrip("/")
 
-@app.get("/policy/eligible")
-def policy_eligible():
-    cfg = _get_config()
-    symbols: List[str]    = cfg.get("SYMBOLS", [])
-    strategies: List[str] = cfg.get("STRATEGIES", [])
+def get_config(request: Request) -> Dict[str, Any]:
+    base = _base_url_from_request(request)
+    try:
+        r = requests.get(f"{base}/config", timeout=5)
+        r.raise_for_status()
+        return r.json()
+    except Exception:
+        return {}
 
-    windows = _load_json(WINDOWS_PATH, default={})              # { "c1": {"BTC/USD": {days:[],hours:[]}, ...}, ... }
-    whitelist = _load_json(WL_PATH, default={})                 # { "c1": ["BTC/USD", ...], "c2": ["ETH/USD", ...], ... }
-    blacklist = _load_json(BL_PATH, default={})                 # { "BTC/USD": ["c1","c2"], ... } (optional)
+@app.get("/policy/eligible", response_class=JSONResponse)
+def policy_eligible(request: Request):
+    cfg = get_config(request)
+    symbols = cfg.get("SYMBOLS") or cfg.get("symbols") or []
+    strategies = cfg.get("STRATEGIES") or cfg.get("strategies") or []
 
+    policy = load_policy(POLICY_CFG_DIR)
     now = _now_utc()
 
-    eligible: List[Dict[str, Any]] = []
-    blocked:  List[Dict[str, Any]] = []
+    eligible = []
+    blocked = []
 
-    for strat in strategies:
-        wl_for_strat = set(whitelist.get(strat, symbols))  # default allow all symbols if no whitelist provided
-        for sym in symbols:
-            # Check whitelist / blacklist
-            if sym not in wl_for_strat:
-                blocked.append({"strategy": strat, "symbol": sym, "reason": "not_in_strategy_whitelist"})
-                continue
-            if sym in blacklist and strat in set(blacklist.get(sym, [])):
-                blocked.append({"strategy": strat, "symbol": sym, "reason": "strategy_blacklisted"})
-                continue
+    for sym in symbols:
+        for strat in strategies:
+            ok, reason = guard_allows(strat, sym, policy, now=now)
+            if ok:
+                eligible.append({"strategy": strat, "symbol": sym})
+            else:
+                blocked.append({"strategy": strat, "symbol": sym, "reason": reason})
 
-            # Check windows
-            strat_windows = windows.get(strat, {})
-            sym_window = strat_windows.get(sym) or strat_windows.get(sym.replace("/", ""))  # tolerate BTC/USD vs BTCUSD
-            if sym_window:
-                ok = _inside_window(sym_window, now)
-                if not ok:
-                    blocked.append({"strategy": strat, "symbol": sym, "reason": f"outside_window hour={now.hour} dow={['Mon','Tue','Wed','Thu','Fri','Sat','Sun'][now.weekday()]}" })
-                    continue
+    return {"ok": True, "time": now.isoformat(), "eligible": eligible, "blocked": blocked}
 
-            # If we made it here, this pair is tradable now
-            eligible.append({"strategy": strat, "symbol": sym})
-
-    return {"ok": True, "time": now.isoformat() + "Z", "eligible": eligible, "blocked": blocked}
-
-# --------------------------------------------------------------------------------------
-# Dashboard (kept at /dashboard). We remove noisy sections and add "Tradable Now".
-# No changes to other routes.
-# --------------------------------------------------------------------------------------
-
-DASHBOARD_HTML = """\
+DASHBOARD_HTML = """
 <!doctype html>
-<html>
+<html lang='en'>
 <head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Crypto System</title>
+  <meta charset='utf-8'/>
+  <meta name='viewport' content='width=device-width, initial-scale=1'/>
+  <title>Crypto System - Dashboard</title>
   <style>
-    body { font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Arial; margin: 0; color: #111; background:#0b0e11; }
-    header { padding: 16px 20px; background: #0f172a; color: #f8fafc; display:flex; align-items:center; gap:16px; flex-wrap:wrap;}
-    .pill { background:#1e293b; padding:6px 10px; border-radius:999px; font-size:12px; color:#e2e8f0;}
-    main { padding: 18px; max-width: 1200px; margin: 0 auto; }
-    h2 { margin: 18px 0 10px; color:#e2e8f0; }
-    .cards { display:grid; grid-template-columns: repeat(auto-fill, minmax(220px,1fr)); gap:12px; }
-    .card { background:#111827; border:1px solid #1f2937; border-radius:10px; padding:12px; color:#e5e7eb; }
-    .muted { color:#94a3b8; font-size:12px; }
-    table { width:100%; border-collapse: collapse; color:#e5e7eb; background:#111827; border:1px solid #1f2937; border-radius:10px; overflow:hidden; }
-    th, td { text-align:left; padding:8px 10px; border-bottom:1px solid #1f2937; }
-    th { background:#0f172a; color:#cbd5e1; }
-    .ok { color:#22c55e; }
-    .bad { color:#ef4444; }
-    .warn { color:#f59e0b; }
-    .grid { display: grid; grid-template-columns: repeat(auto-fill,minmax(180px,1fr)); gap:10px; }
-    .mini { font-size:12px; }
+    :root { color-scheme: dark; }
+    body { margin:0; font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; background:#0b0f14; color:#d8e1ea; }
+    header { padding: 16px 20px; border-bottom: 1px solid #121a22; background:#0d131a; }
+    h1 { margin:0; font-size: 18px; letter-spacing: .3px; color:#e8f1fa; }
+    main { padding: 18px 20px 80px; display:grid; gap:18px; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); }
+    .card { background:#0f1620; border:1px solid #14202b; border-radius:12px; padding:14px; }
+    .card h2 { margin:0 0 10px 0; font-size:14px; color:#96b2c9; text-transform:uppercase; letter-spacing:.8px;}
+    .grid { display:grid; gap:10px; }
+    .row { display:flex; justify-content:space-between; gap:10px; font-variant-numeric: tabular-nums; }
+    .muted { color:#7f97ab; }
+    .pill { display:inline-block; padding:2px 8px; border-radius:999px; background:#0c1b2a; border:1px solid #1c2c3a; color:#b8d4ee; font-size:12px; margin:2px 6px 2px 0; }
+    .ok { background:#0c2a1a; border-color:#18442c; color:#a5e7c4; }
   </style>
 </head>
 <body>
-  <header>
-    <div><strong>Crypto System</strong></div>
-    <div id="status" class="pill">loading…</div>
-    <div class="pill"><span id="now"></span></div>
-  </header>
-
+  <header><h1>Crypto System</h1></header>
   <main>
-    <section>
-      <h2>PnL (Summary)</h2>
-      <div class="cards" id="pnl-cards">
-        <div class="card"><div class="muted">Realized</div><div id="p_realized">$0</div></div>
-        <div class="card"><div class="muted">Unrealized</div><div id="p_unrealized">$0</div></div>
-        <div class="card"><div class="muted">Fees</div><div id="p_fees">$0</div></div>
-        <div class="card"><div class="muted">Equity</div><div id="p_equity">$0</div></div>
+    <section class='card'>
+      <h2>PNL Summary</h2>
+      <div id='pnl' class='grid'>
+        <div class='row'><span class='muted'>Realized</span><span class='mono' id='p_realized'>…</span></div>
+        <div class='row'><span class='muted'>Unrealized</span><span class='mono' id='p_unrealized'>…</span></div>
+        <div class='row'><span class='muted'>Fees</span><span class='mono' id='p_fees'>…</span></div>
+        <div class='row'><span class='muted'>Equity</span><span class='mono' id='p_equity'>…</span></div>
       </div>
     </section>
 
-    <section>
+    <section class='card'>
       <h2>Tradable Now</h2>
-      <div class="grid" id="tradable"></div>
-      <div class="mini muted" id="tradable-note"></div>
+      <div id='tradable'>
+        <div class='muted'>Loading eligibility…</div>
+      </div>
     </section>
 
-    <section>
+    <section class='card'>
       <h2>Prices</h2>
-      <div class="grid" id="quotes"></div>
+      <div id='prices' class='grid'></div>
     </section>
   </main>
 
 <script>
+const fmt = new Intl.NumberFormat(undefined, {maximumFractionDigits: 2});
 const base = location.origin;
 
-function fmtUSD(n){ try { return n.toLocaleString(undefined,{style:'currency',currency:'USD'}); } catch{ return '$'+n }; }
-function el(tag, cls){ const d=document.createElement(tag); if(cls) d.className=cls; return d; }
-
-async function loadConfig(){
-  const r = await fetch(base+'/config'); return await r.json();
-}
-async function loadPnL(){
-  const r = await fetch(base+'/pnl/summary'); return await r.json();
-}
-async function loadEligible(){
-  const r = await fetch(base+'/policy/eligible'); return await r.json();
-}
-async function loadPrice(sym){
-  const r = await fetch(base+'/price/'+encodeURIComponent(sym)); return await r.json();
-}
-
-async function refresh(){
-  document.getElementById('now').textContent = new Date().toLocaleString();
-  // PnL
+async function loadPNL() {
   try {
-    const pnl = await loadPnL();
-    const t = pnl.total || {realized:0,unrealized:0,fees:0,equity:0};
-    document.getElementById('p_realized').textContent  = fmtUSD(t.realized||0);
-    document.getElementById('p_unrealized').textContent= fmtUSD(t.unrealized||0);
-    document.getElementById('p_fees').textContent      = fmtUSD(t.fees||0);
-    document.getElementById('p_equity').textContent    = fmtUSD(t.equity||0);
-  } catch(e){
-    console.error(e);
-  }
-
-  // Tradable Now
-  const trad = document.getElementById('tradable');
-  trad.innerHTML='';
-  try {
-    const e = await loadEligible();
-    (e.eligible||[]).forEach(row => {
-      const c = el('div','card');
-      c.innerHTML = '<div class="muted">'+row.strategy+'</div><div><strong>'+row.symbol+'</strong></div>';
-      trad.appendChild(c);
-    });
-    document.getElementById('tradable-note').textContent = (e.blocked||[]).length + ' blocked by policy';
+    const r = await fetch(base + "/pnl/summary");
+    const j = await r.json();
+    const t = j.total || {};
+    document.getElementById("p_realized").textContent = fmt.format(t.realized || 0);
+    document.getElementById("p_unrealized").textContent = fmt.format(t.unrealized || 0);
+    document.getElementById("p_fees").textContent = fmt.format(t.fees || 0);
+    document.getElementById("p_equity").textContent = fmt.format(t.equity || 0);
   } catch(e) {
-    console.error(e);
+    document.getElementById("pnl").innerHTML = '<div class="muted">Error loading PnL</div>';
   }
+}
 
-  // Quotes (best-effort)
+async function loadConfig() {
+  const r = await fetch(base + "/config");
+  return await r.json();
+}
+
+async function loadEligible() {
+  try {
+    const r = await fetch(base + "/policy/eligible");
+    const j = await r.json();
+    const wrap = document.getElementById("tradable");
+    const ok = j.eligible || [];
+    const blocked = j.blocked || [];
+
+    if (ok.length === 0) {
+      wrap.innerHTML = '<div class="muted">No (strategy, coin) pairs currently tradable under policy.</div>';
+      return;
+    }
+    const pills = ok.map(x => '<span class="pill ok">' + x.strategy + ' · ' + x.symbol + '</span>').join('');
+    const blockedCount = blocked.length ? '<div class="muted" style="margin-top:8px">Blocked: ' + blocked.length + '</div>' : '';
+    wrap.innerHTML = pills + blockedCount;
+  } catch(e) {
+    document.getElementById("tradable").innerHTML = '<div class="muted">Error loading eligibility</div>';
+  }
+}
+
+async function loadPrices() {
   try {
     const cfg = await loadConfig();
-    const syms = cfg.SYMBOLS||[];
-    const q = document.getElementById('quotes'); q.innerHTML='';
-    for(const s of syms){
+    const syms = cfg.SYMBOLS || cfg.symbols || [];
+    const container = document.getElementById("prices");
+    container.innerHTML = '';
+    for (const s of syms) {
       try {
-        const r = await loadPrice(s);
-        const c = el('div','card');
-        c.innerHTML = '<div class="muted">'+s+'</div><div><strong>'+ (r.price ?? '—') +'</strong></div>';
-        q.appendChild(c);
-      } catch {}
+        const r = await fetch(base + "/price/" + encodeURIComponent(s));
+        const j = await r.json();
+        const p = j.price;
+        const div = document.createElement('div');
+        div.className = 'row';
+        div.innerHTML = '<span>'+ s +'</span><span class="mono">'+ (p !== undefined ? fmt.format(p) : '—') +'</span>';
+        container.appendChild(div);
+      } catch(e) {
+        const div = document.createElement('div');
+        div.className = 'row';
+        div.innerHTML = '<span>'+ s +'</span><span class="mono">—</span>';
+        container.appendChild(div);
+      }
     }
-  } catch(e) {}
+  } catch(e) {
+    document.getElementById("prices").innerHTML = '<div class="muted">Error loading prices</div>';
+  }
 }
 
-setInterval(refresh, 15000);
-refresh();
+loadPNL();
+loadEligible();
+loadPrices();
+
+setInterval(loadPNL, 15000);
+setInterval(loadEligible, 30000);
+setInterval(loadPrices, 45000);
 </script>
 </body>
 </html>
 """
 
 @app.get("/dashboard", response_class=HTMLResponse)
-def dashboard():
-    return HTMLResponse(DASHBOARD_HTML)
+def dashboard(_):
+    return HTMLResponse(content=DASHBOARD_HTML, status_code=200)
 
-# -----------------------------
-# Health
-# -----------------------------
-@app.get("/healthz")
-def healthz():
-    return {"ok": True, "policy_dir": POLICY_CFG_DIR}
+if __name__ == "__main__":
+    import uvicorn
+    port = int(os.getenv("PORT", "10000"))
+    print(f"Launching Uvicorn on 0.0.0.0:{port} (policy dir={POLICY_CFG_DIR})")
+    uvicorn.run("app:app", host="0.0.0.0", port=port, reload=False, access_log=True)
