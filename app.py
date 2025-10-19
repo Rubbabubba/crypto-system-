@@ -1,274 +1,822 @@
-from pathlib import Path
-import json
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Crypto System – FastAPI service (Render/Kraken)
+Build: v2.0.0
+
+Routes
+- GET  /                     -> Dashboard
+- GET  /dashboard            -> alias
+- GET  /health               -> Service health (+ scheduler_running)
+- GET  /diag/broker          -> Active broker diagnostics
+- GET  /version              -> App version
+- GET  /config               -> Defaults, symbols, strategies, params
+- POST /scan/{strategy}      -> Run a scan for c1..c6; optional dry=true
+- GET  /bars/{symbol}        -> Recent bars
+- GET  /price/{symbol}       -> Last price
+- GET  /positions            -> Spot positions summary
+- GET  /orders               -> Open orders
+- GET  /fills                -> Recent fills (via broker)
+- POST /order/market         -> Place market order by notional (USD)
+
+Scheduler
+- GET  /scheduler/start      -> Start loop (requires SCHED_ON=1)
+- GET  /scheduler/stop       -> Stop loop
+- GET  /scheduler/status     -> status + live config (includes dynamic notional if enabled)
+
+Journal & PnL
+- POST /journal/sync         -> sync journal JSONL with Kraken fills by txid
+- POST /reconcile/fills      -> alias of /journal/sync (for convenience)
+- GET  /journal              -> list journal rows
+- GET  /pnl/summary          -> total + per-strategy + per-symbol P&L (realized, unrealized, fees, equity)
+- GET  /pnl/strategies       -> per-strategy P&L
+- GET  /pnl/symbols          -> per-symbol P&L
+- POST /pnl/reset            -> clear journal (dangerous; use carefully)
+"""
+
+from __future__ import annotations
+
+__version__ = "2.0.0"
+
+import asyncio
 import os
-from typing import Dict, List, Optional, Tuple
-from datetime import datetime, time
-import zoneinfo
+import sys
+import json
+import logging
+import threading
+import time
+from datetime import datetime, timezone
+from typing import Any, Dict, List, Optional, TypedDict
 
-import requests
-from fastapi import FastAPI, Request
-from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
+import pandas as pd
+from fastapi import FastAPI, HTTPException, Request, Body
+from fastapi.responses import JSONResponse, HTMLResponse
 
-app = FastAPI(title="Crypto System (Policy Dashboard)")  # keep name 'app' for uvicorn app:app
+# -----------------------------------------------------------------------------
+# Logging
+# -----------------------------------------------------------------------------
+logging.basicConfig(
+    level=os.getenv("LOG_LEVEL", "INFO"),
+    format="%(asctime)s | %(levelname)s | %(message)s",
+    stream=sys.stdout,
+)
+log = logging.getLogger("app")
 
-# --- Configuration of policy directory ---
-POLICY_CFG_DIR = os.getenv("POLICY_CFG_DIR")
-if not POLICY_CFG_DIR:
-    POLICY_CFG_DIR = str((Path(__file__).parent / "policy_config").resolve())
-POLICY_DIR_PATH = Path(POLICY_CFG_DIR)
+# -----------------------------------------------------------------------------
+# Broker selection (Kraken by default; Alpaca legacy fallback)
+# -----------------------------------------------------------------------------
+BROKER = os.getenv("BROKER", "kraken").lower()
+USING_KRAKEN = BROKER == "kraken" or (os.getenv("KRAKEN_KEY") and os.getenv("KRAKEN_SECRET"))
 
-# --- Helpers to call our own API base ---
-def base_url_from_request(request: Request) -> str:
-    env_url = os.getenv("PUBLIC_BASE_URL")
-    if env_url:
-        return env_url.rstrip("/")
-    return str(request.base_url).rstrip("/")
+if USING_KRAKEN:
+    import broker_kraken as br  # Kraken adapter
+    ACTIVE_BROKER_MODULE = "broker_kraken"
+else:
+    import broker as br  # Alpaca adapter (legacy)
+    ACTIVE_BROKER_MODULE = "broker"
 
-def get_json(url: str, timeout: float = 10.0) -> dict:
-    r = requests.get(url, timeout=timeout)
-    r.raise_for_status()
-    return r.json()
+# Live trading enablement – broker-specific flag
+TRADING_ENABLED_BASE = os.getenv("TRADING_ENABLED", "1") in ("1", "true", "True")
+if USING_KRAKEN:
+    TRADING_ENABLED = TRADING_ENABLED_BASE and (os.getenv("KRAKEN_TRADING", "0") in ("1", "true", "True"))
+else:
+    TRADING_ENABLED = TRADING_ENABLED_BASE and (os.getenv("ALPACA_TRADING", "0") in ("1", "true", "True"))
 
-# --- Policy loading ---
-def _safe_load_json(path: Path) -> dict:
+# -----------------------------------------------------------------------------
+# Globals & defaults
+# -----------------------------------------------------------------------------
+APP_VERSION = os.getenv("APP_VERSION", __version__)
+SERVICE_NAME = os.getenv("SERVICE_NAME", "Crypto System")
+
+DEFAULT_TIMEFRAME = os.getenv("DEFAULT_TIMEFRAME", "5Min")
+DEFAULT_LIMIT = int(os.getenv("DEFAULT_LIMIT", "300"))
+DEFAULT_NOTIONAL = float(os.getenv("DEFAULT_NOTIONAL", os.getenv("ORDER_NOTIONAL", "25")))
+
+# ---- Risk-based dynamic sizing (safe defaults) ----
+RISK_PCT = float(os.getenv("RISK_PCT", "0.05"))          # 5% of equity
+NOTIONAL_MIN = float(os.getenv("NOTIONAL_MIN", "25"))    # clamp floor
+NOTIONAL_MAX = float(os.getenv("NOTIONAL_MAX", "250"))   # clamp cap
+SCHED_AUTO_SIZE = os.getenv("SCHED_AUTO_SIZE", "1").lower() in ("1","true","yes","y")
+
+# Symbol universe
+try:
+    from universe import load_universe_from_env
+    _CURRENT_SYMBOLS = load_universe_from_env()
+except Exception:
+    _CURRENT_SYMBOLS = ["BTCUSD", "ETHUSD", "SOLUSD", "DOGEUSD", "XRPUSD", "AVAXUSD", "LINKUSD", "BCHUSD", "LTCUSD"]
+
+# Strategy defaults (optimized params retained)
+DEFAULT_STRAT_PARAMS: Dict[str, Dict[str, Any]] = {
+    "c1": {"ema_n": 20, "vwap_pull": 0.0020, "min_vol": 0.0},
+    "c2": {"ema_n": 50, "exit_k": 0.997, "min_atr": 0.0},
+    "c3": {"ch_n": 55, "break_k": 1.0005, "fail_k": 0.997, "min_atr": 0.0},
+    "c4": {"ema_fast": 12, "ema_slow": 26, "sig": 9, "atr_n": 14, "atr_mult": 1.2, "min_vol": 0.0},
+    "c5": {"lookback": 20, "band_k": 1.0010, "exit_k": 0.9990, "min_vol": 0.0},
+    "c6": {"atr_n": 14, "atr_mult": 1.2, "ema_n": 20, "exit_k": 0.997, "min_vol": 0.0},
+}
+ACTIVE_STRATEGIES = list(DEFAULT_STRAT_PARAMS.keys())
+_DISABLED_STRATS: set[str] = set()
+
+# -----------------------------------------------------------------------------
+# Import strategies and build dispatcher
+# -----------------------------------------------------------------------------
+import c1, c2, c3, c4, c5, c6
+
+STRAT_DISPATCH = {
+    "c1": c1.scan,
+    "c2": c2.scan,
+    "c3": c3.scan,
+    "c4": c4.scan,
+    "c5": c5.scan,
+    "c6": c6.scan,
+}
+
+# -----------------------------------------------------------------------------
+# Helpers
+# -----------------------------------------------------------------------------
+def utc_now() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+def _merge_raw(strat: str, raw_in: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    base = dict(DEFAULT_STRAT_PARAMS.get(strat, {}))
+    if raw_in:
+        base.update({k: raw_in[k] for k in raw_in})
+    return base
+
+def _to_list(x: Any) -> List[str]:
+    if x is None: return []
+    if isinstance(x, list): return [str(s).upper() for s in x]
+    if isinstance(x, str): return [s.strip().upper() for s in x.split(",") if s.strip()]
+    return [str(x).upper()]
+
+def _normalize_asset_code(asset: str) -> str:
+    if not asset:
+        return ""
+    base = asset.split(".")[0].upper()
+    if base in ("XBT", "XXBT"):
+        return "BTC"
+    if base.startswith("X") and len(base) in (3,4):
+        return base[1:]
+    return base
+
+def _account_equity_usd() -> float:
     try:
-        if path.exists():
-            return json.loads(path.read_text())
+        pos = br.positions()  # [{'asset': 'USD', 'qty': ...}, {'asset':'SOL.F','qty':...}, ...]
     except Exception:
-        pass
-    return {}
+        return 0.0
+    base_to_sym = {s[:-3].upper(): s for s in _CURRENT_SYMBOLS if s.upper().endswith("USD") and len(s) > 3}
+    cash_usd = 0.0
+    equity = 0.0
+    for p in (pos or []):
+        asset = str(p.get("asset") or "").upper()
+        qty = float(p.get("qty") or 0.0)
+        if asset == "USD":
+            cash_usd += qty
+            continue
+        base = _normalize_asset_code(asset)
+        sym = base_to_sym.get(base)
+        if not sym or qty == 0.0:
+            continue
+        try:
+            px = float(br.last_price(sym))
+        except Exception:
+            px = 0.0
+        equity += qty * px
+    return cash_usd + equity
 
-def load_policy(dir_path: Path) -> Tuple[dict, dict, dict]:
-    whitelist = _safe_load_json(dir_path / "whitelist.json")
-    windows = _safe_load_json(dir_path / "windows.json")
-    blacklist = _safe_load_json(dir_path / "blacklist.json")
-    return whitelist or {}, windows or {}, blacklist or {}
+def _sized_notional_from_equity(equity_usd: float) -> float:
+    raw = float(equity_usd) * float(RISK_PCT)
+    sized = max(NOTIONAL_MIN, min(NOTIONAL_MAX, raw))
+    return round(sized, 2)
 
-# --- Guard checks ---
-DOW_NAMES = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+# -----------------------------------------------------------------------------
+# FastAPI app
+# -----------------------------------------------------------------------------
+app = FastAPI(title=SERVICE_NAME, version=APP_VERSION)
 
-def _in_whitelist(whitelist: dict, strategy: str, symbol: str) -> bool:
-    if not whitelist:
-        return True
-    if strategy in whitelist and isinstance(whitelist[strategy], list):
-        return symbol in whitelist[strategy]
-    syms = set(whitelist.get("symbols", []) if isinstance(whitelist.get("symbols"), list) else [])
-    strats = set(whitelist.get("strategies", []) if isinstance(whitelist.get("strategies"), list) else [])
-    if syms and strats:
-        return symbol in syms and strategy in strats
-    if syms and not strats:
-        return symbol in syms
-    if strats and not syms:
-        return strategy in strats
-    return True
+# -----------------------------------------------------------------------------
+# Core info routes
+# -----------------------------------------------------------------------------
+@app.get("/health")
+def health():
+    return {
+        "ok": True,
+        "service": SERVICE_NAME,
+        "version": APP_VERSION,
+        "broker": ("kraken" if USING_KRAKEN else "alpaca"),
+        "trading": TRADING_ENABLED,
+        "scheduler_running": _RUNNING,
+        "time": utc_now(),
+        "symbols": _CURRENT_SYMBOLS,
+        "strategies": ACTIVE_STRATEGIES,
+    }
 
-def _in_blacklist(blacklist: dict, strategy: str, symbol: str) -> bool:
-    if not blacklist:
-        return False
-    if strategy in blacklist and isinstance(blacklist[strategy], list):
-        return symbol in blacklist[strategy]
-    syms = set(blacklist.get("symbols", []) if isinstance(blacklist.get("symbols"), list) else [])
-    strats = set(blacklist.get("strategies", []) if isinstance(blacklist.get("strategies"), list) else [])
-    if symbol in syms:
-        return True
-    if strategy in strats:
-        return True
-    return False
+@app.get("/diag/broker")
+def diag_broker():
+    return {"broker_module": ACTIVE_BROKER_MODULE, "using_kraken": USING_KRAKEN, "trading": TRADING_ENABLED}
 
-def _within_window(windows: dict, strategy: str, symbol: str, now_utc: datetime) -> bool:
-    if not windows:
-        return True
-    entry = None
-    if strategy in windows and isinstance(windows[strategy], dict):
-        entry = windows[strategy]
-    elif "default" in windows and isinstance(windows["default"], dict):
-        entry = windows["default"]
+@app.get("/version")
+def version():
+    return {"version": APP_VERSION, "time": utc_now()}
+
+@app.get("/config")
+def config():
+    return {
+        "DEFAULT_TIMEFRAME": DEFAULT_TIMEFRAME,
+        "DEFAULT_LIMIT": DEFAULT_LIMIT,
+        "DEFAULT_NOTIONAL": DEFAULT_NOTIONAL,
+        "SIZING": {
+            "RISK_PCT": RISK_PCT,
+            "NOTIONAL_MIN": NOTIONAL_MIN,
+            "NOTIONAL_MAX": NOTIONAL_MAX,
+            "SCHED_AUTO_SIZE": SCHED_AUTO_SIZE,
+        },
+        "SYMBOLS": _CURRENT_SYMBOLS,
+        "STRATEGIES": ACTIVE_STRATEGIES,
+        "PARAMS": DEFAULT_STRAT_PARAMS,
+    }
+
+# -----------------------------------------------------------------------------
+# Scan bridge — dispatch to strategy module
+# -----------------------------------------------------------------------------
+class ScanRequestModel(TypedDict, total=False):
+    symbols: List[str]
+    timeframe: str
+    limit: int
+    notional: float
+    raw: Dict[str, Any]
+    dry: bool
+
+async def _scan_bridge(strat: str, req: Dict[str, Any], *, dry: Optional[bool] = None) -> Dict[str, Any]:
+    strat = (strat or "").lower()
+    fn = STRAT_DISPATCH.get(strat)
+    if not fn:
+        raise HTTPException(status_code=400, detail=f"Unknown strategy '{strat}'")
+
+    is_dry = bool(dry) if dry is not None else (not TRADING_ENABLED)
+
+    timeframe = req.get("timeframe") or DEFAULT_TIMEFRAME
+    limit = int(req.get("limit") or DEFAULT_LIMIT)
+    notional = float(req.get("notional") or DEFAULT_NOTIONAL)
+    symbols = _to_list(req.get("symbols")) or _CURRENT_SYMBOLS
+    raw = _merge_raw(strat, dict(req.get("raw") or {}))
+    ctx = {"timeframe": timeframe, "symbols": symbols, "notional": notional}
+
+    # Strategy returns actionable intents [{"symbol","side",...}]
+    orders = fn({"strategy": strat, "timeframe": timeframe, "limit": limit, "notional": notional, "symbols": symbols, "raw": raw}, ctx) or []
+
+    placed: List[Dict[str, Any]] = []
+    if not is_dry:
+        for o in orders:
+            sym = (o.get("symbol") or symbols[0]).upper()
+            side = (o.get("side") or "buy").lower()
+            notional_o = float(o.get("notional") or notional)
+            try:
+                res = br.market_notional(sym, side, notional_o)
+                placed.append({**o, "symbol": sym, "side": side, "notional": notional_o, "order": res})
+                # journal attribution (txid may be present immediately; fills synced later)
+                try:
+                    _journal_append({
+                        "ts": int(time.time()),
+                        "symbol": sym, "side": side, "notional": notional_o,
+                        "strategy": strat, "txid": res.get("txid"), "descr": res.get("descr"),
+                        "price": None, "vol": None, "fee": None, "cost": None, "filled_ts": None,
+                    })
+                except Exception as je:
+                    log.warning("journal add failed: %s", je)
+            except Exception as e:
+                placed.append({**o, "symbol": sym, "side": side, "notional": notional_o, "error": str(e)})
     else:
-        return True
-    start_s = entry.get("start", "00:00")
-    end_s = entry.get("end", "23:59")
-    tz_name = entry.get("tz", "UTC")
-    days = entry.get("days", DOW_NAMES)
+        for o in orders:
+            sym = (o.get("symbol") or symbols[0]).upper()
+            side = (o.get("side") or "buy").lower()
+            notional_o = float(o.get("notional") or notional)
+            placed.append({**o, "symbol": sym, "side": side, "notional": notional_o, "dry": True})
+
+    return {"ok": True, "orders": orders, "placed": placed, "strategy": strat, "version": APP_VERSION, "time": utc_now()}
+
+@app.post("/scan/{strategy}")
+async def scan(strategy: str, model: Dict[str, Any] = Body(...)):
     try:
-        tz = zoneinfo.ZoneInfo(tz_name)
-    except Exception:
-        tz = zoneinfo.ZoneInfo("UTC")
-    local_now = now_utc.astimezone(tz)
-    dow = DOW_NAMES[local_now.weekday()]
-    if days and dow not in days:
-        return False
+        body = dict(model or {})
+        is_dry = body.get("dry")
+        res = await _scan_bridge(strategy, body, dry=(is_dry in (True, 1, "1", "true", "True")))
+        return res
+    except HTTPException:
+        raise
+    except Exception as e:
+        log.exception("scan error")
+        raise HTTPException(status_code=500, detail=str(e))
+
+# -----------------------------------------------------------------------------
+# Market data & account
+# -----------------------------------------------------------------------------
+@app.get("/bars/{symbol}")
+def bars(symbol: str, timeframe: str = DEFAULT_TIMEFRAME, limit: int = 200):
     try:
-        hh, mm = map(int, start_s.split(":"))
-        s = time(hh, mm)
-        hh2, mm2 = map(int, end_s.split(":"))
-        e = time(hh2, mm2)
-    except Exception:
-        return True
-    if s <= e:
-        return s <= local_now.time() <= e
-    else:
-        return local_now.time() >= s or local_now.time() <= e
+        out = br.get_bars(symbol.upper(), timeframe=timeframe, limit=int(limit))
+        return {"ok": True, "symbol": symbol.upper(), "timeframe": timeframe, "limit": int(limit), "bars": out}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
-def guard_allows(whitelist: dict, windows: dict, blacklist: dict, strategy: str, symbol: str, now_utc: Optional[datetime] = None) -> bool:
-    if now_utc is None:
-        now_utc = datetime.utcnow().replace(tzinfo=zoneinfo.ZoneInfo("UTC"))
-    if _in_blacklist(blacklist, strategy, symbol):
-        return False
-    if not _in_whitelist(whitelist, strategy, symbol):
-        return False
-    if not _within_window(windows, strategy, symbol, now_utc):
-        return False
-    return True
-
-# ---- Routes ----
-
-@app.get("/", response_class=HTMLResponse)
-def index() -> str:
-    return """<html><head><title>Crypto System</title></head>
-<body style="font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial;">
-<h2>Crypto System service</h2>
-<ul>
-  <li><a href="/dashboard">Dashboard</a></li>
-  <li><a href="/policy/eligible">Policy Eligible (JSON)</a></li>
-</ul>
-</body></html>"""
 
 @app.get("/policy/eligible")
-def policy_eligible(request: Request):
-    base = base_url_from_request(request)
-    try:
-        cfg = get_json(f"{base}/config")
-    except Exception as e:
-        return JSONResponse({"ok": False, "error": f"Failed to fetch /config: {e}"}, status_code=500)
-
-    symbols = cfg.get("SYMBOLS") or cfg.get("symbols") or []
-    strategies = cfg.get("STRATEGIES") or cfg.get("strategies") or []
-
-    wl, win, bl = load_policy(POLICY_DIR_PATH)
-    now_utc = datetime.utcnow().replace(tzinfo=zoneinfo.ZoneInfo("UTC"))
-
+def policy_eligible():
+    now = datetime.utcnow()
+    # use configured symbols/strategies already in this module
     eligible = []
-    for sym in symbols:
-        sym_norm = sym.replace("/", "")
-        for strat in strategies:
-            if guard_allows(wl, win, bl, strat, sym_norm, now_utc):
-                eligible.append({"strategy": strat, "symbol": sym})
-
-    return {"ok": True, "count": len(eligible), "eligible": eligible, "time": now_utc.isoformat()}
-
-def _format_money(n: Optional[float]) -> str:
-    if n is None:
-        return "—"
+    blocked  = []
+    for strat in ACTIVE_STRATEGIES:
+        for sym in SYMBOLS:
+            # run light-weight guard: only windows & whitelist; no ATR/expected move checks
+            if guard_allows is None:
+                ok, reason = True, "policy_guard_missing"
+            else:
+                ok, reason = guard_allows(strat, sym, now, expected_move_pct=None, atr_pct=None)
+            (eligible if ok else blocked).append({"strategy": strat, "symbol": sym, "reason": reason})
+    return {"ok": True, "time": now.isoformat(), "eligible": eligible, "blocked": blocked}
+@app.get("/price/{symbol}")
+def price(symbol: str):
     try:
-        return f"${n:,.2f}"
-    except Exception:
-        return str(n)
+        p = br.last_price(symbol.upper())
+        return {"ok": True, "symbol": symbol.upper(), "price": float(p)}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
-@app.get("/dashboard", response_class=HTMLResponse)
-def dashboard(request: Request):
-    base = base_url_from_request(request)
-
-    cfg = {}
+@app.get("/positions")
+def positions():
     try:
-        cfg = get_json(f"{base}/config")
-    except Exception:
-        pass
-    symbols = cfg.get("SYMBOLS") or []
-    strategies = cfg.get("STRATEGIES") or []
+        pos = br.positions()
+        return {"ok": True, "positions": pos}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
-    pnl = {}
+@app.get("/orders")
+def orders():
     try:
-        pnl = get_json(f"{base}/pnl/summary")
-    except Exception:
-        pnl = {"ok": False}
+        out = br.orders()
+        return {"ok": True, "orders": out}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
-    elig = {}
+@app.get("/fills")
+def fills():
     try:
-        elig = get_json(f"{base}/policy/eligible")
-    except Exception:
-        elig = {"ok": False}
+        data = br.trades_history(200)
+        return {"ok": True, **data}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
-    prices_rows = []
-    for s in symbols[:12]:
+@app.post("/order/market")
+async def order_market(request: Request):
+    try:
+        body = await request.json()
+        symbol = (body.get("symbol") or "BTCUSD").upper()
+        side = (body.get("side") or "buy").lower()
+        notional = float(body.get("notional") or DEFAULT_NOTIONAL)
+        if not TRADING_ENABLED:
+            return {"ok": True, "dry": True, "symbol": symbol, "side": side, "notional": notional}
+        res = br.market_notional(symbol, side, notional)
         try:
-            pr = get_json(f"{base}/price/{s}")
-            price = pr.get("price")
-            prices_rows.append(f"<tr><td>{s}</td><td style='text-align:right'>{price:,}</td></tr>")
-        except Exception:
-            prices_rows.append(f"<tr><td>{s}</td><td style='text-align:right'>—</td></tr>")
+            _journal_append({
+                "ts": int(time.time()),
+                "symbol": symbol, "side": side, "notional": notional,
+                "strategy": "manual", "txid": res.get("txid"), "descr": res.get("descr"),
+                "price": None, "vol": None, "fee": None, "cost": None, "filled_ts": None,
+            })
+        except Exception as je:
+            log.warning("journal add (manual) failed: %s", je)
+        return {"ok": True, "order": res}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
-    total = (pnl.get("total") or {}) if isinstance(pnl, dict) else {}
-    realized = _format_money(total.get("realized"))
-    unrealized = _format_money(total.get("unrealized"))
-    fees = _format_money(total.get("fees"))
-    equity = _format_money(total.get("equity"))
-
-    elig_rows = ""
-    if elig.get("ok") and isinstance(elig.get("eligible"), list) and elig["eligible"]:
-        for row in elig["eligible"][:50]:
-            elig_rows += f"<tr><td>{row.get('strategy')}</td><td>{row.get('symbol')}</td></tr>"
-    else:
-        elig_rows = "<tr><td colspan='2' style='opacity:.7'>None right now</td></tr>"
-
-    html = f"""
+# -----------------------------------------------------------------------------
+# Dashboard HTML (with small P&L card)
+# -----------------------------------------------------------------------------
+DASHBOARD_HTML = """
 <!doctype html>
 <html>
 <head>
+  <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Dashboard</title>
+  <title>Crypto System Dashboard</title>
   <style>
-    body {{ font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial; margin: 16px; }}
-    .grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 12px; }}
-    .card {{ border: 1px solid #e4e4e7; border-radius: 10px; padding: 12px; box-shadow: 0 1px 2px rgba(0,0,0,.04); }}
-    h2 {{ margin: 0 0 8px; font-size: 18px; }}
-    table {{ width: 100%; border-collapse: collapse; }}
-    td, th {{ padding: 6px; border-bottom: 1px solid #f0f0f2; text-align: left; }}
-    .muted {{ color: #666; font-size: 12px; }}
+    body{background:#0b0f14;color:#e7edf3;font-family:system-ui,Segoe UI,Roboto,Helvetica,Arial,sans-serif;margin:0;padding:24px}
+    h1,h2{margin:0 0 12px 0;font-weight:600}
+    .card{background:#121a22;border:1px solid #233241;border-radius:10px;padding:16px;margin:12px 0}
+    .muted{color:#90a4b8}
+    table{width:100%;border-collapse:collapse}
+    th,td{padding:8px 10px;border-bottom:1px solid #233241;text-align:left}
+    th{color:#a7c0d8;font-weight:600}
+    code{background:#0e141a;border:1px solid #233241;border-radius:6px;padding:2px 6px}
+    .pill{display:inline-block;padding:4px 8px;border-radius:16px;border:1px solid #2a3b4c;background:#0f151c}
+    .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:12px}
   </style>
 </head>
 <body>
-  <h1 style="font-size:20px;margin:4px 0 12px;">Crypto System</h1>
-  <div class="grid">
-    <div class="card">
-      <h2>P&L</h2>
-      <table>
-        <tr><td>Realized</td><td style="text-align:right">{realized}</td></tr>
-        <tr><td>Unrealized</td><td style="text-align:right">{unrealized}</td></tr>
-        <tr><td>Fees</td><td style="text-align:right">{fees}</td></tr>
-        <tr><td>Equity</td><td style="text-align:right">{equity}</td></tr>
-      </table>
-      <div class="muted">From <code>/pnl/summary</code></div>
+  <h1>Crypto System</h1>
+  <div class="card grid">
+    <div>
+      <div class="muted">Symbols</div>
+      <div id="cfg_symbols" class="pill"></div>
     </div>
-
-    <div class="card">
-      <h2>Tradable Now</h2>
-      <table>
-        <tr><th>Strategy</th><th>Symbol</th></tr>
-        {elig_rows}
-      </table>
-      <div class="muted">From <code>/policy/eligible</code> using rules in <code>{POLICY_DIR_PATH}</code></div>
+    <div>
+      <div class="muted">Strategies</div>
+      <div id="cfg_strats" class="pill"></div>
     </div>
-
-    <div class="card">
-      <h2>Prices</h2>
-      <table>
-        <tr><th>Symbol</th><th style="text-align:right">Last</th></tr>
-        {"".join(prices_rows)}
-      </table>
-      <div class="muted">Live pulls from <code>/price/&lt;symbol&gt;</code></div>
+    <div>
+      <div class="muted">Defaults</div>
+      <div id="cfg_defaults" class="pill"></div>
     </div>
   </div>
+
+  <div class="card">
+    <h2>What can trade now</h2>
+    <div class="muted" id="elig_summary">—</div>
+    <table id="elig_table">
+      <thead><tr><th>Strategy</th><th>Symbol</th><th>Status</th><th>Reason</th></tr></thead>
+      <tbody></tbody>
+    </table>
+  </div>
+
+  <div class="card">
+    <h2>Journal & P&amp;L</h2>
+    <div class="grid">
+      <div>
+        <div class="muted">Sync fills</div>
+        <button onclick="syncFills()">POST /journal/sync</button>
+      </div>
+      <div>
+        <div class="muted">P&amp;L summary</div>
+        <button onclick="fetchPnl()">GET /pnl/summary</button>
+      </div>
+    </div>
+    <pre id="pnl_out" class="muted">// results will appear here</pre>
+  </div>
+
+  <script>
+    async function getJSON(url, opts){const r=await fetch(url,opts||{}); if(!r.ok) throw new Error(await r.text()); return await r.json();}
+
+    async function loadConfig(){
+      const c = await getJSON('/config');
+      document.getElementById('cfg_symbols').textContent = (c.SYMBOLS||[]).join(', ');
+      document.getElementById('cfg_strats').textContent  = (c.STRATEGIES||[]).join(', ');
+      document.getElementById('cfg_defaults').textContent = `${c.DEFAULT_TIMEFRAME||''} • ${c.DEFAULT_LIMIT||''} bars • $${c.DEFAULT_NOTIONAL||''}`;
+    }
+
+    async function loadEligibility(){
+      const data = await getJSON('/policy/eligible');
+      const ok = data.eligible || [], blocked = data.blocked || [];
+      document.getElementById('elig_summary').textContent = `${ok.length} allowed, ${blocked.length} blocked — ${new Date(data.time).toLocaleString()}`;
+      const tbody = document.querySelector('#elig_table tbody');
+      tbody.innerHTML='';
+      function row(s, sym, status, reason){
+        const tr = document.createElement('tr');
+        tr.innerHTML = `<td>${s}</td><td>${sym}</td><td>${status}</td><td class="muted">${reason||''}</td>`;
+        tbody.appendChild(tr);
+      }
+      ok.forEach(x => row(x.strategy, x.symbol, 'allowed', ''));
+      blocked.forEach(x => row(x.strategy, x.symbol, 'blocked', x.reason));
+    }
+
+    async function syncFills(){
+      try{
+        const res = await getJSON('/journal/sync', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({})});
+        document.getElementById('pnl_out').textContent = JSON.stringify(res,null,2);
+      }catch(e){ document.getElementById('pnl_out').textContent = 'Error: '+e.message; }
+    }
+    async function fetchPnl(){
+      try{
+        const res = await getJSON('/pnl/summary');
+        document.getElementById('pnl_out').textContent = JSON.stringify(res,null,2);
+      }catch(e){ document.getElementById('pnl_out').textContent = 'Error: '+e.message; }
+    }
+
+    loadConfig(); loadEligibility();
+    setInterval(loadEligibility, 60000);
+  </script>
 </body>
 </html>
 """
-    return HTMLResponse(content=html)
 
-@app.get("/healthz")
-def healthz():
-    return PlainTextResponse("ok")
+@app.get("/", response_class=HTMLResponse)
+def root():
+    broker_badge = "kraken" if USING_KRAKEN else "alpaca"
+    broker_text = "kraken" if USING_KRAKEN else "alpaca"
+    html = (
+        DASHBOARD_HTML
+        .replace("{SERVICE_NAME}", SERVICE_NAME)
+        .replace("{APP_VERSION}", APP_VERSION)
+        .replace("{BROKER_BADGE}", broker_badge)
+        .replace("{BROKER_TEXT}", broker_text)
+    )
+    return HTMLResponse(content=html, status_code=200)
 
+@app.get("/dashboard", response_class=HTMLResponse)
+def dashboard_alias():
+    return root()
+
+# -----------------------------------------------------------------------------
+# Scheduler (auto, env-driven; dynamic sizing optional)
+# -----------------------------------------------------------------------------
+_RUNNING = False
+
+def _sched_config() -> Dict[str, Any]:
+    raw = os.getenv("SCHED_STRATS", "")
+    strategies = [s.strip().lower() for s in raw.split(",") if s.strip()] or [s.lower() for s in ACTIVE_STRATEGIES]
+    timeframe = os.getenv("SCHED_TIMEFRAME", DEFAULT_TIMEFRAME)
+    try: limit = int(os.getenv("SCHED_LIMIT", str(DEFAULT_LIMIT)))
+    except: limit = DEFAULT_LIMIT
+    try: notional = float(os.getenv("SCHED_NOTIONAL", str(DEFAULT_NOTIONAL)))
+    except: notional = DEFAULT_NOTIONAL
+    try: sleep_s = int(os.getenv("SCHED_SLEEP", "30"))
+    except: sleep_s = 30
+    dry_env = os.getenv("SCHED_DRY", "1").lower() in ("1", "true", "yes", "y")
+    trading_flags = TRADING_ENABLED and (os.getenv("KRAKEN_TRADING", "0").lower() in ("1","true","yes","y"))
+    dry = dry_env or (not trading_flags)
+    return {
+        "strategies": strategies,
+        "timeframe": timeframe,
+        "limit": limit,
+        "notional": notional,
+        "sleep_s": sleep_s,
+        "dry": dry,
+        "trading_flags": trading_flags
+    }
+
+async def _loop():
+    global _RUNNING
+    _RUNNING = True
+    log.info("Scheduler started (v%s, broker=%s)", APP_VERSION, ("kraken" if USING_KRAKEN else "alpaca"))
+    try:
+        while _RUNNING:
+            cfg = _sched_config()
+            if SCHED_AUTO_SIZE:
+                try:
+                    eq = _account_equity_usd()
+                    dyn_notional = _sized_notional_from_equity(eq)
+                    cfg["notional"] = dyn_notional
+                    log.info("Sizing: equity=%.2f USD, risk_pct=%.4f -> notional=%.2f (%.2f..%.2f)",
+                             eq, RISK_PCT, dyn_notional, NOTIONAL_MIN, NOTIONAL_MAX)
+                except Exception as e:
+                    log.warning("Sizing error; using static notional %.2f: %s", cfg["notional"], e)
+            syms = list(_CURRENT_SYMBOLS)
+            run_strats = [s for s in cfg["strategies"] if s in [x.lower() for x in ACTIVE_STRATEGIES] and s not in [x.lower() for x in _DISABLED_STRATS]]
+            log.info("Scheduler pass: strats=%s tf=%s limit=%s notional=%s dry=%s symbols=%s",
+                     ",".join(run_strats), cfg["timeframe"], cfg["limit"], cfg["notional"], cfg["dry"], ",".join(syms))
+            for strat in run_strats:
+                if not _RUNNING: break
+                try:
+                    await _scan_bridge(strat, {
+                        "timeframe": cfg["timeframe"], "limit": cfg["limit"],
+                        "notional": cfg["notional"], "symbols": syms
+                    }, dry=cfg["dry"])
+                except Exception as e:
+                    log.warning("Scheduler scan error (%s): %s", strat, e)
+            total = max(1, int(cfg["sleep_s"]))
+            for _ in range(total):
+                if not _RUNNING: break
+                await asyncio.sleep(1)
+    finally:
+        log.info("Scheduler stopped")
+
+@app.get("/scheduler/start")
+async def scheduler_start():
+    if os.getenv("SCHED_ON", "0").lower() not in ("1","true","yes","y"):
+        return {"ok": False, "why": "SCHED_ON env not enabled"}
+    if _RUNNING:
+        return {"ok": True, "already": True, "config": _sched_config()}
+    asyncio.create_task(_loop())
+    return {"ok": True, "started": True, "config": _sched_config()}
+
+@app.get("/scheduler/stop")
+async def scheduler_stop():
+    global _RUNNING
+    _RUNNING = False
+    return {"ok": True, "stopping": True}
+
+@app.get("/scheduler/status")
+async def scheduler_status():
+    return {"ok": True, "running": _RUNNING, "config": _sched_config()}
+
+@app.on_event("startup")
+async def _maybe_autostart_scheduler():
+    if os.getenv("SCHED_ON", "0").lower() in ("1","true","yes","y"):
+        asyncio.create_task(_loop())
+        log.info("Scheduler autostart: enabled by SCHED_ON")
+
+# -----------------------------------------------------------------------------
+# Journal & P&L (JSONL journal_v2.jsonl)
+# -----------------------------------------------------------------------------
+_JOURNAL_LOCK = threading.Lock()
+_JOURNAL_PATH = os.getenv("JOURNAL_PATH", "./journal_v2.jsonl")
+_JOURNAL: List[Dict[str, Any]] = []
+
+def _journal_load():
+    global _JOURNAL
+    try:
+        rows = []
+        with open(_JOURNAL_PATH, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line: continue
+                rows.append(json.loads(line))
+        with _JOURNAL_LOCK:
+            _JOURNAL = rows
+        log.info("journal: loaded %d rows from %s", len(rows), _JOURNAL_PATH)
+    except FileNotFoundError:
+        pass
+    except Exception as e:
+        log.warning("journal load error: %s", e)
+
+def _journal_append(row: dict):
+    with _JOURNAL_LOCK:
+        _JOURNAL.append(row)
+        try:
+            with open(_JOURNAL_PATH, "a", encoding="utf-8") as f:
+                f.write(json.dumps(row, separators=(",", ":")) + "\n")
+        except Exception as e:
+            log.warning("journal persist error: %s", e)
+
+@app.on_event("startup")
+async def _journal_on_start():
+    _journal_load()
+
+def _sync_journal_with_fills(max_trades: int = 400) -> dict:
+    try:
+        fills = br.trades_history(max_trades)
+        if not fills.get("ok"):
+            return {"ok": False, "error": fills.get("error", "unknown")}
+        by_txid = {t["txid"]: t for t in fills.get("trades", []) if t.get("txid")}
+        updated = 0
+        with _JOURNAL_LOCK:
+            for row in _JOURNAL:
+                tx = row.get("txid")
+                if tx and tx in by_txid:
+                    t = by_txid[tx]
+                    sym_guess = t.get("pair") or ""
+                    try:
+                        from symbol_map import from_kraken as _from
+                        sym_ui = (_from(sym_guess) or sym_guess).upper()
+                    except Exception:
+                        sym_ui = sym_guess.upper()
+                    row["symbol"] = row.get("symbol") or sym_ui
+                    row["price"] = float(t.get("price") or 0.0)
+                    row["vol"] = float(t.get("vol") or 0.0)
+                    row["fee"] = float(t.get("fee") or 0.0)
+                    row["cost"] = float(t.get("cost") or 0.0)
+                    row["filled_ts"] = float(t.get("time") or 0.0)
+                    updated += 1
+        if updated:
+            # persist whole file
+            try:
+                with open(_JOURNAL_PATH, "w", encoding="utf-8") as f:
+                    for r in _JOURNAL:
+                        f.write(json.dumps(r, separators=(",", ":")) + "\n")
+            except Exception as pe:
+                log.warning("journal rewrite error: %s", pe)
+        return {"ok": True, "updated": updated, "count": len(_JOURNAL)}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+@app.post("/journal/sync")
+def journal_sync():
+    return _sync_journal_with_fills(400)
+
+# alias for convenience (you used this)
+@app.post("/reconcile/fills")
+def reconcile_fills_alias():
+    return _sync_journal_with_fills(400)
+
+@app.get("/journal")
+def journal_list(limit: int = 200):
+    with _JOURNAL_LOCK:
+        rows = list(_JOURNAL[-int(limit):])
+    return {"ok": True, "rows": rows, "count": len(_JOURNAL)}
+
+def _prices_for(symbols: List[str]) -> Dict[str, float]:
+    out: Dict[str, float] = {}
+    for s in symbols:
+        try:
+            out[s] = float(br.last_price(s))
+        except Exception:
+            out[s] = 0.0
+    return out
+
+def _pnl_calc(now_prices: Dict[str, float]) -> Dict[str, Any]:
+    from collections import defaultdict, deque
+    with _JOURNAL_LOCK:
+        trades = [r for r in _JOURNAL if r.get("price") and r.get("vol")]
+    trades.sort(key=lambda r: r.get("filled_ts") or r.get("ts") or 0)
+
+    lots = defaultdict(lambda: deque())  # (strategy,symbol) -> deque of [qty, cost_px]
+    stats = defaultdict(lambda: {"realized": 0.0, "fees": 0.0, "qty": 0.0, "avg_cost": 0.0})
+
+    for r in trades:
+        strat = r.get("strategy") or "unknown"
+        sym = (r.get("symbol") or "").upper()
+        side = r.get("side")
+        px = float(r.get("price") or 0.0)
+        vol = float(r.get("vol") or 0.0)
+        fee = float(r.get("fee") or 0.0)
+        key = (strat, sym)
+        if side == "buy":
+            lots[key].append([vol, px])
+            st = stats[key]
+            st["qty"] += vol
+            prev_qty = max(1e-9, st["qty"] - vol)
+            st["avg_cost"] = ((st["avg_cost"] * prev_qty) + px * vol) / max(1e-9, st["qty"])
+            st["fees"] += fee
+        elif side == "sell":
+            remain = vol
+            realized = 0.0
+            while remain > 1e-12 and lots[key]:
+                q, cpx = lots[key][0]
+                take = min(q, remain)
+                realized += (px - cpx) * take
+                q -= take; remain -= take
+                if q <= 1e-12: lots[key].popleft()
+                else: lots[key][0][0] = q
+            st = stats[key]
+            st["qty"] -= vol
+            st["realized"] += realized
+            st["fees"] += fee
+
+    out_strat, out_sym = {}, {}
+    total = {"realized": 0.0, "unrealized": 0.0, "fees": 0.0, "equity": 0.0}
+    for key, st in stats.items():
+        strat, sym = key
+        mkt = float(now_prices.get(sym) or 0.0)
+        unreal = 0.0
+        if mkt > 0 and lots[key]:
+            for q, cpx in lots[key]:
+                unreal += (mkt - cpx) * q
+        equity = st["realized"] + unreal - st["fees"]
+
+        srow = out_strat.get(strat, {"strategy": strat, "realized": 0.0, "unrealized": 0.0, "fees": 0.0, "equity": 0.0})
+        srow["realized"] += st["realized"]; srow["unrealized"] += unreal; srow["fees"] += st["fees"]; srow["equity"] += equity
+        out_strat[strat] = srow
+
+        yrow = out_sym.get(sym, {"symbol": sym, "realized": 0.0, "unrealized": 0.0, "fees": 0.0, "equity": 0.0})
+        yrow["realized"] += st["realized"]; yrow["unrealized"] += unreal; yrow["fees"] += st["fees"]; yrow["equity"] += equity
+        out_sym[sym] = yrow
+
+        total["realized"] += st["realized"]; total["unrealized"] += unreal; total["fees"] += st["fees"]; total["equity"] += equity
+
+    return {
+        "ok": True,
+        "time": utc_now(),
+        "total": total,
+        "per_strategy": sorted(out_strat.values(), key=lambda r: r["equity"], reverse=True),
+        "per_symbol": sorted(out_sym.values(), key=lambda r: r["equity"], reverse=True),
+    }
+
+@app.get("/pnl/summary")
+def pnl_summary():
+    try:
+        with _JOURNAL_LOCK:
+            syms = sorted({(r.get("symbol") or "").upper() for r in _JOURNAL if r.get("symbol")}) or list(_CURRENT_SYMBOLS)
+        prices = _prices_for(syms)
+        return _pnl_calc(prices)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/pnl/strategies")
+def pnl_strategies():
+    try:
+        return pnl_summary().get("per_strategy", [])
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/pnl/symbols")
+def pnl_symbols():
+    try:
+        return pnl_summary().get("per_symbol", [])
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/pnl/reset")
+def pnl_reset():
+    try:
+        with _JOURNAL_LOCK:
+            _JOURNAL.clear()
+        try:
+            if os.path.exists(_JOURNAL_PATH):
+                os.remove(_JOURNAL_PATH)
+        except Exception:
+            pass
+        return {"ok": True}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+# -----------------------------------------------------------------------------
+# Entrypoint
+# -----------------------------------------------------------------------------
 if __name__ == "__main__":
-    import uvicorn
+    import uvicorn  # type: ignore
     port = int(os.getenv("PORT", "10000"))
-    print(f"Launching Uvicorn on 0.0.0.0:{port} (policy dir={POLICY_DIR_PATH})")
-    uvicorn.run(app, host="0.0.0.0", port=port, reload=False)
+    log.info(
+        "Launching Uvicorn on 0.0.0.0:%d (version %s, broker=%s, trading=%s)",
+        port, __version__, ("kraken" if USING_KRAKEN else "alpaca"), TRADING_ENABLED
+    )
+    uvicorn.run("app:app", host="0.0.0.0", port=port, reload=False, access_log=True)
