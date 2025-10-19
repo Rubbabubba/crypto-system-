@@ -1,145 +1,112 @@
+# guard.py
 from __future__ import annotations
-import json, os, time
+
+import json
+import os
 from pathlib import Path
-from dataclasses import dataclass
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Tuple
 from datetime import datetime
-try:
-    from zoneinfo import ZoneInfo
-    _CT = ZoneInfo("America/Chicago")
-except Exception:
-    _CT = None
+import pytz
 
-_CFG_DIR = Path(os.environ.get("POLICY_CFG_DIR", "policy_config"))
-_WINDOWS_PATH  = _CFG_DIR / "windows.json"
-_WHITELIST_PATH = _CFG_DIR / "whitelist.json"
-_RISK_PATH     = _CFG_DIR / "risk.json"
+POLICY_CFG_DIR = Path(os.getenv("POLICY_CFG_DIR", Path(__file__).parent / "policy_config")).resolve()
 
-@dataclass
-class _Cfg:
-    windows: Dict[str, Any]
-    whitelist: Dict[str, Any]
-    risk: Dict[str, Any]
-    mtimes: Dict[str, float]
+_WHITELIST_PATH = POLICY_CFG_DIR / "whitelist.json"
+_WINDOWS_PATH = POLICY_CFG_DIR / "windows.json"
 
-_cfg: Optional[_Cfg] = None
-_symbol_locks: Dict[str, Dict[str, Any]] = {}
-_symbol_cooldowns: Dict[str, float] = {}
+_policy: Dict[str, Any] | None = None
 
-def _load_json(p: Path) -> Dict[str, Any]:
-    if not p.exists():
+def _load_json(path: Path) -> Dict[str, Any]:
+    if not path.exists():
         return {}
     try:
-        return json.loads(p.read_text())
+        with path.open("r", encoding="utf-8") as f:
+            return json.load(f)
     except Exception:
         return {}
 
-def _reload_if_needed():
-    global _cfg
-    paths = {str(_WINDOWS_PATH): _WINDOWS_PATH, str(_WHITELIST_PATH): _WHITELIST_PATH, str(_RISK_PATH): _RISK_PATH}
-    mt = {k: (v.stat().st_mtime if v.exists() else 0.0) for k, v in paths.items()}
-    if _cfg is None or any(_cfg.mtimes.get(k, -1) != mt[k] for k in mt):
-        _cfg = _Cfg(
-            windows=_load_json(_WINDOWS_PATH),
-            whitelist=_load_json(_WHITELIST_PATH),
-            risk=_load_json(_RISK_PATH),
-            mtimes=mt
-        )
+def load_policy() -> Dict[str, Any]:
+    """
+    Returns a dict with keys:
+      - whitelist: {strategy: [symbols...]}
+      - windows: {strategy: {days: [...], hours: [...]} or {hour_start: int, hour_end: int, days: [...]}}
+    Missing files are treated as empty (allow-all).
+    """
+    global _policy
+    if _policy is not None:
+        return _policy
 
-def _now_ct(ts: Optional[float] = None) -> datetime:
-    dt = datetime.utcfromtimestamp(ts or time.time())
-    try:
-        if _CT:
-            return dt.replace(tzinfo=ZoneInfo("UTC")).astimezone(_CT)  # type: ignore
-    except Exception:
-        pass
-    return dt
+    whitelist = _load_json(_WHITELIST_PATH)
+    windows = _load_json(_WINDOWS_PATH)
 
-def _dow_short(dt: datetime) -> str:
-    try:
-        return dt.strftime("%a")
-    except Exception:
-        return "Mon"
+    _policy = {"whitelist": whitelist or {}, "windows": windows or {}}
+    return _policy
 
-def _in_window(strategy: str, dt: datetime) -> bool:
-    win = (_cfg.windows or {}).get("windows", {}).get(strategy, {})
-    hours = set(win.get("hours", []))
-    dows  = set(win.get("dows", []))
-    return (dt.hour in hours) and ((_dow_short(dt) in dows) if dows else True)
+def _now_utc(dt: datetime | None = None) -> datetime:
+    if dt is None:
+        return datetime.now(tz=pytz.UTC)
+    return dt if dt.tzinfo else pytz.UTC.localize(dt)
 
-def _whitelisted(strategy: str, symbol: str) -> bool:
-    wl = (_cfg.whitelist or {}).get(strategy, [])
-    return bool(wl) and (symbol.upper() in {x.upper() for x in wl})
+def _dow_str(dt: datetime) -> str:
+    return dt.strftime("%a")  # Mon, Tue, ...
 
-def _atr_floor(symbol: str) -> float:
-    tiers = (_cfg.risk or {}).get("tiers", {})
-    floors = (_cfg.risk or {}).get("atr_floor_pct", {})
-    s = symbol.upper()
-    if s in {x.upper() for x in tiers.get("tier1", [])}: return float(floors.get("tier1", 0.6))
-    if s in {x.upper() for x in tiers.get("tier2", [])}: return float(floors.get("tier2", 0.9))
-    return float(floors.get("tier3", 1.2))
+def _hour(dt: datetime) -> int:
+    return int(dt.astimezone(pytz.UTC).strftime("%H"))
 
-def _edge_ok(expected_move_pct: float) -> bool:
-    fee = float((_cfg.risk or {}).get("fee_rate_pct", 0.26))
-    multiple = float((_cfg.risk or {}).get("edge_multiple_vs_fee", 3.0))
-    return expected_move_pct >= (multiple * fee)
+def guard_allows(strategy: str, symbol: str, now: datetime | None = None) -> Tuple[bool, str]:
+    """
+    Returns (allowed, reason). If configs are empty or missing, returns (True, "no_policy").
+    - Checks whitelist per-strategy. If whitelist[strategy] exists and symbol not in it -> block.
+    - Checks time windows per-strategy in UTC.
+      Supported formats:
+        windows[strategy] = {
+          "days": ["Mon","Tue","Wed","Thu","Fri","Sat","Sun"],   # optional
+          "hours": [9,10,...,16]                                 # OR
+          "hour_start": 9, "hour_end": 16                        # inclusive start, exclusive end
+        }
+    """
+    cfg = load_policy()
+    wl = cfg.get("whitelist", {})
+    win = cfg.get("windows", {})
 
-def _avoid(symbol: str) -> bool:
-    avoid = {x.upper() for x in (_cfg.risk or {}).get("avoid_pairs", [])}
-    return symbol.upper() in avoid
+    # If both are empty, allow by default
+    if not wl and not win:
+        return True, "no_policy"
 
-def _mutex_allows(symbol: str, strategy: str, now_ts: Optional[float] = None):
-    now_ts = now_ts or time.time()
-    cd_until = _symbol_cooldowns.get(symbol.upper(), 0.0)
-    if cd_until and cd_until > now_ts:
-        return False, f"cooldown_active_until={int(cd_until)}"
-    lock = _symbol_locks.get(symbol.upper())
-    if not lock or lock.get('until', 0) <= now_ts:
-        return True, "free"
-    if lock.get('owner') == strategy:
-        return True, "owner_reentry"
-    return False, f"locked_by={lock.get('owner')}_until={int(lock.get('until', 0))}"
+    s = strategy
+    sym = symbol.replace("/", "").replace("-", "")
+    # Try both 'BTCUSD' and 'BTC/USD' styles in lists
+    wl_list = wl.get(s) or wl.get(s.lower()) or wl.get(s.upper())
+    if isinstance(wl_list, list) and wl_list:
+        norm_list = [x.replace("/", "").replace("-", "") for x in wl_list]
+        if sym not in norm_list:
+            return False, "not_in_strategy_whitelist"
 
-def _claim(symbol: str, strategy: str, now_ts: Optional[float] = None):
-    now_ts = now_ts or time.time()
-    ttl_min = int((_cfg.risk or {}).get("symbol_mutex_minutes", 60))
-    _symbol_locks[symbol.upper()] = {'until': now_ts + 60 * ttl_min, 'owner': strategy}
+    w = win.get(s) or win.get(s.lower()) or win.get(s.upper()) or {}
+    if isinstance(w, dict) and w:
+        dt = _now_utc(now)
+        dow = _dow_str(dt)
+        hr = _hour(dt)
 
-def _release(symbol: str, strategy: str, now_ts: Optional[float] = None):
-    now_ts = now_ts or time.time()
-    lock = _symbol_locks.get(symbol.upper())
-    if lock and lock.get('owner') == strategy:
-        _symbol_locks.pop(symbol.upper(), None)
-    mr_list = set((_cfg.risk or {}).get("mr_strategies", []))
-    if strategy in mr_list:
-        cd_min = int((_cfg.risk or {}).get("cooldown_minutes_after_exit_for_mr", 30))
-        _symbol_cooldowns[symbol.upper()] = now_ts + 60 * cd_min
+        days = w.get("days")  # e.g., ["Mon","Tue","Wed","Thu","Fri"]
+        if isinstance(days, list) and days:
+            if dow not in days:
+                return False, f"outside_window dow={dow}"
 
-def guard_allows(strategy: str, symbol: str, expected_move_pct: Optional[float], atr_pct: Optional[float], now_ts: Optional[float] = None):
-    _reload_if_needed()
-    s = (strategy or '').strip()
-    sym = (symbol or '').strip().upper()
-    if not s or not sym:
-        return False, "missing_strategy_or_symbol"
-    if _avoid(sym):
-        return False, "avoid_pair"
-    dt = _now_ct(now_ts)
-    if not _in_window(s, dt):
-        return False, f"outside_window hour={getattr(dt, 'hour', -1)} dow={_dow_short(dt)}"
-    if not _whitelisted(s, sym):
-        return False, "not_in_strategy_whitelist"
-    if (atr_pct is not None) and (atr_pct < _atr_floor(sym)):
-        return False, f"atr_below_floor floor={_atr_floor(sym)}"
-    if (expected_move_pct is not None) and (not _edge_ok(expected_move_pct)):
-        return False, "edge_lt_fee_multiple"
-    ok, r = _mutex_allows(sym, s, now_ts=now_ts)
-    if not ok:
-        return False, f"mutex_block:{r}"
+        hours = w.get("hours")
+        if isinstance(hours, list) and hours:
+            if hr not in hours:
+                return False, f"outside_window hour={hr}"
+
+        hs = w.get("hour_start")
+        he = w.get("hour_end")
+        if isinstance(hs, int) and isinstance(he, int):
+            # treat as [hs, he) in UTC
+            if hs <= he:
+                ok = (hs <= hr < he)
+            else:
+                # overnight window, e.g., 20..4
+                ok = (hr >= hs or hr < he)
+            if not ok:
+                return False, f"outside_window hour={hr}"
+
     return True, "ok"
-
-def note_trade_event(event: str, strategy: str, symbol: str, now_ts: Optional[float] = None):
-    _reload_if_needed()
-    if event == "claim":
-        _claim(symbol, strategy, now_ts=now_ts)
-    elif event == "release":
-        _release(symbol, strategy, now_ts=now_ts)
