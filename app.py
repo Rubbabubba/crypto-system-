@@ -1,14 +1,3 @@
-from __future__ import annotations
-import os, sys
-from pathlib import Path as _PathAlias  # ensure Path is available even if shadowed later
-# Ensure the directory containing app.py is on sys.path so local modules (guard.py, etc.) can be imported.
-sys.path.append(os.path.dirname(__file__))
-
-try:
-    from guard import load_policy, guard_allows  # local module next to app.py
-except ModuleNotFoundError:
-    # Fallback: attempt package-style relative import if running inside a package
-    from .guard import load_policy, guard_allows  # type: ignore
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
@@ -45,6 +34,7 @@ Journal & PnL
 - POST /pnl/reset            -> clear journal (dangerous; use carefully)
 """
 
+from __future__ import annotations
 
 __version__ = "2.0.0"
 
@@ -329,6 +319,22 @@ def bars(symbol: str, timeframe: str = DEFAULT_TIMEFRAME, limit: int = 200):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+
+@app.get("/policy/eligible")
+def policy_eligible():
+    now = datetime.utcnow()
+    # use configured symbols/strategies already in this module
+    eligible = []
+    blocked  = []
+    for strat in ACTIVE_STRATEGIES:
+        for sym in SYMBOLS:
+            # run light-weight guard: only windows & whitelist; no ATR/expected move checks
+            if guard_allows is None:
+                ok, reason = True, "policy_guard_missing"
+            else:
+                ok, reason = guard_allows(strat, sym, now, expected_move_pct=None, atr_pct=None)
+            (eligible if ok else blocked).append({"strategy": strat, "symbol": sym, "reason": reason})
+    return {"ok": True, "time": now.isoformat(), "eligible": eligible, "blocked": blocked}
 @app.get("/price/{symbol}")
 def price(symbol: str):
     try:
@@ -389,444 +395,106 @@ async def order_market(request: Request):
 # -----------------------------------------------------------------------------
 DASHBOARD_HTML = """
 <!doctype html>
-<html lang="en">
+<html>
 <head>
-<meta charset="utf-8"/>
-<title>{SERVICE_NAME} — Dashboard</title>
-<meta name="viewport" content="width=device-width, initial-scale=1"/>
-<style>
-:root {
-  --bg:#0b0d10; --card:#11161a; --ink:#e6edf3; --muted:#9fb0c0; --border:#1e242c;
-  --accent:#8ab4ff; --ok:#6bdc6b; --warn:#ffcf5a; --err:#ff7d7d;
-}
-* { box-sizing:border-box; }
-body { font-family:-apple-system,Segoe UI,Roboto,Arial,sans-serif; background:var(--bg); color:var(--ink); margin:0; }
-.header { display:flex; align-items:center; justify-content:space-between; padding:12px 16px; border-bottom:1px solid #222; }
-.badge { padding:3px 8px; border-radius:12px; font-size:12px; border:1px solid var(--border); background:#0f141a; }
-.badge.kraken { background:#163; color:#b5f5b5; border-color:#1e5033; }
-.badge.alpaca { background:#322; color:#f5b5b5; border-color:#503333; }
-.grid { display:grid; grid-template-columns: repeat(auto-fit, minmax(330px, 1fr)); grid-gap:12px; padding:12px; }
-.card { background:var(--card); border:1px solid var(--border); border-radius:10px; padding:12px; }
-h2 { margin:0 0 8px 0; font-size:16px; }
-label { font-size:12px; color:var(--muted); }
-input, select, button, textarea { font:inherit; background:#0b1117; color:var(--ink); border:1px solid var(--border); border-radius:8px; padding:8px; }
-button { cursor:pointer; }
-a { color:var(--accent); text-decoration:none; margin-left:8px; }
-a:hover { text-decoration:underline; }
-pre { background:#0b1117; padding:10px; border-radius:8px; overflow:auto; }
-.table { width:100%; border-collapse:collapse; font-size:13px; }
-.table th, .table td { border-bottom:1px solid var(--border); padding:6px 8px; text-align:left; vertical-align:middle; }
-.kv { display:grid; grid-template-columns:160px 1fr; grid-gap:6px; font-size:13px; align-items:center; }
-.mono { font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace; }
-.small { font-size:12px; color:var(--muted); }
-hr { border:none; border-top:1px solid var(--border); margin:8px 0; }
-svg.spark { width:120px; height:28; }
-svg.spark path.line { fill:none; stroke:var(--accent); stroke-width:1.5; }
-svg.spark rect.bg { fill:#0b1117; }
-svg.spark path.fill { fill:rgba(138,180,255,0.12); stroke:none; }
-.good { color: var(--ok); } .bad { color: var(--err); }
-</style>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Crypto System Dashboard</title>
+  <style>
+    body{background:#0b0f14;color:#e7edf3;font-family:system-ui,Segoe UI,Roboto,Helvetica,Arial,sans-serif;margin:0;padding:24px}
+    h1,h2{margin:0 0 12px 0;font-weight:600}
+    .card{background:#121a22;border:1px solid #233241;border-radius:10px;padding:16px;margin:12px 0}
+    .muted{color:#90a4b8}
+    table{width:100%;border-collapse:collapse}
+    th,td{padding:8px 10px;border-bottom:1px solid #233241;text-align:left}
+    th{color:#a7c0d8;font-weight:600}
+    code{background:#0e141a;border:1px solid #233241;border-radius:6px;padding:2px 6px}
+    .pill{display:inline-block;padding:4px 8px;border-radius:16px;border:1px solid #2a3b4c;background:#0f151c}
+    .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:12px}
+  </style>
 </head>
 <body>
-<div class="header">
-  <div>
-    <strong>{SERVICE_NAME}</strong>
-    <span class="badge {BROKER_BADGE}">broker: {BROKER_TEXT}</span>
-    <span class="badge">v{APP_VERSION}</span>
-  </div>
-  <div class="small">Now: <span id="now"></span></div>
-</div>
-
-<div class="grid">
-
-  <div class="card">
-    <h2>Service</h2>
-    <div class="kv">
-      <div>Health</div>
-      <div>
-        <button onclick="callJson('/health')">GET /health</button>
-        <a class="small" href="/health" target="_blank" rel="noopener">open</a>
-      </div>
-
-      <div>Broker</div>
-      <div>
-        <button onclick="callJson('/diag/broker')">GET /diag/broker</button>
-        <a class="small" href="/diag/broker" target="_blank" rel="noopener">open</a>
-      </div>
-
-      <div>Version</div>
-      <div>
-        <button onclick="callJson('/version')">GET /version</button>
-        <a class="small" href="/version" target="_blank" rel="noopener">open</a>
-      </div>
-
-      <div>Config</div>
-      <div>
-        <button onclick="loadConfig()">GET /config</button>
-        <a class="small" href="/config" target="_blank" rel="noopener">open</a>
-      </div>
-
-      <div>Fills</div>
-      <div>
-        <button onclick="callJson('/fills')">GET /fills</button>
-        <a class="small" href="/fills" target="_blank" rel="noopener">open</a>
-      </div>
-
-      <div>Scheduler</div>
-      <div>
-        <button onclick="callJson('/scheduler/status')">GET /scheduler/status</button>
-        <a class="small" href="/scheduler/status" target="_blank" rel="noopener">open</a>
-      </div>
+  <h1>Crypto System</h1>
+  <div class="card grid">
+    <div>
+      <div class="muted">Symbols</div>
+      <div id="cfg_symbols" class="pill"></div>
     </div>
-    <hr/>
-    <div class="small">Symbols: <span id="cfg_symbols" class="mono"></span></div>
-    <div class="small">Strategies: <span id="cfg_strats" class="mono"></span></div>
-  </div>
-
-  <div class="card">
-    <h2>Quick Scan (dry run)</h2>
-    <div style="display:grid; grid-template-columns:1fr 1fr; grid-gap:8px;">
-      <div>
-        <label>Strategy</label>
-        <select id="scan_strat">
-          <option>c1</option><option>c2</option><option>c3</option>
-          <option>c4</option><option>c5</option><option>c6</option>
-        </select>
-      </div>
-      <div>
-        <label>Timeframe</label>
-        <input id="scan_tf" value="5Min"/>
-      </div>
-      <div>
-        <label>Symbols (comma sep)</label>
-        <input id="scan_syms" placeholder="BTCUSD,ETHUSD"/>
-      </div>
-      <div>
-        <label>Notional (USD)</label>
-        <input id="scan_notional" value="25"/>
-      </div>
-      <div>
-        <label>Limit (bars)</label>
-        <input id="scan_limit" value="300"/>
-      </div>
-      <div style="display:flex; align-items:flex-end;">
-        <button onclick="runScan()">POST /scan&lt;strat&gt;</button>
-      </div>
+    <div>
+      <div class="muted">Strategies</div>
+      <div id="cfg_strats" class="pill"></div>
     </div>
-    <hr/>
-    <pre id="scan_out" class="mono small">// orders will appear here</pre>
-  </div>
-
-  <div class="card">
-    <h2>Live Prices <span class="small">(30s auto-refresh)</span></h2>
-    <div class="small">From /price/&lt;symbol&gt; for each configured symbol.</div>
-    <table class="table" id="px_table">
-      <thead>
-        <tr><th>Symbol</th><th>Price</th><th>Spark</th><th>Updated</th></tr>
-      </thead>
-      <tbody id="px_tbody"></tbody>
-    </table>
-    <div style="margin-top:8px;">
-      <button onclick="refreshPrices(true)">Refresh now</button>
+    <div>
+      <div class="muted">Defaults</div>
+      <div id="cfg_defaults" class="pill"></div>
     </div>
   </div>
 
   <div class="card">
-    <h2>Price & Bars</h2>
-    <div style="display:grid; grid-template-columns:1fr 1fr; grid-gap:8px;">
-      <div>
-        <label>Symbol</label>
-        <input id="bars_sym" value="BTCUSD"/>
-      </div>
-      <div>
-        <label>Timeframe</label>
-        <input id="bars_tf" value="5Min"/>
-      </div>
-      <div>
-        <label>Limit</label>
-        <input id="bars_limit" value="60"/>
-      </div>
-      <div style="display:flex; align-items:flex-end;">
-        <button onclick="fetchBars()">GET /bars&lt;symbol&gt;</button>
-        <a class="small" href="/bars/BTCUSD?timeframe=5Min&limit=60" target="_blank" rel="noopener">open</a>
-      </div>
-    </div>
-    <hr/>
-    <div style="display:flex; gap:8px;">
-      <button onclick="fetchPrice()">GET /price&lt;symbol&gt;</button>
-      <a class="small" href="/price/BTCUSD" target="_blank" rel="noopener">open</a>
-      <button onclick="callJson('/orders')">GET /orders</button>
-      <a class="small" href="/orders" target="_blank" rel="noopener">open</a>
-      <button onclick="callJson('/positions')">GET /positions</button>
-      <a class="small" href="/positions" target="_blank" rel="noopener">open</a>
-    </div>
-    <hr/>
-    <pre id="bars_out" class="mono small">// bars/prices will appear here</pre>
-  </div>
-
-  <div class="card">
-    <h2>Place Market Order</h2>
-    <div class="small">Live trading must be enabled (TRADING_ENABLED & KRAKEN_TRADING).</div>
-    <div style="display:grid; grid-template-columns:1fr 1fr; grid-gap:8px; margin-top:6px;">
-      <div>
-        <label>Symbol</label>
-        <input id="ord_sym" value="BTCUSD"/>
-      </div>
-      <div>
-        <label>Side</label>
-        <select id="ord_side"><option>buy</option><option>sell</option></select>
-      </div>
-      <div>
-        <label>Notional (USD)</label>
-        <input id="ord_notional" value="25"/>
-      </div>
-      <div style="display:flex; align-items:flex-end;">
-        <button onclick="placeOrder()">POST /order/market</button>
-      </div>
-    </div>
-    <hr/>
-    <pre id="ord_out" class="mono small">// order result will appear here</pre>
-  </div>
-
-  <div class="card">
-    <h2>Scheduler</h2>
-    <div style="display:flex; gap:8px;">
-      <button onclick="callJson('/scheduler/start')">/scheduler/start</button>
-      <button onclick="callJson('/scheduler/stop')">/scheduler/stop</button>
-      <button onclick="callJson('/scheduler/status')">/scheduler/status</button>
-    </div>
-    <hr/>
-    <pre id="sched_out" class="mono small">// scheduler responses here</pre>
-  </div>
-
-  <div class="card" id="pnlCard">
-    <h2>P&amp;L</h2>
-    <div class="small">Realized + Unrealized (MTM) with fees; live from /pnl/summary</div>
-    <div id="pnl_time" class="small"></div>
-    <table class="table" id="pnl_strat_tbl">
-      <thead><tr><th>Strategy</th><th>Realized</th><th>Unrealized</th><th>Fees</th><th>Equity</th></tr></thead>
+    <h2>What can trade now</h2>
+    <div class="muted" id="elig_summary">—</div>
+    <table id="elig_table">
+      <thead><tr><th>Strategy</th><th>Symbol</th><th>Status</th><th>Reason</th></tr></thead>
       <tbody></tbody>
     </table>
-    <div class="small" style="margin-top:6px;">Total: <span id="pnl_total" class="mono"></span></div>
-    <div style="margin-top:8px;">
-      <button onclick="refreshPNL()">Refresh P&amp;L</button>
-      <button onclick="callJson('/journal/sync')">Sync Fills</button>
-      <a class="small" href="/pnl/summary" target="_blank" rel="noopener">open</a>
-      <a class="small" href="/journal" target="_blank" rel="noopener">journal</a>
-    </div>
   </div>
 
   <div class="card">
-    <h2>Console</h2>
-    <pre id="console" class="mono small">// responses will stream here</pre>
+    <h2>Journal & P&amp;L</h2>
+    <div class="grid">
+      <div>
+        <div class="muted">Sync fills</div>
+        <button onclick="syncFills()">POST /journal/sync</button>
+      </div>
+      <div>
+        <div class="muted">P&amp;L summary</div>
+        <button onclick="fetchPnl()">GET /pnl/summary</button>
+      </div>
+    </div>
+    <pre id="pnl_out" class="muted">// results will appear here</pre>
   </div>
 
-</div>
+  <script>
+    async function getJSON(url, opts){const r=await fetch(url,opts||{}); if(!r.ok) throw new Error(await r.text()); return await r.json();}
 
-<script>
-function nowISO() { return new Date().toISOString(); }
-function setNow() { document.getElementById('now').textContent = nowISO(); }
-setNow(); setInterval(setNow, 1000);
-
-function println(id, txt) {
-  const el = document.getElementById(id);
-  el.textContent = (el.textContent ? el.textContent + "\\n" : "") + txt;
-  el.scrollTop = el.scrollHeight;
-}
-
-async function callJson(path) {
-  try {
-    const r = await fetch(path);
-    const j = await r.json();
-    println('console', `[${nowISO()}] GET ${path}\\n` + JSON.stringify(j, null, 2));
-    if (path === '/config') {
-      document.getElementById('cfg_symbols').textContent = (j.SYMBOLS || []).join(',');
-      document.getElementById('cfg_strats').textContent = (j.STRATEGIES || []).join(',');
-      buildPriceRows(j.SYMBOLS || []);
+    async function loadConfig(){
+      const c = await getJSON('/config');
+      document.getElementById('cfg_symbols').textContent = (c.SYMBOLS||[]).join(', ');
+      document.getElementById('cfg_strats').textContent  = (c.STRATEGIES||[]).join(', ');
+      document.getElementById('cfg_defaults').textContent = `${c.DEFAULT_TIMEFRAME||''} • ${c.DEFAULT_LIMIT||''} bars • $${c.DEFAULT_NOTIONAL||''}`;
     }
-    if (path.startsWith('/scheduler')) {
-      document.getElementById('sched_out').textContent = JSON.stringify(j, null, 2);
-    }
-    return j;
-  } catch (e) {
-    println('console', `[${nowISO()}] ERROR GET ${path}: ` + e);
-  }
-}
 
-async function loadConfig() { return await callJson('/config'); }
-
-/* Quick scan */
-async function runScan() {
-  const strat = document.getElementById('scan_strat').value;
-  const tf = document.getElementById('scan_tf').value;
-  const syms = document.getElementById('scan_syms').value || document.getElementById('cfg_symbols').textContent;
-  const notional = parseFloat(document.getElementById('scan_notional').value || '25');
-  const limit = parseInt(document.getElementById('scan_limit').value || '300');
-  const body = {
-    symbols: (syms ? syms.split(',').map(s => s.trim()).filter(Boolean) : []),
-    timeframe: tf, limit: limit, notional: notional, dry: true
-  };
-  try {
-    const r = await fetch(`/scan/${strat}`, { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body) });
-    const j = await r.json();
-    document.getElementById('scan_out').textContent = JSON.stringify(j, null, 2);
-    println('console', `[${nowISO()}] POST /scan/${strat}\\n` + JSON.stringify(j, null, 2));
-  } catch (e) {
-    println('console', `[${nowISO()}] ERROR POST /scan/${strat}: ` + e);
-  }
-}
-
-/* Bars & price */
-async function fetchBars() {
-  const sym = document.getElementById('bars_sym').value;
-  const tf = document.getElementById('bars_tf').value;
-  const limit = document.getElementById('bars_limit').value;
-  try {
-    const r = await fetch(`/bars/${sym}?timeframe=${encodeURIComponent(tf)}&limit=${encodeURIComponent(limit)}`);
-    const j = await r.json();
-    document.getElementById('bars_out').textContent = JSON.stringify(j, null, 2);
-    println('console', `[${nowISO()}] GET /bars/${sym}\\n` + JSON.stringify(j, null, 2));
-  } catch (e) {
-    println('console', `[${nowISO()}] ERROR GET /bars/${sym}: ` + e);
-  }
-}
-
-async function fetchPrice() {
-  const sym = document.getElementById('bars_sym').value;
-  try {
-    const r = await fetch(`/price/${sym}`);
-    const j = await r.json();
-    document.getElementById('bars_out').textContent = JSON.stringify(j, null, 2);
-    println('console', `[${nowISO()}] GET /price/${sym}\\n` + JSON.stringify(j, null, 2));
-  } catch (e) {
-    println('console', `[${nowISO()}] ERROR GET /price/${sym}: ` + e);
-  }
-}
-
-/* Live Prices + Sparklines */
-let PX_SYMBOLS = [];
-const PX_SERIES = {};
-const MAX_POINTS = 50;
-
-function buildPriceRows(symbols) {
-  PX_SYMBOLS = (symbols || []).map(s => String(s).toUpperCase());
-  const tbody = document.getElementById('px_tbody');
-  tbody.innerHTML = '';
-  PX_SYMBOLS.forEach(sym => {
-    PX_SERIES[sym] = PX_SERIES[sym] || [];
-    const tr = document.createElement('tr');
-    tr.innerHTML =
-      `<td class="mono">${sym}</td>` +
-      `<td id="px_${sym}" class="mono">—</td>` +
-      `<td><svg class="spark" viewBox="0 0 120 28" id="px_svg_${sym}">` +
-      `<rect class="bg" x="0" y="0" width="120" height="28"></rect>` +
-      `<path class="fill" id="px_fill_${sym}" d=""></path>` +
-      `<path class="line" id="px_line_${sym}" d=""></path>` +
-      `</svg></td>` +
-      `<td id="px_t_${sym}" class="small">—</td>`;
-    tbody.appendChild(tr);
-  });
-}
-
-function computePath(points, w=120, h=28, pad=2) {
-  if (!points || points.length === 0) return { line:'', fill:'' };
-  const n = points.length;
-  const min = Math.min.apply(null, points);
-  const max = Math.max.apply(null, points);
-  const rng = (max - min) || 1e-9;
-  const innerW = w - pad*2;
-  const innerH = h - pad*2;
-  const x = i => pad + (i/(n-1))*innerW;
-  const y = v => pad + innerH - ((v - min)/rng)*innerH;
-  let d = `M ${x(0).toFixed(2)} ${y(points[0]).toFixed(2)}`;
-  for (let i = 1; i < n; i++) d += ` L ${x(i).toFixed(2)} ${y(points[i]).toFixed(2)}`;
-  let df = d + ` L ${x(n-1).toFixed(2)} ${(h-pad).toFixed(2)} L ${x(0).toFixed(2)} ${(h-pad).toFixed(2)} Z`;
-  return { line: d, fill: df };
-}
-
-function renderSparkline(sym) {
-  const pts = PX_SERIES[sym] || [];
-  const { line, fill } = computePath(pts);
-  const lineEl = document.getElementById(`px_line_${sym}`);
-  const fillEl = document.getElementById(`px_fill_${sym}`);
-  if (lineEl) lineEl.setAttribute('d', line || '');
-  if (fillEl) fillEl.setAttribute('d', fill || '');
-}
-
-async function refreshPrices(forceLog) {
-  if (!PX_SYMBOLS.length) {
-    await loadConfig();
-  }
-  for (const sym of PX_SYMBOLS) {
-    try {
-      const r = await fetch(`/price/${sym}`);
-      const j = await r.json();
-      const px = (j && j.price != null) ? Number(j.price) : null;
-      if (px != null && isFinite(px)) {
-        const arr = (PX_SERIES[sym] = (PX_SERIES[sym] || []));
-        arr.push(px);
-        if (arr.length > MAX_POINTS) arr.splice(0, arr.length - MAX_POINTS);
-        renderSparkline(sym);
+    async function loadEligibility(){
+      const data = await getJSON('/policy/eligible');
+      const ok = data.eligible || [], blocked = data.blocked || [];
+      document.getElementById('elig_summary').textContent = `${ok.length} allowed, ${blocked.length} blocked — ${new Date(data.time).toLocaleString()}`;
+      const tbody = document.querySelector('#elig_table tbody');
+      tbody.innerHTML='';
+      function row(s, sym, status, reason){
+        const tr = document.createElement('tr');
+        tr.innerHTML = `<td>${s}</td><td>${sym}</td><td>${status}</td><td class="muted">${reason||''}</td>`;
+        tbody.appendChild(tr);
       }
-      document.getElementById(`px_${sym}`).textContent = (px == null ? '—' : String(px));
-      document.getElementById(`px_t_${sym}`).textContent = nowISO();
-      if (forceLog) println('console', `[${nowISO()}] price ${sym} -> ${px}`);
-    } catch (e) {
-      println('console', `[${nowISO()}] ERROR price ${sym}: ` + e);
+      ok.forEach(x => row(x.strategy, x.symbol, 'allowed', ''));
+      blocked.forEach(x => row(x.strategy, x.symbol, 'blocked', x.reason));
     }
-  }
-}
 
-window.addEventListener('load', async () => {
-  await loadConfig();
-  await refreshPrices(true);
-  setInterval(refreshPrices, 30000);
-  setInterval(refreshPNL, 30000);
-});
+    async function syncFills(){
+      try{
+        const res = await getJSON('/journal/sync', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({})});
+        document.getElementById('pnl_out').textContent = JSON.stringify(res,null,2);
+      }catch(e){ document.getElementById('pnl_out').textContent = 'Error: '+e.message; }
+    }
+    async function fetchPnl(){
+      try{
+        const res = await getJSON('/pnl/summary');
+        document.getElementById('pnl_out').textContent = JSON.stringify(res,null,2);
+      }catch(e){ document.getElementById('pnl_out').textContent = 'Error: '+e.message; }
+    }
 
-/* Orders */
-async function placeOrder() {
-  const sym = document.getElementById('ord_sym').value;
-  const side = document.getElementById('ord_side').value;
-  const notional = parseFloat(document.getElementById('ord_notional').value || '25');
-  const body = { symbol: sym, side: side, notional: notional };
-  try {
-    const r = await fetch('/order/market', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body) });
-    const j = await r.json();
-    document.getElementById('ord_out').textContent = JSON.stringify(j, null, 2);
-    println('console', `[${nowISO()}] POST /order/market\\n` + JSON.stringify(j, null, 2));
-  } catch (e) {
-    println('console', `[${nowISO()}] ERROR POST /order/market: ` + e);
-  }
-}
-
-/* P&L card */
-function fmt(x){ const v = Number(x||0); const s = (v>=0?'+':''); return s + (Math.round(v*100)/100).toFixed(2); }
-async function refreshPNL() {
-  try {
-    const r = await fetch('/pnl/summary');
-    const j = await r.json();
-    const tbody = document.querySelector('#pnl_strat_tbl tbody');
-    tbody.innerHTML = '';
-    (j.per_strategy || []).forEach(row => {
-      const tr = document.createElement('tr');
-      tr.innerHTML = `<td>${row.strategy}</td>`
-        + `<td class="mono ${row.realized>=0?'good':'bad'}">${fmt(row.realized)}</td>`
-        + `<td class="mono ${row.unrealized>=0?'good':'bad'}">${fmt(row.unrealized)}</td>`
-        + `<td class="mono">${fmt(-row.fees)}</td>`
-        + `<td class="mono ${row.equity>=0?'good':'bad'}">${fmt(row.equity)}</td>`;
-      tbody.appendChild(tr);
-    });
-    const t = j.total || {};
-    document.getElementById('pnl_total').textContent =
-      `Realized ${fmt(t.realized)}  |  Unrealized ${fmt(t.unrealized)}  |  Fees ${fmt(-(t.fees||0))}  |  Equity ${fmt(t.equity)}`;
-    document.getElementById('pnl_time').textContent = 'As of ' + (j.time || new Date().toISOString());
-    println('console', `[${nowISO()}] GET /pnl/summary\\n` + JSON.stringify(j, null, 2));
-  } catch (e) {
-    println('console', `[${nowISO()}] ERROR /pnl/summary: ` + e);
-  }
-}
-</script>
+    loadConfig(); loadEligibility();
+    setInterval(loadEligibility, 60000);
+  </script>
 </body>
 </html>
 """
