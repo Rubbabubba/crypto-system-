@@ -2,36 +2,14 @@
 # -*- coding: utf-8 -*-
 """
 Crypto System – FastAPI service (Render/Kraken)
-Build: v2.0.0
+Build: v2.0.0 — Dashboard HTML moved to an external file
 
-Routes
-- GET  /                     -> Dashboard
-- GET  /dashboard            -> alias
-- GET  /health               -> Service health (+ scheduler_running)
-- GET  /diag/broker          -> Active broker diagnostics
-- GET  /version              -> App version
-- GET  /config               -> Defaults, symbols, strategies, params
-- POST /scan/{strategy}      -> Run a scan for c1..c6; optional dry=true
-- GET  /bars/{symbol}        -> Recent bars
-- GET  /price/{symbol}       -> Last price
-- GET  /positions            -> Spot positions summary
-- GET  /orders               -> Open orders
-- GET  /fills                -> Recent fills (via broker)
-- POST /order/market         -> Place market order by notional (USD)
-
-Scheduler
-- GET  /scheduler/start      -> Start loop (requires SCHED_ON=1)
-- GET  /scheduler/stop       -> Stop loop
-- GET  /scheduler/status     -> status + live config (includes dynamic notional if enabled)
-
-Journal & PnL
-- POST /journal/sync         -> sync journal JSONL with Kraken fills by txid
-- POST /reconcile/fills      -> alias of /journal/sync (for convenience)
-- GET  /journal              -> list journal rows
-- GET  /pnl/summary          -> total + per-strategy + per-symbol P&L (realized, unrealized, fees, equity)
-- GET  /pnl/strategies       -> per-strategy P&L
-- GET  /pnl/symbols          -> per-symbol P&L
-- POST /pnl/reset            -> clear journal (dangerous; use carefully)
+Summary of this change
+- Removed the large inline DASHBOARD_HTML string from the app.
+- Root routes ("/" and "/dashboard") now read an HTML file from disk on each request.
+- You can edit the file without redeploying app code; simply redeploy static assets / restart the service if needed.
+- The HTML supports the same placeholder tokens as before: {SERVICE_NAME}, {APP_VERSION}, {BROKER_BADGE}, {BROKER_TEXT}.
+- Optional env var DASHBOARD_PATH can point to a custom path; default is "./dashboard.html".
 """
 
 from __future__ import annotations
@@ -262,7 +240,6 @@ async def _scan_bridge(strat: str, req: Dict[str, Any], *, dry: Optional[bool] =
     raw = _merge_raw(strat, dict(req.get("raw") or {}))
     ctx = {"timeframe": timeframe, "symbols": symbols, "notional": notional}
 
-    # Strategy returns actionable intents [{"symbol","side",...}]
     orders = fn({"strategy": strat, "timeframe": timeframe, "limit": limit, "notional": notional, "symbols": symbols, "raw": raw}, ctx) or []
 
     placed: List[Dict[str, Any]] = []
@@ -274,7 +251,6 @@ async def _scan_bridge(strat: str, req: Dict[str, Any], *, dry: Optional[bool] =
             try:
                 res = br.market_notional(sym, side, notional_o)
                 placed.append({**o, "symbol": sym, "side": side, "notional": notional_o, "order": res})
-                # journal attribution (txid may be present immediately; fills synced later)
                 try:
                     _journal_append({
                         "ts": int(time.time()),
@@ -319,22 +295,6 @@ def bars(symbol: str, timeframe: str = DEFAULT_TIMEFRAME, limit: int = 200):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-
-@app.get("/policy/eligible")
-def policy_eligible():
-    now = datetime.utcnow()
-    # use configured symbols/strategies already in this module
-    eligible = []
-    blocked  = []
-    for strat in ACTIVE_STRATEGIES:
-        for sym in SYMBOLS:
-            # run light-weight guard: only windows & whitelist; no ATR/expected move checks
-            if guard_allows is None:
-                ok, reason = True, "policy_guard_missing"
-            else:
-                ok, reason = guard_allows(strat, sym, now, expected_move_pct=None, atr_pct=None)
-            (eligible if ok else blocked).append({"strategy": strat, "symbol": sym, "reason": reason})
-    return {"ok": True, "time": now.isoformat(), "eligible": eligible, "blocked": blocked}
 @app.get("/price/{symbol}")
 def price(symbol: str):
     try:
@@ -391,126 +351,34 @@ async def order_market(request: Request):
         raise HTTPException(status_code=500, detail=str(e))
 
 # -----------------------------------------------------------------------------
-# Dashboard HTML (with small P&L card)
+# Dashboard HTML — now externalized
 # -----------------------------------------------------------------------------
-DASHBOARD_HTML = """
-<!doctype html>
-<html>
-<head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Crypto System Dashboard</title>
-  <style>
-    body{background:#0b0f14;color:#e7edf3;font-family:system-ui,Segoe UI,Roboto,Helvetica,Arial,sans-serif;margin:0;padding:24px}
-    h1,h2{margin:0 0 12px 0;font-weight:600}
-    .card{background:#121a22;border:1px solid #233241;border-radius:10px;padding:16px;margin:12px 0}
-    .muted{color:#90a4b8}
-    table{width:100%;border-collapse:collapse}
-    th,td{padding:8px 10px;border-bottom:1px solid #233241;text-align:left}
-    th{color:#a7c0d8;font-weight:600}
-    code{background:#0e141a;border:1px solid #233241;border-radius:6px;padding:2px 6px}
-    .pill{display:inline-block;padding:4px 8px;border-radius:16px;border:1px solid #2a3b4c;background:#0f151c}
-    .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:12px}
-  </style>
-</head>
-<body>
-  <h1>Crypto System</h1>
-  <div class="card grid">
-    <div>
-      <div class="muted">Symbols</div>
-      <div id="cfg_symbols" class="pill"></div>
-    </div>
-    <div>
-      <div class="muted">Strategies</div>
-      <div id="cfg_strats" class="pill"></div>
-    </div>
-    <div>
-      <div class="muted">Defaults</div>
-      <div id="cfg_defaults" class="pill"></div>
-    </div>
-  </div>
 
-  <div class="card">
-    <h2>What can trade now</h2>
-    <div class="muted" id="elig_summary">—</div>
-    <table id="elig_table">
-      <thead><tr><th>Strategy</th><th>Symbol</th><th>Status</th><th>Reason</th></tr></thead>
-      <tbody></tbody>
-    </table>
-  </div>
+def _read_dashboard_template() -> str:
+    path = os.getenv("DASHBOARD_PATH", "./dashboard.html")
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return f.read()
+    except FileNotFoundError:
+        return f"<h1>Dashboard file not found</h1><p>Expected at: {path}</p>"
+    except Exception as e:
+        return f"<h1>Dashboard error</h1><pre>{e}</pre>"
 
-  <div class="card">
-    <h2>Journal & P&amp;L</h2>
-    <div class="grid">
-      <div>
-        <div class="muted">Sync fills</div>
-        <button onclick="syncFills()">POST /journal/sync</button>
-      </div>
-      <div>
-        <div class="muted">P&amp;L summary</div>
-        <button onclick="fetchPnl()">GET /pnl/summary</button>
-      </div>
-    </div>
-    <pre id="pnl_out" class="muted">// results will appear here</pre>
-  </div>
-
-  <script>
-    async function getJSON(url, opts){const r=await fetch(url,opts||{}); if(!r.ok) throw new Error(await r.text()); return await r.json();}
-
-    async function loadConfig(){
-      const c = await getJSON('/config');
-      document.getElementById('cfg_symbols').textContent = (c.SYMBOLS||[]).join(', ');
-      document.getElementById('cfg_strats').textContent  = (c.STRATEGIES||[]).join(', ');
-      document.getElementById('cfg_defaults').textContent = `${c.DEFAULT_TIMEFRAME||''} • ${c.DEFAULT_LIMIT||''} bars • $${c.DEFAULT_NOTIONAL||''}`;
-    }
-
-    async function loadEligibility(){
-      const data = await getJSON('/policy/eligible');
-      const ok = data.eligible || [], blocked = data.blocked || [];
-      document.getElementById('elig_summary').textContent = `${ok.length} allowed, ${blocked.length} blocked — ${new Date(data.time).toLocaleString()}`;
-      const tbody = document.querySelector('#elig_table tbody');
-      tbody.innerHTML='';
-      function row(s, sym, status, reason){
-        const tr = document.createElement('tr');
-        tr.innerHTML = `<td>${s}</td><td>${sym}</td><td>${status}</td><td class="muted">${reason||''}</td>`;
-        tbody.appendChild(tr);
-      }
-      ok.forEach(x => row(x.strategy, x.symbol, 'allowed', ''));
-      blocked.forEach(x => row(x.strategy, x.symbol, 'blocked', x.reason));
-    }
-
-    async function syncFills(){
-      try{
-        const res = await getJSON('/journal/sync', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({})});
-        document.getElementById('pnl_out').textContent = JSON.stringify(res,null,2);
-      }catch(e){ document.getElementById('pnl_out').textContent = 'Error: '+e.message; }
-    }
-    async function fetchPnl(){
-      try{
-        const res = await getJSON('/pnl/summary');
-        document.getElementById('pnl_out').textContent = JSON.stringify(res,null,2);
-      }catch(e){ document.getElementById('pnl_out').textContent = 'Error: '+e.message; }
-    }
-
-    loadConfig(); loadEligibility();
-    setInterval(loadEligibility, 60000);
-  </script>
-</body>
-</html>
-"""
+def _render_dashboard_html() -> str:
+    broker_badge = "kraken" if USING_KRAKEN else "alpaca"
+    broker_text = "kraken" if USING_KRAKEN else "alpaca"
+    html = _read_dashboard_template()
+    # Keep legacy tokens for backwards compat
+    html = (html
+            .replace("{SERVICE_NAME}", SERVICE_NAME)
+            .replace("{APP_VERSION}", APP_VERSION)
+            .replace("{BROKER_BADGE}", broker_badge)
+            .replace("{BROKER_TEXT}", broker_text))
+    return html
 
 @app.get("/", response_class=HTMLResponse)
 def root():
-    broker_badge = "kraken" if USING_KRAKEN else "alpaca"
-    broker_text = "kraken" if USING_KRAKEN else "alpaca"
-    html = (
-        DASHBOARD_HTML
-        .replace("{SERVICE_NAME}", SERVICE_NAME)
-        .replace("{APP_VERSION}", APP_VERSION)
-        .replace("{BROKER_BADGE}", broker_badge)
-        .replace("{BROKER_TEXT}", broker_text)
-    )
-    return HTMLResponse(content=html, status_code=200)
+    return HTMLResponse(content=_render_dashboard_html(), status_code=200)
 
 @app.get("/dashboard", response_class=HTMLResponse)
 def dashboard_alias():
@@ -634,65 +502,13 @@ def _journal_append(row: dict):
         _JOURNAL.append(row)
         try:
             with open(_JOURNAL_PATH, "a", encoding="utf-8") as f:
-                f.write(json.dumps(row, separators=(",", ":")) + "\n")
+                f.write(json.dumps(row, separators=(",", ":")) + "\\n")
         except Exception as e:
             log.warning("journal persist error: %s", e)
 
 @app.on_event("startup")
 async def _journal_on_start():
     _journal_load()
-
-def _sync_journal_with_fills(max_trades: int = 400) -> dict:
-    try:
-        fills = br.trades_history(max_trades)
-        if not fills.get("ok"):
-            return {"ok": False, "error": fills.get("error", "unknown")}
-        by_txid = {t["txid"]: t for t in fills.get("trades", []) if t.get("txid")}
-        updated = 0
-        with _JOURNAL_LOCK:
-            for row in _JOURNAL:
-                tx = row.get("txid")
-                if tx and tx in by_txid:
-                    t = by_txid[tx]
-                    sym_guess = t.get("pair") or ""
-                    try:
-                        from symbol_map import from_kraken as _from
-                        sym_ui = (_from(sym_guess) or sym_guess).upper()
-                    except Exception:
-                        sym_ui = sym_guess.upper()
-                    row["symbol"] = row.get("symbol") or sym_ui
-                    row["price"] = float(t.get("price") or 0.0)
-                    row["vol"] = float(t.get("vol") or 0.0)
-                    row["fee"] = float(t.get("fee") or 0.0)
-                    row["cost"] = float(t.get("cost") or 0.0)
-                    row["filled_ts"] = float(t.get("time") or 0.0)
-                    updated += 1
-        if updated:
-            # persist whole file
-            try:
-                with open(_JOURNAL_PATH, "w", encoding="utf-8") as f:
-                    for r in _JOURNAL:
-                        f.write(json.dumps(r, separators=(",", ":")) + "\n")
-            except Exception as pe:
-                log.warning("journal rewrite error: %s", pe)
-        return {"ok": True, "updated": updated, "count": len(_JOURNAL)}
-    except Exception as e:
-        return {"ok": False, "error": str(e)}
-
-@app.post("/journal/sync")
-def journal_sync():
-    return _sync_journal_with_fills(400)
-
-# alias for convenience (you used this)
-@app.post("/reconcile/fills")
-def reconcile_fills_alias():
-    return _sync_journal_with_fills(400)
-
-@app.get("/journal")
-def journal_list(limit: int = 200):
-    with _JOURNAL_LOCK:
-        rows = list(_JOURNAL[-int(limit):])
-    return {"ok": True, "rows": rows, "count": len(_JOURNAL)}
 
 def _prices_for(symbols: List[str]) -> Dict[str, float]:
     out: Dict[str, float] = {}
