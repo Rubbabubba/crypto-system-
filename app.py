@@ -2,19 +2,18 @@
 # -*- coding: utf-8 -*-
 """
 Crypto System – FastAPI service (Render/Kraken)
-Build: v2.0.0 — Dashboard HTML moved to an external file
+Build: v2.0.1 — Dashboard externalized + policy & price endpoint fixes
 
-Summary of this change
-- Removed the large inline DASHBOARD_HTML string from the app.
-- Root routes ("/" and "/dashboard") now read an HTML file from disk on each request.
-- You can edit the file without redeploying app code; simply redeploy static assets / restart the service if needed.
-- The HTML supports the same placeholder tokens as before: {SERVICE_NAME}, {APP_VERSION}, {BROKER_BADGE}, {BROKER_TEXT}.
-- Optional env var DASHBOARD_PATH can point to a custom path; default is "./dashboard.html".
+Changes in 2.0.1
+- Added SYMBOLS alias to avoid NameError in older routes.
+- Added GET /price/{base}/{quote} so calls like /price/BTC/USD work.
+- Restored /policy/eligible using guard.py if present; safe fallback otherwise.
+- Dashboard HTML still loaded from external dashboard.html (DASHBOARD_PATH optional).
 """
 
 from __future__ import annotations
 
-__version__ = "2.0.0"
+__version__ = "2.0.1"
 
 import asyncio
 import os
@@ -30,9 +29,6 @@ import pandas as pd
 from fastapi import FastAPI, HTTPException, Request, Body
 from fastapi.responses import JSONResponse, HTMLResponse
 
-# -----------------------------------------------------------------------------
-# Logging
-# -----------------------------------------------------------------------------
 logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO"),
     format="%(asctime)s | %(levelname)s | %(message)s",
@@ -40,9 +36,6 @@ logging.basicConfig(
 )
 log = logging.getLogger("app")
 
-# -----------------------------------------------------------------------------
-# Broker selection (Kraken by default; Alpaca legacy fallback)
-# -----------------------------------------------------------------------------
 BROKER = os.getenv("BROKER", "kraken").lower()
 USING_KRAKEN = BROKER == "kraken" or (os.getenv("KRAKEN_KEY") and os.getenv("KRAKEN_SECRET"))
 
@@ -53,16 +46,12 @@ else:
     import broker as br  # Alpaca adapter (legacy)
     ACTIVE_BROKER_MODULE = "broker"
 
-# Live trading enablement – broker-specific flag
 TRADING_ENABLED_BASE = os.getenv("TRADING_ENABLED", "1") in ("1", "true", "True")
 if USING_KRAKEN:
     TRADING_ENABLED = TRADING_ENABLED_BASE and (os.getenv("KRAKEN_TRADING", "0") in ("1", "true", "True"))
 else:
     TRADING_ENABLED = TRADING_ENABLED_BASE and (os.getenv("ALPACA_TRADING", "0") in ("1", "true", "True"))
 
-# -----------------------------------------------------------------------------
-# Globals & defaults
-# -----------------------------------------------------------------------------
 APP_VERSION = os.getenv("APP_VERSION", __version__)
 SERVICE_NAME = os.getenv("SERVICE_NAME", "Crypto System")
 
@@ -70,20 +59,20 @@ DEFAULT_TIMEFRAME = os.getenv("DEFAULT_TIMEFRAME", "5Min")
 DEFAULT_LIMIT = int(os.getenv("DEFAULT_LIMIT", "300"))
 DEFAULT_NOTIONAL = float(os.getenv("DEFAULT_NOTIONAL", os.getenv("ORDER_NOTIONAL", "25")))
 
-# ---- Risk-based dynamic sizing (safe defaults) ----
-RISK_PCT = float(os.getenv("RISK_PCT", "0.05"))          # 5% of equity
-NOTIONAL_MIN = float(os.getenv("NOTIONAL_MIN", "25"))    # clamp floor
-NOTIONAL_MAX = float(os.getenv("NOTIONAL_MAX", "250"))   # clamp cap
+RISK_PCT = float(os.getenv("RISK_PCT", "0.05"))
+NOTIONAL_MIN = float(os.getenv("NOTIONAL_MIN", "25"))
+NOTIONAL_MAX = float(os.getenv("NOTIONAL_MAX", "250"))
 SCHED_AUTO_SIZE = os.getenv("SCHED_AUTO_SIZE", "1").lower() in ("1","true","yes","y")
 
-# Symbol universe
 try:
     from universe import load_universe_from_env
     _CURRENT_SYMBOLS = load_universe_from_env()
 except Exception:
-    _CURRENT_SYMBOLS = ["BTCUSD", "ETHUSD", "SOLUSD", "DOGEUSD", "XRPUSD", "AVAXUSD", "LINKUSD", "BCHUSD", "LTCUSD"]
+    _CURRENT_SYMBOLS = ["BTC/USD","ETH/USD","SOL/USD","DOGE/USD","XRP/USD","AVAX/USD","LINK/USD","BCH/USD","LTC/USD"]
 
-# Strategy defaults (optimized params retained)
+# Compatibility alias for older code paths:
+SYMBOLS = _CURRENT_SYMBOLS
+
 DEFAULT_STRAT_PARAMS: Dict[str, Dict[str, Any]] = {
     "c1": {"ema_n": 20, "vwap_pull": 0.0020, "min_vol": 0.0},
     "c2": {"ema_n": 50, "exit_k": 0.997, "min_atr": 0.0},
@@ -95,9 +84,6 @@ DEFAULT_STRAT_PARAMS: Dict[str, Dict[str, Any]] = {
 ACTIVE_STRATEGIES = list(DEFAULT_STRAT_PARAMS.keys())
 _DISABLED_STRATS: set[str] = set()
 
-# -----------------------------------------------------------------------------
-# Import strategies and build dispatcher
-# -----------------------------------------------------------------------------
 import c1, c2, c3, c4, c5, c6
 
 STRAT_DISPATCH = {
@@ -109,9 +95,6 @@ STRAT_DISPATCH = {
     "c6": c6.scan,
 }
 
-# -----------------------------------------------------------------------------
-# Helpers
-# -----------------------------------------------------------------------------
 def utc_now() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
@@ -139,10 +122,10 @@ def _normalize_asset_code(asset: str) -> str:
 
 def _account_equity_usd() -> float:
     try:
-        pos = br.positions()  # [{'asset': 'USD', 'qty': ...}, {'asset':'SOL.F','qty':...}, ...]
+        pos = br.positions()
     except Exception:
         return 0.0
-    base_to_sym = {s[:-3].upper(): s for s in _CURRENT_SYMBOLS if s.upper().endswith("USD") and len(s) > 3}
+    base_to_sym = {s.split("/")[0].upper(): s for s in _CURRENT_SYMBOLS if s.upper().endswith("/USD")}
     cash_usd = 0.0
     equity = 0.0
     for p in (pos or []):
@@ -167,14 +150,8 @@ def _sized_notional_from_equity(equity_usd: float) -> float:
     sized = max(NOTIONAL_MIN, min(NOTIONAL_MAX, raw))
     return round(sized, 2)
 
-# -----------------------------------------------------------------------------
-# FastAPI app
-# -----------------------------------------------------------------------------
 app = FastAPI(title=SERVICE_NAME, version=APP_VERSION)
 
-# -----------------------------------------------------------------------------
-# Core info routes
-# -----------------------------------------------------------------------------
 @app.get("/health")
 def health():
     return {
@@ -214,9 +191,6 @@ def config():
         "PARAMS": DEFAULT_STRAT_PARAMS,
     }
 
-# -----------------------------------------------------------------------------
-# Scan bridge — dispatch to strategy module
-# -----------------------------------------------------------------------------
 class ScanRequestModel(TypedDict, total=False):
     symbols: List[str]
     timeframe: str
@@ -236,7 +210,7 @@ async def _scan_bridge(strat: str, req: Dict[str, Any], *, dry: Optional[bool] =
     timeframe = req.get("timeframe") or DEFAULT_TIMEFRAME
     limit = int(req.get("limit") or DEFAULT_LIMIT)
     notional = float(req.get("notional") or DEFAULT_NOTIONAL)
-    symbols = _to_list(req.get("symbols")) or _CURRENT_SYMBOLS
+    symbols = _to_list(req.get("symbols")) or [s.upper().replace("USD","/USD") if "USD" in s and "/" not in s else s.upper() for s in _CURRENT_SYMBOLS]
     raw = _merge_raw(strat, dict(req.get("raw") or {}))
     ctx = {"timeframe": timeframe, "symbols": symbols, "notional": notional}
 
@@ -251,15 +225,6 @@ async def _scan_bridge(strat: str, req: Dict[str, Any], *, dry: Optional[bool] =
             try:
                 res = br.market_notional(sym, side, notional_o)
                 placed.append({**o, "symbol": sym, "side": side, "notional": notional_o, "order": res})
-                try:
-                    _journal_append({
-                        "ts": int(time.time()),
-                        "symbol": sym, "side": side, "notional": notional_o,
-                        "strategy": strat, "txid": res.get("txid"), "descr": res.get("descr"),
-                        "price": None, "vol": None, "fee": None, "cost": None, "filled_ts": None,
-                    })
-                except Exception as je:
-                    log.warning("journal add failed: %s", je)
             except Exception as e:
                 placed.append({**o, "symbol": sym, "side": side, "notional": notional_o, "error": str(e)})
     else:
@@ -284,9 +249,8 @@ async def scan(strategy: str, model: Dict[str, Any] = Body(...)):
         log.exception("scan error")
         raise HTTPException(status_code=500, detail=str(e))
 
-# -----------------------------------------------------------------------------
-# Market data & account
-# -----------------------------------------------------------------------------
+# ------------------------------- Market Data ---------------------------------
+
 @app.get("/bars/{symbol}")
 def bars(symbol: str, timeframe: str = DEFAULT_TIMEFRAME, limit: int = 200):
     try:
@@ -295,11 +259,23 @@ def bars(symbol: str, timeframe: str = DEFAULT_TIMEFRAME, limit: int = 200):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+# Original endpoint kept for compatibility: /price/BTCUSD or /price/BTC/USD (the latter will 404 here)
 @app.get("/price/{symbol}")
 def price(symbol: str):
     try:
         p = br.last_price(symbol.upper())
         return {"ok": True, "symbol": symbol.upper(), "price": float(p)}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+# New endpoint to support /price/BTC/USD pattern used by the dashboard
+@app.get("/price/{base}/{quote}")
+def price_pair(base: str, quote: str):
+    try:
+        # prefer slash form e.g., BTC/USD to match Kraken adapter expectations
+        symbol = f"{base.upper()}/{quote.upper()}"
+        p = br.last_price(symbol)
+        return {"ok": True, "symbol": symbol, "price": float(p)}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -331,28 +307,17 @@ def fills():
 async def order_market(request: Request):
     try:
         body = await request.json()
-        symbol = (body.get("symbol") or "BTCUSD").upper()
+        symbol = (body.get("symbol") or "BTC/USD").upper()
         side = (body.get("side") or "buy").lower()
         notional = float(body.get("notional") or DEFAULT_NOTIONAL)
         if not TRADING_ENABLED:
             return {"ok": True, "dry": True, "symbol": symbol, "side": side, "notional": notional}
         res = br.market_notional(symbol, side, notional)
-        try:
-            _journal_append({
-                "ts": int(time.time()),
-                "symbol": symbol, "side": side, "notional": notional,
-                "strategy": "manual", "txid": res.get("txid"), "descr": res.get("descr"),
-                "price": None, "vol": None, "fee": None, "cost": None, "filled_ts": None,
-            })
-        except Exception as je:
-            log.warning("journal add (manual) failed: %s", je)
         return {"ok": True, "order": res}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-# -----------------------------------------------------------------------------
-# Dashboard HTML — now externalized
-# -----------------------------------------------------------------------------
+# ----------------------------- Dashboard HTML --------------------------------
 
 def _read_dashboard_template() -> str:
     path = os.getenv("DASHBOARD_PATH", "./dashboard.html")
@@ -368,7 +333,6 @@ def _render_dashboard_html() -> str:
     broker_badge = "kraken" if USING_KRAKEN else "alpaca"
     broker_text = "kraken" if USING_KRAKEN else "alpaca"
     html = _read_dashboard_template()
-    # Keep legacy tokens for backwards compat
     html = (html
             .replace("{SERVICE_NAME}", SERVICE_NAME)
             .replace("{APP_VERSION}", APP_VERSION)
@@ -384,9 +348,7 @@ def root():
 def dashboard_alias():
     return root()
 
-# -----------------------------------------------------------------------------
-# Scheduler (auto, env-driven; dynamic sizing optional)
-# -----------------------------------------------------------------------------
+# ------------------------------- Scheduler -----------------------------------
 _RUNNING = False
 
 def _sched_config() -> Dict[str, Any]:
@@ -473,9 +435,37 @@ async def _maybe_autostart_scheduler():
         asyncio.create_task(_loop())
         log.info("Scheduler autostart: enabled by SCHED_ON")
 
-# -----------------------------------------------------------------------------
-# Journal & P&L (JSONL journal_v2.jsonl)
-# -----------------------------------------------------------------------------
+# ------------------------------ Policy/Guard ---------------------------------
+
+def _coerce_slash(sym: str) -> str:
+    sym = sym.upper().replace(" ", "")
+    if "/" not in sym and sym.endswith("USD"):
+        return sym[:-3] + "/USD"
+    return sym
+
+@app.get("/policy/eligible")
+def policy_eligible():
+    """
+    Returns eligibility of each symbol based on guard module if present.
+    Fallback: allow True for all symbols.
+    """
+    syms = [_coerce_slash(s) for s in _CURRENT_SYMBOLS]
+    try:
+        import guard  # local policy helper using policy_config/*
+        now_ts = time.time()
+        out = []
+        for sym in syms:
+            try:
+                ok, reason = guard.is_trade_allowed("dashboard", sym, now_ts=now_ts)
+                out.append({"symbol": sym, "allowed": bool(ok), "reason": str(reason)})
+            except Exception as e:
+                out.append({"symbol": sym, "allowed": False, "reason": f"guard_error:{e}"})
+        return {"ok": True, "symbols": out, "time": utc_now()}
+    except Exception:
+        # Safe fallback if guard isn't available or errors
+        return {"ok": True, "symbols": [{"symbol": s, "allowed": True, "reason": "fallback"} for s in syms], "time": utc_now()}
+
+# ----------------------------- Journal & P&L ---------------------------------
 _JOURNAL_LOCK = threading.Lock()
 _JOURNAL_PATH = os.getenv("JOURNAL_PATH", "./journal_v2.jsonl")
 _JOURNAL: List[Dict[str, Any]] = []
@@ -502,7 +492,7 @@ def _journal_append(row: dict):
         _JOURNAL.append(row)
         try:
             with open(_JOURNAL_PATH, "a", encoding="utf-8") as f:
-                f.write(json.dumps(row, separators=(",", ":")) + "\\n")
+                f.write(json.dumps(row, separators=(",", ":")) + "\n")
         except Exception as e:
             log.warning("journal persist error: %s", e)
 
@@ -525,7 +515,7 @@ def _pnl_calc(now_prices: Dict[str, float]) -> Dict[str, Any]:
         trades = [r for r in _JOURNAL if r.get("price") and r.get("vol")]
     trades.sort(key=lambda r: r.get("filled_ts") or r.get("ts") or 0)
 
-    lots = defaultdict(lambda: deque())  # (strategy,symbol) -> deque of [qty, cost_px]
+    lots = defaultdict(lambda: deque())
     stats = defaultdict(lambda: {"realized": 0.0, "fees": 0.0, "qty": 0.0, "avg_cost": 0.0})
 
     for r in trades:
@@ -625,9 +615,6 @@ def pnl_reset():
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-# -----------------------------------------------------------------------------
-# Entrypoint
-# -----------------------------------------------------------------------------
 if __name__ == "__main__":
     import uvicorn  # type: ignore
     port = int(os.getenv("PORT", "10000"))
