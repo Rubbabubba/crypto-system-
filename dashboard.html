@@ -1,13 +1,14 @@
 <!doctype html>
 <html lang="en">
 <head>
-  <!-- Crypto System Dashboard UI v1.4.3 -->
+  <!-- Crypto System Dashboard UI v1.4.4 -->
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width,initial-scale=1" />
   <title>{SERVICE_NAME} — Dashboard</title>
   <style>
     :root{--bg:#0c0f14;--card-bg:#121720;--border:#223041;--text:#e8eef7;--muted:#9bb0c3;--btn-bg:#111722;--accent:#4ea7ff;--ok:#2e7d32;--warn:#c62828}
-    *{box-sizing:border-box} html,body{margin:0;padding:0;background:var(--bg);color:var(--text);font:14px/1.45 system-ui,-apple-system,Segoe UI,Roboto,Ubuntu,Cantarell,Arial,sans-serif}
+    *{box-sizing:border-box}
+    html,body{margin:0;padding:0;background:var(--bg);color:var(--text);font:14px/1.45 system-ui,-apple-system,Segoe UI,Roboto,Ubuntu,Cantarell,Arial,sans-serif}
     a{color:var(--accent);text-decoration:none}
     .wrap-page{width:100%;padding:16px 18px}
     header{display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:16px}
@@ -71,7 +72,7 @@
       <div class="meta">
         <span class="badge">Broker: <strong>{BROKER_TEXT}</strong></span>
         <span class="badge">App v{APP_VERSION}</span>
-        <span class="badge">UI v1.4.3</span>
+        <span class="badge">UI v1.4.4</span>
       </div>
     </header>
 
@@ -79,12 +80,12 @@
       <!-- CONTROL PANEL -->
       <section id="control-panel" class="card">
         <div class="card-header"><h2>Control Panel</h2><div class="subtext">Crypto System • v2.0.0 • kraken</div></div>
-        <div class="row"><button class="btn" onclick="fetchAndLog('/health')">GET /health</button><a class="link-open" href="/health" target="_blank" rel="noopener">open</a></div>
-        <div class="row"><button class="btn" onclick="fetchAndLog('/diag/broker')">GET /diag/broker</button><a class="link-open" href="/diag/broker" target="_blank" rel="noopener">open</a></div>
-        <div class="row"><button class="btn" onclick="fetchAndLog('/version')">GET /version</button><a class="link-open" href="/version" target="_blank" rel="noopener">open</a></div>
-        <div class="row"><button class="btn" onclick="fetchAndLog('/config')">GET /config</button><a class="link-open" href="/config" target="_blank" rel="noopener">open</a></div>
-        <div class="row"><button class="btn" onclick="fetchAndLog('/fills')">GET /fills</button><a class="link-open" href="/fills" target="_blank" rel="noopener">open</a></div>
-        <div class="row" style="margin-top:6px"><button id="btn_sched_status" class="btn" onclick="schedulerStatus()">GET /scheduler/status</button><a class="link-open" href="/scheduler/status" target="_blank" rel="noopener">open</a></div>
+        <div class="row"><button class="btn" onclick="fetchAndLog('/health')">GET /health</button><a class="link-open" href="/health" target="_blank">open</a></div>
+        <div class="row"><button class="btn" onclick="fetchAndLog('/diag/broker')">GET /diag/broker</button><a class="link-open" href="/diag/broker" target="_blank">open</a></div>
+        <div class="row"><button class="btn" onclick="fetchAndLog('/version')">GET /version</button><a class="link-open" href="/version" target="_blank">open</a></div>
+        <div class="row"><button class="btn" onclick="fetchAndLog('/config')">GET /config</button><a class="link-open" href="/config" target="_blank">open</a></div>
+        <div class="row"><button class="btn" onclick="fetchAndLog('/fills')">GET /fills</button><a class="link-open" href="/fills" target="_blank">open</a></div>
+        <div class="row" style="margin-top:6px"><button id="btn_sched_status" class="btn" onclick="schedulerStatus()">GET /scheduler/status</button><a class="link-open" href="/scheduler/status" target="_blank">open</a></div>
         <div class="row"><button id="btn_sched_start" class="btn success" onclick="schedulerStart()">/scheduler/start</button><button id="btn_sched_stop" class="btn danger" onclick="schedulerStop()">/scheduler/stop</button></div>
         <div class="mini-meta"><div><strong>Symbols:</strong> <code id="meta_symbols">—</code></div><div><strong>Strategies:</strong> <code id="meta_strategies">—</code></div></div>
       </section>
@@ -98,7 +99,7 @@
 
       <!-- P&L -->
       <section id="pnl" class="card">
-        <div class="card-header"><h2>P&amp;L</h2><div class="subtext">Aggregated from /pnl/summary</div></div>
+        <div class="card-header"><h2>P&amp;L</h2><div class="subtext">Primary: /pnl/summary • Fallback: client FIFO from /fills + prices</div></div>
         <div class="stat-tiles">
           <div class="tile"><div class="label">Realized</div><div id="tile_realized" class="val">$0</div></div>
           <div class="tile"><div class="label">Unrealized</div><div id="tile_unrealized" class="val">$0</div></div>
@@ -119,7 +120,7 @@
           <button class="btn" onclick="refreshPnL()">Refresh P&amp;L</button>
           <button class="btn" onclick="fetchAndLog('/journal/sync')">Sync fills</button>
           <a class="link-open" href="/pnl/summary" target="_blank">open</a>
-          <a class="link-open" href="/journal" target="_blank">journal</a>
+          <!-- journal link removed: route 404 -->
         </div>
       </section>
 
@@ -143,148 +144,196 @@
     </div>
 
     <footer><div>© <span id="year"></span> {SERVICE_NAME}</div>
-      <div>Broker: <strong>{BROKER_TEXT}</strong> · App v{APP_VERSION} · UI v1.4.3</div></footer>
+      <div>Broker: <strong>{BROKER_TEXT}</strong> · App v{APP_VERSION} · UI v1.4.4</div></footer>
   </div>
 
   <script>
-    /* ---------- Console & global error capture ---------- */
-    const $ = sel => document.querySelector(sel);
-    const log = (t, d='') => {
-      const el = $('#console_log'); if(!el) return;
-      const body = typeof d === 'string' ? d : JSON.stringify(d, null, 2);
-      el.textContent += `[${new Date().toISOString()}] ${t}\n${body}\n\n`;
-      el.scrollTop = el.scrollHeight;
-    };
-    function logBoot(){ log('UI', 'booting…'); }
-    window.onerror = (msg, src, line, col, err) => { log('window.onerror', {msg, src, line, col, err: String(err)}); };
-    window.onunhandledrejection = ev => { log('unhandledrejection', String(ev.reason || ev)); };
+    /* ===== Console & diagnostics ===== */
+    const $ = s => document.querySelector(s);
+    const log = (t, d='') => { const el=$('#console_log'); if(!el) return; const body=typeof d==='string'?d:JSON.stringify(d,null,2); el.textContent+=`[${new Date().toISOString()}] ${t}\n${body}\n\n`; el.scrollTop=el.scrollHeight; };
+    window.onerror = (m,src,l,c,e)=>log('window.onerror',{m,src,l,c,err:String(e)});
+    window.onunhandledrejection = ev=>log('unhandledrejection',String(ev.reason||ev));
+    const money=v=>(v<0?'-':'')+'$'+Math.abs(Number(v||0)).toLocaleString(undefined,{maximumFractionDigits:2});
 
-    /* ---------- Robust fetch helpers ---------- */
     async function fetchJSON(path){
       try{
-        const r = await fetch(path, {cache:'no-store'});
-        const text = await r.text(); // read once
-        let data;
-        try { data = JSON.parse(text); }
-        catch { data = { raw:text }; }
+        const r = await fetch(path,{cache:'no-store'}); const text = await r.text(); let data;
+        try{ data=JSON.parse(text); }catch{ data={raw:text}; }
         if(!r.ok){ log(`HTTP ${r.status} ${path}`, data); throw new Error(`HTTP ${r.status}`); }
         return data;
       }catch(e){ log(`FETCH FAIL ${path}`, String(e)); throw e; }
     }
-    async function fetchAndLog(path){ const j = await fetchJSON(path); log(`GET ${path}`, j); return j; }
+    async function fetchAndLog(path){ const j=await fetchJSON(path); log(`GET ${path}`, j); return j; }
 
-    /* ---------- Control Panel ---------- */
-    async function schedulerStatus(){ try{ return await fetchAndLog('/scheduler/status'); }catch(_){} }
-    async function schedulerStart(){ try{ return await fetchAndLog('/scheduler/start'); }catch(_){} }
-    async function schedulerStop(){  try{ return await fetchAndLog('/scheduler/stop'); }catch(_){} }
+    /* ===== Control Panel ===== */
+    async function schedulerStatus(){ try{ return await fetchAndLog('/scheduler/status'); }catch(e){} }
+    async function schedulerStart(){ try{ return await fetchAndLog('/scheduler/start'); }catch(e){} }
+    async function schedulerStop(){  try{ return await fetchAndLog('/scheduler/stop'); }catch(e){} }
 
-    /* ---------- Config ---------- */
-    let SYMBOLS = [];
+    /* ===== Config / Symbols ===== */
+    let SYMBOLS=[];
     async function initFromConfig(){
       try{
         const cfg = await fetchJSON('/config');
-        const syms = cfg.SYMBOLS || cfg.symbols || [];
-        const strats = cfg.STRATEGIES || cfg.strategies || [];
-        SYMBOLS = syms.map(s => String(s).toUpperCase());
-        $('#meta_symbols').textContent = SYMBOLS.join(', ') || '—';
-        $('#meta_strategies').textContent = (strats||[]).join(', ') || '—';
-        buildPriceRows(SYMBOLS);
+        const syms=(cfg.SYMBOLS||cfg.symbols||[]).map(s=>String(s).toUpperCase());
+        const strats=cfg.STRATEGIES||cfg.strategies||[];
+        SYMBOLS=syms; $('#meta_symbols').textContent=syms.join(', ')||'—'; $('#meta_strategies').textContent=(strats||[]).join(', ')||'—';
+        buildPriceRows(syms);
       }catch(e){
-        log('CONFIG', 'failed to load /config; continuing with empty symbols');
-        SYMBOLS = [];
-        buildPriceRows(SYMBOLS);
+        SYMBOLS=[]; buildPriceRows([]);
       }
     }
 
-    /* ---------- Prices (try both route shapes) ---------- */
-    const SERIES = {}; const MAX_POINTS = 60;
+    /* ===== Prices ===== */
+    const SERIES={}; const MAX_POINTS=60;
     function buildPriceRows(syms){
-      const tbody = $('#prices_tbody'); tbody.innerHTML = '';
+      const tbody=$('#prices_tbody'); if(!tbody) return; tbody.innerHTML='';
       (syms||[]).forEach(sym=>{
-        SERIES[sym] = SERIES[sym] || [];
-        const tr = document.createElement('tr');
-        tr.innerHTML = `
-          <td class="mono">${sym}</td>
-          <td class="mono" id="px_${sym}">—</td>
-          <td><svg viewBox="0 0 120 28" width="120" height="28"><path id="line_${sym}" stroke="${getComputedStyle(document.body).getPropertyValue('--accent')||'#82b1ff'}" fill="none" stroke-width="1.5"/></svg></td>
-          <td class="mono" id="ts_${sym}" style="color:var(--muted)">—</td>`;
+        SERIES[sym]=SERIES[sym]||[];
+        const tr=document.createElement('tr');
+        tr.innerHTML = `<td class="mono">${sym}</td>
+                        <td class="mono" id="px_${sym}">—</td>
+                        <td><svg viewBox="0 0 120 28" width="120" height="28"><path id="line_${sym}" stroke="${getComputedStyle(document.body).getPropertyValue('--accent')||'#82b1ff'}" fill="none" stroke-width="1.5"/></svg></td>
+                        <td class="mono" id="ts_${sym}" style="color:var(--muted)">—</td>`;
         tbody.appendChild(tr);
       });
     }
-    function splitSymbol(sym){
-      const s = sym.replace(/\s+/g,'').toUpperCase();
-      if(s.includes('/')){ const [b,q]=s.split('/'); return [b,q]; }
-      if(s.endsWith('USD')) return [s.slice(0,-3), 'USD'];
-      return [s, 'USD'];
-    }
+    function splitSymbol(sym){ const s=sym.replace(/\s+/g,'').toUpperCase(); if(s.includes('/')){const [b,q]=s.split('/'); return [b,q];} if(s.endsWith('USD')) return [s.slice(0,-3),'USD']; return [s,'USD']; }
     async function fetchPriceFor(sym){
       const [b,q]=splitSymbol(sym);
-      // try /price/BASE/QUOTE
-      try{
-        const j = await fetchJSON(`/price/${encodeURIComponent(b)}/${encodeURIComponent(q)}`);
-        if(j && (j.price!=null)) return j;
-      }catch(_){}
-      // fallback /price/SYMBOL
+      try{ const j=await fetchJSON(`/price/${encodeURIComponent(b)}/${encodeURIComponent(q)}`); if(j && j.price!=null) return j; }catch(_){}
       return await fetchJSON(`/price/${encodeURIComponent(sym)}`);
     }
-    function sparkPath(points, w=120, h=28, pad=2){
-      if(!points.length) return '';
-      const n=points.length, lo=Math.min(...points), hi=Math.max(...points), rng=(hi-lo)||1e-9;
-      const x=i=>pad + (i/(n-1))*(w-pad*2), y=v=>pad + (h-pad*2) - ((v-lo)/rng)*(h-pad*2);
-      let d=`M ${x(0)} ${y(points[0])}`; for(let i=1;i<n;i++) d+=` L ${x(i)} ${y(points[i])}`; return d;
-    }
+    function sparkPath(points,w=120,h=28,pad=2){ if(!points.length) return ''; const n=points.length,lo=Math.min(...points),hi=Math.max(...points),rng=(hi-lo)||1e-9;
+      const x=i=>pad+(i/(n-1))*(w-pad*2), y=v=>pad+(h-pad*2)-((v-lo)/rng)*(h-pad*2); let d=`M ${x(0)} ${y(points[0])}`; for(let i=1;i<n;i++) d+=` L ${x(i)} ${y(points[i])}`; return d; }
     async function refreshPrices(forceLog=false){
-      if(!SYMBOLS.length){ return; }
       for(const sym of SYMBOLS){
         try{
-          const j = await fetchPriceFor(sym);
-          const px = Number(j.price);
-          if(Number.isFinite(px)){
-            const arr = SERIES[sym]; arr.push(px); if(arr.length>MAX_POINTS) arr.shift();
-            document.getElementById(`px_${sym}`).textContent = px;
-            document.getElementById(`line_${sym}`).setAttribute('d', sparkPath(arr));
-            document.getElementById(`ts_${sym}`).textContent = new Date().toISOString();
-            if(forceLog) log(`price ${sym}`, j);
+          const j=await fetchPriceFor(sym); const px=Number(j.price);
+          if(Number.isFinite(px)){ const arr=SERIES[sym]; arr.push(px); if(arr.length>MAX_POINTS) arr.shift();
+            document.getElementById(`px_${sym}`).textContent=px; document.getElementById(`line_${sym}`).setAttribute('d',sparkPath(arr));
+            document.getElementById(`ts_${sym}`).textContent=new Date().toISOString(); if(forceLog) log(`price ${sym}`, j);
           }
         }catch(e){ log(`price ${sym} error`, String(e)); }
       }
     }
 
-    /* ---------- P&L ---------- */
-    const money = v => (v<0?'-':'') + '$' + Math.abs(Number(v||0)).toLocaleString(undefined,{maximumFractionDigits:2});
-    async function refreshPnL(){
-      try{
-        const j = await fetchJSON('/pnl/summary');
-        const t = j.total || {};
-        $('#tile_realized').textContent  = money(t.realized);
-        $('#tile_unrealized').textContent= money(t.unrealized);
-        $('#tile_fees').textContent      = money(t.fees);
-        $('#tile_equity').textContent    = money(t.equity);
-
-        const fillT = (tbody, rows, key) => {
-          tbody.innerHTML = '';
-          (rows||[]).slice(0,5).forEach(r=>{
-            const tr = document.createElement('tr');
-            tr.innerHTML = `<td>${r[key]}</td><td class="mono">${money(r.realized)}</td><td class="mono">${money(r.unrealized)}</td><td class="mono">${money(r.fees)}</td><td class="mono">${money(r.equity)}</td>`;
-            tbody.appendChild(tr);
-          });
-        };
-        fillT($('#tbl_strategy tbody'), j.per_strategy, 'strategy');
-        fillT($('#tbl_symbol tbody'),   j.per_symbol,   'symbol');
-      }catch(e){ log('pnl error', String(e)); }
-    }
-
-    /* ---------- Calendar ---------- */
+    /* ===== Client P&L fallback (FIFO) ===== */
     function parseFill(r){
       const side=(r.side||r.type||'').toLowerCase(), sym=(r.symbol||r.pair||'').toUpperCase();
       const price=+r.price||+r.avg_price||+r.px||0, vol=+r.vol||+r.volume||+r.qty||+r.quantity||0;
-      const fee=+r.fee||+r.fees||0, t=Date.parse(r.time||r.timestamp||r.filled_ts||0)/1000;
-      return {side,sym,price,vol,fee,t:t||0};
+      const fee=+r.fee||+r.fees||0, strat=(r.strategy||r.strat||'misc');
+      return {side,sym,price,vol,fee,strategy:strat};
+    }
+    async function computePnLFromFills(){
+      const resp = await fetchJSON('/fills');
+      const fillsRaw = resp.fills || resp.trades || resp.data || resp || [];
+      const fills = (Array.isArray(fillsRaw)?fillsRaw:Object.values(fillsRaw)).map(parseFill).filter(f=>f.vol>0 && f.price>0 && (f.side==='buy'||f.side==='sell'));
+      // FIFO per symbol
+      const lots=new Map(); const realizedBySym=new Map(); const feesBySym=new Map(); const realizedByStrat=new Map(); let totalFee=0;
+      for(const f of fills){
+        if(!lots.has(f.sym)) lots.set(f.sym, []);
+        if(f.side==='buy'){ lots.get(f.sym).push({q:f.vol, px:f.price, strategy:f.strategy}); totalFee += f.fee||0; feesBySym.set(f.sym, (feesBySym.get(f.sym)||0) + (f.fee||0)); continue; }
+        // sell
+        let rem=f.vol, real=0;
+        const L=lots.get(f.sym);
+        while(rem>1e-12 && L && L.length){
+          const lot=L[0]; const take=Math.min(lot.q,rem);
+          real += (f.price - lot.px) * take;
+          // attribute to lot.strategy for realized-by-strategy
+          realizedByStrat.set(lot.strategy, (realizedByStrat.get(lot.strategy)||0) + (f.price - lot.px) * take);
+          lot.q -= take; rem -= take; if(lot.q<=1e-12) L.shift();
+        }
+        totalFee += f.fee||0;
+        realizedBySym.set(f.sym, (realizedBySym.get(f.sym)||0) + real - (f.fee||0));
+        feesBySym.set(f.sym, (feesBySym.get(f.sym)||0) + (f.fee||0));
+      }
+      // Unrealized from remaining lots using latest prices
+      let unrealTotal=0; const unrealBySym=new Map();
+      for(const sym of SYMBOLS){
+        const L=lots.get(sym)||[]; if(!L.length) continue;
+        // get latest price from SERIES or fetch once
+        let lastPrice = (SERIES[sym] && SERIES[sym].length)? SERIES[sym][SERIES[sym].length-1] : null;
+        if(lastPrice==null){ try{ const j=await fetchPriceFor(sym); lastPrice=+j.price; }catch(_){} }
+        if(lastPrice==null) continue;
+        let q=0, cost=0; L.forEach(l=>{ q+=l.q; cost+=l.q*l.px; });
+        const avg= q>0 ? cost/q : 0; const unreal = (lastPrice-avg)*q;
+        unrealBySym.set(sym, unreal); unrealTotal += unreal;
+      }
+      const realizedTotal = [...realizedBySym.values()].reduce((a,b)=>a+b,0);
+      const feesTotal = totalFee;
+      const equity = realizedTotal + unrealTotal - feesTotal;
+
+      // Strategy rows
+      const stratRows = [...realizedByStrat.entries()].map(([strategy, realized])=>({strategy, realized, unrealized:0, fees:0, equity:realized}));
+      stratRows.sort((a,b)=>Math.abs(b.realized)-Math.abs(a.realized));
+
+      // Symbol rows
+      const symRows = SYMBOLS.map(sym=>{
+        const realized=realizedBySym.get(sym)||0, unrealized=unrealBySym.get(sym)||0, fees=feesBySym.get(sym)||0;
+        return {symbol:sym, realized, unrealized, fees, equity:realized+unrealized-fees};
+      }).filter(r=>r.realized||r.unrealized||r.fees);
+      symRows.sort((a,b)=>Math.abs((b.realized+b.unrealized)) - Math.abs((a.realized+a.unrealized)));
+
+      return { total:{realized:realizedTotal, unrealized:unrealTotal, fees:feesTotal, equity}, per_strategy:stratRows, per_symbol:symRows };
+    }
+
+    function fillPnLTables(summary){
+      $('#tile_realized').textContent  = money(summary.total.realized);
+      $('#tile_unrealized').textContent= money(summary.total.unrealized);
+      $('#tile_fees').textContent      = money(summary.total.fees);
+      $('#tile_equity').textContent    = money(summary.total.equity);
+
+      const tbS = $('#tbl_strategy tbody'); tbS.innerHTML='';
+      (summary.per_strategy||[]).slice(0,5).forEach(r=>{
+        const tr=document.createElement('tr');
+        tr.innerHTML=`<td>${r.strategy}</td><td class="mono">${money(r.realized)}</td><td class="mono">${money(r.unrealized||0)}</td><td class="mono">${money(r.fees||0)}</td><td class="mono">${money(r.equity)}</td>`;
+        tbS.appendChild(tr);
+      });
+
+      const tbY = $('#tbl_symbol tbody'); tbY.innerHTML='';
+      (summary.per_symbol||[]).slice(0,5).forEach(r=>{
+        const tr=document.createElement('tr');
+        tr.innerHTML=`<td>${r.symbol}</td><td class="mono">${money(r.realized)}</td><td class="mono">${money(r.unrealized)}</td><td class="mono">${money(r.fees)}</td><td class="mono">${money(r.equity)}</td>`;
+        tbY.appendChild(tr);
+      });
+    }
+
+    async function refreshPnL(){
+      // Try server summary first
+      try{
+        const j = await fetchJSON('/pnl/summary');
+        const t = j.total || {realized:0,unrealized:0,fees:0,equity:0};
+        const isAllZero = !t.realized && !t.unrealized && !t.fees && !t.equity;
+        if(!isAllZero){
+          log('pnl/summary', j);
+          fillPnLTables(j);
+          return;
+        }
+        log('pnl/summary all zeros — using client fallback');
+      }catch(e){
+        log('pnl/summary failed — using client fallback', String(e));
+      }
+
+      // Fallback from fills + prices
+      try{
+        const computed = await computePnLFromFills();
+        log('pnl/fallback', computed.total);
+        fillPnLTables(computed);
+      }catch(e){
+        log('pnl/fallback error', String(e));
+      }
+    }
+
+    /* ===== Calendar (same FIFO engine) ===== */
+    function parseFillCalendar(r){
+      const side=(r.side||r.type||'').toLowerCase(), sym=(r.symbol||r.pair||'').toUpperCase();
+      const price=+r.price||+r.avg_price||+r.px||0, vol=+r.vol||+r.volume||+r.qty||+r.quantity||0, fee=+r.fee||+r.fees||0;
+      const ts=Date.parse(r.time||r.timestamp||r.filled_ts||0)/1000; return {side,sym,price,vol,fee,t:ts||0};
     }
     const dayStart = s=>{ const d=new Date(s*1000); return Date.UTC(d.getUTCFullYear(),d.getUTCMonth(),d.getUTCDate())/1000; };
-    function calColor(v){ if(v>0){const g=Math.min(255,100+Math.log10(v+1)*80);return `rgba(40,${g},60,0.25)`;} if(v<0){const r=Math.min(255,100+Math.log10(-v+1)*80);return `rgba(${r},60,60,0.25)`;} return 'rgba(255,255,255,0.02)'; }
     function fifoDaily(fills){
-      fills = (fills||[]).map(parseFill).filter(f=>f.t&&f.vol&&f.price&&(f.side==='buy'||f.side==='sell')).sort((a,b)=>a.t-b.t);
+      fills=(fills||[]).map(parseFillCalendar).filter(f=>f.t&&f.vol&&f.price&&(f.side==='buy'||f.side==='sell')).sort((a,b)=>a.t-b.t);
       const lot=new Map(), daily={}, byDay={};
       for(const f of fills){
         (byDay[dayStart(f.t)] ||= []).push(f);
@@ -295,54 +344,41 @@
       }
       return {daily,byDay};
     }
+    function calColor(v){ if(v>0){const g=Math.min(255,100+Math.log10(v+1)*80);return `rgba(40,${g},60,0.25)`;} if(v<0){const r=Math.min(255,100+Math.log10(-v+1)*80);return `rgba(${r},60,60,0.25)`;} return 'rgba(255,255,255,0.02)'; }
     async function buildCalendar(offset=0){
       try{
         const now=new Date(), baseUTC=new Date(Date.UTC(now.getUTCFullYear(),now.getUTCMonth()+offset,1));
-        const y=baseUTC.getUTCFullYear(), m=baseUTC.getUTCMonth();
-        $('#cal_title').textContent = baseUTC.toLocaleString(undefined,{month:'long',year:'numeric'});
-
-        const fillsResp = await fetchJSON('/fills');
-        const fills = fillsResp.fills || fillsResp.trades || fillsResp.data || fillsResp || [];
-        const {daily,byDay} = fifoDaily(Array.isArray(fills)?fills:Object.values(fills));
-
-        const firstDow=new Date(Date.UTC(y,m,1)).getUTCDay();
-        const daysIn=new Date(Date.UTC(y,m+1,0)).getUTCDate();
-        const grid=$('#cal_grid'); grid.innerHTML='';
-
-        ['Sun','Mon','Tue','Wed','Thu','Fri','Sat'].forEach(d=>{ const e=document.createElement('div'); e.className='cal-dow'; e.textContent=d; grid.appendChild(e); });
-        for(let i=0;i<firstDow;i++){ const c=document.createElement('div'); c.className='cal-cell muted'; grid.appendChild(c); }
-
-        for(let d=1; d<=daysIn; d++){
-          const k = Date.UTC(y,m,d)/1000, v=daily[k]?.p||0, t=daily[k]?.t||0, w=daily[k]?.w||0, wr=t?((w/t)*100).toFixed(1)+'%':'—';
+        const y=baseUTC.getUTCFullYear(), m=baseUTC.getUTCMonth(); $('#cal_title').textContent = baseUTC.toLocaleString(undefined,{month:'long',year:'numeric'});
+        const fillsResp=await fetchJSON('/fills'); const fills=fillsResp.fills||fillsResp.trades||fillsResp.data||fillsResp||[];
+        const {daily,byDay}=fifoDaily(Array.isArray(fills)?fills:Object.values(fills));
+        const firstDow=new Date(Date.UTC(y,m,1)).getUTCDay(); const daysIn=new Date(Date.UTC(y,m+1,0)).getUTCDate();
+        const grid=$('#cal_grid'); grid.innerHTML=''; ['Sun','Mon','Tue','Wed','Thu','Fri','Sat'].forEach(d=>{const e=document.createElement('div');e.className='cal-dow';e.textContent=d;grid.appendChild(e);});
+        for(let i=0;i<firstDow;i++){const c=document.createElement('div');c.className='cal-cell muted';grid.appendChild(c);}
+        for(let d=1;d<=daysIn;d++){const k=Date.UTC(y,m,d)/1000, v=daily[k]?.p||0, t=daily[k]?.t||0, w=daily[k]?.w||0, wr=t?((w/t)*100).toFixed(1)+'%':'—';
           const c=document.createElement('div'); c.className='cal-cell'; c.style.background=calColor(v);
-          c.innerHTML = `<div class="cal-date">${d}</div><div class="cal-pnl">${money(v)}</div><div class="cal-metric">${t} trades · ${wr}</div>`;
-          c.onclick = ()=> showDayDetail(k, byDay[k]||[]);
-          grid.appendChild(c);
-        }
+          c.innerHTML=`<div class="cal-date">${d}</div><div class="cal-pnl">${money(v)}</div><div class="cal-metric">${t} trades · ${wr}</div>`;
+          c.onclick=()=>showDayDetail(k, byDay[k]||[]); grid.appendChild(c);}
         $('#cal_detail').innerHTML='';
       }catch(e){ log('calendar error', String(e)); }
     }
     function showDayDetail(day, fills){
       if(!fills.length){ $('#cal_detail').innerHTML='<em>No trades this day.</em>'; return; }
-      const rows = ['<table><thead><tr><th>Time (UTC)</th><th>Symbol</th><th>Side</th><th>Qty</th><th>Price</th><th>Fee</th></tr></thead><tbody>'];
-      fills.forEach(f=> rows.push(`<tr><td>${new Date(f.t*1000).toISOString()}</td><td>${f.sym}</td><td>${f.side}</td><td>${f.vol}</td><td>${f.price}</td><td>${f.fee}</td></tr>`));
-      rows.push('</tbody></table>');
-      $('#cal_detail').innerHTML = rows.join('');
+      const rows=['<table><thead><tr><th>Time (UTC)</th><th>Symbol</th><th>Side</th><th>Qty</th><th>Price</th><th>Fee</th></tr></thead><tbody>'];
+      fills.forEach(f=>rows.push(`<tr><td>${new Date(f.t*1000).toISOString()}</td><td>${f.sym}</td><td>${f.side}</td><td>${f.vol}</td><td>${f.price}</td><td>${f.fee}</td></tr>`)); rows.push('</tbody></table>');
+      $('#cal_detail').innerHTML=rows.join('');
     }
 
-    /* ---------- Init ---------- */
+    /* ===== Boot ===== */
     async function init(){
-      logBoot();
-      $('#year').textContent = new Date().getFullYear();
-
-      // Don’t let one failure kill the others
+      $('#year').textContent=new Date().getFullYear();
+      await initFromConfig();
       await Promise.allSettled([
-        (async()=>{ await initFromConfig(); await refreshPrices(true); setInterval(refreshPrices, 30000); })(),
-        (async()=>{ await refreshPnL(); setInterval(refreshPnL, 30000); })(),
-        (async()=>{ let offset=0; await buildCalendar(0); $('#prev_month').onclick=()=>{offset--;buildCalendar(offset)}; $('#next_month').onclick=()=>{offset++;buildCalendar(offset)}; })(),
+        (async()=>{ await refreshPrices(true); setInterval(refreshPrices,30000); })(),
+        (async()=>{ await refreshPnL(); setInterval(refreshPnL,30000); })(),
+        (async()=>{ let off=0; await buildCalendar(0); $('#prev_month').onclick=()=>{off--;buildCalendar(off)}; $('#next_month').onclick=()=>{off++;buildCalendar(off)}; })(),
         schedulerStatus()
       ]);
-      log('UI', 'ready');
+      log('UI','ready');
     }
     document.addEventListener('DOMContentLoaded', init);
   </script>
