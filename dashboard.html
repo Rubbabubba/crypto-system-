@@ -1,7 +1,7 @@
 <!doctype html>
 <html lang="en">
 <head>
-  <!-- Crypto System Dashboard UI v1.3.0 -->
+  <!-- Crypto System Dashboard UI v1.3.1 -->
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width,initial-scale=1" />
   <title>{SERVICE_NAME} — Dashboard</title>
@@ -23,18 +23,26 @@
     *{box-sizing:border-box}
     html,body{margin:0;padding:0;background:var(--bg);color:var(--text);font:14px/1.45 system-ui,-apple-system,Segoe UI,Roboto,Ubuntu,Cantarell,"Helvetica Neue",Arial,"Noto Sans",sans-serif}
     a{color:var(--accent);text-decoration:none}
-    .wrap-page{max-width:1200px;margin:0 auto;padding:20px}
+
+    /* FULL-WIDTH LAYOUT */
+    .wrap-page{
+      width:100%;
+      max-width:none;          /* remove cap */
+      margin:0 auto;
+      padding:16px 18px;       /* minimal safe padding at edges */
+    }
     header{display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:16px}
     header h1{font-size:20px;margin:0}
     header .meta{color:var(--muted);font-size:13px;display:flex;gap:10px;align-items:center;flex-wrap:wrap}
     .badge{display:inline-flex;align-items:center;gap:6px;border:1px solid var(--border);padding:4px 8px;border-radius:999px}
+
     .card{border:1px solid var(--border);border-radius:12px;background:var(--card-bg);padding:14px}
     .card-header{display:flex;justify-content:space-between;gap:12px;flex-wrap:wrap;align-items:baseline;margin-bottom:8px}
     .card-header h2{font-size:16px;margin:0}
     .subtext{opacity:.85;color:var(--muted);font-size:13px;display:flex;gap:6px;align-items:center;flex-wrap:wrap}
     .dot::before{content:"•";opacity:.6}
 
-    /* Layout: 3 cards on top row, console full-width below (desktop) */
+    /* GRID: three equal columns across full width on desktop; console full width on row 2 */
     .grid{
       display:grid;
       gap:16px;
@@ -45,7 +53,7 @@
         "pnl"
         "console";
     }
-    @media(min-width:1000px){
+    @media (min-width:900px){
       .grid{
         grid-template-columns:1fr 1fr 1fr;
         grid-template-areas:
@@ -66,11 +74,11 @@
     .btn.danger{border-color:var(--warn)}
     .link-open{font-size:12px;color:var(--muted);margin-left:6px}
 
-    /* “Symbols / Strategies” small block that wraps inside the section */
+    /* Symbols / Strategies text block that wraps and stays inside */
     .mini-meta{margin-top:10px;padding:8px;border:1px dashed var(--border);border-radius:8px;color:var(--muted);font-size:12px}
     .mini-meta code{white-space:pre-wrap;word-break:break-word}
 
-    /* Live Prices table look matches prior UI */
+    /* LIVE PRICES — original table look */
     table{
       width:100%;
       border-collapse:collapse;
@@ -89,6 +97,7 @@
     .col-updated{width:20%}
     canvas.spark{width:100%;height:28px;display:block}
 
+    /* P&L tiles */
     .stat-tiles{
       display:grid;
       grid-template-columns:1fr 1fr;
@@ -118,18 +127,18 @@
       <h1>{SERVICE_NAME}</h1>
       <div class="meta">
         <span class="badge">App <strong>v{APP_VERSION}</strong></span>
-        <span class="badge">Dashboard UI <strong>v1.3.0</strong></span>
+        <span class="badge">Dashboard UI <strong>v1.3.1</strong></span>
         <span class="badge">Broker <strong id="badge_broker">{BROKER_BADGE}</strong></span>
       </div>
     </header>
 
     <div class="grid">
-      <!-- ============ CONTROL PANEL (old Service, fully restored + start/stop) ============ -->
+      <!-- ============ CONTROL PANEL (Service restored + Start/Stop) ============ -->
       <section id="control-panel" class="card">
         <div class="card-header">
           <h2>Control Panel</h2>
           <div class="subtext">
-            <span>{SERVICE_NAME}</span>
+            <span>Crypto System</span>
             <span class="dot"></span>
             <span>v{APP_VERSION}</span>
             <span class="dot"></span>
@@ -138,7 +147,7 @@
         </div>
 
         <div class="card-body">
-          <!-- Top group: old Service buttons -->
+          <!-- Old Service buttons -->
           <div class="row">
             <button class="btn" onclick="fetchAndLog('/health')">GET /health</button>
             <a class="link-open" href="/health" target="_blank" rel="noopener">open</a>
@@ -160,7 +169,7 @@
             <a class="link-open" href="/fills" target="_blank" rel="noopener">open</a>
           </div>
 
-          <!-- Scheduler controls (moved here) -->
+          <!-- Scheduler controls under Status -->
           <div class="row" style="margin-top:6px">
             <button id="btn_sched_status" class="btn" onclick="schedulerStatus()">GET /scheduler/status</button>
             <a class="link-open" href="/scheduler/status" target="_blank" rel="noopener">open</a>
@@ -170,7 +179,7 @@
             <button id="btn_sched_stop"  class="btn danger"  onclick="schedulerStop()">/scheduler/stop</button>
           </div>
 
-          <!-- Symbols/Strategies in the section (wrap & stay inside) -->
+          <!-- Symbols / Strategies (wrap inside) -->
           <div class="mini-meta" id="mini_meta">
             <div><strong>Symbols:</strong> <code id="meta_symbols">—</code></div>
             <div><strong>Strategies:</strong> <code id="meta_strategies">—</code></div>
@@ -194,9 +203,7 @@
               <th class="col-updated">Updated</th>
             </tr>
           </thead>
-          <tbody id="prices_tbody">
-            <!-- rows inserted dynamically -->
-          </tbody>
+          <tbody id="prices_tbody"></tbody>
         </table>
 
         <div class="row" style="margin-top:10px">
@@ -204,14 +211,13 @@
         </div>
       </section>
 
-      <!-- ============ P&L (as in your accepted version) ============ -->
+      <!-- ============ P&L ============ -->
       <section id="pnl" class="card">
         <div class="card-header">
           <h2>P&amp;L</h2>
           <div class="subtext">Aggregated from /pnl/summary</div>
         </div>
 
-        <!-- Totals -->
         <div class="stat-tiles" id="pnl_tiles">
           <div class="tile"><div class="label">Realized</div><div class="val" id="pnl_realized">—</div></div>
           <div class="tile"><div class="label">Unrealized</div><div class="val" id="pnl_unreal">—</div></div>
@@ -219,7 +225,6 @@
           <div class="tile"><div class="label">Equity</div><div class="val" id="pnl_equity">—</div></div>
         </div>
 
-        <!-- Tables -->
         <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px">
           <div>
             <h3 style="margin:6px 0">By Strategy (Top 5)</h3>
@@ -260,12 +265,12 @@
 
     <footer>
       <div>© <span id="year"></span> {SERVICE_NAME}</div>
-      <div>Broker: <strong>{BROKER_TEXT}</strong> · App v{APP_VERSION} · UI v1.3.0</div>
+      <div>Broker: <strong>{BROKER_TEXT}</strong> · App v{APP_VERSION} · UI v1.3.1</div>
     </footer>
   </div>
 
   <script>
-    /* ------------------------ Console helpers ------------------------ */
+    /* ---------------------- Console helpers ---------------------- */
     function logToConsole(title, data) {
       try {
         const el = document.getElementById('console_log');
@@ -274,14 +279,14 @@
         const payload = (typeof data === 'string') ? data : JSON.stringify(data, null, 2);
         el.textContent += `[${time}] ${title}:\n${payload}\n\n`;
         el.scrollTop = el.scrollHeight;
-      } catch(e) { /* no-op */ }
+      } catch(e) {}
     }
     function clearConsole() {
       const el = document.getElementById('console_log');
       if (el) el.textContent = '';
     }
 
-    /* --------------------------- Fetch util -------------------------- */
+    /* ---------------------- Fetch util --------------------------- */
     async function fetchAndLog(path){
       try{
         const r = await fetch(path);
@@ -294,7 +299,7 @@
       }
     }
 
-    /* ------------------------- Control Panel ------------------------- */
+    /* ---------------------- Control Panel ------------------------ */
     async function schedulerStatus() {
       const j = await fetchAndLog('/scheduler/status');
       try{
@@ -303,14 +308,8 @@
         document.getElementById('btn_sched_stop')?.toggleAttribute('disabled', !running);
       }catch(_){}
     }
-    async function schedulerStart() {
-      await fetchAndLog('/scheduler/start');
-      schedulerStatus();
-    }
-    async function schedulerStop() {
-      await fetchAndLog('/scheduler/stop');
-      schedulerStatus();
-    }
+    async function schedulerStart() { await fetchAndLog('/scheduler/start'); schedulerStatus(); }
+    async function schedulerStop()  { await fetchAndLog('/scheduler/stop');  schedulerStatus(); }
 
     async function initConfig() {
       const cfg = await fetchAndLog('/config');
@@ -319,24 +318,19 @@
         const strats = (cfg && (cfg.STRATEGIES || cfg.strategies)) || [];
         document.getElementById('meta_symbols').textContent = syms.join(', ');
         document.getElementById('meta_strategies').textContent = strats.join(', ');
-        // cache for prices table
-        window.__SYMBOLS__ = syms;
+        window.__SYMBOLS__ = syms; // cache for Live Prices
       }catch(_){}
     }
 
-    /* -------------------------- Live Prices -------------------------- */
+    /* ---------------------- Live Prices -------------------------- */
     function splitSymbol(sym) {
       const s = String(sym).toUpperCase().replace(/\s+/g,'');
-      if (s.includes('/')) {
-        const [base, quote] = s.split('/');
-        return [base, quote];
-      }
+      if (s.includes('/')) { const [b,q]=s.split('/'); return [b,q]; }
       if (s.endsWith('USD')) return [s.slice(0,-3), 'USD'];
       return [s, 'USD'];
     }
     async function fetchPriceSymbol(sym) {
       const [base, quote] = splitSymbol(sym);
-      // Prefer /price/base/quote; fallback to /price/{symbol}
       try {
         const r = await fetch(`/price/${encodeURIComponent(base)}/${encodeURIComponent(quote)}`);
         if (r.ok) return await r.json();
@@ -351,8 +345,6 @@
       if (Math.abs(n) >= 1) return Number(n).toLocaleString(undefined,{maximumFractionDigits:4});
       return Number(n).toLocaleString(undefined,{maximumFractionDigits:8});
     }
-
-    // simple sparkline using <canvas>
     function drawSpark(canvas, values){
       if(!canvas) return;
       const ctx = canvas.getContext('2d');
@@ -360,13 +352,9 @@
       const h = canvas.height = canvas.clientHeight;
       ctx.clearRect(0,0,w,h);
       if(!values || values.length < 2) return;
-
-      const v = values.slice(-40); // last 40 points
-      const min = Math.min(...v);
-      const max = Math.max(...v);
-      const spread = (max - min) || 1;
+      const v = values.slice(-40);
+      const min = Math.min(...v), max = Math.max(...v), spread = (max - min) || 1;
       const stepX = w / (v.length - 1);
-
       ctx.beginPath();
       ctx.moveTo(0, h - ((v[0]-min)/spread)*h);
       for(let i=1;i<v.length;i++){
@@ -379,8 +367,7 @@
       ctx.stroke();
     }
 
-    // price state
-    const PRICE_STATE = { series:{} }; // symbol -> array of numbers
+    const PRICE_STATE = { series:{} };
 
     function ensureRowForSymbol(tbody, sym){
       const id = 'row_' + btoa(sym);
@@ -404,7 +391,6 @@
         tbody.innerHTML = '<tr><td colspan="4" class="subtext">No symbols configured.</td></tr>';
         return;
       }
-      // ensure rows exist in fixed order
       tbody.innerHTML = '';
       syms.forEach(s => ensureRowForSymbol(tbody, s));
 
@@ -413,21 +399,14 @@
           const j = await fetchPriceSymbol(s);
           const px = j && j.price != null ? Number(j.price) : null;
           const tnow = new Date().toISOString();
-
-          // update price cell
           const pxEl = document.getElementById('px_' + btoa(s));
           if (pxEl) pxEl.textContent = fmt(px);
-
-          // update spark series and draw
           if (!PRICE_STATE.series[s]) PRICE_STATE.series[s] = [];
           if (px != null && isFinite(px)) PRICE_STATE.series[s].push(px);
           const cv = document.getElementById('sp_' + btoa(s));
           drawSpark(cv, PRICE_STATE.series[s]);
-
-          // updated time
           const tsEl = document.getElementById('ts_' + btoa(s));
           if (tsEl) tsEl.textContent = tnow;
-
           logToConsole('price', { symbol: s, price: px });
         }catch(e){
           logToConsole('price:error', { symbol: s, error: String(e) });
@@ -436,18 +415,10 @@
     }
 
     let _priceTimer=null;
-    function startPriceAutoRefresh(){
-      stopPriceAutoRefresh();
-      _priceTimer = setInterval(refreshPrices, 30000); // 30s to match prior UI
-      const hint = document.getElementById('prices_hint');
-      if (hint) hint.textContent = '30s auto-refresh';
-    }
-    function stopPriceAutoRefresh(){
-      if (_priceTimer) clearInterval(_priceTimer);
-      _priceTimer=null;
-    }
+    function startPriceAutoRefresh(){ stopPriceAutoRefresh(); _priceTimer = setInterval(refreshPrices, 30000); }
+    function stopPriceAutoRefresh(){ if (_priceTimer) clearInterval(_priceTimer); _priceTimer=null; }
 
-    /* ------------------------------ P&L -------------------------------- */
+    /* ---------------------- P&L -------------------------- */
     function setTile(id,val,highlight=false){
       const el = document.getElementById(id);
       if (!el) return;
@@ -455,9 +426,7 @@
       const parent = el.closest('.tile');
       if (parent) {
         parent.classList.remove('pos','neg');
-        if (highlight){
-          parent.classList.add(val >= 0 ? 'pos' : 'neg');
-        }
+        if (highlight) parent.classList.add(val >= 0 ? 'pos' : 'neg');
       }
     }
     function fillTable(tbody, rows, key) {
@@ -488,7 +457,7 @@
       fillTable(tbY, j.per_symbol   || [], 'symbol');
     }
 
-    /* ------------------------------ Init ------------------------------- */
+    /* ---------------------- Init -------------------------- */
     document.addEventListener('DOMContentLoaded', async () => {
       document.getElementById('year').textContent = new Date().getFullYear().toString();
       await initConfig();
