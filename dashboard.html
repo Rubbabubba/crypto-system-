@@ -1,59 +1,42 @@
 <!doctype html>
 <html lang="en">
 <head>
-  <!-- Crypto System Dashboard UI v1.4.2 -->
+  <!-- Crypto System Dashboard UI v1.4.3 -->
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width,initial-scale=1" />
   <title>{SERVICE_NAME} — Dashboard</title>
   <style>
-    :root{
-      --bg:#0c0f14;--card-bg:#121720;--border:#223041;--text:#e8eef7;--muted:#9bb0c3;
-      --btn-bg:#111722;--accent:#4ea7ff;--ok:#2e7d32;--warn:#c62828;
-      --good:#174a2a;--bad:#4a1f21;--mid:#1b2634;
-    }
-    *{box-sizing:border-box}
-    html,body{margin:0;padding:0;background:var(--bg);color:var(--text);
-      font:14px/1.45 system-ui,-apple-system,Segoe UI,Roboto,Ubuntu,Cantarell,Arial,sans-serif}
+    :root{--bg:#0c0f14;--card-bg:#121720;--border:#223041;--text:#e8eef7;--muted:#9bb0c3;--btn-bg:#111722;--accent:#4ea7ff;--ok:#2e7d32;--warn:#c62828}
+    *{box-sizing:border-box} html,body{margin:0;padding:0;background:var(--bg);color:var(--text);font:14px/1.45 system-ui,-apple-system,Segoe UI,Roboto,Ubuntu,Cantarell,Arial,sans-serif}
     a{color:var(--accent);text-decoration:none}
-
     .wrap-page{width:100%;padding:16px 18px}
     header{display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:16px}
     header h1{font-size:20px;margin:0}
     header .meta{color:var(--muted);font-size:13px;display:flex;gap:10px;align-items:center;flex-wrap:wrap}
-    .badge{display:inline-flex;align-items:center;gap:6px;border:1px solid var(--border);
-      padding:4px 8px;border-radius:999px}
+    .badge{display:inline-flex;align-items:center;gap:6px;border:1px solid var(--border);padding:4px 8px;border-radius:999px}
 
     .card{border:1px solid var(--border);border-radius:12px;background:var(--card-bg);padding:14px}
     .card-header{display:flex;justify-content:space-between;gap:12px;flex-wrap:wrap;align-items:baseline;margin-bottom:8px}
     .subtext{opacity:.85;color:var(--muted);font-size:13px;display:flex;gap:6px;align-items:center;flex-wrap:wrap}
     .dot::before{content:"•";opacity:.6}
 
-    .grid{display:grid;gap:16px;
-      grid-template-areas:"control" "prices" "pnl" "calendar" "console";}
+    .grid{display:grid;gap:16px;grid-template-areas:"control" "prices" "pnl" "calendar" "console"}
     @media(min-width:900px){
-      .grid{grid-template-columns:1fr 1fr 1fr;
-        grid-template-areas:"control prices pnl" "calendar calendar calendar" "console console console";}
+      .grid{grid-template-columns:1fr 1fr 1fr;grid-template-areas:"control prices pnl" "calendar calendar calendar" "console console console"}
     }
-    #control-panel{grid-area:control}
-    #live-prices{grid-area:prices}
-    #pnl{grid-area:pnl}
-    #calendar-pnl{grid-area:calendar}
-    #console-card{grid-area:console}
+    #control-panel{grid-area:control} #live-prices{grid-area:prices} #pnl{grid-area:pnl}
+    #calendar-pnl{grid-area:calendar} #console-card{grid-area:console}
 
     .row{display:flex;gap:10px;align-items:center;margin:8px 0;flex-wrap:wrap}
-    .btn{padding:8px 12px;border:1px solid var(--border);background:var(--btn-bg);
-      color:var(--text);border-radius:8px;cursor:pointer}
-    .btn:hover{filter:brightness(1.05)}
-    .btn:disabled{opacity:.55;cursor:not-allowed}
-    .btn.success{border-color:var(--ok)}.btn.danger{border-color:var(--warn)}
+    .btn{padding:8px 12px;border:1px solid var(--border);background:var(--btn-bg);color:var(--text);border-radius:8px;cursor:pointer}
+    .btn:hover{filter:brightness(1.05)} .btn:disabled{opacity:.55;cursor:not-allowed}
+    .btn.success{border-color:var(--ok)} .btn.danger{border-color:var(--warn)}
     .link-open{font-size:12px;color:var(--muted);margin-left:6px}
 
-    .mini-meta{margin-top:10px;padding:8px;border:1px dashed var(--border);
-      border-radius:8px;color:var(--muted);font-size:12px}
+    .mini-meta{margin-top:10px;padding:8px;border:1px dashed var(--border);border-radius:8px;color:var(--muted);font-size:12px}
     .mini-meta code{white-space:pre-wrap;word-break:break-word}
 
-    table{width:100%;border-collapse:collapse;font-size:13px;background:transparent;
-      border:1px solid var(--border);border-radius:10px;overflow:hidden}
+    table{width:100%;border-collapse:collapse;font-size:13px;background:transparent;border:1px solid var(--border);border-radius:10px;overflow:hidden}
     th,td{padding:8px;border-bottom:1px solid var(--border);text-align:left}
     th{color:var(--muted);background:rgba(255,255,255,0.03)}
     td.mono{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
@@ -62,27 +45,23 @@
     @media(min-width:600px){.stat-tiles{grid-template-columns:repeat(4,1fr)}}
     .tile{border:1px solid var(--border);border-radius:10px;padding:10px;background:rgba(255,255,255,0.02)}
     .tile .label{color:var(--muted);font-size:12px}.tile .val{font-size:18px;font-weight:700;margin-top:4px}
-    .pos{background:#16291b}.neg{background:#2a1618}
 
     /* Calendar */
     .cal-head{display:flex;justify-content:space-between;align-items:center;gap:10px;margin-bottom:8px}
-    .nav-btn{background:none;border:none;color:var(--text);font-size:18px;cursor:pointer}
+    .nav-btn{background:none;border:1px solid var(--border);border-radius:8px;padding:4px 8px;color:var(--text);cursor:pointer}
     .cal-title{font-weight:700}
     .cal-grid{display:grid;grid-template-columns:repeat(7,1fr);gap:8px}
     .cal-dow{color:var(--muted);font-size:12px;text-align:center}
-    .cal-cell{border:1px solid var(--border);border-radius:12px;min-height:110px;padding:8px;
-      display:flex;flex-direction:column;gap:6px;background:rgba(255,255,255,0.02);cursor:pointer;transition:background .15s}
+    .cal-cell{border:1px solid var(--border);border-radius:12px;min-height:110px;padding:8px;display:flex;flex-direction:column;gap:6px;background:rgba(255,255,255,0.02);cursor:pointer}
     .cal-cell:hover{filter:brightness(1.2)}
-    .cal-cell.muted{opacity:.4;pointer-events:none}
+    .cal-cell.muted{opacity:.35;pointer-events:none}
     .cal-date{font-size:12px;color:var(--muted)}
     .cal-pnl{font-weight:700}
     .cal-metric{font-size:12px;color:var(--muted)}
     .cal-detail{margin-top:12px;border-top:1px solid var(--border);padding-top:10px;font-size:13px}
     .cal-detail table{font-size:12px}
-    .swatch{display:inline-block;width:12px;height:12px;border-radius:3px;margin-right:6px}
 
-    pre.console{width:100%;min-height:260px;max-height:520px;overflow:auto;background:#0a0e16;
-      border:1px solid var(--border);border-radius:10px;padding:12px;margin:0;white-space:pre-wrap}
+    pre.console{width:100%;min-height:260px;max-height:520px;overflow:auto;background:#0a0e16;border:1px solid var(--border);border-radius:10px;padding:12px;margin:0;white-space:pre-wrap}
   </style>
 </head>
 <body>
@@ -92,130 +71,65 @@
       <div class="meta">
         <span class="badge">Broker: <strong>{BROKER_TEXT}</strong></span>
         <span class="badge">App v{APP_VERSION}</span>
-        <span class="badge">UI v1.4.2</span>
+        <span class="badge">UI v1.4.3</span>
       </div>
     </header>
 
     <div class="grid">
-
-      <!-- ============ CONTROL PANEL (formerly Service) ============ -->
+      <!-- CONTROL PANEL -->
       <section id="control-panel" class="card">
-        <div class="card-header">
-          <h2>Control Panel</h2>
-          <div class="subtext">Crypto System • v2.0.0 • kraken</div>
-        </div>
-
-        <!-- Same buttons as original Service -->
-        <div class="row">
-          <button class="btn" onclick="fetchAndLog('/health')">GET /health</button>
-          <a class="link-open" href="/health" target="_blank" rel="noopener">open</a>
-        </div>
-        <div class="row">
-          <button class="btn" onclick="fetchAndLog('/diag/broker')">GET /diag/broker</button>
-          <a class="link-open" href="/diag/broker" target="_blank" rel="noopener">open</a>
-        </div>
-        <div class="row">
-          <button class="btn" onclick="fetchAndLog('/version')">GET /version</button>
-          <a class="link-open" href="/version" target="_blank" rel="noopener">open</a>
-        </div>
-        <div class="row">
-          <button class="btn" onclick="fetchAndLog('/config')">GET /config</button>
-          <a class="link-open" href="/config" target="_blank" rel="noopener">open</a>
-        </div>
-        <div class="row">
-          <button class="btn" onclick="fetchAndLog('/fills')">GET /fills</button>
-          <a class="link-open" href="/fills" target="_blank" rel="noopener">open</a>
-        </div>
-
-        <!-- Scheduler controls under Status -->
-        <div class="row" style="margin-top:6px">
-          <button id="btn_sched_status" class="btn" onclick="schedulerStatus()">GET /scheduler/status</button>
-          <a class="link-open" href="/scheduler/status" target="_blank" rel="noopener">open</a>
-        </div>
-        <div class="row">
-          <button id="btn_sched_start" class="btn success" onclick="schedulerStart()">/scheduler/start</button>
-          <button id="btn_sched_stop"  class="btn danger"  onclick="schedulerStop()">/scheduler/stop</button>
-        </div>
-
-        <!-- Symbols / Strategies (wrap inside) -->
-        <div class="mini-meta" id="mini_meta">
-          <div><strong>Symbols:</strong> <code id="meta_symbols">—</code></div>
-          <div><strong>Strategies:</strong> <code id="meta_strategies">—</code></div>
-        </div>
+        <div class="card-header"><h2>Control Panel</h2><div class="subtext">Crypto System • v2.0.0 • kraken</div></div>
+        <div class="row"><button class="btn" onclick="fetchAndLog('/health')">GET /health</button><a class="link-open" href="/health" target="_blank" rel="noopener">open</a></div>
+        <div class="row"><button class="btn" onclick="fetchAndLog('/diag/broker')">GET /diag/broker</button><a class="link-open" href="/diag/broker" target="_blank" rel="noopener">open</a></div>
+        <div class="row"><button class="btn" onclick="fetchAndLog('/version')">GET /version</button><a class="link-open" href="/version" target="_blank" rel="noopener">open</a></div>
+        <div class="row"><button class="btn" onclick="fetchAndLog('/config')">GET /config</button><a class="link-open" href="/config" target="_blank" rel="noopener">open</a></div>
+        <div class="row"><button class="btn" onclick="fetchAndLog('/fills')">GET /fills</button><a class="link-open" href="/fills" target="_blank" rel="noopener">open</a></div>
+        <div class="row" style="margin-top:6px"><button id="btn_sched_status" class="btn" onclick="schedulerStatus()">GET /scheduler/status</button><a class="link-open" href="/scheduler/status" target="_blank" rel="noopener">open</a></div>
+        <div class="row"><button id="btn_sched_start" class="btn success" onclick="schedulerStart()">/scheduler/start</button><button id="btn_sched_stop" class="btn danger" onclick="schedulerStop()">/scheduler/stop</button></div>
+        <div class="mini-meta"><div><strong>Symbols:</strong> <code id="meta_symbols">—</code></div><div><strong>Strategies:</strong> <code id="meta_strategies">—</code></div></div>
       </section>
 
-      <!-- ============ LIVE PRICES (original table layout) ============ -->
+      <!-- LIVE PRICES -->
       <section id="live-prices" class="card">
-        <div class="card-header">
-          <h2>Live Prices</h2>
-          <div class="subtext">From <span class="dot">/price/&lt;symbol&gt;</span> — 30s auto-refresh</div>
-        </div>
-        <table>
-          <thead>
-            <tr>
-              <th>Symbol</th>
-              <th>Price</th>
-              <th>Spark</th>
-              <th>Updated</th>
-            </tr>
-          </thead>
-          <tbody id="prices_tbody"></tbody>
-        </table>
-
-        <div class="row" style="margin-top:10px">
-          <button class="btn" onclick="refreshPrices()">Refresh now</button>
-        </div>
+        <div class="card-header"><h2>Live Prices</h2><div class="subtext">From /price/* — 30s auto-refresh</div></div>
+        <table><thead><tr><th>Symbol</th><th>Price</th><th>Spark</th><th>Updated</th></tr></thead><tbody id="prices_tbody"></tbody></table>
+        <div class="row" style="margin-top:10px"><button class="btn" onclick="refreshPrices(true)">Refresh now</button></div>
       </section>
 
-      <!-- ============ P&L ============ -->
+      <!-- P&L -->
       <section id="pnl" class="card">
-        <div class="card-header">
-          <h2>P&amp;L</h2>
-          <div class="subtext">Aggregated from <span class="dot">/pnl/summary</span></div>
-        </div>
-
+        <div class="card-header"><h2>P&amp;L</h2><div class="subtext">Aggregated from /pnl/summary</div></div>
         <div class="stat-tiles">
-          <div class="tile"><div class="label">Realized</div><div id="tile_realized" class="val">0</div></div>
-          <div class="tile"><div class="label">Unrealized</div><div id="tile_unrealized" class="val">0</div></div>
-          <div class="tile"><div class="label">Fees</div><div id="tile_fees" class="val">0</div></div>
-          <div class="tile"><div class="label">Equity</div><div id="tile_equity" class="val">0</div></div>
+          <div class="tile"><div class="label">Realized</div><div id="tile_realized" class="val">$0</div></div>
+          <div class="tile"><div class="label">Unrealized</div><div id="tile_unrealized" class="val">$0</div></div>
+          <div class="tile"><div class="label">Fees</div><div id="tile_fees" class="val">$0</div></div>
+          <div class="tile"><div class="label">Equity</div><div id="tile_equity" class="val">$0</div></div>
         </div>
-
         <div class="row">
           <div style="flex:1">
             <h3 style="margin:6px 0">By Strategy (Top 5)</h3>
-            <table id="tbl_strategy">
-              <thead><tr><th>Strategy</th><th>Realized</th><th>Unrealized</th><th>Fees</th><th>Equity</th></tr></thead>
-              <tbody></tbody>
-            </table>
+            <table id="tbl_strategy"><thead><tr><th>Strategy</th><th>Realized</th><th>Unrealized</th><th>Fees</th><th>Equity</th></tr></thead><tbody></tbody></table>
           </div>
           <div>
             <h3 style="margin:6px 0">By Symbol (Top 5)</h3>
-            <table id="tbl_symbol">
-              <thead><tr><th>Symbol</th><th>Realized</th><th>Unrealized</th><th>Fees</th><th>Equity</th></tr></thead>
-              <tbody></tbody>
-            </table>
+            <table id="tbl_symbol"><thead><tr><th>Symbol</th><th>Realized</th><th>Unrealized</th><th>Fees</th><th>Equity</th></tr></thead><tbody></tbody></table>
           </div>
         </div>
-
         <div class="row" style="margin-top:10px">
           <button class="btn" onclick="refreshPnL()">Refresh P&amp;L</button>
           <button class="btn" onclick="fetchAndLog('/journal/sync')">Sync fills</button>
-          <a class="link-open" href="/pnl/summary" target="_blank" rel="noopener">open</a>
-          <a class="link-open" href="/journal" target="_blank" rel="noopener">journal</a>
+          <a class="link-open" href="/pnl/summary" target="_blank">open</a>
+          <a class="link-open" href="/journal" target="_blank">journal</a>
         </div>
       </section>
 
-      <!-- ============ CALENDAR P&L ============ -->
+      <!-- CALENDAR P&L -->
       <section id="calendar-pnl" class="card">
-        <div class="card-header">
-          <h2>Calendar P&amp;L</h2>
-          <div class="subtext">Client-side FIFO realized attribution from <span class="dot">/fills</span></div>
-        </div>
+        <div class="card-header"><h2>Calendar P&amp;L</h2><div class="subtext">Client-side FIFO realized attribution from /fills</div></div>
         <div class="cal-head">
-          <button class="nav-btn" id="prev_month">&#9664;</button>
+          <button class="nav-btn" id="prev_month">&#9664; Prev</button>
           <div class="cal-title" id="cal_title">—</div>
-          <button class="nav-btn" id="next_month">&#9654;</button>
+          <button class="nav-btn" id="next_month">Next &#9654;</button>
         </div>
         <div class="cal-grid" id="cal_grid"></div>
         <div class="cal-detail" id="cal_detail"></div>
@@ -229,212 +143,208 @@
     </div>
 
     <footer><div>© <span id="year"></span> {SERVICE_NAME}</div>
-      <div>Broker: <strong>{BROKER_TEXT}</strong> · App v{APP_VERSION} · UI v1.4.2</div></footer>
+      <div>Broker: <strong>{BROKER_TEXT}</strong> · App v{APP_VERSION} · UI v1.4.3</div></footer>
   </div>
 
   <script>
-    /* ---------- Console + helpers ---------- */
-    const log = (title, data) => {
-      const el = document.getElementById('console_log');
-      const block = (typeof data === 'string') ? data : JSON.stringify(data, null, 2);
-      el.textContent += `[${new Date().toISOString()}] ${title}\n${block}\n\n`;
+    /* ---------- Console & global error capture ---------- */
+    const $ = sel => document.querySelector(sel);
+    const log = (t, d='') => {
+      const el = $('#console_log'); if(!el) return;
+      const body = typeof d === 'string' ? d : JSON.stringify(d, null, 2);
+      el.textContent += `[${new Date().toISOString()}] ${t}\n${body}\n\n`;
       el.scrollTop = el.scrollHeight;
     };
+    function logBoot(){ log('UI', 'booting…'); }
+    window.onerror = (msg, src, line, col, err) => { log('window.onerror', {msg, src, line, col, err: String(err)}); };
+    window.onunhandledrejection = ev => { log('unhandledrejection', String(ev.reason || ev)); };
+
+    /* ---------- Robust fetch helpers ---------- */
     async function fetchJSON(path){
-      try{ const r = await fetch(path); const j = await r.json(); return j; }
-      catch(e){ log(`ERROR ${path}`, String(e)); throw e; }
+      try{
+        const r = await fetch(path, {cache:'no-store'});
+        const text = await r.text(); // read once
+        let data;
+        try { data = JSON.parse(text); }
+        catch { data = { raw:text }; }
+        if(!r.ok){ log(`HTTP ${r.status} ${path}`, data); throw new Error(`HTTP ${r.status}`); }
+        return data;
+      }catch(e){ log(`FETCH FAIL ${path}`, String(e)); throw e; }
     }
-    async function fetchAndLog(path){
-      const j = await fetchJSON(path);
-      log(`GET ${path}`, j);
-      return j;
+    async function fetchAndLog(path){ const j = await fetchJSON(path); log(`GET ${path}`, j); return j; }
+
+    /* ---------- Control Panel ---------- */
+    async function schedulerStatus(){ try{ return await fetchAndLog('/scheduler/status'); }catch(_){} }
+    async function schedulerStart(){ try{ return await fetchAndLog('/scheduler/start'); }catch(_){} }
+    async function schedulerStop(){  try{ return await fetchAndLog('/scheduler/stop'); }catch(_){} }
+
+    /* ---------- Config ---------- */
+    let SYMBOLS = [];
+    async function initFromConfig(){
+      try{
+        const cfg = await fetchJSON('/config');
+        const syms = cfg.SYMBOLS || cfg.symbols || [];
+        const strats = cfg.STRATEGIES || cfg.strategies || [];
+        SYMBOLS = syms.map(s => String(s).toUpperCase());
+        $('#meta_symbols').textContent = SYMBOLS.join(', ') || '—';
+        $('#meta_strategies').textContent = (strats||[]).join(', ') || '—';
+        buildPriceRows(SYMBOLS);
+      }catch(e){
+        log('CONFIG', 'failed to load /config; continuing with empty symbols');
+        SYMBOLS = [];
+        buildPriceRows(SYMBOLS);
+      }
     }
 
-    /* ---------- Control Panel actions ---------- */
-    async function schedulerStatus(){ const j = await fetchAndLog('/scheduler/status'); return j; }
-    async function schedulerStart(){ const j = await fetchAndLog('/scheduler/start'); return j; }
-    async function schedulerStop(){ const j = await fetchAndLog('/scheduler/stop'); return j; }
-
-    /* ---------- Live Prices ---------- */
-    let PX_SYMBOLS = [];
-    const SERIES = {};   // sym -> [prices]
-    const MAX_POINTS = 50;
-
-    function buildPriceRows(symbols){
-      PX_SYMBOLS = (symbols || []).map(s => String(s).toUpperCase());
-      const tbody = document.getElementById('prices_tbody');
-      tbody.innerHTML = '';
-      PX_SYMBOLS.forEach(sym=>{
+    /* ---------- Prices (try both route shapes) ---------- */
+    const SERIES = {}; const MAX_POINTS = 60;
+    function buildPriceRows(syms){
+      const tbody = $('#prices_tbody'); tbody.innerHTML = '';
+      (syms||[]).forEach(sym=>{
         SERIES[sym] = SERIES[sym] || [];
         const tr = document.createElement('tr');
-        tr.innerHTML =
-          `<td class="mono">${sym}</td>` +
-          `<td class="mono" id="px_${sym}">—</td>` +
-          `<td><svg viewBox="0 0 120 28" width="120" height="28"><path id="line_${sym}" stroke="${getComputedStyle(document.body).getPropertyValue('--accent')}" fill="none" stroke-width="1.5"/></svg></td>` +
-          `<td id="ts_${sym}" class="mono" style="color:var(--muted)">—</td>`;
+        tr.innerHTML = `
+          <td class="mono">${sym}</td>
+          <td class="mono" id="px_${sym}">—</td>
+          <td><svg viewBox="0 0 120 28" width="120" height="28"><path id="line_${sym}" stroke="${getComputedStyle(document.body).getPropertyValue('--accent')||'#82b1ff'}" fill="none" stroke-width="1.5"/></svg></td>
+          <td class="mono" id="ts_${sym}" style="color:var(--muted)">—</td>`;
         tbody.appendChild(tr);
       });
+    }
+    function splitSymbol(sym){
+      const s = sym.replace(/\s+/g,'').toUpperCase();
+      if(s.includes('/')){ const [b,q]=s.split('/'); return [b,q]; }
+      if(s.endsWith('USD')) return [s.slice(0,-3), 'USD'];
+      return [s, 'USD'];
+    }
+    async function fetchPriceFor(sym){
+      const [b,q]=splitSymbol(sym);
+      // try /price/BASE/QUOTE
+      try{
+        const j = await fetchJSON(`/price/${encodeURIComponent(b)}/${encodeURIComponent(q)}`);
+        if(j && (j.price!=null)) return j;
+      }catch(_){}
+      // fallback /price/SYMBOL
+      return await fetchJSON(`/price/${encodeURIComponent(sym)}`);
     }
     function sparkPath(points, w=120, h=28, pad=2){
       if(!points.length) return '';
       const n=points.length, lo=Math.min(...points), hi=Math.max(...points), rng=(hi-lo)||1e-9;
-      const x=i=>pad + (i/(n-1))*(w-pad*2);
-      const y=v=>pad + (h-pad*2) - ((v-lo)/rng)*(h-pad*2);
-      let d=`M ${x(0)} ${y(points[0])}`;
-      for(let i=1;i<n;i++) d+=` L ${x(i)} ${y(points[i])}`;
-      return d;
+      const x=i=>pad + (i/(n-1))*(w-pad*2), y=v=>pad + (h-pad*2) - ((v-lo)/rng)*(h-pad*2);
+      let d=`M ${x(0)} ${y(points[0])}`; for(let i=1;i<n;i++) d+=` L ${x(i)} ${y(points[i])}`; return d;
     }
-    async function refreshPrices(){
-      if(!PX_SYMBOLS.length){ await initFromConfig(); }
-      for(const sym of PX_SYMBOLS){
+    async function refreshPrices(forceLog=false){
+      if(!SYMBOLS.length){ return; }
+      for(const sym of SYMBOLS){
         try{
-          const j = await fetchJSON(`/price/${sym}`);
-          const px = Number((j||{}).price ?? NaN);
-          if(!Number.isNaN(px)){
+          const j = await fetchPriceFor(sym);
+          const px = Number(j.price);
+          if(Number.isFinite(px)){
             const arr = SERIES[sym]; arr.push(px); if(arr.length>MAX_POINTS) arr.shift();
             document.getElementById(`px_${sym}`).textContent = px;
-            const d = sparkPath(arr); const el = document.getElementById(`line_${sym}`); if(el) el.setAttribute('d', d||'');
+            document.getElementById(`line_${sym}`).setAttribute('d', sparkPath(arr));
             document.getElementById(`ts_${sym}`).textContent = new Date().toISOString();
-            log(`price ${sym}`, j);
+            if(forceLog) log(`price ${sym}`, j);
           }
-        }catch(e){ log(`ERROR /price/${sym}`, String(e)); }
+        }catch(e){ log(`price ${sym} error`, String(e)); }
       }
     }
 
     /* ---------- P&L ---------- */
-    function money(x){
-      const v = Number(x||0);
-      const s = (v<0?'-':'');
-      const a = Math.abs(v).toLocaleString(undefined, {maximumFractionDigits:2});
-      return `${s}$${a}`;
-    }
+    const money = v => (v<0?'-':'') + '$' + Math.abs(Number(v||0)).toLocaleString(undefined,{maximumFractionDigits:2});
     async function refreshPnL(){
       try{
         const j = await fetchJSON('/pnl/summary');
         const t = j.total || {};
-        document.getElementById('tile_realized').textContent  = money(t.realized);
-        document.getElementById('tile_unrealized').textContent= money(t.unrealized);
-        document.getElementById('tile_fees').textContent      = money(t.fees);
-        document.getElementById('tile_equity').textContent    = money(t.equity);
+        $('#tile_realized').textContent  = money(t.realized);
+        $('#tile_unrealized').textContent= money(t.unrealized);
+        $('#tile_fees').textContent      = money(t.fees);
+        $('#tile_equity').textContent    = money(t.equity);
 
-        const top5S = (j.per_strategy||[]).slice(0,5);
-        const top5Y = (j.per_symbol||[]).slice(0,5);
-
-        const bS = document.querySelector('#tbl_strategy tbody'); bS.innerHTML = '';
-        top5S.forEach(r=>{
-          const tr = document.createElement('tr');
-          tr.innerHTML = `<td>${r.strategy}</td><td class="mono">${money(r.realized)}</td><td class="mono">${money(r.unrealized)}</td><td class="mono">${money(r.fees)}</td><td class="mono">${money(r.equity)}</td>`;
-          bS.appendChild(tr);
-        });
-
-        const bY = document.querySelector('#tbl_symbol tbody'); bY.innerHTML = '';
-        top5Y.forEach(r=>{
-          const tr = document.createElement('tr');
-          tr.innerHTML = `<td>${r.symbol}</td><td class="mono">${money(r.realized)}</td><td class="mono">${money(r.unrealized)}</td><td class="mono">${money(r.fees)}</td><td class="mono">${money(r.equity)}</td>`;
-          bY.appendChild(tr);
-        });
-
-        log('GET /pnl/summary', j);
-      }catch(e){ log('ERROR /pnl/summary', String(e)); }
+        const fillT = (tbody, rows, key) => {
+          tbody.innerHTML = '';
+          (rows||[]).slice(0,5).forEach(r=>{
+            const tr = document.createElement('tr');
+            tr.innerHTML = `<td>${r[key]}</td><td class="mono">${money(r.realized)}</td><td class="mono">${money(r.unrealized)}</td><td class="mono">${money(r.fees)}</td><td class="mono">${money(r.equity)}</td>`;
+            tbody.appendChild(tr);
+          });
+        };
+        fillT($('#tbl_strategy tbody'), j.per_strategy, 'strategy');
+        fillT($('#tbl_symbol tbody'),   j.per_symbol,   'symbol');
+      }catch(e){ log('pnl error', String(e)); }
     }
 
-    /* ---------- Calendar (from your v1.4.1) ---------- */
+    /* ---------- Calendar ---------- */
     function parseFill(r){
-      const s=(r.side||r.type||'').toLowerCase(),sym=(r.symbol||r.pair||'').toUpperCase();
-      const px=+r.price||+r.avg_price||+r.px||0,vol=+r.vol||+r.volume||+r.qty||+r.quantity||0;
-      const fee=+r.fee||+r.fees||0,t=Date.parse(r.time||r.timestamp||r.filled_ts||0)/1000;
-      return {s:sym,side:s,px,vol,fee,t:t||0}
+      const side=(r.side||r.type||'').toLowerCase(), sym=(r.symbol||r.pair||'').toUpperCase();
+      const price=+r.price||+r.avg_price||+r.px||0, vol=+r.vol||+r.volume||+r.qty||+r.quantity||0;
+      const fee=+r.fee||+r.fees||0, t=Date.parse(r.time||r.timestamp||r.filled_ts||0)/1000;
+      return {side,sym,price,vol,fee,t:t||0};
     }
-    function dayStart(t){const d=new Date(t*1000);return Date.UTC(d.getUTCFullYear(),d.getUTCMonth(),d.getUTCDate())/1000}
-    function colorFor(v){ if(v>0){const g=Math.min(255,100+Math.log10(v+1)*80);return `rgba(40,${g},60,0.25)`;}
-                          if(v<0){const r=Math.min(255,100+Math.log10(-v+1)*80);return `rgba(${r},60,60,0.25)`;}
-                          return 'rgba(255,255,255,0.02)'; }
-    function fifoPnL(fills){
-      const lot=new Map(), daily={}, fillsByDay={};
-      for(const raw of (fills||[])){
-        const x=parseFill(raw); if(!x.t||!x.s||!x.vol||!x.px) continue;
-        (fillsByDay[dayStart(x.t)] ||= []).push(x);
-        if(x.side==='buy'){ (lot.get(x.s)||=[]).push({q:x.vol,px:x.px}); continue; }
-        if(x.side==='sell'){
-          let rem=x.vol,real=0.0; const l=lot.get(x.s)||[];
-          while(rem>1e-12 && l.length){
-            const head=l[0]; const take=Math.min(head.q, rem);
-            real += (x.px - head.px) * take; head.q -= take; rem -= take;
-            if(head.q<=1e-12) l.shift();
-          }
-          const k=dayStart(x.t); (daily[k] ||= {p:0,t:0,w:0}); daily[k].p += (real - (x.fee||0)); daily[k].t++; if((real - (x.fee||0))>0) daily[k].w++;
+    const dayStart = s=>{ const d=new Date(s*1000); return Date.UTC(d.getUTCFullYear(),d.getUTCMonth(),d.getUTCDate())/1000; };
+    function calColor(v){ if(v>0){const g=Math.min(255,100+Math.log10(v+1)*80);return `rgba(40,${g},60,0.25)`;} if(v<0){const r=Math.min(255,100+Math.log10(-v+1)*80);return `rgba(${r},60,60,0.25)`;} return 'rgba(255,255,255,0.02)'; }
+    function fifoDaily(fills){
+      fills = (fills||[]).map(parseFill).filter(f=>f.t&&f.vol&&f.price&&(f.side==='buy'||f.side==='sell')).sort((a,b)=>a.t-b.t);
+      const lot=new Map(), daily={}, byDay={};
+      for(const f of fills){
+        (byDay[dayStart(f.t)] ||= []).push(f);
+        if(f.side==='buy'){ (lot.get(f.sym)||lot.set(f.sym,[]).get(f.sym)).push({q:f.vol,px:f.price}); continue; }
+        let rem=f.vol, real=0; const L=lot.get(f.sym)||[];
+        while(rem>1e-12 && L.length){ const head=L[0], take=Math.min(head.q,rem); real+=(f.price-head.px)*take; head.q-=take; rem-=take; if(head.q<=1e-12) L.shift(); }
+        const k=dayStart(f.t); (daily[k] ||= {p:0,t:0,w:0}); daily[k].p += (real - f.fee); daily[k].t++; if((real - f.fee)>0) daily[k].w++;
+      }
+      return {daily,byDay};
+    }
+    async function buildCalendar(offset=0){
+      try{
+        const now=new Date(), baseUTC=new Date(Date.UTC(now.getUTCFullYear(),now.getUTCMonth()+offset,1));
+        const y=baseUTC.getUTCFullYear(), m=baseUTC.getUTCMonth();
+        $('#cal_title').textContent = baseUTC.toLocaleString(undefined,{month:'long',year:'numeric'});
+
+        const fillsResp = await fetchJSON('/fills');
+        const fills = fillsResp.fills || fillsResp.trades || fillsResp.data || fillsResp || [];
+        const {daily,byDay} = fifoDaily(Array.isArray(fills)?fills:Object.values(fills));
+
+        const firstDow=new Date(Date.UTC(y,m,1)).getUTCDay();
+        const daysIn=new Date(Date.UTC(y,m+1,0)).getUTCDate();
+        const grid=$('#cal_grid'); grid.innerHTML='';
+
+        ['Sun','Mon','Tue','Wed','Thu','Fri','Sat'].forEach(d=>{ const e=document.createElement('div'); e.className='cal-dow'; e.textContent=d; grid.appendChild(e); });
+        for(let i=0;i<firstDow;i++){ const c=document.createElement('div'); c.className='cal-cell muted'; grid.appendChild(c); }
+
+        for(let d=1; d<=daysIn; d++){
+          const k = Date.UTC(y,m,d)/1000, v=daily[k]?.p||0, t=daily[k]?.t||0, w=daily[k]?.w||0, wr=t?((w/t)*100).toFixed(1)+'%':'—';
+          const c=document.createElement('div'); c.className='cal-cell'; c.style.background=calColor(v);
+          c.innerHTML = `<div class="cal-date">${d}</div><div class="cal-pnl">${money(v)}</div><div class="cal-metric">${t} trades · ${wr}</div>`;
+          c.onclick = ()=> showDayDetail(k, byDay[k]||[]);
+          grid.appendChild(c);
         }
-      }
-      return {daily,fillsByDay}
-    }
-    async function buildCal(monthOffset=0){
-      const now=new Date(),utc=new Date(Date.UTC(now.getUTCFullYear(),now.getUTCMonth()+monthOffset,1));
-      const y=utc.getUTCFullYear(),m=utc.getUTCMonth();
-      document.getElementById('cal_title').textContent = utc.toLocaleString(undefined,{month:'long',year:'numeric'});
-      const {daily,fillsByDay} = fifoPnL((await fetchJSON('/fills')).fills || []);
-
-      const firstDow=new Date(Date.UTC(y,m,1)).getUTCDay();
-      const daysIn=new Date(Date.UTC(y,m+1,0)).getUTCDate();
-
-      const grid=document.getElementById('cal_grid'); grid.innerHTML='';
-      ['Sun','Mon','Tue','Wed','Thu','Fri','Sat'].forEach(d=>{
-        const e=document.createElement('div'); e.className='cal-dow'; e.textContent=d; grid.appendChild(e);
-      });
-
-      for(let i=0;i<firstDow;i++){ const c=document.createElement('div'); c.className='cal-cell muted'; grid.appendChild(c); }
-      for(let d=1; d<=daysIn; d++){
-        const key = Date.UTC(y,m,d)/1000;
-        const v = daily[key]?.p || 0, t = daily[key]?.t || 0, w = daily[key]?.w || 0;
-        const wr = t ? ((w/t)*100).toFixed(1)+'%' : '—';
-        const c = document.createElement('div');
-        c.className='cal-cell'; c.style.background = colorFor(v);
-        c.innerHTML = `<div class="cal-date">${d}</div><div class="cal-pnl">${money(v)}</div><div class="cal-metric">${t} trades · ${wr}</div>`;
-        c.onclick = ()=> showDayDetail(key, fillsByDay[key] || []);
-        grid.appendChild(c);
-      }
-      document.getElementById('cal_detail').innerHTML='';
+        $('#cal_detail').innerHTML='';
+      }catch(e){ log('calendar error', String(e)); }
     }
     function showDayDetail(day, fills){
-      const cont = document.getElementById('cal_detail');
-      if(!fills.length){ cont.innerHTML='<em>No trades this day.</em>'; return; }
-      const rows = ['<table><thead><tr><th>Symbol</th><th>Side</th><th>Qty</th><th>Price</th><th>Fee</th></tr></thead><tbody>'];
-      fills.forEach(f=> rows.push(`<tr><td>${f.s}</td><td>${f.side}</td><td>${f.vol}</td><td>${f.px}</td><td>${f.fee}</td></tr>`));
+      if(!fills.length){ $('#cal_detail').innerHTML='<em>No trades this day.</em>'; return; }
+      const rows = ['<table><thead><tr><th>Time (UTC)</th><th>Symbol</th><th>Side</th><th>Qty</th><th>Price</th><th>Fee</th></tr></thead><tbody>'];
+      fills.forEach(f=> rows.push(`<tr><td>${new Date(f.t*1000).toISOString()}</td><td>${f.sym}</td><td>${f.side}</td><td>${f.vol}</td><td>${f.price}</td><td>${f.fee}</td></tr>`));
       rows.push('</tbody></table>');
-      cont.innerHTML = rows.join('');
+      $('#cal_detail').innerHTML = rows.join('');
     }
 
-    /* ---------- Initialization ---------- */
-    async function initFromConfig(){
-      const cfg = await fetchJSON('/config');
-      const syms = cfg.SYMBOLS || [];
-      const strats = cfg.STRATEGIES || [];
-      document.getElementById('meta_symbols').textContent = syms.join(', ');
-      document.getElementById('meta_strategies').textContent = strats.join(', ');
-      buildPriceRows(syms);
-      return cfg;
+    /* ---------- Init ---------- */
+    async function init(){
+      logBoot();
+      $('#year').textContent = new Date().getFullYear();
+
+      // Don’t let one failure kill the others
+      await Promise.allSettled([
+        (async()=>{ await initFromConfig(); await refreshPrices(true); setInterval(refreshPrices, 30000); })(),
+        (async()=>{ await refreshPnL(); setInterval(refreshPnL, 30000); })(),
+        (async()=>{ let offset=0; await buildCalendar(0); $('#prev_month').onclick=()=>{offset--;buildCalendar(offset)}; $('#next_month').onclick=()=>{offset++;buildCalendar(offset)}; })(),
+        schedulerStatus()
+      ]);
+      log('UI', 'ready');
     }
-    async function initDashboard(){
-      document.getElementById('year').textContent = new Date().getFullYear();
-
-      // Control Panel initial state
-      schedulerStatus().catch(()=>{});
-
-      // Config → symbols → prices
-      await initFromConfig();
-      await refreshPrices();
-      await refreshPnL();
-
-      // Timers
-      setInterval(refreshPrices, 30_000);
-      setInterval(refreshPnL, 30_000);
-
-      // Calendar
-      let offset=0; await buildCal(0);
-      document.getElementById('prev_month').onclick = ()=>{ offset--; buildCal(offset); };
-      document.getElementById('next_month').onclick = ()=>{ offset++; buildCal(offset); };
-    }
-
-    document.addEventListener('DOMContentLoaded', initDashboard);
+    document.addEventListener('DOMContentLoaded', init);
   </script>
 </body>
 </html>
