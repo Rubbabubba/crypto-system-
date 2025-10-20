@@ -95,8 +95,119 @@
     </header>
 
     <div class="grid">
-      <!-- CONTROL PANEL / PRICES / P&L (unchanged from v1.4.0 for brevity) -->
-      <!-- ... [keep your existing control panel + live prices + P&L sections here exactly as v1.4.0] ... -->
+      <!-- ============ CONTROL PANEL (Service restored + Start/Stop) ============ -->
+      <section id="control-panel" class="card">
+        <div class="card-header">
+          <h2>Control Panel</h2>
+          <div class="subtext">
+            <span>Crypto System</span>
+            <span class="dot"></span>
+            <span>v{APP_VERSION}</span>
+            <span class="dot"></span>
+            <span>{BROKER_TEXT}</span>
+          </div>
+        </div>
+
+        <div class="card-body">
+          <!-- Old Service buttons -->
+          <div class="row">
+            <button class="btn" onclick="fetchAndLog('/health')">GET /health</button>
+            <a class="link-open" href="/health" target="_blank" rel="noopener">open</a>
+          </div>
+          <div class="row">
+            <button class="btn" onclick="fetchAndLog('/diag/broker')">GET /diag/broker</button>
+            <a class="link-open" href="/diag/broker" target="_blank" rel="noopener">open</a>
+          </div>
+          <div class="row">
+            <button class="btn" onclick="fetchAndLog('/version')">GET /version</button>
+            <a class="link-open" href="/version" target="_blank" rel="noopener">open</a>
+          </div>
+          <div class="row">
+            <button class="btn" onclick="fetchAndLog('/config')">GET /config</button>
+            <a class="link-open" href="/config" target="_blank" rel="noopener">open</a>
+          </div>
+          <div class="row">
+            <button class="btn" onclick="fetchAndLog('/fills')">GET /fills</button>
+            <a class="link-open" href="/fills" target="_blank" rel="noopener">open</a>
+          </div>
+
+          <!-- Scheduler controls under Status -->
+          <div class="row" style="margin-top:6px">
+            <button id="btn_sched_status" class="btn" onclick="schedulerStatus()">GET /scheduler/status</button>
+            <a class="link-open" href="/scheduler/status" target="_blank" rel="noopener">open</a>
+          </div>
+          <div class="row">
+            <button id="btn_sched_start" class="btn success" onclick="schedulerStart()">/scheduler/start</button>
+            <button id="btn_sched_stop"  class="btn danger"  onclick="schedulerStop()">/scheduler/stop</button>
+          </div>
+
+          <!-- Symbols / Strategies (wrap inside) -->
+          <div class="mini-meta" id="mini_meta">
+            <div><strong>Symbols:</strong> <code id="meta_symbols">—</code></div>
+            <div><strong>Strategies:</strong> <code id="meta_strategies">—</code></div>
+          </div>
+        </div>
+      </section>
+
+      <!-- ============ LIVE PRICES (original table layout) ============ -->
+      <section id="live-prices" class="card">
+        <div class="card-header">
+          <h2>Live Prices</h2>
+          <div class="subtext">From /price/* — <span id="prices_hint">30s auto-refresh</span></div>
+        </div>
+
+        <table>
+          <thead>
+            <tr>
+              <th class="col-symbol">Symbol</th>
+              <th class="col-price">Price</th>
+              <th class="col-spark">Spark</th>
+              <th class="col-updated">Updated</th>
+            </tr>
+          </thead>
+          <tbody id="prices_tbody"></tbody>
+        </table>
+
+        <div class="row" style="margin-top:10px">
+          <button class="btn" onclick="refreshPrices()">Refresh now</button>
+        </div>
+      </section>
+
+      <!-- ============ P&L ============ -->
+      <section id="pnl" class="card">
+        <div class="card-header">
+          <h2>P&amp;L</h2>
+          <div class="subtext">Aggregated from /pnl/summary</div>
+        </div>
+
+        <div class="stat-tiles" id="pnl_tiles">
+          <div class="tile"><div class="label">Realized</div><div class="val" id="pnl_realized">—</div></div>
+          <div class="tile"><div class="label">Unrealized</div><div class="val" id="pnl_unreal">—</div></div>
+          <div class="tile"><div class="label">Fees</div><div class="val" id="pnl_fees">—</div></div>
+          <div class="tile"><div class="label">Equity</div><div class="val" id="pnl_equity">—</div></div>
+        </div>
+
+        <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px">
+          <div>
+            <h3 style="margin:6px 0">By Strategy (Top 5)</h3>
+            <table id="tbl_strategy">
+              <thead><tr><th>Strategy</th><th>Realized</th><th>Unrealized</th><th>Fees</th><th>Equity</th></tr></thead>
+              <tbody></tbody>
+            </table>
+          </div>
+          <div>
+            <h3 style="margin:6px 0">By Symbol (Top 5)</h3>
+            <table id="tbl_symbol">
+              <thead><tr><th>Symbol</th><th>Realized</th><th>Unrealized</th><th>Fees</th><th>Equity</th></tr></thead>
+              <tbody></tbody>
+            </table>
+          </div>
+        </div>
+
+        <div class="row" style="margin-top:10px">
+          <button class="btn" onclick="refreshPnL()">Refresh P&amp;L</button>
+        </div>
+      </section>
 
       <!-- ============ CALENDAR P&L ============ -->
       <section id="calendar-pnl" class="card">
