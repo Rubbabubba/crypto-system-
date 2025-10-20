@@ -55,6 +55,8 @@ from typing import Any, Dict, List, Optional, TypedDict
 from fastapi import Query
 import advisor
 import pandas as pd
+from pathlib import Path
+from fastapi.responses import RedirectResponse
 from fastapi import FastAPI, HTTPException, Request, Body
 from fastapi.responses import JSONResponse, HTMLResponse
 
@@ -394,17 +396,31 @@ async def order_market(request: Request):
 # -----------------------------------------------------------------------------
 # Dashboard HTML (kept only for root alias demo)
 # -----------------------------------------------------------------------------
-# (unchanged – your production dashboard is now separate)
-DASHBOARD_HTML = """<!doctype html><html><body><p>Use /dashboard.html static asset.</p></body></html>"""
+# -------- Serve the real dashboard.html from the repo root --------
+DASHBOARD_PATH = Path(os.getenv("DASHBOARD_FILE", "dashboard.html"))
 
-@app.get("/", response_class=HTMLResponse)
+@app.get("/", include_in_schema=False)
 def root():
-    html = DASHBOARD_HTML
-    return HTMLResponse(content=html, status_code=200)
+    # send anyone hitting "/" to the actual dashboard
+    return RedirectResponse(url="/dashboard.html")
 
-@app.get("/dashboard", response_class=HTMLResponse)
+@app.get("/dashboard", include_in_schema=False)
 def dashboard_alias():
-    return root()
+    return RedirectResponse(url="/dashboard.html")
+
+@app.get("/dashboard.html", response_class=HTMLResponse)
+def serve_dashboard_html():
+    if not DASHBOARD_PATH.exists():
+        # Helpful message if the file isn’t in the image yet
+        return HTMLResponse(
+            "<pre>dashboard.html not found in the container.\n"
+            "Confirm it’s committed to the repo root and redeploy.</pre>", status_code=200
+        )
+    try:
+        return HTMLResponse(DASHBOARD_PATH.read_text(encoding="utf-8"))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to read dashboard.html: {e}")
+# ------------------------------------------------------------------
 
 # -----------------------------------------------------------------------------
 # Scheduler (unchanged)
