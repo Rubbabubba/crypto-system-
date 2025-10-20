@@ -588,6 +588,16 @@ def _sync_journal_with_fills(max_trades: int = 400) -> dict:
 @app.post("/journal/sync")
 def journal_sync():
     return _sync_journal_with_fills(400)
+    
+# --- GET aliases so buttons/links can hit them without a POST ---
+@app.get("/journal/sync")
+def journal_sync_get():
+    return _sync_journal_with_fills(400)
+
+@app.get("/reconcile/fills")
+def reconcile_fills_get():
+    return _sync_journal_with_fills(400)
+# ----------------------------------------------------------------
 
 @app.post("/reconcile/fills")
 def reconcile_fills_alias():
