@@ -129,7 +129,7 @@
         </div>
         <div class="row" style="margin-top:10px">
           <button class="btn" onclick="refreshPnL()">Refresh P&amp;L</button>
-          <button class="btn" onclick="fetchAndLog('/journal/sync')">Sync fills</button>
+          <button class="btn" onclick="syncFills()">Sync fills</button>
           <a class="link-open" href="/pnl/summary" target="_blank">open</a>
         </div>
       </section>
@@ -174,6 +174,28 @@
       }catch(e){ log(`FETCH FAIL ${path}`, String(e)); throw e; }
     }
     async function fetchAndLog(path){ const j=await fetchJSON(path); log(`GET ${path}`, j); return j; }
+	
+	async function syncFills(){
+      try{
+        // Update any existing journal rows that already have txids
+        let r = await fetch('/journal/sync', {method:'POST'}).catch(()=>null);
+        let j = r ? await r.json() : {ok:false};
+        log('POST /journal/sync', j);
+
+        // If the journal is empty (count === 0), populate it from full broker history
+        if (!j || j.count === 0) {
+          const r2 = await fetch('/journal/backfill', {method:'POST'});
+          const j2 = await r2.json();
+          log('POST /journal/backfill', j2);
+        }
+
+        // Refresh P&L tiles/tables and rebuild the calendar view
+        await refreshPnL();
+        await (async()=>{ let off=0; await buildCalendar(0); })();
+      }catch(e){
+        log('syncFills error', String(e));
+      }
+    }
 
     /* ===== Control Panel ===== */
     async function schedulerStatus(){ try{ return await fetchAndLog('/scheduler/status'); }catch(e){} }

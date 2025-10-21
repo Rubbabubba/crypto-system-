@@ -548,6 +548,75 @@ def _journal_append(row: dict):
 async def _journal_on_start():
     _journal_load()
 
+def _journal_backfill(max_trades: int = 5000) -> dict:
+    """
+    Create journal rows from broker trade history for any txid that's not already in the journal.
+    Safe to run multiple times; it skips existing txids.
+    """
+    try:
+        fills = br.trades_history(max_trades)
+        if not fills.get("ok"):
+            return {"ok": False, "error": fills.get("error", "unknown")}
+
+        # Build existing txid set
+        with _JOURNAL_LOCK:
+            existing_txids = {str(r.get("txid")) for r in _JOURNAL if r.get("txid")}
+
+        # Kraken symbol -> UI symbol mapper (fallback to raw pair)
+        try:
+            from symbol_map import from_kraken as _from_k
+        except Exception:
+            _from_k = lambda s: s
+
+        added = 0
+        new_rows = []
+
+        for t in (fills.get("trades") or []):
+            txid = str(t.get("txid") or "")
+            if not txid or txid in existing_txids:
+                continue
+
+            pair_raw = str(t.get("pair") or "")
+            sym_ui = (_from_k(pair_raw) or pair_raw).upper()
+            side = str(t.get("type") or t.get("side") or "").lower()  # 'buy'/'sell'
+            price = float(t.get("price") or 0.0)
+            vol = float(t.get("vol") or 0.0)
+            fee = float(t.get("fee") or 0.0)
+            cost = float(t.get("cost") or 0.0)
+            ts_fill = float(t.get("time") or 0.0)
+
+            # Strategy unknown if imported; you can later re-attribute if you encode strategy in trade descr
+            row = {
+                "ts": int(ts_fill) or int(time.time()),
+                "filled_ts": float(ts_fill) if ts_fill else None,
+                "symbol": sym_ui,
+                "side": side,
+                "price": price,
+                "vol": vol,
+                "fee": fee,
+                "cost": cost,
+                "strategy": "import",     # mark backfilled rows
+                "txid": txid,
+                "descr": t.get("descr"),
+            }
+            new_rows.append(row)
+
+        if new_rows:
+            # Persist to memory + file
+            with _JOURNAL_LOCK:
+                _JOURNAL.extend(new_rows)
+            try:
+                with open(_JOURNAL_PATH, "a", encoding="utf-8") as f:
+                    for r in new_rows:
+                        f.write(json.dumps(r, separators=(",", ":")) + "\n")
+            except Exception as pe:
+                log.warning("journal backfill persist error: %s", pe)
+            added = len(new_rows)
+
+        return {"ok": True, "added": added, "count": len(_JOURNAL)}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
 def _sync_journal_with_fills(max_trades: int = 400) -> dict:
     try:
         fills = br.trades_history(max_trades)
@@ -723,6 +792,14 @@ def pnl_reset():
         return {"ok": True}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+        
+@app.post("/journal/backfill")
+def journal_backfill_post():
+    return _journal_backfill(5000)
+
+@app.get("/journal/backfill")
+def journal_backfill_get():
+    return _journal_backfill(5000)
 
 # -----------------------------------------------------------------------------
 # Advisor (unchanged)
