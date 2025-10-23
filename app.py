@@ -103,7 +103,9 @@ def _journal_load():
     try:
         with open(_JOURNAL_PATH,"r",encoding="utf-8") as f:
             for line in f:
-                line=line.strip(); if not line: continue
+                line = line.strip()
+                if not line:
+                    continue
                 rows.append(json.loads(line))
     except FileNotFoundError:
         pass
