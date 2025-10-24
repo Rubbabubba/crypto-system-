@@ -176,10 +176,18 @@ def _journal_backfill(n=5000):
     added = _journal_append_many(rows)
     return {"ok": True, "added": added, "count": len(_JOURNAL)}
 
-@app.post("/journal/sync") def journal_sync(): return _sync_journal_with_fills(500)
-@app.get("/journal/sync")  def journal_sync_get(): return _sync_journal_with_fills(500)
-@app.post("/journal/backfill") def journal_backfill_post(): return _journal_backfill(5000)
-@app.get("/journal/backfill")  def journal_backfill_get(): return _journal_backfill(5000)
+@app.post("/journal/sync")
+def journal_sync():
+    return _sync_journal_with_fills(500)
+@app.get("/journal/sync")
+def journal_sync_get():
+    return _sync_journal_with_fills(500)
+@app.post("/journal/backfill")
+def journal_backfill_post():
+    return _journal_backfill(5000)
+@app.get("/journal/backfill")
+def journal_backfill_get():
+    return _journal_backfill(5000)
 
 @app.post("/journal/enrich")
 def journal_enrich():
