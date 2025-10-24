@@ -50,6 +50,7 @@ import json
 import logging
 import threading
 import time
+import re
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, TypedDict
 from fastapi import Query
@@ -825,6 +826,13 @@ def advisor_apply(body: Dict[str, Any] = Body(...)):
 
 @app.post("/journal/enrich/deep")
 def journal_enrich_deep():
+    """
+    For rows with strategy=='import', attempt broker lookups by txid:
+      - trades -> ordertxid
+      - orders -> descr, userref
+    Then re-run inference. If still unknown, do guard-based attribution.
+    """
+    # Lazy import to avoid hard dependency at boot
     try:
         from broker_kraken import trade_details as _trade_details
     except Exception:
@@ -834,21 +842,26 @@ def journal_enrich_deep():
     fixed_guard  = 0
     missing = []
 
+    # Load policy config (local aliases used inside this function)
     from pathlib import Path as _Path
-    import json as _json, datetime as _dt
+    import json as _json
+    from datetime import timezone as _tz
+    import datetime as _dt
+
     POLICY_DIR = _Path(os.getenv("POLICY_CFG_DIR", "policy_config"))
     try:
-        _windows = _json.loads((POLICY_DIR/"windows.json").read_text())
+        _windows = _json.loads((POLICY_DIR / "windows.json").read_text())
     except Exception:
         _windows = {}
     try:
-        _whitelist = _json.loads((POLICY_DIR/"whitelist.json").read_text())
+        _whitelist = _json.loads((POLICY_DIR / "whitelist.json").read_text())
     except Exception:
         _whitelist = {}
 
     _DOWS = ["Mon","Tue","Wed","Thu","Fri","Sat","Sun"]
+
     def _in_window(strat: str, ts: float) -> bool:
-        t = _dt.datetime.fromtimestamp(float(ts), tz=timezone.utc).astimezone(_dt.timezone(_dt.timedelta(hours=-5)))
+        t = _dt.datetime.fromtimestamp(float(ts), tz=_tz.utc).astimezone(_dt.timezone(_dt.timedelta(hours=-5)))
         w = (_windows.get("windows") or {}).get(strat, {})
         hours = set((w.get("hours") or []))
         dows  = set((w.get("dows")  or _DOWS))
@@ -858,7 +871,8 @@ def journal_enrich_deep():
         s = (s or "").upper()
         return s if "/" in s else (s[:-3] + "/USD" if s.endswith("USD") and len(s) > 3 else s)
 
-    def _guess_strategy(symbol: str, ts: float) -> tuple[str|None, float]:
+    def _guess_strategy(symbol: str, ts: float):
+        """Pick the single strategy that both whitelists the symbol and is 'in window' at ts."""
         sym = _norm_pair(symbol)
         cands = []
         for strat, syms in (_whitelist or {}).items():
@@ -869,30 +883,38 @@ def journal_enrich_deep():
             return cands[0], 0.7
         return None, 0.0
 
+    import re
     STRAT_TAG_RE = re.compile(r"(?:strategy\s*=\s*|strat\s*[:=]\s*|\[strategy\s*=\s*)([a-z0-9_]+)", re.I)
+
     def _infer_strategy(descr: str|None, userref: int|None, default="import")->str:
         s = descr or ""
         m = STRAT_TAG_RE.search(s)
         if m: return m.group(1).lower()
         if userref is not None:
             try:
-                umap = json.loads((Path(os.getenv("USERREF_MAP_FILE", "policy_config/userref_map.json"))).read_text())
+                umap = _json.loads((_Path(os.getenv("USERREF_MAP_FILE", "policy_config/userref_map.json"))).read_text())
             except Exception:
                 umap = {}
             v = umap.get(str(int(userref)))
             if v: return v.lower()
         return default
 
+    # gather txids to enrich
     with _JOURNAL_LOCK:
-        need = [r for r in _JOURNAL if (r.get("strategy") or "import") == "import" and (not r.get("userref") or not r.get("descr")) and r.get("txid")]
+        need = [r for r in _JOURNAL
+                if (r.get("strategy") or "import") == "import"
+                and (not r.get("userref") or not r.get("descr"))
+                and r.get("txid")]
         txids = [r["txid"] for r in need]
 
+    # broker lookups
     details = {}
     try:
         details = _trade_details(txids)
     except Exception:
         details = {}
 
+    # apply updates
     with _JOURNAL_LOCK:
         for r in _JOURNAL:
             if (r.get("strategy") or "import") != "import":
@@ -922,11 +944,14 @@ def journal_enrich_deep():
             else:
                 missing.append(tx)
 
-        with open(_JOURNAL_PATH,"w",encoding="utf-8") as f:
+        # persist journal
+        with open(_JOURNAL_PATH, "w", encoding="utf-8") as f:
             for row in _JOURNAL:
-                f.write(json.dumps(row, separators=(",",":"))+"\n")
+                f.write(json.dumps(row, separators=(",",":")) + "\n")
 
-    return {"ok": True, "fixed_by_broker": fixed_broker, "fixed_by_guard": fixed_guard, "still_missing": len(missing), "missing_txids": missing[:50]}
+    return {"ok": True, "fixed_by_broker": fixed_broker, "fixed_by_guard": fixed_guard,
+            "still_missing": len(missing), "missing_txids": missing[:50]}
+
 
 if __name__ == "__main__":
     import uvicorn  # type: ignore
