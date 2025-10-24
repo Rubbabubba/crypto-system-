@@ -414,3 +414,47 @@ def trades_history(count: int = 20) -> Dict[str, Any]:
         return {"ok": True, "trades": items}
     except Exception as e:
         return {"ok": False, "error": str(e)}
+
+# --- Added helper: trade_details -------------------------------------------------
+def trade_details(txids):
+    out = {}
+    try:
+        client = globals().get("_client") or globals().get("client") or None
+        if not client or not txids:
+            return out
+        try:
+            qtr = client.request("QueryTrades", {"txid": ",".join(txids)})
+            tr_res = (qtr.get("result") or {}) if isinstance(qtr, dict) else {}
+        except Exception:
+            tr_res = {}
+        order_ids = []
+        for txid, t in tr_res.items():
+            oid = (t or {}).get("ordertxid")
+            if oid:
+                order_ids.append(oid)
+        orders = {}
+        if order_ids:
+            try:
+                qor = client.request("QueryOrders", {"txid": ",".join(order_ids)})
+                orders = (qor.get("result") or {}) if isinstance(qor, dict) else {}
+            except Exception:
+                orders = {}
+        for txid, t in tr_res.items():
+            row = {}
+            oid = (t or {}).get("ordertxid")
+            if oid:
+                row["ordertxid"] = oid
+                if oid in orders:
+                    o = orders[oid] or {}
+                    desc_blob = o.get("descr") or {}
+                    if isinstance(desc_blob, dict):
+                        row["descr"] = desc_blob.get("order") or ""
+                    elif isinstance(desc_blob, str):
+                        row["descr"] = desc_blob
+                    if "userref" in o and o["userref"] is not None:
+                        row["userref"] = o["userref"]
+            if row:
+                out[txid] = row
+        return out
+    except Exception:
+        return out
