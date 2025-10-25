@@ -416,22 +416,25 @@ def trades_history(count: int = 20) -> Dict[str, Any]:
         return {"ok": False, "error": str(e)}
 
 # --- Added helper: trade_details -------------------------------------------------
-def trade_details(txids):
+def trade_details(ids):
+    """
+    Accepts a mixed list of Kraken order ids (start with 'O') and trade ids (start with 'T').
+    Returns a dict keyed by BOTH order and trade ids, each containing as many of:
+    ordertxid, descr, userref, price, vol, fee, cost, filled_ts.
+    """
     out = {}
     try:
         client = globals().get("_client") or globals().get("client") or None
-        if not client or not txids:
+        if not client:
             return out
-        try:
-            qtr = client.request("QueryTrades", {"txid": ",".join(txids)})
-            tr_res = (qtr.get("result") or {}) if isinstance(qtr, dict) else {}
-        except Exception:
-            tr_res = {}
-        order_ids = []
-        for txid, t in tr_res.items():
-            oid = (t or {}).get("ordertxid")
-            if oid:
-                order_ids.append(oid)
+        ids = [i for i in (ids or []) if i]
+        if not ids:
+            return out
+
+        trade_ids = [i for i in ids if str(i).startswith("T")]
+        order_ids = [i for i in ids if str(i).startswith("O")]
+
+        # 1) Pull orders; collect their trade ids
         orders = {}
         if order_ids:
             try:
@@ -439,22 +442,70 @@ def trade_details(txids):
                 orders = (qor.get("result") or {}) if isinstance(qor, dict) else {}
             except Exception:
                 orders = {}
-        for txid, t in tr_res.items():
+
+            for o in (orders or {}).values():
+                for tid in (o.get("trades") or []):
+                    if tid and tid not in trade_ids:
+                        trade_ids.append(tid)
+
+        # 2) Pull trades (includes those discovered from orders)
+        tr_res = {}
+        if trade_ids:
+            try:
+                qtr = client.request("QueryTrades", {"txid": ",".join(trade_ids)})
+                tr_res = (qtr.get("result") or {}) if isinstance(qtr, dict) else {}
+            except Exception:
+                tr_res = {}
+
+        # 3) Build rows for each trade id
+        for tid, t in (tr_res or {}).items():
+            if not t:
+                continue
             row = {}
-            oid = (t or {}).get("ordertxid")
-            if oid:
-                row["ordertxid"] = oid
-                if oid in orders:
-                    o = orders[oid] or {}
-                    desc_blob = o.get("descr") or {}
-                    if isinstance(desc_blob, dict):
-                        row["descr"] = desc_blob.get("order") or ""
-                    elif isinstance(desc_blob, str):
-                        row["descr"] = desc_blob
-                    if "userref" in o and o["userref"] is not None:
-                        row["userref"] = o["userref"]
-            if row:
-                out[txid] = row
+            row["ordertxid"] = t.get("ordertxid")
+            # numeric fields (best-effort)
+            for k_src, k_dst in [("price", "price"), ("vol", "vol"), ("fee", "fee"), ("cost", "cost")]:
+                v = t.get(k_src)
+                try:
+                    row[k_dst] = float(v) if v is not None else None
+                except Exception:
+                    row[k_dst] = None
+            # Kraken "time" is epoch seconds
+            try:
+                row["filled_ts"] = float(t.get("time")) if t.get("time") is not None else None
+            except Exception:
+                row["filled_ts"] = None
+            out[tid] = row
+
+        # 4) Build/augment rows for each order id
+        for oid, o in (orders or {}).items():
+            row = out.get(oid, {})
+            desc_blob = o.get("descr") or {}
+            if isinstance(desc_blob, dict):
+                row["descr"] = desc_blob.get("order") or ""
+            else:
+                row["descr"] = desc_blob or ""
+            if "userref" in o and o["userref"] is not None:
+                row["userref"] = o["userref"]
+
+            # If the order lists trades, copy the latest trade's monetized fields
+            tr_list = o.get("trades") or []
+            if tr_list:
+                last_tid = tr_list[-1]
+                t = (tr_res or {}).get(last_tid) or {}
+                for k_src, k_dst in [("price", "price"), ("vol", "vol"), ("fee", "fee"), ("cost", "cost")]:
+                    v = t.get(k_src)
+                    try:
+                        row[k_dst] = float(v) if v is not None else row.get(k_dst)
+                    except Exception:
+                        pass
+                try:
+                    row["filled_ts"] = float(t.get("time")) if t.get("time") is not None else row.get("filled_ts")
+                except Exception:
+                    pass
+
+            out[oid] = row
+
         return out
     except Exception:
         return out
