@@ -35,6 +35,7 @@ Journal & PnL
 """
 
 from __future__ import annotations
+import re
 
 __version__ = "2.0.0"
 
@@ -52,10 +53,6 @@ import advisor
 import pandas as pd
 from fastapi import FastAPI, HTTPException, Request, Body
 from fastapi.responses import JSONResponse, HTMLResponse
-# Extract strategy tag from descriptions like "[strategy=c2]" or "strategy=c3"
-STRAT_TAG_RE = re.compile(r"(?:strategy\s*=\s*|strat\s*[:=]\s*|\[strategy\s*=\s*)([a-z0-9_]+)", re.I)
-
-
 
 # -----------------------------------------------------------------------------
 # Logging
@@ -202,6 +199,16 @@ app = FastAPI(title=SERVICE_NAME, version=APP_VERSION)
 # -----------------------------------------------------------------------------
 # Core info routes
 # -----------------------------------------------------------------------------
+
+def _parse_strategy_from_descr(descr: str) -> str | None:
+    if not descr or not isinstance(descr, str):
+        return None
+    m = STRAT_TAG_RE.search(descr)
+    if m:
+        return m.group(1).lower()
+    # Fallback: look for space-delimited tokens that look like c1..c9
+    m2 = re.search(r"\b(c[1-9])\b", descr, re.I)
+    return m2.group(1).lower() if m2 else None
 @app.get("/health")
 def health():
     return {
@@ -937,6 +944,9 @@ async def _maybe_autostart_scheduler():
 # -----------------------------------------------------------------------------
 _JOURNAL_LOCK = threading.Lock()
 _JOURNAL_PATH = os.getenv("JOURNAL_PATH", "./journal_v2.jsonl")
+# Parse strategy tag from descriptions like: "… [strategy=c3]" or "strategy=c2" or "strat: c1"
+STRAT_TAG_RE = re.compile(r"(?:strategy\s*=\s*|strat\s*[:=]\s*|\[strategy\s*=\s*)([a-z0-9_]+)", re.I)
+
 _JOURNAL: List[Dict[str, Any]] = []
 
 def _journal_load():
@@ -1021,14 +1031,7 @@ def journal_list(limit: int = 200):
         rows = list(_JOURNAL[-int(limit):])
     return {"ok": True, "rows": rows, "count": len(_JOURNAL)}
 
-def _pri
-@app.post("/journal/backfill")
-def journal_backfill(max_trades: int = 400):
-    """
-    Alias of /journal/sync; fetches trades/fills from broker and merges into journal.
-    """
-    return _sync_journal_with_fills(max_trades)
-ces_for(symbols: List[str]) -> Dict[str, float]:
+def _prices_for(symbols: List[str]) -> Dict[str, float]:
     out: Dict[str, float] = {}
     for s in symbols:
         try:
@@ -1178,26 +1181,154 @@ if __name__ == "__main__":
     )
     uvicorn.run("app:app", host="0.0.0.0", port=port, reload=False, access_log=True)
 
-@app.post("/journal/enrich")
-def journal_enrich(limit: int = 200):
+def _kraken_fetch_order_details(txids: list[str]) -> dict:
+    """Fetch order/trade details for the given Kraken IDs.
+
+    Supports passing either trade IDs (T...) or order IDs (O...).
+    Returns: { id -> { 'descr': str, 'userref': int|str|None, 'ordertxid': str|None } }
     """
-    Shallow enrichment: fill missing strategy from descr and normalize symbols.
-    """
+    out: dict[str, dict] = {}
     try:
-        updated = 0
-        with _JOURNAL_LOCK:
-            for row in _JOURNAL:
-                # Normalize symbol like "SOL/USD" => upper
-                if row.get("symbol"):
-                    row["symbol"] = row["symbol"].upper().replace(" ", "")
-                # Strategy hint from descr
-                if not row.get("strategy"):
-                    descr = (row.get("descr") or "") + " " + (row.get("notes") or "")
-                    m = STRAT_TAG_RE.search(descr)
-                    if m:
-                        row["strategy"] = m.group(1).lower()
-                        updated += 1
-            count = len(_JOURNAL)
-        return {"ok": True, "updated": updated, "checked": count}
-    except Exception as e:
-        return {"ok": False, "error": str(e)}
+        br = globals().get("br")  # broker_kraken imported as 'br' elsewhere
+        client = getattr(br, "client", None) if br else None
+        if not client or not txids:
+            # Try the convenience function if provided
+            if br and hasattr(br, "trade_details"):
+                try:
+                    return br.trade_details(txids) or {}
+                except Exception:
+                    return {}
+            return {}
+
+        # Split into likely order IDs and trade IDs
+        order_ids = [x for x in txids if x and x[0].upper() == "O"]
+        trade_ids = [x for x in txids if x and x[0].upper() == "T"]
+
+        # 4a) If we have trades, fetch trades first to discover ordertxid(s)
+        try:
+            tr_res = {}
+            if trade_ids:
+                qtr = client.request("QueryTrades", {"txid": ",".join(trade_ids)})
+                tr_res = (qtr.get("result") or {}) if isinstance(qtr, dict) else {}
+            else:
+                tr_res = {}
+        except Exception:
+            tr_res = {}
+
+        need_orders = set(order_ids)
+        for txid, t in (tr_res or {}).items():
+            if not isinstance(t, dict):
+                continue
+            oid = t.get("ordertxid")
+            row = {}
+            if oid:
+                row["ordertxid"] = oid
+                need_orders.add(oid)
+            out[txid] = row
+
+        # 4b) Fetch orders for anything we need (explicit order ids + discovered from trades)
+        try:
+            orders = {}
+            if need_orders:
+                qor = client.request("QueryOrders", {"txid": ",".join(sorted(need_orders))})
+                orders = (qor.get("result") or {}) if isinstance(qor, dict) else {}
+            else:
+                orders = {}
+        except Exception:
+            orders = {}
+
+        # 4c) Attach order descr + userref back to both order ids and trade ids
+        for oid, o in (orders or {}).items():
+            if not isinstance(o, dict):
+                continue
+            rec = out.setdefault(oid, {})
+            desc_blob = o.get("descr") or {}
+            if isinstance(desc_blob, dict):
+                rec["descr"] = desc_blob.get("order") or ""
+            elif isinstance(desc_blob, str):
+                rec["descr"] = desc_blob
+            if "userref" in o and o["userref"] is not None:
+                rec["userref"] = o["userref"]
+
+        # Also populate trade records with their order fields, if known
+        for txid, row in list(out.items()):
+            if txid and txid[0].upper() == "T":
+                oid = row.get("ordertxid")
+                if oid and oid in orders:
+                    o = orders[oid] or {}
+                    desc_blob = o.get("descr") or {}
+                    if isinstance(desc_blob, dict):
+                        row["descr"] = desc_blob.get("order") or ""
+                    elif isinstance(desc_blob, str):
+                        row["descr"] = desc_blob
+                    if "userref" in o and o["userref"] is not None:
+                        row["userref"] = o["userref"]
+        return out
+    except Exception:
+        return out
+
+@app.post("/journal/enrich")
+def journal_enrich(body: dict | None = None):
+    """Light enrichment: fill missing strategy/descr/userref using Kraken order/trade lookups."""
+    global _JOURNAL
+    body = body or {}
+    # Find rows that look "pending" or missing attribs
+    pending = [r for r in _JOURNAL if r.get("price") in (None, 0) or r.get("vol") in (None, 0) or r.get("filled_ts") in (None, 0)]
+    txids = [r.get("txid") for r in pending if r.get("txid")]
+    details = _kraken_fetch_order_details(txids) if txids else {}
+
+    updated = 0
+    for r in pending:
+        txid = r.get("txid")
+        d = (details or {}).get(txid) or (details or {}).get(r.get("ordertxid") or "")
+        if not d:
+            continue
+        if "descr" in d and d["descr"] and not r.get("descr"):
+            r["descr"] = d["descr"]
+        if "userref" in d and d["userref"] is not None:
+            r["userref"] = d["userref"]
+        # Strategy inference
+        if not r.get("strategy"):
+            s = _parse_strategy_from_descr(r.get("descr", ""))
+            if s:
+                r["strategy"] = s
+        updated += 1
+    save_journal()
+    return {"ok": True, "updated": updated, "checked": len(pending)}
+
+@app.post("/journal/enrich/deep")
+def journal_enrich_deep(body: dict | None = None):
+    """Deep enrichment: also try to attribute by matching descr to symbol/side/size and fill any missing fields we can parse."""
+    global _JOURNAL
+    body = body or {}
+    # First run light enrichment
+    _ = journal_enrich({})
+
+    # Pass 2: parse description lines and backfill basic fields if empty
+    updated = 0
+    for r in _JOURNAL:
+        descr = r.get("descr") or ""
+        if descr:
+            # Example descr: "buy 1.44271 LINKUSD @ market"
+            m = re.search(r"\b(buy|sell)\b\s+([0-9]*\.?[0-9]+)\s+([A-Z/]+)\b", descr, re.I)
+            if m:
+                side = m.group(1).lower()
+                vol = float(m.group(2))
+                sym = m.group(3).upper().replace("USD", "/USD").replace("USDT", "/USDT")
+                if not r.get("side"):
+                    r["side"] = side
+                if not r.get("vol"):
+                    r["vol"] = vol
+                if not r.get("symbol"):
+                    # normalize symbols like LINKUSD -> LINK/USD
+                    if "/" not in sym and sym.endswith("USD"):
+                        sym = sym[:-3] + "/USD"
+                    r["symbol"] = sym
+                # infer strategy if still missing
+                if not r.get("strategy"):
+                    s = _parse_strategy_from_descr(descr)
+                    if s:
+                        r["strategy"] = s
+                updated += 1
+    save_journal()
+    return {"ok": True, "updated": updated, "checked": len(_JOURNAL)}
