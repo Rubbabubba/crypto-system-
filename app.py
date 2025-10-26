@@ -14,7 +14,6 @@ Routes
 - POST /scan/{strategy}      -> Run a scan for c1..c6; optional dry=true
 - GET  /bars/{symbol}        -> Recent bars
 - GET  /price/{symbol}       -> Last price
-- GET  /price/{base}/{quote} -> Last price (alias: BTC/USD)   # <-- PAIR PRICE ALIAS
 - GET  /positions            -> Spot positions summary
 - GET  /orders               -> Open orders
 - GET  /fills                -> Recent fills (via broker)
@@ -33,10 +32,6 @@ Journal & PnL
 - GET  /pnl/strategies       -> per-strategy P&L
 - GET  /pnl/symbols          -> per-symbol P&L
 - POST /pnl/reset            -> clear journal (dangerous; use carefully)
-
-Advisor
-- GET  /advisor/daily
-- POST /advisor/apply
 """
 
 from __future__ import annotations
@@ -55,10 +50,12 @@ from typing import Any, Dict, List, Optional, TypedDict
 from fastapi import Query
 import advisor
 import pandas as pd
-from pathlib import Path
-from fastapi.responses import RedirectResponse
 from fastapi import FastAPI, HTTPException, Request, Body
 from fastapi.responses import JSONResponse, HTMLResponse
+# Extract strategy tag from descriptions like "[strategy=c2]" or "strategy=c3"
+STRAT_TAG_RE = re.compile(r"(?:strategy\s*=\s*|strat\s*[:=]\s*|\[strategy\s*=\s*)([a-z0-9_]+)", re.I)
+
+
 
 # -----------------------------------------------------------------------------
 # Logging
@@ -335,17 +332,6 @@ def price(symbol: str):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-# ---- PAIR PRICE ALIAS: supports /price/BTC/USD ----
-@app.get("/price/{base}/{quote}")
-def price_pair(base: str, quote: str):
-    try:
-        sym = f"{base.upper()}{quote.upper()}"
-        p = br.last_price(sym)
-        return {"ok": True, "symbol": sym, "price": float(p)}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-# ---------------------------------------------------
-
 @app.get("/positions")
 def positions():
     try:
@@ -394,36 +380,471 @@ async def order_market(request: Request):
         raise HTTPException(status_code=500, detail=str(e))
 
 # -----------------------------------------------------------------------------
-# Dashboard HTML (kept only for root alias demo)
+# Dashboard HTML (with small P&L card)
 # -----------------------------------------------------------------------------
-# -------- Serve the real dashboard.html from the repo root --------
-DASHBOARD_PATH = Path(os.getenv("DASHBOARD_FILE", "dashboard.html"))
+DASHBOARD_HTML = """
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<title>{SERVICE_NAME} — Dashboard</title>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<style>
+:root {
+  --bg:#0b0d10; --card:#11161a; --ink:#e6edf3; --muted:#9fb0c0; --border:#1e242c;
+  --accent:#8ab4ff; --ok:#6bdc6b; --warn:#ffcf5a; --err:#ff7d7d;
+}
+* { box-sizing:border-box; }
+body { font-family:-apple-system,Segoe UI,Roboto,Arial,sans-serif; background:var(--bg); color:var(--ink); margin:0; }
+.header { display:flex; align-items:center; justify-content:space-between; padding:12px 16px; border-bottom:1px solid #222; }
+.badge { padding:3px 8px; border-radius:12px; font-size:12px; border:1px solid var(--border); background:#0f141a; }
+.badge.kraken { background:#163; color:#b5f5b5; border-color:#1e5033; }
+.badge.alpaca { background:#322; color:#f5b5b5; border-color:#503333; }
+.grid { display:grid; grid-template-columns: repeat(auto-fit, minmax(330px, 1fr)); grid-gap:12px; padding:12px; }
+.card { background:var(--card); border:1px solid var(--border); border-radius:10px; padding:12px; }
+h2 { margin:0 0 8px 0; font-size:16px; }
+label { font-size:12px; color:var(--muted); }
+input, select, button, textarea { font:inherit; background:#0b1117; color:var(--ink); border:1px solid var(--border); border-radius:8px; padding:8px; }
+button { cursor:pointer; }
+a { color:var(--accent); text-decoration:none; margin-left:8px; }
+a:hover { text-decoration:underline; }
+pre { background:#0b1117; padding:10px; border-radius:8px; overflow:auto; }
+.table { width:100%; border-collapse:collapse; font-size:13px; }
+.table th, .table td { border-bottom:1px solid var(--border); padding:6px 8px; text-align:left; vertical-align:middle; }
+.kv { display:grid; grid-template-columns:160px 1fr; grid-gap:6px; font-size:13px; align-items:center; }
+.mono { font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace; }
+.small { font-size:12px; color:var(--muted); }
+hr { border:none; border-top:1px solid var(--border); margin:8px 0; }
+svg.spark { width:120px; height:28; }
+svg.spark path.line { fill:none; stroke:var(--accent); stroke-width:1.5; }
+svg.spark rect.bg { fill:#0b1117; }
+svg.spark path.fill { fill:rgba(138,180,255,0.12); stroke:none; }
+.good { color: var(--ok); } .bad { color: var(--err); }
+</style>
+</head>
+<body>
+<div class="header">
+  <div>
+    <strong>{SERVICE_NAME}</strong>
+    <span class="badge {BROKER_BADGE}">broker: {BROKER_TEXT}</span>
+    <span class="badge">v{APP_VERSION}</span>
+  </div>
+  <div class="small">Now: <span id="now"></span></div>
+</div>
 
-@app.get("/", include_in_schema=False)
+<div class="grid">
+
+  <div class="card">
+    <h2>Service</h2>
+    <div class="kv">
+      <div>Health</div>
+      <div>
+        <button onclick="callJson('/health')">GET /health</button>
+        <a class="small" href="/health" target="_blank" rel="noopener">open</a>
+      </div>
+
+      <div>Broker</div>
+      <div>
+        <button onclick="callJson('/diag/broker')">GET /diag/broker</button>
+        <a class="small" href="/diag/broker" target="_blank" rel="noopener">open</a>
+      </div>
+
+      <div>Version</div>
+      <div>
+        <button onclick="callJson('/version')">GET /version</button>
+        <a class="small" href="/version" target="_blank" rel="noopener">open</a>
+      </div>
+
+      <div>Config</div>
+      <div>
+        <button onclick="loadConfig()">GET /config</button>
+        <a class="small" href="/config" target="_blank" rel="noopener">open</a>
+      </div>
+
+      <div>Fills</div>
+      <div>
+        <button onclick="callJson('/fills')">GET /fills</button>
+        <a class="small" href="/fills" target="_blank" rel="noopener">open</a>
+      </div>
+
+      <div>Scheduler</div>
+      <div>
+        <button onclick="callJson('/scheduler/status')">GET /scheduler/status</button>
+        <a class="small" href="/scheduler/status" target="_blank" rel="noopener">open</a>
+      </div>
+    </div>
+    <hr/>
+    <div class="small">Symbols: <span id="cfg_symbols" class="mono"></span></div>
+    <div class="small">Strategies: <span id="cfg_strats" class="mono"></span></div>
+  </div>
+
+  <div class="card">
+    <h2>Quick Scan (dry run)</h2>
+    <div style="display:grid; grid-template-columns:1fr 1fr; grid-gap:8px;">
+      <div>
+        <label>Strategy</label>
+        <select id="scan_strat">
+          <option>c1</option><option>c2</option><option>c3</option>
+          <option>c4</option><option>c5</option><option>c6</option>
+        </select>
+      </div>
+      <div>
+        <label>Timeframe</label>
+        <input id="scan_tf" value="5Min"/>
+      </div>
+      <div>
+        <label>Symbols (comma sep)</label>
+        <input id="scan_syms" placeholder="BTCUSD,ETHUSD"/>
+      </div>
+      <div>
+        <label>Notional (USD)</label>
+        <input id="scan_notional" value="25"/>
+      </div>
+      <div>
+        <label>Limit (bars)</label>
+        <input id="scan_limit" value="300"/>
+      </div>
+      <div style="display:flex; align-items:flex-end;">
+        <button onclick="runScan()">POST /scan&lt;strat&gt;</button>
+      </div>
+    </div>
+    <hr/>
+    <pre id="scan_out" class="mono small">// orders will appear here</pre>
+  </div>
+
+  <div class="card">
+    <h2>Live Prices <span class="small">(30s auto-refresh)</span></h2>
+    <div class="small">From /price/&lt;symbol&gt; for each configured symbol.</div>
+    <table class="table" id="px_table">
+      <thead>
+        <tr><th>Symbol</th><th>Price</th><th>Spark</th><th>Updated</th></tr>
+      </thead>
+      <tbody id="px_tbody"></tbody>
+    </table>
+    <div style="margin-top:8px;">
+      <button onclick="refreshPrices(true)">Refresh now</button>
+    </div>
+  </div>
+
+  <div class="card">
+    <h2>Price & Bars</h2>
+    <div style="display:grid; grid-template-columns:1fr 1fr; grid-gap:8px;">
+      <div>
+        <label>Symbol</label>
+        <input id="bars_sym" value="BTCUSD"/>
+      </div>
+      <div>
+        <label>Timeframe</label>
+        <input id="bars_tf" value="5Min"/>
+      </div>
+      <div>
+        <label>Limit</label>
+        <input id="bars_limit" value="60"/>
+      </div>
+      <div style="display:flex; align-items:flex-end;">
+        <button onclick="fetchBars()">GET /bars&lt;symbol&gt;</button>
+        <a class="small" href="/bars/BTCUSD?timeframe=5Min&limit=60" target="_blank" rel="noopener">open</a>
+      </div>
+    </div>
+    <hr/>
+    <div style="display:flex; gap:8px;">
+      <button onclick="fetchPrice()">GET /price&lt;symbol&gt;</button>
+      <a class="small" href="/price/BTCUSD" target="_blank" rel="noopener">open</a>
+      <button onclick="callJson('/orders')">GET /orders</button>
+      <a class="small" href="/orders" target="_blank" rel="noopener">open</a>
+      <button onclick="callJson('/positions')">GET /positions</button>
+      <a class="small" href="/positions" target="_blank" rel="noopener">open</a>
+    </div>
+    <hr/>
+    <pre id="bars_out" class="mono small">// bars/prices will appear here</pre>
+  </div>
+
+  <div class="card">
+    <h2>Place Market Order</h2>
+    <div class="small">Live trading must be enabled (TRADING_ENABLED & KRAKEN_TRADING).</div>
+    <div style="display:grid; grid-template-columns:1fr 1fr; grid-gap:8px; margin-top:6px;">
+      <div>
+        <label>Symbol</label>
+        <input id="ord_sym" value="BTCUSD"/>
+      </div>
+      <div>
+        <label>Side</label>
+        <select id="ord_side"><option>buy</option><option>sell</option></select>
+      </div>
+      <div>
+        <label>Notional (USD)</label>
+        <input id="ord_notional" value="25"/>
+      </div>
+      <div style="display:flex; align-items:flex-end;">
+        <button onclick="placeOrder()">POST /order/market</button>
+      </div>
+    </div>
+    <hr/>
+    <pre id="ord_out" class="mono small">// order result will appear here</pre>
+  </div>
+
+  <div class="card">
+    <h2>Scheduler</h2>
+    <div style="display:flex; gap:8px;">
+      <button onclick="callJson('/scheduler/start')">/scheduler/start</button>
+      <button onclick="callJson('/scheduler/stop')">/scheduler/stop</button>
+      <button onclick="callJson('/scheduler/status')">/scheduler/status</button>
+    </div>
+    <hr/>
+    <pre id="sched_out" class="mono small">// scheduler responses here</pre>
+  </div>
+
+  <div class="card" id="pnlCard">
+    <h2>P&amp;L</h2>
+    <div class="small">Realized + Unrealized (MTM) with fees; live from /pnl/summary</div>
+    <div id="pnl_time" class="small"></div>
+    <table class="table" id="pnl_strat_tbl">
+      <thead><tr><th>Strategy</th><th>Realized</th><th>Unrealized</th><th>Fees</th><th>Equity</th></tr></thead>
+      <tbody></tbody>
+    </table>
+    <div class="small" style="margin-top:6px;">Total: <span id="pnl_total" class="mono"></span></div>
+    <div style="margin-top:8px;">
+      <button onclick="refreshPNL()">Refresh P&amp;L</button>
+      <button onclick="callJson('/journal/sync')">Sync Fills</button>
+      <a class="small" href="/pnl/summary" target="_blank" rel="noopener">open</a>
+      <a class="small" href="/journal" target="_blank" rel="noopener">journal</a>
+    </div>
+  </div>
+
+  <div class="card">
+    <h2>Console</h2>
+    <pre id="console" class="mono small">// responses will stream here</pre>
+  </div>
+
+</div>
+
+<script>
+function nowISO() { return new Date().toISOString(); }
+function setNow() { document.getElementById('now').textContent = nowISO(); }
+setNow(); setInterval(setNow, 1000);
+
+function println(id, txt) {
+  const el = document.getElementById(id);
+  el.textContent = (el.textContent ? el.textContent + "\\n" : "") + txt;
+  el.scrollTop = el.scrollHeight;
+}
+
+async function callJson(path) {
+  try {
+    const r = await fetch(path);
+    const j = await r.json();
+    println('console', `[${nowISO()}] GET ${path}\\n` + JSON.stringify(j, null, 2));
+    if (path === '/config') {
+      document.getElementById('cfg_symbols').textContent = (j.SYMBOLS || []).join(',');
+      document.getElementById('cfg_strats').textContent = (j.STRATEGIES || []).join(',');
+      buildPriceRows(j.SYMBOLS || []);
+    }
+    if (path.startsWith('/scheduler')) {
+      document.getElementById('sched_out').textContent = JSON.stringify(j, null, 2);
+    }
+    return j;
+  } catch (e) {
+    println('console', `[${nowISO()}] ERROR GET ${path}: ` + e);
+  }
+}
+
+async function loadConfig() { return await callJson('/config'); }
+
+/* Quick scan */
+async function runScan() {
+  const strat = document.getElementById('scan_strat').value;
+  const tf = document.getElementById('scan_tf').value;
+  const syms = document.getElementById('scan_syms').value || document.getElementById('cfg_symbols').textContent;
+  const notional = parseFloat(document.getElementById('scan_notional').value || '25');
+  const limit = parseInt(document.getElementById('scan_limit').value || '300');
+  const body = {
+    symbols: (syms ? syms.split(',').map(s => s.trim()).filter(Boolean) : []),
+    timeframe: tf, limit: limit, notional: notional, dry: true
+  };
+  try {
+    const r = await fetch(`/scan/${strat}`, { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body) });
+    const j = await r.json();
+    document.getElementById('scan_out').textContent = JSON.stringify(j, null, 2);
+    println('console', `[${nowISO()}] POST /scan/${strat}\\n` + JSON.stringify(j, null, 2));
+  } catch (e) {
+    println('console', `[${nowISO()}] ERROR POST /scan/${strat}: ` + e);
+  }
+}
+
+/* Bars & price */
+async function fetchBars() {
+  const sym = document.getElementById('bars_sym').value;
+  const tf = document.getElementById('bars_tf').value;
+  const limit = document.getElementById('bars_limit').value;
+  try {
+    const r = await fetch(`/bars/${sym}?timeframe=${encodeURIComponent(tf)}&limit=${encodeURIComponent(limit)}`);
+    const j = await r.json();
+    document.getElementById('bars_out').textContent = JSON.stringify(j, null, 2);
+    println('console', `[${nowISO()}] GET /bars/${sym}\\n` + JSON.stringify(j, null, 2));
+  } catch (e) {
+    println('console', `[${nowISO()}] ERROR GET /bars/${sym}: ` + e);
+  }
+}
+
+async function fetchPrice() {
+  const sym = document.getElementById('bars_sym').value;
+  try {
+    const r = await fetch(`/price/${sym}`);
+    const j = await r.json();
+    document.getElementById('bars_out').textContent = JSON.stringify(j, null, 2);
+    println('console', `[${nowISO()}] GET /price/${sym}\\n` + JSON.stringify(j, null, 2));
+  } catch (e) {
+    println('console', `[${nowISO()}] ERROR GET /price/${sym}: ` + e);
+  }
+}
+
+/* Live Prices + Sparklines */
+let PX_SYMBOLS = [];
+const PX_SERIES = {};
+const MAX_POINTS = 50;
+
+function buildPriceRows(symbols) {
+  PX_SYMBOLS = (symbols || []).map(s => String(s).toUpperCase());
+  const tbody = document.getElementById('px_tbody');
+  tbody.innerHTML = '';
+  PX_SYMBOLS.forEach(sym => {
+    PX_SERIES[sym] = PX_SERIES[sym] || [];
+    const tr = document.createElement('tr');
+    tr.innerHTML =
+      `<td class="mono">${sym}</td>` +
+      `<td id="px_${sym}" class="mono">—</td>` +
+      `<td><svg class="spark" viewBox="0 0 120 28" id="px_svg_${sym}">` +
+      `<rect class="bg" x="0" y="0" width="120" height="28"></rect>` +
+      `<path class="fill" id="px_fill_${sym}" d=""></path>` +
+      `<path class="line" id="px_line_${sym}" d=""></path>` +
+      `</svg></td>` +
+      `<td id="px_t_${sym}" class="small">—</td>`;
+    tbody.appendChild(tr);
+  });
+}
+
+function computePath(points, w=120, h=28, pad=2) {
+  if (!points || points.length === 0) return { line:'', fill:'' };
+  const n = points.length;
+  const min = Math.min.apply(null, points);
+  const max = Math.max.apply(null, points);
+  const rng = (max - min) || 1e-9;
+  const innerW = w - pad*2;
+  const innerH = h - pad*2;
+  const x = i => pad + (i/(n-1))*innerW;
+  const y = v => pad + innerH - ((v - min)/rng)*innerH;
+  let d = `M ${x(0).toFixed(2)} ${y(points[0]).toFixed(2)}`;
+  for (let i = 1; i < n; i++) d += ` L ${x(i).toFixed(2)} ${y(points[i]).toFixed(2)}`;
+  let df = d + ` L ${x(n-1).toFixed(2)} ${(h-pad).toFixed(2)} L ${x(0).toFixed(2)} ${(h-pad).toFixed(2)} Z`;
+  return { line: d, fill: df };
+}
+
+function renderSparkline(sym) {
+  const pts = PX_SERIES[sym] || [];
+  const { line, fill } = computePath(pts);
+  const lineEl = document.getElementById(`px_line_${sym}`);
+  const fillEl = document.getElementById(`px_fill_${sym}`);
+  if (lineEl) lineEl.setAttribute('d', line || '');
+  if (fillEl) fillEl.setAttribute('d', fill || '');
+}
+
+async function refreshPrices(forceLog) {
+  if (!PX_SYMBOLS.length) {
+    await loadConfig();
+  }
+  for (const sym of PX_SYMBOLS) {
+    try {
+      const r = await fetch(`/price/${sym}`);
+      const j = await r.json();
+      const px = (j && j.price != null) ? Number(j.price) : null;
+      if (px != null && isFinite(px)) {
+        const arr = (PX_SERIES[sym] = (PX_SERIES[sym] || []));
+        arr.push(px);
+        if (arr.length > MAX_POINTS) arr.splice(0, arr.length - MAX_POINTS);
+        renderSparkline(sym);
+      }
+      document.getElementById(`px_${sym}`).textContent = (px == null ? '—' : String(px));
+      document.getElementById(`px_t_${sym}`).textContent = nowISO();
+      if (forceLog) println('console', `[${nowISO()}] price ${sym} -> ${px}`);
+    } catch (e) {
+      println('console', `[${nowISO()}] ERROR price ${sym}: ` + e);
+    }
+  }
+}
+
+window.addEventListener('load', async () => {
+  await loadConfig();
+  await refreshPrices(true);
+  setInterval(refreshPrices, 30000);
+  setInterval(refreshPNL, 30000);
+});
+
+/* Orders */
+async function placeOrder() {
+  const sym = document.getElementById('ord_sym').value;
+  const side = document.getElementById('ord_side').value;
+  const notional = parseFloat(document.getElementById('ord_notional').value || '25');
+  const body = { symbol: sym, side: side, notional: notional };
+  try {
+    const r = await fetch('/order/market', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body) });
+    const j = await r.json();
+    document.getElementById('ord_out').textContent = JSON.stringify(j, null, 2);
+    println('console', `[${nowISO()}] POST /order/market\\n` + JSON.stringify(j, null, 2));
+  } catch (e) {
+    println('console', `[${nowISO()}] ERROR POST /order/market: ` + e);
+  }
+}
+
+/* P&L card */
+function fmt(x){ const v = Number(x||0); const s = (v>=0?'+':''); return s + (Math.round(v*100)/100).toFixed(2); }
+async function refreshPNL() {
+  try {
+    const r = await fetch('/pnl/summary');
+    const j = await r.json();
+    const tbody = document.querySelector('#pnl_strat_tbl tbody');
+    tbody.innerHTML = '';
+    (j.per_strategy || []).forEach(row => {
+      const tr = document.createElement('tr');
+      tr.innerHTML = `<td>${row.strategy}</td>`
+        + `<td class="mono ${row.realized>=0?'good':'bad'}">${fmt(row.realized)}</td>`
+        + `<td class="mono ${row.unrealized>=0?'good':'bad'}">${fmt(row.unrealized)}</td>`
+        + `<td class="mono">${fmt(-row.fees)}</td>`
+        + `<td class="mono ${row.equity>=0?'good':'bad'}">${fmt(row.equity)}</td>`;
+      tbody.appendChild(tr);
+    });
+    const t = j.total || {};
+    document.getElementById('pnl_total').textContent =
+      `Realized ${fmt(t.realized)}  |  Unrealized ${fmt(t.unrealized)}  |  Fees ${fmt(-(t.fees||0))}  |  Equity ${fmt(t.equity)}`;
+    document.getElementById('pnl_time').textContent = 'As of ' + (j.time || new Date().toISOString());
+    println('console', `[${nowISO()}] GET /pnl/summary\\n` + JSON.stringify(j, null, 2));
+  } catch (e) {
+    println('console', `[${nowISO()}] ERROR /pnl/summary: ` + e);
+  }
+}
+</script>
+</body>
+</html>
+"""
+
+@app.get("/", response_class=HTMLResponse)
 def root():
-    # send anyone hitting "/" to the actual dashboard
-    return RedirectResponse(url="/dashboard.html")
+    broker_badge = "kraken" if USING_KRAKEN else "alpaca"
+    broker_text = "kraken" if USING_KRAKEN else "alpaca"
+    html = (
+        DASHBOARD_HTML
+        .replace("{SERVICE_NAME}", SERVICE_NAME)
+        .replace("{APP_VERSION}", APP_VERSION)
+        .replace("{BROKER_BADGE}", broker_badge)
+        .replace("{BROKER_TEXT}", broker_text)
+    )
+    return HTMLResponse(content=html, status_code=200)
 
-@app.get("/dashboard", include_in_schema=False)
+@app.get("/dashboard", response_class=HTMLResponse)
 def dashboard_alias():
-    return RedirectResponse(url="/dashboard.html")
-
-@app.get("/dashboard.html", response_class=HTMLResponse)
-def serve_dashboard_html():
-    if not DASHBOARD_PATH.exists():
-        # Helpful message if the file isn’t in the image yet
-        return HTMLResponse(
-            "<pre>dashboard.html not found in the container.\n"
-            "Confirm it’s committed to the repo root and redeploy.</pre>", status_code=200
-        )
-    try:
-        return HTMLResponse(DASHBOARD_PATH.read_text(encoding="utf-8"))
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to read dashboard.html: {e}")
-# ------------------------------------------------------------------
+    return root()
 
 # -----------------------------------------------------------------------------
-# Scheduler (unchanged)
+# Scheduler (auto, env-driven; dynamic sizing optional)
 # -----------------------------------------------------------------------------
 _RUNNING = False
 
@@ -512,7 +933,7 @@ async def _maybe_autostart_scheduler():
         log.info("Scheduler autostart: enabled by SCHED_ON")
 
 # -----------------------------------------------------------------------------
-# Journal & P&L (unchanged)
+# Journal & P&L (JSONL journal_v2.jsonl)
 # -----------------------------------------------------------------------------
 _JOURNAL_LOCK = threading.Lock()
 _JOURNAL_PATH = os.getenv("JOURNAL_PATH", "./journal_v2.jsonl")
@@ -547,75 +968,6 @@ def _journal_append(row: dict):
 @app.on_event("startup")
 async def _journal_on_start():
     _journal_load()
-
-def _journal_backfill(max_trades: int = 5000) -> dict:
-    """
-    Create journal rows from broker trade history for any txid that's not already in the journal.
-    Safe to run multiple times; it skips existing txids.
-    """
-    try:
-        fills = br.trades_history(max_trades)
-        if not fills.get("ok"):
-            return {"ok": False, "error": fills.get("error", "unknown")}
-
-        # Build existing txid set
-        with _JOURNAL_LOCK:
-            existing_txids = {str(r.get("txid")) for r in _JOURNAL if r.get("txid")}
-
-        # Kraken symbol -> UI symbol mapper (fallback to raw pair)
-        try:
-            from symbol_map import from_kraken as _from_k
-        except Exception:
-            _from_k = lambda s: s
-
-        added = 0
-        new_rows = []
-
-        for t in (fills.get("trades") or []):
-            txid = str(t.get("txid") or "")
-            if not txid or txid in existing_txids:
-                continue
-
-            pair_raw = str(t.get("pair") or "")
-            sym_ui = (_from_k(pair_raw) or pair_raw).upper()
-            side = str(t.get("type") or t.get("side") or "").lower()  # 'buy'/'sell'
-            price = float(t.get("price") or 0.0)
-            vol = float(t.get("vol") or 0.0)
-            fee = float(t.get("fee") or 0.0)
-            cost = float(t.get("cost") or 0.0)
-            ts_fill = float(t.get("time") or 0.0)
-
-            # Strategy unknown if imported; you can later re-attribute if you encode strategy in trade descr
-            row = {
-                "ts": int(ts_fill) or int(time.time()),
-                "filled_ts": float(ts_fill) if ts_fill else None,
-                "symbol": sym_ui,
-                "side": side,
-                "price": price,
-                "vol": vol,
-                "fee": fee,
-                "cost": cost,
-                "strategy": "import",     # mark backfilled rows
-                "txid": txid,
-                "descr": t.get("descr"),
-            }
-            new_rows.append(row)
-
-        if new_rows:
-            # Persist to memory + file
-            with _JOURNAL_LOCK:
-                _JOURNAL.extend(new_rows)
-            try:
-                with open(_JOURNAL_PATH, "a", encoding="utf-8") as f:
-                    for r in new_rows:
-                        f.write(json.dumps(r, separators=(",", ":")) + "\n")
-            except Exception as pe:
-                log.warning("journal backfill persist error: %s", pe)
-            added = len(new_rows)
-
-        return {"ok": True, "added": added, "count": len(_JOURNAL)}
-    except Exception as e:
-        return {"ok": False, "error": str(e)}
 
 def _sync_journal_with_fills(max_trades: int = 400) -> dict:
     try:
@@ -657,28 +1009,26 @@ def _sync_journal_with_fills(max_trades: int = 400) -> dict:
 @app.post("/journal/sync")
 def journal_sync():
     return _sync_journal_with_fills(400)
-    
-# --- GET aliases so buttons/links can hit them without a POST ---
-@app.get("/journal/sync")
-def journal_sync_get():
-    return _sync_journal_with_fills(400)
 
-@app.get("/reconcile/fills")
-def reconcile_fills_get():
-    return _sync_journal_with_fills(400)
-# ----------------------------------------------------------------
-
+# alias for convenience (you used this)
 @app.post("/reconcile/fills")
 def reconcile_fills_alias():
     return _sync_journal_with_fills(400)
 
 @app.get("/journal")
-def journal_list(limit: int = 2000):
+def journal_list(limit: int = 200):
     with _JOURNAL_LOCK:
         rows = list(_JOURNAL[-int(limit):])
     return {"ok": True, "rows": rows, "count": len(_JOURNAL)}
 
-def _prices_for(symbols: List[str]) -> Dict[str, float]:
+def _pri
+@app.post("/journal/backfill")
+def journal_backfill(max_trades: int = 400):
+    """
+    Alias of /journal/sync; fetches trades/fills from broker and merges into journal.
+    """
+    return _sync_journal_with_fills(max_trades)
+ces_for(symbols: List[str]) -> Dict[str, float]:
     out: Dict[str, float] = {}
     for s in symbols:
         try:
@@ -793,19 +1143,12 @@ def pnl_reset():
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
         
-@app.post("/journal/backfill")
-def journal_backfill_post():
-    return _journal_backfill(5000)
-
-@app.get("/journal/backfill")
-def journal_backfill_get():
-    return _journal_backfill(5000)
-
 # -----------------------------------------------------------------------------
-# Advisor (unchanged)
+# Advisor
 # -----------------------------------------------------------------------------
 @app.get("/advisor/daily")
 def advisor_daily(date: Optional[str] = Query(None, description="YYYY-MM-DD")):
+    """Compute KPIs + recommendations for a day (default: today in America/Chicago)."""
     try:
         out = advisor.analyze_day(date)
         return {"ok": True, **out}
@@ -814,6 +1157,7 @@ def advisor_daily(date: Optional[str] = Query(None, description="YYYY-MM-DD")):
 
 @app.post("/advisor/apply")
 def advisor_apply(body: Dict[str, Any] = Body(...)):
+    """Apply recommendations to policy_config/* (default dry-run)."""
     try:
         recs = body.get("recommendations") or {}
         dry = bool(body.get("dry", True))
@@ -822,6 +1166,9 @@ def advisor_apply(body: Dict[str, Any] = Body(...)):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+# -----------------------------------------------------------------------------
+# Entrypoint
+# -----------------------------------------------------------------------------
 if __name__ == "__main__":
     import uvicorn  # type: ignore
     port = int(os.getenv("PORT", "10000"))
@@ -830,3 +1177,27 @@ if __name__ == "__main__":
         port, __version__, ("kraken" if USING_KRAKEN else "alpaca"), TRADING_ENABLED
     )
     uvicorn.run("app:app", host="0.0.0.0", port=port, reload=False, access_log=True)
+
+@app.post("/journal/enrich")
+def journal_enrich(limit: int = 200):
+    """
+    Shallow enrichment: fill missing strategy from descr and normalize symbols.
+    """
+    try:
+        updated = 0
+        with _JOURNAL_LOCK:
+            for row in _JOURNAL:
+                # Normalize symbol like "SOL/USD" => upper
+                if row.get("symbol"):
+                    row["symbol"] = row["symbol"].upper().replace(" ", "")
+                # Strategy hint from descr
+                if not row.get("strategy"):
+                    descr = (row.get("descr") or "") + " " + (row.get("notes") or "")
+                    m = STRAT_TAG_RE.search(descr)
+                    if m:
+                        row["strategy"] = m.group(1).lower()
+                        updated += 1
+            count = len(_JOURNAL)
+        return {"ok": True, "updated": updated, "checked": count}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
