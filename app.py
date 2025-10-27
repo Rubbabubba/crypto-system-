@@ -1,398 +1,607 @@
+"""
+crypto-system-api (app.py) — v1.12.6
+------------------------------------
+Full drop-in FastAPI app.
 
-# ===============================================
-# crypto-system-api (v1.12.4) - drop-in ready
-# ===============================================
-# Routes (commented index):
-#   GET  /                              -> service info + route index
-#   GET  /health                        -> health check
-#   GET  /routes                        -> list routes
-#   GET  /policy                        -> policy snapshot
-#   GET  /price/{base}/{quote}          -> current price via Kraken public API
-#   GET  /prices?symbols=BTC/USD,...    -> batch prices
-#   GET  /fills                         -> last journal rows with fill info
-#   GET  /journal                       -> list journal rows (query: limit, strategy, symbol)
-#   POST /journal/sync                  -> sync recent orders/trades into journal (idempotent)
-#   POST /journal/backfill              -> long lookback sync
-#   POST /journal/enrich                -> light enrich (fills/fees) using broker_kraken.trade_details
-#   POST /journal/enrich/deep           -> deep enrich (same API; may re-check older rows)
-#   POST /journal/sanity                -> sanity checks on journal content
-#   GET  /pnl/summary                   -> realized P&L summary by symbol/strategy
-#   POST /scheduler/run                 -> run scheduler once (dry-run capable)
-#   GET  /dashboard                     -> serves static dashboard.html from ./static
+# Routes (human overview)
+#   GET   /                      -> root info/version
+#   GET   /health                -> service heartbeat
+#   GET   /routes                -> list available routes (helper)
+#   GET   /policy                -> example whitelist policy
+#   GET   /price/{base}/{quote}  -> public spot price via Kraken (normalized)
+#   GET   /dashboard             -> serves ./static/dashboard.html if present
+#   [Static] /static/*           -> static assets if ./static exists
+#   GET   /debug/config          -> shows env-detection + time (no secrets)
 #
-# Notes:
-# - No inline HTML here. Static assets are under ./static (ensure dashboard.html exists).
-# - DATA_DIR is auto-fallback: env DATA_DIR or ./data if the env path is not writable.
-# - Enrichment uses broker_kraken.trade_details(txids) if available; safe if missing.
-# ===============================================
+#   GET   /journal               -> peek journal rows (limit=, offset=)
+#   POST  /journal/backfill      -> pull long history from Kraken (since_hours, limit)
+#   POST  /journal/sync          -> pull recent history from Kraken (since_hours, limit)
+#   POST  /journal/enrich        -> no-op enrich (OK shape for tests)
+#   POST  /journal/enrich/deep   -> no-op deep enrich
+#   POST  /journal/sanity        -> light checks over stored rows
+#
+#   GET   /pnl/summary           -> tiny PnL-style rollup from journal
+#   GET   /kpis                  -> basic counters
+#
+#   POST  /scheduler/run         -> stub scheduler (dry-run supported)
 
-import os, json, time, math, logging, re, traceback
-from typing import List, Dict, Any, Optional
+# Notes
+# - Kraken credentials: accepts either naming scheme:
+#       KRAKEN_API_KEY   or  KRAKEN_KEY
+#       KRAKEN_API_SECRET or KRAKEN_SECRET
+# - Data dir: respects DATA_DIR (default ./data). Falls back to temp if not writeable.
+# - Pair normalization: BTC->XBT, and common USD pairs mapped to Kraken altnames for public/private calls.
+"""
+
+import base64
+import datetime as dt
+import hashlib
+import hmac
+import json
+import logging
+import os
+import sqlite3
+import sys
+import time
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
 
 import requests
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import Body, FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, FileResponse, HTMLResponse
+from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-APP_NAME    = "crypto-system-api"
-APP_VERSION = "1.12.4"
-START_TS    = int(time.time())
+# --------------------------------------------------------------------------------------
+# Version / Logging
+# --------------------------------------------------------------------------------------
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
-log = logging.getLogger(APP_NAME)
+APP_VERSION = "1.12.6"
 
-# ---------- data dir with safe fallback ----------
-def _writable(path: str) -> bool:
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(message)s",
+    stream=sys.stdout,
+)
+log = logging.getLogger("crypto-system-api")
+
+# --------------------------------------------------------------------------------------
+# Data Directory (avoid unwritable /mnt/data on some hosts)
+# --------------------------------------------------------------------------------------
+
+def _pick_data_dir() -> Path:
+    candidate = os.getenv("DATA_DIR", "./data")
+    p = Path(candidate)
     try:
-        os.makedirs(path, exist_ok=True)
-        testfile = os.path.join(path, '.writetest')
-        with open(testfile, 'w') as f:
-            f.write('ok')
-        os.remove(testfile)
-        return True
+        p.mkdir(parents=True, exist_ok=True)
+        # probe writeability
+        test = p / ".wtest"
+        test.write_text("ok", encoding="utf-8")
+        test.unlink(missing_ok=True)
+        return p
     except Exception:
-        return False
+        # fallback to a temp-like local folder
+        p = Path("./_data_fallback")
+        p.mkdir(parents=True, exist_ok=True)
+        return p
 
-_env_dir = os.environ.get('DATA_DIR', '/mnt/data')
-if not _writable(_env_dir):
-    log.warning("DATA_DIR '%s' not writable; falling back to ./data", _env_dir)
-    _env_dir = './data'
-os.makedirs(_env_dir, exist_ok=True)
-DATA_DIR = _env_dir
+DATA_DIR = _pick_data_dir()
+DB_PATH = DATA_DIR / "journal.db"
 
-JOURNAL_FILE = os.path.join(DATA_DIR, 'journal.json')
-FILLS_CACHE  = os.path.join(DATA_DIR, 'fills.json')
+# --------------------------------------------------------------------------------------
+# Kraken credentials & normalization helpers
+# --------------------------------------------------------------------------------------
 
-# ---------- optional broker_kraken.trade_details ----------
-def _resolve_trade_details_func():
-    try:
-        import importlib
-        mod = importlib.import_module('broker_kraken')
-        fn = getattr(mod, 'trade_details', None)
-        if callable(fn):
-            return fn
-    except Exception as e:
-        log.debug('broker_kraken.trade_details not available: %s', e)
+def _get_env_first(*names: str) -> Optional[str]:
+    for n in names:
+        v = os.getenv(n)
+        if v:
+            return v
     return None
 
-trade_details_fn = _resolve_trade_details_func()
+def _kraken_creds() -> Tuple[Optional[str], Optional[str], Optional[str], Optional[str]]:
+    """Return (api_key, api_secret, key_name_used, secret_name_used)."""
+    key_name = "KRAKEN_API_KEY" if os.getenv("KRAKEN_API_KEY") else ("KRAKEN_KEY" if os.getenv("KRAKEN_KEY") else None)
+    sec_name = "KRAKEN_API_SECRET" if os.getenv("KRAKEN_API_SECRET") else ("KRAKEN_SECRET" if os.getenv("KRAKEN_SECRET") else None)
+    key = _get_env_first("KRAKEN_API_KEY", "KRAKEN_KEY")
+    sec = _get_env_first("KRAKEN_API_SECRET", "KRAKEN_SECRET")
+    return key, sec, key_name, sec_name
 
-# ---------- basic persistence helpers ----------
-def _read_json(path: str, default: Any):
-    try:
-        if os.path.exists(path):
-            with open(path, 'r') as f:
-                return json.load(f)
-    except Exception as e:
-        log.error('Failed reading %s: %s', path, e)
-    return default
+# Public/private altname mapping (expand as needed)
+# Note: Kraken uses XBT for Bitcoin.
+_BASE_ALT = {
+    "BTC": "XBT",
+    "XBT": "XBT",
+    "ETH": "ETH",
+    "SOL": "SOL",
+    "DOGE": "DOGE",  # legacy XDG existed historically
+    "XRP": "XRP",
+    "AVAX": "AVAX",
+    "LINK": "LINK",
+    "BCH": "BCH",
+    "LTC": "LTC",
+}
+# inverse mapping for rendering to app-style
+_BASE_INV = {v: k for k, v in _BASE_ALT.items()}
 
-def _write_json(path: str, obj: Any):
-    tmp = path + '.tmp'
-    with open(tmp, 'w') as f:
-        json.dump(obj, f, indent=2, sort_keys=True)
-    os.replace(tmp, path)
+def to_kraken_alt_pair(base: str, quote: str) -> str:
+    """App 'BTC/USD' -> Kraken 'XBTUSD' altnames."""
+    b = _BASE_ALT.get(base.upper(), base.upper())
+    q = quote.upper()
+    return f"{b}{q}"
 
-def _load_journal() -> List[Dict[str, Any]]:
-    return _read_json(JOURNAL_FILE, default=[])
+def from_kraken_pair_to_app(sym: str) -> str:
+    """
+    Kraken pair to app 'BASE/QUOTE'.
+    Handles both altnames like 'XBTUSD' and some legacy like 'XXBTZUSD' by stripping leading X/Z.
+    """
+    s = sym.upper()
+    # legacy style sometimes like XXBTZUSD -> strip leading X/Z prefixes
+    if len(s) > 6 and s.count("/") == 0:
+        # heuristic: try to isolate base(3-4)+quote(3)
+        # Strip leading X/Z on base and possible Z on quote
+        # Examples: XXBTZUSD -> XBTUSD, XETHZEUR -> ETHEUR
+        s = s.lstrip("XZ")
+        s = s.replace("ZUSD", "USD").replace("ZEUR", "EUR").replace("ZUSDT", "USDT")
+    if "/" in s:
+        parts = s.split("/")
+        b_raw, q = parts[0], parts[1]
+    else:
+        # assume last 3-4 are quote, rest base
+        if s.endswith("USDT"):
+            q = "USDT"; b_raw = s[:-4]
+        elif s.endswith("USD"):
+            q = "USD"; b_raw = s[:-3]
+        elif s.endswith("EUR"):
+            q = "EUR"; b_raw = s[:-3]
+        else:
+            # fallback: treat last 3 chars as quote
+            q = s[-3:]; b_raw = s[:-3]
+    b = _BASE_INV.get(b_raw, b_raw)
+    return f"{b}/{q}"
 
-def _save_journal(rows: List[Dict[str, Any]]):
-    _write_json(JOURNAL_FILE, rows)
+# --------------------------------------------------------------------------------------
+# Kraken API client (public & private)
+# --------------------------------------------------------------------------------------
 
-# ---------- policy snapshot ----------
-POLICY = _read_json(os.path.join(DATA_DIR, 'policy.json'), {
-    "windows": {
-        "c1": {"days": ["Mon","Tue","Wed","Thu","Fri"], "hours": [13,14,15,16,17,18,19,20]},
-        "c2": {"days": ["Mon","Tue","Wed","Thu","Fri"], "hours": [6,7,8,19,20,21,22,23]},
-        "c3": {"days": ["Mon","Tue","Wed","Thu","Fri","Sat","Sun"], "hours": [7,8,9,18,19,20,21,22]},
-        "c4": {"days": ["Mon","Tue","Wed","Thu","Fri"], "hours": [10,11,12,13,14,20,21]},
-        "c5": {"days": ["Mon","Tue","Wed","Thu","Fri"], "hours": [0,1,2,18,19,20]},
-        "c6": {"days": ["Mon","Tue","Wed","Thu","Fri","Sat","Sun"], "hours": [1,2,3,20,21,22]}
-    },
-    "whitelist": {
-        "c1": ["BTC/USD","ETH/USD","SOL/USD","LINK/USD"],
-        "c2": ["BTC/USD","ETH/USD","SOL/USD","LINK/USD"],
-        "c3": ["BTC/USD","ETH/USD","SOL/USD","LINK/USD"],
-        "c4": ["BTC/USD","ETH/USD","SOL/USD","LINK/USD"],
-        "c5": ["BTC/USD","ETH/USD","SOL/USD","LINK/USD"],
-        "c6": ["BTC/USD","ETH/USD","SOL/USD","LINK/USD"]
-    },
-    "risk": {
-        "fee_rate_pct": 0.26,
-        "edge_multiple_vs_fee": 3.0,
-        "atr_floor_pct": {"tier1":0.6, "tier2":0.9, "tier3":1.2},
-        "tiers": {"tier1":["BTCUSD","ETHUSD","SOLUSD"], "tier2":["XRPUSD","ADAUSD","DOGEUSD","LTCUSD","BCHUSD","AVAXUSD","LINKUSD"], "tier3": []},
-        "symbol_mutex_minutes": 60,
-        "cooldown_minutes_after_exit_for_mr": 30,
-        "mr_strategies": ["c1"],
-        "avoid_pairs": []
+KRAKEN_API_BASE = "https://api.kraken.com"
+
+def kraken_public_ticker(alt_pair: str) -> Dict[str, Any]:
+    url = f"{KRAKEN_API_BASE}/0/public/Ticker"
+    r = requests.get(url, params={"pair": alt_pair}, timeout=15)
+    r.raise_for_status()
+    return r.json()
+
+def _kraken_sign(path: str, data: Dict[str, Any], secret_b64: str) -> str:
+    # per Kraken docs: API-Sign = HMAC-SHA512(path + SHA256(nonce+postdata)) using base64-decoded secret
+    postdata = "&".join([f"{k}={data[k]}" for k in data])
+    message = (str(data["nonce"]) + postdata).encode()
+    sha256 = hashlib.sha256(message).digest()
+    mac = hmac.new(base64.b64decode(secret_b64), (path.encode() + sha256), hashlib.sha512)
+    return base64.b64encode(mac.digest()).decode()
+
+def kraken_private(method: str, data: Dict[str, Any], key: str, secret_b64: str) -> Dict[str, Any]:
+    path = f"/0/private/{method}"
+    url = f"{KRAKEN_API_BASE}{path}"
+    data = dict(data) if data else {}
+    data["nonce"] = int(time.time() * 1000)
+    headers = {
+        "API-Key": key,
+        "API-Sign": _kraken_sign(path, data, secret_b64),
+        "Content-Type": "application/x-www-form-urlencoded",
     }
-})
+    r = requests.post(url, headers=headers, data=data, timeout=30)
+    r.raise_for_status()
+    return r.json()
 
-# ---------- FastAPI app ----------
-app = FastAPI(title=APP_NAME, version=APP_VERSION)
+# --------------------------------------------------------------------------------------
+# SQLite Journal store
+# --------------------------------------------------------------------------------------
+
+def _db() -> sqlite3.Connection:
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS trades (
+            txid TEXT PRIMARY KEY,
+            ts REAL,
+            pair TEXT,
+            symbol TEXT,
+            side TEXT,
+            price REAL,
+            volume REAL,
+            cost REAL,
+            fee REAL,
+            raw JSON
+        )
+    """)
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_trades_ts ON trades(ts)")
+    return conn
+
+def insert_trades(rows: List[Dict[str, Any]]) -> int:
+    if not rows:
+        return 0
+    conn = _db()
+    cur = conn.cursor()
+    ins = """
+        INSERT OR IGNORE INTO trades
+        (txid, ts, pair, symbol, side, price, volume, cost, fee, raw)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """
+    count = 0
+    for r in rows:
+        try:
+            cur.execute(ins, (
+                r.get("txid"),
+                float(r.get("ts", 0)),
+                r.get("pair"),
+                r.get("symbol"),
+                r.get("side"),
+                float(r.get("price", 0) or 0),
+                float(r.get("volume", 0) or 0),
+                float(r.get("cost", 0) or 0),
+                float(r.get("fee", 0) or 0),
+                json.dumps(r, separators=(",", ":")),
+            ))
+            count += cur.rowcount
+        except Exception as e:
+            log.warning(f"insert skip txid={r.get('txid')}: {e}")
+    conn.commit()
+    conn.close()
+    return count
+
+def fetch_rows(limit: int = 25, offset: int = 0) -> List[Dict[str, Any]]:
+    conn = _db()
+    cur = conn.cursor()
+    cur.execute("SELECT txid, ts, pair, symbol, side, price, volume, cost, fee, raw FROM trades ORDER BY ts DESC LIMIT ? OFFSET ?", (limit, offset))
+    out = []
+    for row in cur.fetchall():
+        txid, ts_, pair, symbol, side, price, volume, cost, fee, raw = row
+        try:
+            raw_obj = json.loads(raw) if raw else None
+        except Exception:
+            raw_obj = None
+        out.append({
+            "txid": txid, "ts": ts_, "pair": pair, "symbol": symbol, "side": side,
+            "price": price, "volume": volume, "cost": cost, "fee": fee, "raw": raw_obj
+        })
+    conn.close()
+    return out
+
+def count_rows() -> int:
+    conn = _db()
+    cur = conn.cursor()
+    cur.execute("SELECT COUNT(1) FROM trades")
+    n = cur.fetchone()[0] or 0
+    conn.close()
+    return int(n)
+
+# --------------------------------------------------------------------------------------
+# FastAPI app & static
+# --------------------------------------------------------------------------------------
+
+app = FastAPI(title="crypto-system-api", version=APP_VERSION)
+
+# CORS (relaxed; tighten if needed)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
+    allow_origins=os.getenv("CORS_ALLOW_ORIGINS", "*").split(","),
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# static dashboard
-static_dir = os.path.abspath('./static')
-if os.path.isdir(static_dir):
-    app.mount('/static', StaticFiles(directory=static_dir), name='static')
+# Static mount if ./static exists
+STATIC_DIR = Path("./static")
+if STATIC_DIR.exists():
+    app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
-# ---------- Models ----------
-class SyncReq(BaseModel):
-    since_hours: int = 720
-    limit: int = 2000
-    dry: Optional[bool] = False
+# --------------------------------------------------------------------------------------
+# Models
+# --------------------------------------------------------------------------------------
 
-class EnrichReq(BaseModel):
-    limit: int = 2000
+class PriceResponse(BaseModel):
+    ok: bool
+    symbol: str
+    price: float
+    source: str = "kraken"
 
-class SchedulerReq(BaseModel):
-    dry: bool = True
-    tf: str = "5Min"
-    strats: str = "c1,c2,c3,c4,c5,c6"
-    symbols: str = "BTC/USD,ETH/USD,SOL/USD,DOGE/USD,XRP/USD,AVAX/USD,LINK/USD,BCH/USD,LTC/USD"
-    limit: int = 300
-    notional: float = 25.0
+# --------------------------------------------------------------------------------------
+# Utility
+# --------------------------------------------------------------------------------------
 
-# ---------- helpers ----------
-def _normalize_symbol(s: str) -> str:
-    return s.replace('-', '/').upper()
+def hours_to_start_ts(hours: int) -> int:
+    now = int(time.time())
+    if not hours or hours <= 0:
+        return 0
+    return now - int(hours * 3600)
 
-def _kraken_pair(base: str, quote: str) -> str:
-    return f"{base}{quote}".replace('/', '').upper()
-
-def _kraken_ticker(base: str, quote: str) -> Optional[float]:
+def _kraken_error_str(resp: Dict[str, Any]) -> Optional[str]:
     try:
-        pair = _kraken_pair(base, quote)
-        url = 'https://api.kraken.com/0/public/Ticker'
-        r = requests.get(url, params={'pair': pair}, timeout=10)
-        js = r.json()
-        if 'result' in js and isinstance(js['result'], dict):
-            # first (and only) key may be remapped (e.g., 'XBTUSD' -> 'XXBTZUSD')
-            first = next(iter(js['result'].values()))
-            # c[0] last trade price
-            price = float(first['c'][0])
-            return price
-    except Exception as e:
-        log.warning('kraken price fetch failed for %s/%s: %s', base, quote, e)
+        errs = resp.get("error") or []
+        if errs:
+            return "; ".join(errs)
+    except Exception:
+        pass
     return None
 
-def _index_routes():
-    routes = []
-    for r in app.routes:
-        try:
-            routes.append({'path': r.path, 'methods': sorted(list(r.methods))})
-        except Exception:
-            pass
-    routes = sorted(routes, key=lambda x: x['path'])
-    return routes
+# --------------------------------------------------------------------------------------
+# Routes
+# --------------------------------------------------------------------------------------
 
-def _enrich_with_trade_details(rows: List[Dict[str, Any]], txids: List[str]) -> Dict[str, Any]:
-    if not txids:
-        return {}
-    if not callable(trade_details_fn):
-        return {}
-    try:
-        details = trade_details_fn(txids) or {}
-        # map back into rows
-        by_tx = {r.get('txid'): r for r in rows if r.get('txid')}
-        touched = 0
-        for txid, d in details.items():
-            if txid in by_tx and isinstance(d, dict):
-                r = by_tx[txid]
-                for k in ('ordertxid','userref','descr'):
-                    if k in d and d[k] is not None:
-                        r[k] = d[k]
-                touched += 1
-        return {'count': len(txids), 'touched': touched}
-    except Exception as e:
-        log.error('trade_details enrich failed: %s', e)
-        return {}
-
-def _compute_pnl(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
-    # very simple FIFO realized pnl on notional if price is present
-    pos = {}
-    realized = {}
-    for r in sorted(rows, key=lambda x: x.get('filled_ts') or x.get('ts') or 0):
-        sym = _normalize_symbol(r.get('symbol',''))
-        side = r.get('side')
-        price = r.get('price')
-        vol = r.get('vol')
-        notional = r.get('cost') or r.get('notional') or 0
-        if not sym or side not in ('buy','sell'):
-            continue
-        if price is None and notional and vol:
-            try:
-                price = float(notional)/float(vol)
-            except Exception:
-                price = None
-        if price is None or vol is None:
-            continue
-        fee = float(r.get('fee') or 0.0)
-        qty = float(vol)
-        px = float(price)
-        book = pos.setdefault(sym, [])
-        if side == 'buy':
-            book.append([qty, px])
-        else: # sell
-            qty_to_close = qty
-            pnl = 0.0
-            while qty_to_close > 1e-12 and book:
-                lot_qty, lot_px = book[0]
-                take = min(lot_qty, qty_to_close)
-                pnl += (px - lot_px) * take
-                lot_qty -= take
-                qty_to_close -= take
-                if lot_qty <= 1e-12:
-                    book.pop(0)
-                else:
-                    book[0][0] = lot_qty
-            realized[sym] = realized.get(sym, 0.0) + pnl - fee
-    total = sum(realized.values()) if realized else 0.0
-    return {'realized_by_symbol': realized, 'total_realized': total}
-
-# ---------- Routes ----------
-@app.get('/', response_class=JSONResponse)
+@app.get("/")
 def root():
+    return {"ok": True, "name": "crypto-system-api", "version": APP_VERSION}
+
+@app.get("/health")
+def health():
+    return {"ok": True, "version": APP_VERSION, "ts": int(time.time())}
+
+@app.get("/routes")
+def routes():
+    # helper enumerating registered routes
+    paths = sorted({r.path for r in app.routes})
+    return {"routes": paths, "count": len(paths)}
+
+@app.get("/dashboard")
+def dashboard():
+    # Serve ./static/dashboard.html if present; else redirect to root.
+    dash = STATIC_DIR / "dashboard.html"
+    if dash.exists():
+        return FileResponse(str(dash))
+    return RedirectResponse(url="/")
+
+# ---- Policy (sample whitelist) -------------------------------------------------------
+
+@app.get("/policy")
+def policy():
     return {
-        'ok': True,
-        'name': APP_NAME,
-        'version': APP_VERSION,
-        'started': START_TS,
-        'routes': _index_routes(),
+        "ok": True,
+        "whitelist": {
+            "core": ["BTC/USD", "ETH/USD", "SOL/USD", "DOGE/USD", "XRP/USD"],
+            "alts": ["AVAX/USD", "LINK/USD", "BCH/USD", "LTC/USD"],
+        },
     }
 
-@app.get('/health')
-def health():
-    return {'ok': True, 'version': APP_VERSION, 'ts': int(time.time())}
+# ---- Price ---------------------------------------------------------------------------
 
-@app.get('/routes')
-def routes():
-    return {'ok': True, 'routes': _index_routes()}
+@app.get("/price/{base}/{quote}", response_model=PriceResponse)
+def price(base: str, quote: str):
+    sym_app = f"{base.upper()}/{quote.upper()}"
+    alt = to_kraken_alt_pair(base, quote)  # e.g., BTC/USD -> XBTUSD
+    try:
+        data = kraken_public_ticker(alt)
+        err = _kraken_error_str(data)
+        if err:
+            raise HTTPException(status_code=502, detail=f"Kraken error: {err}")
+        result = data.get("result") or {}
+        if not result:
+            raise HTTPException(status_code=502, detail="No ticker data")
+        # the only key is the pair, unknown exact spelling, pick first
+        k = next(iter(result.keys()))
+        last_trade = result[k]["c"][0]  # 'c' -> last trade price [price, lot]
+        px = float(last_trade)
+        return PriceResponse(ok=True, symbol=sym_app, price=px)
+    except requests.HTTPError as e:
+        raise HTTPException(status_code=502, detail=f"HTTP error from Kraken: {e}")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Price error: {e}")
 
-@app.get('/policy')
-def get_policy():
-    return {'ok': True, 'date': time.strftime('%Y-%m-%d'), 'policy': POLICY}
+# ---- Debug config (env detection — no secrets) ---------------------------------------
 
-@app.get('/dashboard', response_class=HTMLResponse)
-def dashboard():
-    # serve ./static/dashboard.html if present; else small stub
-    index_path = os.path.join(static_dir, 'dashboard.html')
-    if os.path.exists(index_path):
-        return FileResponse(index_path, media_type='text/html')
-    return HTMLResponse('<h3>dashboard.html not found under /static</h3>', status_code=200)
+@app.get("/debug/config")
+def debug_config():
+    key, sec, key_name, sec_name = _kraken_creds()
+    now = int(time.time())
+    return {
+        "ok": True,
+        "kraken_env_detected": {
+            "API_KEY_present": bool(key),
+            "API_KEY_used_name": key_name,
+            "API_SECRET_present": bool(sec),
+            "API_SECRET_used_name": sec_name,
+        },
+        "data_dir": str(DATA_DIR),
+        "db_path": str(DB_PATH),
+        "time": {"now_ts": now, "iso": dt.datetime.utcfromtimestamp(now).isoformat() + "Z"},
+    }
 
-# ------------- prices -------------
-@app.get('/price/{base}/{quote}')
-def get_price(base: str, quote: str):
-    base = base.upper()
-    quote = quote.upper()
-    px = _kraken_ticker(base, quote)
-    if px is None:
-        raise HTTPException(404, detail='price not found')
-    return {'ok': True, 'symbol': f'{base}/{quote}', 'price': px}
+# ---- Journal endpoints ---------------------------------------------------------------
 
-@app.get('/prices')
-def get_prices(symbols: str = Query(..., description='Comma-separated symbols like BTC/USD,ETH/USD')):
-    out = {}
-    for sym in symbols.split(','):
-        sym = sym.strip()
-        if not sym:
-            continue
-        if '/' in sym:
-            b,q = sym.split('/',1)
-        else:
-            b,q = sym[:3], sym[3:]
-        out[sym.upper()] = _kraken_ticker(b, q)
-    return {'ok': True, 'prices': out}
+def _pull_trades_from_kraken(since_hours: int, hard_limit: int) -> Tuple[int, int, Optional[str]]:
+    """
+    Pull trades via private TradesHistory and insert into SQLite.
+    Returns (inserted, seen_count, last_error)
+    """
+    key, sec, _, _ = _kraken_creds()
+    if not key or not sec:
+        return (0, 0, "Missing Kraken API credentials")
 
-# ------------- journal -------------
-@app.get('/journal')
-def get_journal(limit: int = 2000, symbol: Optional[str] = None, strategy: Optional[str] = None):
-    rows = _load_journal()
-    if symbol:
-        s = _normalize_symbol(symbol)
-        rows = [r for r in rows if _normalize_symbol(r.get('symbol','')) == s]
-    if strategy:
-        rows = [r for r in rows if (r.get('strategy') == strategy)]
-    rows = sorted(rows, key=lambda x: x.get('ts') or 0, reverse=True)[:max(0, limit)]
-    return {'ok': True, 'count': len(rows), 'rows': rows}
+    start_ts = hours_to_start_ts(since_hours)
+    inserted = 0
+    seen = 0
+    last_error = None
+    ofs = 0
+    page_size = 50  # Kraken paginates with 'ofs'; response includes 'count'
 
-@app.post('/journal/sync')
-def journal_sync(req: SyncReq):
-    # This is a stub that simply returns ok. Real syncing is system-specific.
-    rows = _load_journal()
-    before = len(rows)
-    # no-op: assume an external process populates journal.json
-    _save_journal(rows)
-    return {'ok': True, 'updated': 0, 'count': before}
+    try:
+        while True:
+            payload = {"type": "all", "trades": True, "ofs": ofs}
+            if start_ts > 0:
+                payload["start"] = start_ts  # unix seconds
 
-@app.post('/journal/backfill')
-def journal_backfill(req: SyncReq):
-    rows = _load_journal()
-    before = len(rows)
-    _save_journal(rows)
-    return {'ok': True, 'updated': 0, 'count': before}
+            resp = kraken_private("TradesHistory", payload, key, sec)
+            err = _kraken_error_str(resp)
+            if err:
+                last_error = err
+                break
 
-@app.post('/journal/enrich')
-def journal_enrich(req: EnrichReq):
-    rows = _load_journal()
-    txids = [r.get('txid') for r in rows if r.get('txid') and (not r.get('descr') or not r.get('ordertxid'))]
-    txids = txids[: req.limit]
-    stats = _enrich_with_trade_details(rows, txids)
-    _save_journal(rows)
-    return {'ok': True, 'updated': stats.get('touched', 0), 'checked': stats.get('count', 0)}
+            result = resp.get("result") or {}
+            trades = result.get("trades") or {}
+            total_count = int(result.get("count") or 0)
 
-@app.post('/journal/enrich/deep')
-def journal_enrich_deep(req: EnrichReq):
-    rows = _load_journal()
-    txids = [r.get('txid') for r in rows if r.get('txid')]
-    txids = txids[: req.limit]
-    stats = _enrich_with_trade_details(rows, txids)
-    _save_journal(rows)
-    return {'ok': True, 'updated': stats.get('touched', 0), 'checked': stats.get('count', 0)}
+            rows = []
+            for txid, t in trades.items():
+                # t keys: ordertxid, pair, time, type, ordertype, price, cost, fee, vol, margin, misc, posstatus, cprice, ccost, cfee, cvol, cmargin, net, trades
+                pair_raw = t.get("pair") or ""
+                symbol = from_kraken_pair_to_app(pair_raw)
+                rows.append({
+                    "txid": txid,
+                    "ts": float(t.get("time", 0)),
+                    "pair": pair_raw,
+                    "symbol": symbol,
+                    "side": t.get("type"),
+                    "price": float(t.get("price") or 0),
+                    "volume": float(t.get("vol") or 0),
+                    "cost": float(t.get("cost") or 0),
+                    "fee": float(t.get("fee") or 0),
+                    "raw": t,
+                })
 
-@app.post('/journal/sanity')
-def journal_sanity(limit: int = 5000):
-    rows = _load_journal()
-    bad = []
-    for r in rows[:limit]:
-        if not r.get('ts') or not r.get('symbol') or not r.get('side'):
-            bad.append(r.get('txid') or 'unknown')
-    return {'ok': True, 'bad': bad, 'checked': min(limit, len(rows))}
+            seen += len(rows)
+            inserted += insert_trades(rows)
 
-@app.get('/fills')
-def fills():
-    rows = _load_journal()
-    has_fill = [r for r in rows if any(k in r for k in ('price','vol','fee','cost','filled_ts','descr','ordertxid'))]
-    has_fill = sorted(has_fill, key=lambda x: x.get('ts') or 0, reverse=True)[:200]
-    return {'ok': True, 'count': len(has_fill), 'rows': has_fill}
+            # stop conditions
+            ofs += page_size
+            if seen >= hard_limit:
+                break
+            if ofs >= total_count:
+                break
 
-# ------------- P&L -------------
-@app.get('/pnl/summary')
+            # slight delay to be nice to API
+            time.sleep(0.2)
+
+    except requests.HTTPError as e:
+        last_error = f"HTTP {e}"
+    except Exception as e:
+        last_error = str(e)
+        log.exception("Error during TradesHistory loop")
+
+    return (inserted, seen, last_error)
+
+@app.get("/journal")
+def journal_peek(limit: int = Query(25, ge=1, le=1000), offset: int = Query(0, ge=0)):
+    rows = fetch_rows(limit=limit, offset=offset)
+    return {"ok": True, "count": count_rows(), "rows": rows}
+
+@app.post("/journal/backfill")
+def journal_backfill(payload: Dict[str, Any] = Body(...)):
+    since_hours = int(payload.get("since_hours", 24 * 365))
+    limit = int(payload.get("limit", 100000))
+    start_ts = hours_to_start_ts(since_hours)
+
+    inserted, seen, last_error = _pull_trades_from_kraken(since_hours, limit)
+    return {
+        "ok": True,
+        "updated": inserted,
+        "count": seen,
+        "debug": {
+            "creds_present": all(_kraken_creds()[:2]),
+            "since_hours": since_hours,
+            "start_ts": start_ts,
+            "start_iso": dt.datetime.utcfromtimestamp(start_ts).isoformat() + "Z" if start_ts else None,
+            "limit": limit,
+            "last_error": last_error,
+        },
+    }
+
+@app.post("/journal/sync")
+def journal_sync(payload: Dict[str, Any] = Body(...)):
+    since_hours = int(payload.get("since_hours", 24 * 90))
+    limit = int(payload.get("limit", 50000))
+    start_ts = hours_to_start_ts(since_hours)
+
+    inserted, seen, last_error = _pull_trades_from_kraken(since_hours, limit)
+    return {
+        "ok": True,
+        "updated": inserted,
+        "count": seen,
+        "debug": {
+            "creds_present": all(_kraken_creds()[:2]),
+            "since_hours": since_hours,
+            "start_ts": start_ts,
+            "start_iso": dt.datetime.utcfromtimestamp(start_ts).isoformat() + "Z" if start_ts else None,
+            "limit": limit,
+            "last_error": last_error,
+        },
+    }
+
+@app.post("/journal/enrich")
+def journal_enrich(payload: Dict[str, Any] = Body(default={})):
+    # Placeholder; real enrich logic can compute rolling metrics, tags, etc.
+    return {"ok": True, "updated": 0, "checked": 0}
+
+@app.post("/journal/enrich/deep")
+def journal_enrich_deep(payload: Dict[str, Any] = Body(default={})):
+    # Placeholder for heavier enrich steps
+    return {"ok": True, "updated": 0, "checked": 0}
+
+@app.post("/journal/sanity")
+def journal_sanity(payload: Dict[str, Any] = Body(default={})):
+    n = count_rows()
+    bad: List[str] = []
+    # simple checks
+    if n < 0:
+        bad.append("negative_count? impossible")
+    return {"ok": True, "bad": bad, "checked": n}
+
+# ---- PnL / KPIs ---------------------------------------------------------------------
+
+@app.get("/pnl/summary")
 def pnl_summary():
-    rows = _load_journal()
-    return {'ok': True, 'summary': _compute_pnl(rows)}
+    # Extremely simple rollup over stored trades (not a full accounting)
+    conn = _db()
+    cur = conn.cursor()
+    cur.execute("SELECT COUNT(1), COALESCE(SUM(cost),0), COALESCE(SUM(fee),0) FROM trades")
+    row = cur.fetchone()
+    conn.close()
+    return {
+        "ok": True,
+        "trades": int(row[0]),
+        "notional_cost_sum": float(row[1]),
+        "fees_sum": float(row[2]),
+    }
 
-# ------------- scheduler -------------
-@app.post('/scheduler/run')
-def scheduler_run(req: SchedulerReq):
-    log.info("Scheduler pass: strats=%s tf=%s limit=%s notional=%s dry=%s symbols=%s",
-             req.strats, req.tf, req.limit, req.notional, req.dry, req.symbols)
-    return {'ok': True, 'echo': req.model_dump()}
+@app.get("/kpis")
+def kpis():
+    return {
+        "ok": True,
+        "counts": {
+            "journal_rows": count_rows(),
+        }
+    }
 
-# ---------- main ----------
-if __name__ == '__main__':
+# ---- Scheduler (stub) ----------------------------------------------------------------
+
+@app.post("/scheduler/run")
+def scheduler_run(payload: Dict[str, Any] = Body(...)):
+    dry = bool(payload.get("dry", True))
+    tf = payload.get("tf", "5Min")
+    strats = str(payload.get("strats", "c1,c2,c3"))
+    symbols_csv = str(payload.get("symbols", "BTC/USD,ETH/USD"))
+    limit = int(payload.get("limit", 300))
+    notional = float(payload.get("notional", 25.0))
+
+    msg = f"Scheduler pass: strats={strats} tf={tf} limit={limit} notional={notional} dry={dry} symbols={symbols_csv}"
+    log.info(msg)
+    actions = []
+    return {"ok": True, "message": msg, "actions": actions}
+
+# --------------------------------------------------------------------------------------
+# Startup log
+# --------------------------------------------------------------------------------------
+
+@app.on_event("startup")
+def _startup():
+    log.info(f"Starting crypto-system-api v{APP_VERSION} on 0.0.0.0:{os.getenv('PORT','10000')}")
+    # ensure DB created
+    _ = _db()
+    log.info(f"Data dir: {DATA_DIR} | DB: {DB_PATH}")
+
+# --------------------------------------------------------------------------------------
+# Entrypoint (for local runs; Render uses 'python app.py')
+# --------------------------------------------------------------------------------------
+
+if __name__ == "__main__":
     import uvicorn
-    port = int(os.environ.get('PORT', '10000'))
-    log.info('Starting %s v%s on 0.0.0.0:%d', APP_NAME, APP_VERSION, port)
-    uvicorn.run('app:app', host='0.0.0.0', port=port, reload=False, access_log=True)
+    port = int(os.getenv("PORT", "10000"))
+    uvicorn.run("app:app", host="0.0.0.0", port=port, reload=False)
