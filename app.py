@@ -389,7 +389,6 @@ def price(base: str, quote: str):
 
 # ---- Debug config (env detection — no secrets) ---------------------------------------
 
-@
 @app.get("/config")
 def get_config():
     symbols = [s.strip() for s in os.getenv("SYMBOLS","").split(",") if s.strip()]
@@ -406,7 +405,7 @@ def get_config():
         "trading_enabled": bool(int(os.getenv("TRADING_ENABLED","1") or "1")),
         "tz": os.getenv("TZ","America/Chicago")
     }
-app.get("/debug/config")
+@app.get("/debug/config")
 def debug_config():
     key, sec, key_name, sec_name = _kraken_creds()
     now = int(time.time())
@@ -499,6 +498,28 @@ def _pull_trades_from_kraken(since_hours: int, hard_limit: int) -> Tuple[int, in
 
 @app.get("/journal")
 def journal_peek(limit: int = Query(25, ge=1, le=1000), offset: int = Query(0, ge=0)):
+
+    rows = fetch_rows(limit=limit, offset=offset)
+    return {"ok": True, "count": count_rows(), "rows": rows}
+@app.post("/journal/attach")
+def journal_attach(payload: Dict[str, Any] = Body(...)):
+    txid = payload.get("txid")
+    strategy = payload.get("strategy")
+    if not txid or not strategy:
+        raise HTTPException(status_code=400, detail="txid and strategy required")
+    conn = _db()
+    cur = conn.cursor()
+    cur.execute("UPDATE trades SET strategy=? WHERE txid=?", (str(strategy), str(txid)))
+    conn.commit()
+    return {"ok": True, "updated": cur.rowcount}
+
+@app.get("/fills")
+def get_fills(limit: int = Query(100, ge=1, le=1000)):
+    conn = _db()
+    cur = conn.cursor()
+    cur.execute("SELECT txid, ts, symbol, side, price, volume, fee, strategy FROM trades ORDER BY ts DESC LIMIT ?", (limit,))
+    rows = [dict(txid=r[0], ts=r[1], symbol=r[2], side=r[3], price=r[4], volume=r[5], fee=r[6], strategy=r[7]) for r in cur.fetchall()]
+    return {"ok": True, "rows": rows, "count": len(rows)}
     rows = fetch_rows(limit=limit, offset=offset)
     return {"ok": True, "count": count_rows(), "rows": rows}
 
@@ -539,7 +560,10 @@ def journal_sync(payload: Dict[str, Any] = Body(...)):
             "since_hours": since_hours,
             "start_ts": start_ts,
             "start_iso": dt.datetime.utcfromtimestamp(start_ts).isoformat() + "Z" if start_ts else None,
-            "li
+            "limit": limit,
+        }
+    }
+
 def _fetch_prices(symbols: List[str]) -> Dict[str, float]:
     prices = {}
     for sym in symbols:
@@ -555,64 +579,27 @@ def _compute_fifo_pnl(rows: List[Dict[str, Any]], prices: Dict[str, float]):
     # rows: must contain symbol, side, price, volume, fee, strategy
     per = {}  # (strategy, symbol) -> dict
     for r in sorted(rows, key=lambda x: x.get("ts", 0)):
-        strat = r.get("strategy") or "misc"
+        strat = (r.get("strategy") or "misc")
         sym = r.get("symbol")
         side = (r.get("side") or "").lower()
         price = float(r.get("price") or 0.0)
-        vol = float(r.ge
-DAILY_JSON = os.path.join(DATA_DIR, "daily.json")
-@app.get("/advisor/daily")
-def advisor_daily():
-    try:
-        with open(DAILY_JSON, "r", encoding="utf-8") as fh:
-            data = json.load(fh)
-    except FileNotFoundError:
-        data = {"date": dt.date.today().isoformat(), "notes": "", "recommendations": []}
-    return {"ok": True, **data}
-
-@app.post("/advisor/apply")
-def advisor_apply(payload: Dict[str, Any] = Body(...)):
-    # For now, persist incoming recommendations into daily.json
-    data = {
-        "date": payload.get("date") or dt.date.today().isoformat(),
-        "notes": payload.get("notes") or "",
-        "recommendations": payload.get("recommendations") or []
-    }
-    os.makedirs(DATA_DIR, exist_ok=True)
-    with open(DAILY_JSON, "w", encoding="utf-8") as fh:
-        json.dump(data, fh, indent=2)
-    return {"ok": True, "saved": True, **data}
-
-
-@app.get("/fills")
-def get_fills(limit: int = Query(100, ge=1, le=1000)):
-    conn = _db()
-    cur = conn.cursor()
-    cur.execute("SELECT txid, ts, symbol, side, price, volume, fee, strategy FROM trades ORDER BY ts DESC LIMIT ?", (limit,))
-    rows = [dict(txid=r[0], ts=r[1], symbol=r[2], side=r[3], price=r[4], volume=r[5], fee=r[6], strategy=r[7]) for r in cur.fetchall()]
-    return {"ok": True, "rows": rows, "count": len(rows)}
-
-t("volume") or 0.0)
+        vol = float(r.get("volume") or 0.0)
         fee = float(r.get("fee") or 0.0)
         key = (strat, sym)
         d = per.setdefault(key, {"qty":0.0, "avg":0.0, "realized":0.0, "fees":0.0})
         d["fees"] += fee
         if side == "buy":
-            # new avg = (qty*avg + vol*price)/(qty+vol)
             new_qty = d["qty"] + vol
             if new_qty > 0:
                 d["avg"] = (d["qty"]*d["avg"] + vol*price) / new_qty
             d["qty"] = new_qty
         elif side == "sell":
-            # realize on the amount closed (min of vol, d['qty'])
             close = min(vol, d["qty"])
             if close > 0:
                 d["realized"] += (price - d["avg"]) * close
                 d["qty"] -= close
-            # if over-sell, treat extra as short-close reset (rare with spot); ignore
         else:
             continue
-    # Build outputs
     per_strategy = {}
     per_symbol = {}
     total = {"realized":0.0, "unrealized":0.0, "fees":0.0, "equity":0.0}
@@ -639,45 +626,29 @@ t("volume") or 0.0)
     for sym, vals in per_symbol.items():
         out_per_symbol.append({"symbol": sym, **vals})
     return {"total": total, "per_strategy": out_per_strategy, "per_symbol": out_per_symbol}
-mit": limit,
-            "last_error": last_error,
-        },
+
+DAILY_JSON = os.path.join(DATA_DIR, "daily.json")
+
+@app.get("/advisor/daily")
+def advisor_daily():
+    try:
+        with open(DAILY_JSON, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+    except FileNotFoundError:
+        data = {"date": dt.date.today().isoformat(), "notes": "", "recommendations": []}
+    return {"ok": True, **data}
+
+@app.post("/advisor/apply")
+def advisor_apply(payload: Dict[str, Any] = Body(...)):
+    data = {
+        "date": payload.get("date") or dt.date.today().isoformat(),
+        "notes": payload.get("notes") or "",
+        "recommendations": payload.get("recommendations") or []
     }
-
-@app.post("/journal/enrich")
-def journal_enrich(payload: Dict[str, Any] = Body(default={})):
-    # Placeholder; real enrich logic can compute rolling metrics, tags, etc.
-    return {"ok": True, "updated": 0, "checked": 0}
-
-@app.post("/journal/enrich/deep")
-def journal_enrich_deep(payload: Dict[str, Any] = Body(default={})):
-    # Placeholder for heavier enrich steps
-    return {"ok": True, "updated": 0, "checked": 0}
-
-@app.post("/journal/sanity")
-def journal_sanity(payload: Dict[str, Any] = Body(default={})):
-    n = count_rows()
-    bad: List[str] = []
-    # simple checks
-    if n < 0:
-        bad.append("negative_count? impossible")
-    return {"ok": True, "bad": bad, "checked": n}
-
-
-@app.post("/journal/attach")
-def journal_attach(payload: Dict[str, Any] = Body(...)):
-    txid = payload.get("txid")
-    strategy = payload.get("strategy")
-    if not txid or not strategy:
-        raise HTTPException(status_code=400, detail="txid and strategy required")
-    conn = _db()
-    cur = conn.cursor()
-    cur.execute("UPDATE trades SET strategy=? WHERE txid=?", (str(strategy), str(txid)))
-    conn.commit()
-    return {"ok": True, "updated": cur.rowcount}
-
-# ---- PnL / KPIs ---------------------------------------------------------------------
-
+    os.makedirs(DATA_DIR, exist_ok=True)
+    with open(DAILY_JSON, "w", encoding="utf-8") as fh:
+        json.dump(data, fh, indent=2)
+    return {"ok": True, "saved": True, **data}
 @app.get("/pnl/summary")
 def pnl_summary():
     conn = _db()
