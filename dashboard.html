@@ -1,7 +1,7 @@
 <!doctype html>
 <html lang="en">
 <head>
-  <!-- Crypto System Dashboard UI v1.4.4 -->
+  <!-- Crypto System Dashboard UI v1.5.0 -->
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width,initial-scale=1" />
   <title>{SERVICE_NAME} — Dashboard</title>
@@ -72,7 +72,7 @@
       <div class="meta">
         <span class="badge">Broker: <strong>{BROKER_TEXT}</strong></span>
         <span class="badge">App v{APP_VERSION}</span>
-        <span class="badge">UI v1.4.4</span>
+        <span class="badge">UI v1.4.5</span>
       </div>
     </header>
 
@@ -87,6 +87,17 @@
         <div class="row"><button class="btn" onclick="fetchAndLog('/fills')">GET /fills</button><a class="link-open" href="/fills" target="_blank">open</a></div>
         <div class="row" style="margin-top:6px"><button id="btn_sched_status" class="btn" onclick="schedulerStatus()">GET /scheduler/status</button><a class="link-open" href="/scheduler/status" target="_blank">open</a></div>
         <div class="row"><button id="btn_sched_start" class="btn success" onclick="schedulerStart()">/scheduler/start</button><button id="btn_sched_stop" class="btn danger" onclick="schedulerStop()">/scheduler/stop</button></div>
+
+        <!-- Advisor controls (added inside Control Panel) -->
+        <div class="row" style="margin-top:6px;border-top:1px dashed var(--border);padding-top:8px">
+          <label for="adv_date">Advisor Date</label>
+          <input id="adv_date" type="date" />
+          <button class="btn" onclick="runAdvisor()">GET /advisor/daily</button>
+          <button class="btn" onclick="applyAdvisor(true)">Apply (dry-run)</button>
+          <button class="btn danger" onclick="applyAdvisor(false)">Apply (live)</button>
+          <a class="link-open" href="/advisor/daily" target="_blank">open</a>
+        </div>
+
         <div class="mini-meta"><div><strong>Symbols:</strong> <code id="meta_symbols">—</code></div><div><strong>Strategies:</strong> <code id="meta_strategies">—</code></div></div>
       </section>
 
@@ -99,7 +110,7 @@
 
       <!-- P&L -->
       <section id="pnl" class="card">
-        <div class="card-header"><h2>P&amp;L</h2><div class="subtext">Primary: /pnl/summary • Fallback: client FIFO from /fills + prices</div></div>
+        <div class="card-header"><h2>P&amp;L</h2><div class="subtext">Primary: /pnl/summary • Fallback: journal-based FIFO + prices</div></div>
         <div class="stat-tiles">
           <div class="tile"><div class="label">Realized</div><div id="tile_realized" class="val">$0</div></div>
           <div class="tile"><div class="label">Unrealized</div><div id="tile_unrealized" class="val">$0</div></div>
@@ -118,15 +129,14 @@
         </div>
         <div class="row" style="margin-top:10px">
           <button class="btn" onclick="refreshPnL()">Refresh P&amp;L</button>
-          <button class="btn" onclick="fetchAndLog('/journal/sync')">Sync fills</button>
+          <button class="btn" onclick="syncFills()">Sync fills</button>
           <a class="link-open" href="/pnl/summary" target="_blank">open</a>
-          <!-- journal link removed: route 404 -->
         </div>
       </section>
 
       <!-- CALENDAR P&L -->
       <section id="calendar-pnl" class="card">
-        <div class="card-header"><h2>Calendar P&amp;L</h2><div class="subtext">Client-side FIFO realized attribution from /fills</div></div>
+        <div class="card-header"><h2>Calendar P&amp;L</h2><div class="subtext">Journal-based FIFO realized attribution (per-day)</div></div>
         <div class="cal-head">
           <button class="nav-btn" id="prev_month">&#9664; Prev</button>
           <div class="cal-title" id="cal_title">—</div>
@@ -144,7 +154,7 @@
     </div>
 
     <footer><div>© <span id="year"></span> {SERVICE_NAME}</div>
-      <div>Broker: <strong>{BROKER_TEXT}</strong> · App v{APP_VERSION} · UI v1.4.4</div></footer>
+      <div>Broker: <strong>{BROKER_TEXT}</strong> · App v{APP_VERSION} · UI v1.4.5</div></footer>
   </div>
 
   <script>
@@ -152,7 +162,7 @@
     const $ = s => document.querySelector(s);
     const log = (t, d='') => { const el=$('#console_log'); if(!el) return; const body=typeof d==='string'?d:JSON.stringify(d,null,2); el.textContent+=`[${new Date().toISOString()}] ${t}\n${body}\n\n`; el.scrollTop=el.scrollHeight; };
     window.onerror = (m,src,l,c,e)=>log('window.onerror',{m,src,l,c,err:String(e)});
-    window.onunhandledrejection = ev=>log('unhandledrejection',String(ev.reason||ev));
+    window.onunhandledrejection = ev=>log('unhandledrejection',String(ev));
     const money=v=>(v<0?'-':'')+'$'+Math.abs(Number(v||0)).toLocaleString(undefined,{maximumFractionDigits:2});
 
     async function fetchJSON(path){
@@ -164,11 +174,56 @@
       }catch(e){ log(`FETCH FAIL ${path}`, String(e)); throw e; }
     }
     async function fetchAndLog(path){ const j=await fetchJSON(path); log(`GET ${path}`, j); return j; }
+	
+	async function syncFills(){
+      try{
+        // Update any existing journal rows that already have txids
+        let r = await fetch('/journal/sync', {method:'POST'}).catch(()=>null);
+        let j = r ? await r.json() : {ok:false};
+        log('POST /journal/sync', j);
+
+        // If the journal is empty (count === 0), populate it from full broker history
+        if (!j || j.count === 0) {
+          const r2 = await fetch('/journal/backfill', {method:'POST'});
+          const j2 = await r2.json();
+          log('POST /journal/backfill', j2);
+        }
+
+        // Refresh P&L tiles/tables and rebuild the calendar view
+        await refreshPnL();
+        await (async()=>{ let off=0; await buildCalendar(0); })();
+      }catch(e){
+        log('syncFills error', String(e));
+      }
+    }
 
     /* ===== Control Panel ===== */
     async function schedulerStatus(){ try{ return await fetchAndLog('/scheduler/status'); }catch(e){} }
     async function schedulerStart(){ try{ return await fetchAndLog('/scheduler/start'); }catch(e){} }
     async function schedulerStop(){  try{ return await fetchAndLog('/scheduler/stop'); }catch(e){} }
+
+    // ---- Advisor controls ----
+    let LAST_ADVISOR = null;
+    function defaultAdvisorDateISO(){
+      const now = new Date();
+      // set default to today in local (CT): yyyy-mm-dd
+      const yyyy = now.getFullYear();
+      const mm = String(now.getMonth()+1).padStart(2,'0');
+      const dd = String(now.getDate()).padStart(2,'0');
+      return `${yyyy}-${mm}-${dd}`;
+    }
+    async function runAdvisor(){
+      const v = $('#adv_date').value || defaultAdvisorDateISO();
+      const j = await fetchAndLog(`/advisor/daily?date=${encodeURIComponent(v)}`);
+      LAST_ADVISOR = j;
+    }
+    async function applyAdvisor(dry=true){
+      if(!LAST_ADVISOR || !LAST_ADVISOR.recommendations){ log('advisor/apply','No recommendations loaded yet. Click GET first.'); return; }
+      const body = { dry: !!dry, recommendations: LAST_ADVISOR.recommendations };
+      const r = await fetch('/advisor/apply',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+      const j = await r.json();
+      log('POST /advisor/apply', j);
+    }
 
     /* ===== Config / Symbols ===== */
     let SYMBOLS=[];
@@ -218,64 +273,89 @@
       }
     }
 
-    /* ===== Client P&L fallback (FIFO) ===== */
-    function parseFill(r){
-      const side=(r.side||r.type||'').toLowerCase(), sym=(r.symbol||r.pair||'').toUpperCase();
-      const price=+r.price||+r.avg_price||+r.px||0, vol=+r.vol||+r.volume||+r.qty||+r.quantity||0;
-      const fee=+r.fee||+r.fees||0, strat=(r.strategy||r.strat||'misc');
-      return {side,sym,price,vol,fee,strategy:strat};
+    /* ===== Journal-based P&L fallback ===== */
+    function parseJournalRow(r){
+      return {
+        side:String(r.side||'').toLowerCase(),
+        sym:String(r.symbol||'').toUpperCase(),
+        price:+(r.price||0),
+        vol:+(r.vol||0),
+        fee:+(r.fee||0),
+        strategy:String(r.strategy||'misc'),
+        t:+(r.filled_ts||r.ts||0)
+      };
     }
-    async function computePnLFromFills(){
-      const resp = await fetchJSON('/fills');
-      const fillsRaw = resp.fills || resp.trades || resp.data || resp || [];
-      const fills = (Array.isArray(fillsRaw)?fillsRaw:Object.values(fillsRaw)).map(parseFill).filter(f=>f.vol>0 && f.price>0 && (f.side==='buy'||f.side==='sell'));
-      // FIFO per symbol
-      const lots=new Map(); const realizedBySym=new Map(); const feesBySym=new Map(); const realizedByStrat=new Map(); let totalFee=0;
-      for(const f of fills){
-        if(!lots.has(f.sym)) lots.set(f.sym, []);
-        if(f.side==='buy'){ lots.get(f.sym).push({q:f.vol, px:f.price, strategy:f.strategy}); totalFee += f.fee||0; feesBySym.set(f.sym, (feesBySym.get(f.sym)||0) + (f.fee||0)); continue; }
-        // sell
-        let rem=f.vol, real=0;
-        const L=lots.get(f.sym);
-        while(rem>1e-12 && L && L.length){
-          const lot=L[0]; const take=Math.min(lot.q,rem);
-          real += (f.price - lot.px) * take;
-          // attribute to lot.strategy for realized-by-strategy
-          realizedByStrat.set(lot.strategy, (realizedByStrat.get(lot.strategy)||0) + (f.price - lot.px) * take);
-          lot.q -= take; rem -= take; if(lot.q<=1e-12) L.shift();
+    async function computePnLFromJournal(){
+      const resp = await fetchJSON('/journal?limit=5000');
+      const rows = (resp.rows||[]).map(parseJournalRow)
+        .filter(f=>f.t && f.vol>0 && f.price>0 && (f.side==='buy'||f.side==='sell'))
+        .sort((a,b)=>a.t-b.t);
+
+      // FIFO by (strategy, symbol) for realized; mark-to-market uses latest price
+      const lots = new Map(); // key -> [{q,px}]
+      const stat = new Map(); // key -> {realized, fees, qty}
+      const keyOf = (f)=>`${f.strategy}||${f.sym}`;
+      for(const f of rows){
+        const k = keyOf(f);
+        if(!lots.has(k)) lots.set(k, []);
+        if(!stat.has(k)) stat.set(k, {realized:0, fees:0, qty:0});
+        const L = lots.get(k), S = stat.get(k);
+        if(f.side==='buy'){
+          L.push({q:f.vol, px:f.price});
+          S.qty += f.vol; S.fees += f.fee||0;
+        }else{
+          let rem=f.vol, real=0;
+          while(rem>1e-12 && L.length){
+            const head=L[0], take=Math.min(head.q,rem);
+            real += (f.price-head.px)*take;
+            head.q -= take; rem -= take;
+            if(head.q<=1e-12) L.shift();
+          }
+          S.qty -= f.vol; S.realized += real; S.fees += f.fee||0;
         }
-        totalFee += f.fee||0;
-        realizedBySym.set(f.sym, (realizedBySym.get(f.sym)||0) + real - (f.fee||0));
-        feesBySym.set(f.sym, (feesBySym.get(f.sym)||0) + (f.fee||0));
       }
-      // Unrealized from remaining lots using latest prices
-      let unrealTotal=0; const unrealBySym=new Map();
-      for(const sym of SYMBOLS){
-        const L=lots.get(sym)||[]; if(!L.length) continue;
-        // get latest price from SERIES or fetch once
-        let lastPrice = (SERIES[sym] && SERIES[sym].length)? SERIES[sym][SERIES[sym].length-1] : null;
-        if(lastPrice==null){ try{ const j=await fetchPriceFor(sym); lastPrice=+j.price; }catch(_){} }
-        if(lastPrice==null) continue;
-        let q=0, cost=0; L.forEach(l=>{ q+=l.q; cost+=l.q*l.px; });
-        const avg= q>0 ? cost/q : 0; const unreal = (lastPrice-avg)*q;
-        unrealBySym.set(sym, unreal); unrealTotal += unreal;
+
+      // Latest prices for unrealized
+      const syms = Array.from(new Set(rows.map(r=>r.sym)));
+      const pxMap = {};
+      for(const s of syms){
+        try{ const j=await fetchPriceFor(s); pxMap[s]=+j.price; }catch(_){ pxMap[s]=0; }
       }
-      const realizedTotal = [...realizedBySym.values()].reduce((a,b)=>a+b,0);
-      const feesTotal = totalFee;
-      const equity = realizedTotal + unrealTotal - feesTotal;
 
-      // Strategy rows
-      const stratRows = [...realizedByStrat.entries()].map(([strategy, realized])=>({strategy, realized, unrealized:0, fees:0, equity:realized}));
-      stratRows.sort((a,b)=>Math.abs(b.realized)-Math.abs(a.realized));
+      const per_strategy = {};
+      const per_symbol = {};
+      let Treal=0, Tunreal=0, Tfees=0;
 
-      // Symbol rows
-      const symRows = SYMBOLS.map(sym=>{
-        const realized=realizedBySym.get(sym)||0, unrealized=unrealBySym.get(sym)||0, fees=feesBySym.get(sym)||0;
-        return {symbol:sym, realized, unrealized, fees, equity:realized+unrealized-fees};
-      }).filter(r=>r.realized||r.unrealized||r.fees);
-      symRows.sort((a,b)=>Math.abs((b.realized+b.unrealized)) - Math.abs((a.realized+a.unrealized)));
+      for(const [k,S] of stat.entries()){
+        const [strategy, sym] = k.split('||');
+        let unreal=0;
+        const L = lots.get(k)||[];
+        const mkt = +pxMap[sym]||0;
+        if(mkt>0 && L.length){
+          for(const lot of L){ unreal += (mkt - lot.px) * lot.q; }
+        }
+        const equity = S.realized + unreal - S.fees;
 
-      return { total:{realized:realizedTotal, unrealized:unrealTotal, fees:feesTotal, equity}, per_strategy:stratRows, per_symbol:symRows };
+        if(!per_strategy[strategy]) per_strategy[strategy]={strategy, realized:0, unrealized:0, fees:0, equity:0};
+        per_strategy[strategy].realized  += S.realized;
+        per_strategy[strategy].unrealized+= unreal;
+        per_strategy[strategy].fees      += S.fees;
+        per_strategy[strategy].equity    += equity;
+
+        if(!per_symbol[sym]) per_symbol[sym]={symbol:sym, realized:0, unrealized:0, fees:0, equity:0};
+        per_symbol[sym].realized  += S.realized;
+        per_symbol[sym].unrealized+= unreal;
+        per_symbol[sym].fees      += S.fees;
+        per_symbol[sym].equity    += equity;
+
+        Treal += S.realized; Tunreal += unreal; Tfees += S.fees;
+      }
+
+      return {
+        total: { realized:Treal, unrealized:Tunreal, fees:Tfees, equity: (Treal+Tunreal-Tfees) },
+        per_strategy: Object.values(per_strategy).sort((a,b)=>b.equity-a.equity),
+        per_symbol:   Object.values(per_symbol).sort((a,b)=>b.equity-a.equity),
+      };
     }
 
     function fillPnLTables(summary){
@@ -300,7 +380,7 @@
     }
 
     async function refreshPnL(){
-      // Try server summary first
+      // Server truth first (journal-based)
       try{
         const j = await fetchJSON('/pnl/summary');
         const t = j.total || {realized:0,unrealized:0,fees:0,equity:0};
@@ -310,57 +390,70 @@
           fillPnLTables(j);
           return;
         }
-        log('pnl/summary all zeros — using client fallback');
+        log('pnl/summary all zeros — using journal fallback');
       }catch(e){
-        log('pnl/summary failed — using client fallback', String(e));
+        log('pnl/summary failed — using journal fallback', String(e));
       }
 
-      // Fallback from fills + prices
+      // Journal-based fallback
       try{
-        const computed = await computePnLFromFills();
-        log('pnl/fallback', computed.total);
+        const computed = await computePnLFromJournal();
+        log('pnl/fallback (journal)', computed.total);
         fillPnLTables(computed);
       }catch(e){
         log('pnl/fallback error', String(e));
       }
     }
 
-    /* ===== Calendar (same FIFO engine) ===== */
-    function parseFillCalendar(r){
-      const side=(r.side||r.type||'').toLowerCase(), sym=(r.symbol||r.pair||'').toUpperCase();
-      const price=+r.price||+r.avg_price||+r.px||0, vol=+r.vol||+r.volume||+r.qty||+r.quantity||0, fee=+r.fee||+r.fees||0;
-      const ts=Date.parse(r.time||r.timestamp||r.filled_ts||0)/1000; return {side,sym,price,vol,fee,t:ts||0};
+    /* ===== Calendar (journal-based, daily realized) ===== */
+    function dayStartUTC(ts){ const d=new Date(ts*1000); return Date.UTC(d.getUTCFullYear(),d.getUTCMonth(),d.getUTCDate())/1000; }
+    function calColor(v){ if(v>0){const g=Math.min(255,100+Math.log10(v+1)*80);return `rgba(40,${g},60,0.25)`;} if(v<0){const r=Math.min(255,100+Math.log10(-v+1)*80);return `rgba(${r},60,60,0.25)`;} return 'rgba(255,255,255,0.02)'; }
+
+    function parseJournalForCalendar(r){
+      const side=String(r.side||'').toLowerCase(), sym=String(r.symbol||'').toUpperCase();
+      const price=+r.price||0, vol=+r.vol||0, fee=+r.fee||0, t=+(r.filled_ts||r.ts||0);
+      return {side,sym,price,vol,fee,t};
     }
-    const dayStart = s=>{ const d=new Date(s*1000); return Date.UTC(d.getUTCFullYear(),d.getUTCMonth(),d.getUTCDate())/1000; };
-    function fifoDaily(fills){
-      fills=(fills||[]).map(parseFillCalendar).filter(f=>f.t&&f.vol&&f.price&&(f.side==='buy'||f.side==='sell')).sort((a,b)=>a.t-b.t);
-      const lot=new Map(), daily={}, byDay={};
+
+    function fifoDailyFromJournal(rows){
+      const fills = rows.map(parseJournalForCalendar)
+        .filter(f=>f.t && f.vol>0 && f.price>0 && (f.side==='buy'||f.side==='sell'))
+        .sort((a,b)=>a.t-b.t);
+      const lotBySym=new Map(), daily={}, byDay={};
       for(const f of fills){
-        (byDay[dayStart(f.t)] ||= []).push(f);
-        if(f.side==='buy'){ (lot.get(f.sym)||lot.set(f.sym,[]).get(f.sym)).push({q:f.vol,px:f.price}); continue; }
-        let rem=f.vol, real=0; const L=lot.get(f.sym)||[];
+        (byDay[dayStartUTC(f.t)] ||= []).push(f);
+        if(f.side==='buy'){ (lotBySym.get(f.sym)||lotBySym.set(f.sym,[]).get(f.sym)).push({q:f.vol,px:f.price}); continue; }
+        let rem=f.vol, real=0; const L=lotBySym.get(f.sym)||[];
         while(rem>1e-12 && L.length){ const head=L[0], take=Math.min(head.q,rem); real+=(f.price-head.px)*take; head.q-=take; rem-=take; if(head.q<=1e-12) L.shift(); }
-        const k=dayStart(f.t); (daily[k] ||= {p:0,t:0,w:0}); daily[k].p += (real - f.fee); daily[k].t++; if((real - f.fee)>0) daily[k].w++;
+        const k=dayStartUTC(f.t); (daily[k] ||= {p:0,t:0,w:0}); daily[k].p += (real - f.fee); daily[k].t++; if((real - f.fee)>0) daily[k].w++;
       }
       return {daily,byDay};
     }
-    function calColor(v){ if(v>0){const g=Math.min(255,100+Math.log10(v+1)*80);return `rgba(40,${g},60,0.25)`;} if(v<0){const r=Math.min(255,100+Math.log10(-v+1)*80);return `rgba(${r},60,60,0.25)`;} return 'rgba(255,255,255,0.02)'; }
+
     async function buildCalendar(offset=0){
       try{
         const now=new Date(), baseUTC=new Date(Date.UTC(now.getUTCFullYear(),now.getUTCMonth()+offset,1));
-        const y=baseUTC.getUTCFullYear(), m=baseUTC.getUTCMonth(); $('#cal_title').textContent = baseUTC.toLocaleString(undefined,{month:'long',year:'numeric'});
-        const fillsResp=await fetchJSON('/fills'); const fills=fillsResp.fills||fillsResp.trades||fillsResp.data||fillsResp||[];
-        const {daily,byDay}=fifoDaily(Array.isArray(fills)?fills:Object.values(fills));
+        const y=baseUTC.getUTCFullYear(), m=baseUTC.getUTCMonth();
+        $('#cal_title').textContent = baseUTC.toLocaleString(undefined,{month:'long',year:'numeric'});
+
+        // Pull journal (enough rows to cover a month)
+        const j = await fetchJSON('/journal?limit=5000');
+        const {daily,byDay} = fifoDailyFromJournal(j.rows||[]);
+
         const firstDow=new Date(Date.UTC(y,m,1)).getUTCDay(); const daysIn=new Date(Date.UTC(y,m+1,0)).getUTCDate();
         const grid=$('#cal_grid'); grid.innerHTML=''; ['Sun','Mon','Tue','Wed','Thu','Fri','Sat'].forEach(d=>{const e=document.createElement('div');e.className='cal-dow';e.textContent=d;grid.appendChild(e);});
         for(let i=0;i<firstDow;i++){const c=document.createElement('div');c.className='cal-cell muted';grid.appendChild(c);}
-        for(let d=1;d<=daysIn;d++){const k=Date.UTC(y,m,d)/1000, v=daily[k]?.p||0, t=daily[k]?.t||0, w=daily[k]?.w||0, wr=t?((w/t)*100).toFixed(1)+'%':'—';
+        for(let d=1;d<=daysIn;d++){
+          const k=Date.UTC(y,m,d)/1000, v=daily[k]?.p||0, t=daily[k]?.t||0, w=daily[k]?.w||0, wr=t?((w/t)*100).toFixed(1)+'%':'—';
           const c=document.createElement('div'); c.className='cal-cell'; c.style.background=calColor(v);
           c.innerHTML=`<div class="cal-date">${d}</div><div class="cal-pnl">${money(v)}</div><div class="cal-metric">${t} trades · ${wr}</div>`;
-          c.onclick=()=>showDayDetail(k, byDay[k]||[]); grid.appendChild(c);}
+          c.onclick=()=>showDayDetail(k, byDay[k]||[]);
+          grid.appendChild(c);
+        }
         $('#cal_detail').innerHTML='';
       }catch(e){ log('calendar error', String(e)); }
     }
+
     function showDayDetail(day, fills){
       if(!fills.length){ $('#cal_detail').innerHTML='<em>No trades this day.</em>'; return; }
       const rows=['<table><thead><tr><th>Time (UTC)</th><th>Symbol</th><th>Side</th><th>Qty</th><th>Price</th><th>Fee</th></tr></thead><tbody>'];
@@ -371,6 +464,7 @@
     /* ===== Boot ===== */
     async function init(){
       $('#year').textContent=new Date().getFullYear();
+      const d = $('#adv_date'); if(d) d.value = (new Date()).toISOString().slice(0,10);
       await initFromConfig();
       await Promise.allSettled([
         (async()=>{ await refreshPrices(true); setInterval(refreshPrices,30000); })(),

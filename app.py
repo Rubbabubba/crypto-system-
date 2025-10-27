@@ -1,5 +1,5 @@
 """
-crypto-system-api (app.py) — v1.12.6
+crypto-system-api (app.py) — v2.1.0
 ------------------------------------
 Full drop-in FastAPI app.
 
@@ -212,6 +212,7 @@ def _db() -> sqlite3.Connection:
             volume REAL,
             cost REAL,
             fee REAL,
+            strategy TEXT,
             raw JSON
         )
     """)
@@ -388,7 +389,24 @@ def price(base: str, quote: str):
 
 # ---- Debug config (env detection — no secrets) ---------------------------------------
 
-@app.get("/debug/config")
+@
+@app.get("/config")
+def get_config():
+    symbols = [s.strip() for s in os.getenv("SYMBOLS","").split(",") if s.strip()]
+    strategies = [s.strip() for s in os.getenv("SCHED_STRATS","").split(",") if s.strip()]
+    return {
+        "ok": True,
+        "service": os.getenv("SERVICE_NAME", "Crypto System"),
+        "version": APP_VERSION,
+        "symbols": symbols,
+        "strategies": strategies,
+        "timeframe": os.getenv("SCHED_TIMEFRAME", os.getenv("DEFAULT_TIMEFRAME","5Min")),
+        "notional": float(os.getenv("SCHED_NOTIONAL", os.getenv("DEFAULT_NOTIONAL","25") or 25)),
+        "limit": int(os.getenv("SCHED_LIMIT", os.getenv("DEFAULT_LIMIT","300") or 300)),
+        "trading_enabled": bool(int(os.getenv("TRADING_ENABLED","1") or "1")),
+        "tz": os.getenv("TZ","America/Chicago")
+    }
+app.get("/debug/config")
 def debug_config():
     key, sec, key_name, sec_name = _kraken_creds()
     now = int(time.time())
@@ -454,6 +472,7 @@ def _pull_trades_from_kraken(since_hours: int, hard_limit: int) -> Tuple[int, in
                     "volume": float(t.get("vol") or 0),
                     "cost": float(t.get("cost") or 0),
                     "fee": float(t.get("fee") or 0),
+                    "strategy": None,
                     "raw": t,
                 })
 
@@ -520,7 +539,107 @@ def journal_sync(payload: Dict[str, Any] = Body(...)):
             "since_hours": since_hours,
             "start_ts": start_ts,
             "start_iso": dt.datetime.utcfromtimestamp(start_ts).isoformat() + "Z" if start_ts else None,
-            "limit": limit,
+            "li
+def _fetch_prices(symbols: List[str]) -> Dict[str, float]:
+    prices = {}
+    for sym in symbols:
+        try:
+            base, quote = sym.split("/")
+            data = price_ticker(base, quote)
+            prices[sym] = float(data.get("price", 0.0))
+        except Exception:
+            prices[sym] = 0.0
+    return prices
+
+def _compute_fifo_pnl(rows: List[Dict[str, Any]], prices: Dict[str, float]):
+    # rows: must contain symbol, side, price, volume, fee, strategy
+    per = {}  # (strategy, symbol) -> dict
+    for r in sorted(rows, key=lambda x: x.get("ts", 0)):
+        strat = r.get("strategy") or "misc"
+        sym = r.get("symbol")
+        side = (r.get("side") or "").lower()
+        price = float(r.get("price") or 0.0)
+        vol = float(r.ge
+DAILY_JSON = os.path.join(DATA_DIR, "daily.json")
+@app.get("/advisor/daily")
+def advisor_daily():
+    try:
+        with open(DAILY_JSON, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+    except FileNotFoundError:
+        data = {"date": dt.date.today().isoformat(), "notes": "", "recommendations": []}
+    return {"ok": True, **data}
+
+@app.post("/advisor/apply")
+def advisor_apply(payload: Dict[str, Any] = Body(...)):
+    # For now, persist incoming recommendations into daily.json
+    data = {
+        "date": payload.get("date") or dt.date.today().isoformat(),
+        "notes": payload.get("notes") or "",
+        "recommendations": payload.get("recommendations") or []
+    }
+    os.makedirs(DATA_DIR, exist_ok=True)
+    with open(DAILY_JSON, "w", encoding="utf-8") as fh:
+        json.dump(data, fh, indent=2)
+    return {"ok": True, "saved": True, **data}
+
+
+@app.get("/fills")
+def get_fills(limit: int = Query(100, ge=1, le=1000)):
+    conn = _db()
+    cur = conn.cursor()
+    cur.execute("SELECT txid, ts, symbol, side, price, volume, fee, strategy FROM trades ORDER BY ts DESC LIMIT ?", (limit,))
+    rows = [dict(txid=r[0], ts=r[1], symbol=r[2], side=r[3], price=r[4], volume=r[5], fee=r[6], strategy=r[7]) for r in cur.fetchall()]
+    return {"ok": True, "rows": rows, "count": len(rows)}
+
+t("volume") or 0.0)
+        fee = float(r.get("fee") or 0.0)
+        key = (strat, sym)
+        d = per.setdefault(key, {"qty":0.0, "avg":0.0, "realized":0.0, "fees":0.0})
+        d["fees"] += fee
+        if side == "buy":
+            # new avg = (qty*avg + vol*price)/(qty+vol)
+            new_qty = d["qty"] + vol
+            if new_qty > 0:
+                d["avg"] = (d["qty"]*d["avg"] + vol*price) / new_qty
+            d["qty"] = new_qty
+        elif side == "sell":
+            # realize on the amount closed (min of vol, d['qty'])
+            close = min(vol, d["qty"])
+            if close > 0:
+                d["realized"] += (price - d["avg"]) * close
+                d["qty"] -= close
+            # if over-sell, treat extra as short-close reset (rare with spot); ignore
+        else:
+            continue
+    # Build outputs
+    per_strategy = {}
+    per_symbol = {}
+    total = {"realized":0.0, "unrealized":0.0, "fees":0.0, "equity":0.0}
+    out_per_strategy = []
+    out_per_symbol = []
+    for (strat, sym), d in per.items():
+        mkt = prices.get(sym, 0.0)
+        unreal = (mkt - d["avg"]) * d["qty"] if d["qty"] != 0 else 0.0
+        realized = d["realized"]
+        fees = d["fees"]
+        equity = realized + unreal - fees
+        S = per_strategy.setdefault(strat, {"realized":0.0,"unrealized":0.0,"fees":0.0,"equity":0.0})
+        for k,v in [("realized",realized),("unrealized",unreal),("fees",fees),("equity",equity)]:
+            S[k] += v
+        P = per_symbol.setdefault(sym, {"realized":0.0,"unrealized":0.0,"fees":0.0,"equity":0.0})
+        for k,v in [("realized",realized),("unrealized",unreal),("fees",fees),("equity",equity)]:
+            P[k] += v
+        total["realized"] += realized
+        total["unrealized"] += unreal
+        total["fees"] += fees
+        total["equity"] += equity
+    for strat, vals in per_strategy.items():
+        out_per_strategy.append({"strategy": strat, **vals})
+    for sym, vals in per_symbol.items():
+        out_per_symbol.append({"symbol": sym, **vals})
+    return {"total": total, "per_strategy": out_per_strategy, "per_symbol": out_per_symbol}
+mit": limit,
             "last_error": last_error,
         },
     }
@@ -544,22 +663,34 @@ def journal_sanity(payload: Dict[str, Any] = Body(default={})):
         bad.append("negative_count? impossible")
     return {"ok": True, "bad": bad, "checked": n}
 
+
+@app.post("/journal/attach")
+def journal_attach(payload: Dict[str, Any] = Body(...)):
+    txid = payload.get("txid")
+    strategy = payload.get("strategy")
+    if not txid or not strategy:
+        raise HTTPException(status_code=400, detail="txid and strategy required")
+    conn = _db()
+    cur = conn.cursor()
+    cur.execute("UPDATE trades SET strategy=? WHERE txid=?", (str(strategy), str(txid)))
+    conn.commit()
+    return {"ok": True, "updated": cur.rowcount}
+
 # ---- PnL / KPIs ---------------------------------------------------------------------
 
 @app.get("/pnl/summary")
 def pnl_summary():
-    # Extremely simple rollup over stored trades (not a full accounting)
     conn = _db()
     cur = conn.cursor()
-    cur.execute("SELECT COUNT(1), COALESCE(SUM(cost),0), COALESCE(SUM(fee),0) FROM trades")
-    row = cur.fetchone()
-    conn.close()
-    return {
-        "ok": True,
-        "trades": int(row[0]),
-        "notional_cost_sum": float(row[1]),
-        "fees_sum": float(row[2]),
-    }
+    cur.execute("SELECT ts, symbol, side, price, volume, fee, COALESCE(strategy, 'misc') as strategy FROM trades")
+    rows = [
+        {"ts": r[0], "symbol": r[1], "side": r[2], "price": r[3], "volume": r[4], "fee": r[5], "strategy": r[6]} for r in cur.fetchall()
+    ]
+    symbols = sorted({r["symbol"] for r in rows})
+    prices = _fetch_prices(symbols)
+    roll = _compute_fifo_pnl(rows, prices)
+    roll.update({"ok": True, "counts": {"journal_rows": len(rows)}})
+    return roll
 
 @app.get("/kpis")
 def kpis():
@@ -569,6 +700,24 @@ def kpis():
             "journal_rows": count_rows(),
         }
     }
+
+
+_SCHED_ENABLED = bool(int(os.getenv("SCHED_ON", os.getenv("SCHED_ENABLED","1") or "1")))
+@app.get("/scheduler/status")
+def scheduler_status():
+    return { "ok": True, "enabled": _SCHED_ENABLED, "interval_secs": int(os.getenv("SCHED_SLEEP","30") or "30") }
+
+@app.post("/scheduler/start")
+def scheduler_start():
+    global _SCHED_ENABLED
+    _SCHED_ENABLED = True
+    return {"ok": True, "enabled": True}
+
+@app.post("/scheduler/stop")
+def scheduler_stop():
+    global _SCHED_ENABLED
+    _SCHED_ENABLED = False
+    return {"ok": True, "enabled": False}
 
 # ---- Scheduler (stub) ----------------------------------------------------------------
 
@@ -590,11 +739,28 @@ def scheduler_run(payload: Dict[str, Any] = Body(...)):
 # Startup log
 # --------------------------------------------------------------------------------------
 
+
+def _ensure_strategy_column():
+    conn = sqlite3.connect(DB_PATH)
+    try:
+        cur = conn.cursor()
+        # Check if column exists
+        cur.execute("PRAGMA table_info(trades)")
+        cols = [r[1] for r in cur.fetchall()]
+        if "strategy" not in cols:
+            cur.execute("ALTER TABLE trades ADD COLUMN strategy TEXT")
+            conn.commit()
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_trades_strategy ON trades(strategy)")
+        conn.commit()
+    finally:
+        conn.close()
+
 @app.on_event("startup")
 def _startup():
     log.info(f"Starting crypto-system-api v{APP_VERSION} on 0.0.0.0:{os.getenv('PORT','10000')}")
     # ensure DB created
     _ = _db()
+    _ensure_strategy_column()
     log.info(f"Data dir: {DATA_DIR} | DB: {DB_PATH}")
 
 # --------------------------------------------------------------------------------------
