@@ -691,7 +691,7 @@ def journal_counts():
 def journal_enrich(payload: Dict[str, Any] = Body(...)):
     """
     Backfill strategies for unlabeled trades:
-    A) Kraken QueryTradesInfo (trade txid -> ordertxid)
+    A) Kraken QueryTrades (trade txid -> ordertxid)
     B) Kraken QueryOrdersInfo (ordertxid -> userref/descr -> strategy)
     C) Optional rules fallback (whitelist/windows) when unambiguous
     Body: { "batch_size": 40, "max_rows": 5000, "apply_rules": true }
@@ -736,8 +736,9 @@ def journal_enrich(payload: Dict[str, Any] = Body(...)):
     # 3) Kraken creds
     key, sec, _, _ = _kraken_creds()
 
-    # 4) Stage A: trades -> order ids
+    # 4) Stage A: trades -> order ids (QueryTrades)
     trade_meta: Dict[str, Dict[str, Any]] = {}
+    order_to_trades: Dict[str, List[str]] = {}
     if key and sec:
         for i in range(0, len(trade_ids), batch_size):
             chunk = trade_ids[i:i+batch_size]
@@ -748,22 +749,19 @@ def journal_enrich(payload: Dict[str, Any] = Body(...)):
                     trade_meta.update(res)  # keys: trade txid
             except Exception as e:
                 log.warning(f"QueryTrades failed for {len(chunk)} txids: {e}")
+        # Build order -> trades map
+        for txid in trade_ids:
+            meta = trade_meta.get(txid, {})
+            otx = meta.get("ordertxid")
+            if isinstance(otx, list): otx = otx[0] if otx else None
+            if otx:
+                order_to_trades.setdefault(str(otx), []).append(txid)
     else:
         log.warning("journal_enrich: Kraken creds missing; skipping API enrichment")
 
-    # Map order -> trades
-    order_to_trades: Dict[str, List[str]] = {}
-    for txid in trade_ids:
-        meta = trade_meta.get(txid, {})
-        otx = meta.get("ordertxid")
-        if isinstance(otx, list):
-            otx = otx[0] if otx else None
-        if otx:
-            order_to_trades.setdefault(str(otx), []).append(txid)
-
     all_order_ids = list(order_to_trades.keys())
 
-    # 5) Stage B: orders -> userref/descr -> strategy
+    # 5) Stage B: orders -> strategy (QueryOrdersInfo)
     orders_meta: Dict[str, Dict[str, Any]] = {}
     if key and sec and all_order_ids:
         for i in range(0, len(all_order_ids), batch_size):
@@ -791,7 +789,7 @@ def journal_enrich(payload: Dict[str, Any] = Body(...)):
             if m: return m.group(1)
         return None
 
-    # Rules
+    # Load rules
     whitelist = {}
     windows = {}
     try:
@@ -820,7 +818,7 @@ def journal_enrich(payload: Dict[str, Any] = Body(...)):
         if syms and ("*" not in syms) and (symbol not in syms): return False
         win = windows.get(strat) or {}
         days = set([d[:3].title() for d in (win.get("days") or [])])
-        hours = set(win.get("hours") or [] )
+        hours = set(win.get("hours") or [])
         if not days and not hours: return True
         try:
             t = _dt.datetime.fromtimestamp(float(ts), tz)
@@ -834,7 +832,7 @@ def journal_enrich(payload: Dict[str, Any] = Body(...)):
     to_update: Dict[str, str] = {}
     api_labeled = rules_labeled = ambiguous = missing_order = 0
 
-    # API (authoritative)
+    # Authoritative (orders)
     for oid, txs in order_to_trades.items():
         strat = infer_from_order(orders_meta.get(oid) or {})
         if strat:
@@ -843,7 +841,7 @@ def journal_enrich(payload: Dict[str, Any] = Body(...)):
         else:
             missing_order += len(txs)
 
-    # Rules (only for trades still unlabeled)
+    # Rules (only for still-unlabeled)
     if apply_rules and (whitelist or windows):
         all_strats = list(set(list(whitelist.keys()) + list(windows.keys())))
         for txid, info in trade_info.items():
