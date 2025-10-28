@@ -1,5 +1,5 @@
 """
-crypto-system-api (app.py) — v2.3.2
+crypto-system-api (app.py) — v2.3.3
 ------------------------------------
 Full drop-in FastAPI app.
 
@@ -60,7 +60,7 @@ logging.basicConfig(
 )
 log = logging.getLogger("crypto-system")
 log.info("Logging initialized at level %s", LOG_LEVEL)
-__version__ = '2.3.0'
+__version__ = '2.3.3'
 # Routes:
 #  - /
 #  - /health
@@ -81,12 +81,14 @@ __version__ = '2.3.0'
 #  - /price/{base}/{quote}
 #  - /debug/log/test
 #  - /debug/kraken
+#  - /debug/db
 #  - /pnl/summary
 #  - /kpis
 #  - /scheduler/status
 #  - /scheduler/start
 #  - /scheduler/stop
 #  - /scheduler/run
+
 
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
@@ -342,6 +344,24 @@ def price_ticker(base: str, quote: str) -> Dict[str, Any]:
     except Exception as e:
         log.warning(f"price_ticker failed for {pair}: {e}")
     return {"pair": pair, "price": 0.0}
+
+
+# --- Kraken public REST helper (no auth) ---
+import requests as _rq
+
+def kraken_public(endpoint: str, params: dict) -> dict:
+    """
+    Minimal public API caller for Kraken.
+    Example: kraken_public("Time", {}), kraken_public("Ticker", {"pair":"BTC/USD"})
+    """
+    url = f"https://api.kraken.com/0/public/{endpoint}"
+    try:
+        r = _rq.get(url, params=params or {}, timeout=10)
+        r.raise_for_status()
+        return r.json()
+    except Exception as e:
+        log.warning("kraken_public error for %s: %s", endpoint, e)
+        return {"error": [str(e)], "result": {}}
 
 @app.get("/")
 def root():
@@ -906,6 +926,51 @@ def debug_kraken():
     else:
         out["private"] = {"ok": False, "error": "no_creds_in_env"}
     return out
+
+
+@app.get("/debug/db")
+def debug_db():
+    """
+    Show DB path, file existence/size, and per-table counts to diagnose empty state.
+    """
+    import os, sqlite3, time
+    info = {"ok": True}
+    try:
+        # Try to introspect the connection the app uses
+        conn = _db()
+        cur = conn.cursor()
+        # PRAGMA database_list returns file path for main DB
+        try:
+            rows = cur.execute("PRAGMA database_list").fetchall()
+            info["database_list"] = [{"seq": r[0], "name": r[1], "file": r[2]} for r in rows]
+            dbfile = rows[0][2] if rows else ""
+            if dbfile and os.path.exists(dbfile):
+                st = os.stat(dbfile)
+                info["db_file"] = {"path": dbfile, "exists": True, "size_bytes": st.st_size, "mtime": st.st_mtime}
+            else:
+                info["db_file"] = {"path": dbfile, "exists": False}
+        except Exception as e:
+            info["database_list_error"] = str(e)
+        # List tables
+        try:
+            tables = [r[0] for r in cur.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()]
+            info["tables"] = tables
+            counts = {}
+            for t in tables:
+                try:
+                    c = cur.execute(f"SELECT COUNT(*) FROM {t}").fetchone()[0]
+                    counts[t] = c
+                except Exception as e:
+                    counts[t] = f"err: {e}"
+            info["counts"] = counts
+        except Exception as e:
+            info["tables_error"] = str(e)
+        conn.close()
+    except Exception as e:
+        info["ok"] = False
+        info["error"] = str(e)
+    return info
+
 @app.get("/pnl/summary")
 def pnl_summary():
     conn = _db()
