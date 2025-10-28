@@ -1,5 +1,5 @@
 """
-crypto-system-api (app.py) — v2.3.1
+crypto-system-api (app.py) — v2.3.2
 ------------------------------------
 Full drop-in FastAPI app.
 
@@ -48,7 +48,46 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import requests
 from fastapi import Body, FastAPI, HTTPException, Query
+
+# --- logging baseline for Render stdout ---
+import logging, sys, os as _os
+LOG_LEVEL = _os.getenv("LOG_LEVEL", "INFO").upper()
+logging.basicConfig(
+    level=getattr(logging, LOG_LEVEL, logging.INFO),
+    format="%(asctime)s %(levelname)s %(name)s :: %(message)s",
+    handlers=[logging.StreamHandler(sys.stdout)],
+    force=True,
+)
+log = logging.getLogger("crypto-system")
+log.info("Logging initialized at level %s", LOG_LEVEL)
 __version__ = '2.3.0'
+# Routes:
+#  - /
+#  - /health
+#  - /routes
+#  - /dashboard
+#  - /policy
+#  - /config
+#  - /debug/config
+#  - /journal
+#  - /journal/attach
+#  - /fills
+#  - /journal/backfill
+#  - /journal/sync
+#  - /advisor/daily
+#  - /advisor/apply
+#  - /journal/counts
+#  - /journal/enrich
+#  - /price/{base}/{quote}
+#  - /debug/log/test
+#  - /debug/kraken
+#  - /pnl/summary
+#  - /kpis
+#  - /scheduler/status
+#  - /scheduler/start
+#  - /scheduler/stop
+#  - /scheduler/run
+
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
@@ -101,66 +140,18 @@ def _get_env_first(*names: str) -> Optional[str]:
             return v
     return None
 
-def _kraken_creds() -> Tuple[Optional[str], Optional[str], Optional[str], Optional[str]]:
-    """Return (api_key, api_secret, key_name_used, secret_name_used)."""
-    key_name = "KRAKEN_API_KEY" if os.getenv("KRAKEN_API_KEY") else ("KRAKEN_KEY" if os.getenv("KRAKEN_KEY") else None)
-    sec_name = "KRAKEN_API_SECRET" if os.getenv("KRAKEN_API_SECRET") else ("KRAKEN_SECRET" if os.getenv("KRAKEN_SECRET") else None)
-    key = _get_env_first("KRAKEN_API_KEY", "KRAKEN_KEY")
-    sec = _get_env_first("KRAKEN_API_SECRET", "KRAKEN_SECRET")
-    return key, sec, key_name, sec_name
 
-# Public/private altname mapping (expand as needed)
-# Note: Kraken uses XBT for Bitcoin.
-_BASE_ALT = {
-    "BTC": "XBT",
-    "XBT": "XBT",
-    "ETH": "ETH",
-    "SOL": "SOL",
-    "DOGE": "DOGE",  # legacy XDG existed historically
-    "XRP": "XRP",
-    "AVAX": "AVAX",
-    "LINK": "LINK",
-    "BCH": "BCH",
-    "LTC": "LTC",
-}
-# inverse mapping for rendering to app-style
-_BASE_INV = {v: k for k, v in _BASE_ALT.items()}
-
-def to_kraken_alt_pair(base: str, quote: str) -> str:
-    """App 'BTC/USD' -> Kraken 'XBTUSD' altnames."""
-    b = _BASE_ALT.get(base.upper(), base.upper())
-    q = quote.upper()
-    return f"{b}{q}"
-
-def from_kraken_pair_to_app(sym: str) -> str:
-    """
-    Kraken pair to app 'BASE/QUOTE'.
-    Handles both altnames like 'XBTUSD' and some legacy like 'XXBTZUSD' by stripping leading X/Z.
-    """
-    s = sym.upper()
-    # legacy style sometimes like XXBTZUSD -> strip leading X/Z prefixes
-    if len(s) > 6 and s.count("/") == 0:
-        # heuristic: try to isolate base(3-4)+quote(3)
-        # Strip leading X/Z on base and possible Z on quote
-        # Examples: XXBTZUSD -> XBTUSD, XETHZEUR -> ETHEUR
-        s = s.lstrip("XZ")
-        s = s.replace("ZUSD", "USD").replace("ZEUR", "EUR").replace("ZUSDT", "USDT")
-    if "/" in s:
-        parts = s.split("/")
-        b_raw, q = parts[0], parts[1]
-    else:
-        # assume last 3-4 are quote, rest base
-        if s.endswith("USDT"):
-            q = "USDT"; b_raw = s[:-4]
-        elif s.endswith("USD"):
-            q = "USD"; b_raw = s[:-3]
-        elif s.endswith("EUR"):
-            q = "EUR"; b_raw = s[:-3]
-        else:
-            # fallback: treat last 3 chars as quote
-            q = s[-3:]; b_raw = s[:-3]
-    b = _BASE_INV.get(b_raw, b_raw)
-    return f"{b}/{q}"
+def _kraken_creds():
+    key = os.getenv("KRAKEN_API_KEY") or os.getenv("KRAKEN_KEY") or ""
+    sec = os.getenv("KRAKEN_API_SECRET") or os.getenv("KRAKEN_SECRET") or ""
+    user = os.getenv("KRAKEN_USER") or ""
+    pwd  = os.getenv("KRAKEN_PASS") or ""
+    used = "KRAKEN_API_KEY/SECRET" if os.getenv("KRAKEN_API_KEY") or os.getenv("KRAKEN_API_SECRET") else            ("KRAKEN_KEY/SECRET" if os.getenv("KRAKEN_KEY") or os.getenv("KRAKEN_SECRET") else "none")
+    try:
+        log.info("_kraken_creds: using pair=%s; key_len=%d sec_len=%d", used, len(key), len(sec))
+    except Exception:
+        pass
+    return key, sec, user, pwd
 
 # --------------------------------------------------------------------------------------
 # Kraken API client (public & private)
@@ -880,6 +871,41 @@ def journal_enrich(payload: Dict[str, Any] = Body(...)):
         "max_rows": max_rows,
     }
 
+
+@app.get("/price/{base}/{quote}")
+def price_endpoint(base: str, quote: str):
+    data = price_ticker(base, quote)
+    return {"ok": True, "pair": data.get("pair"), "price": data.get("price")}
+
+@app.get("/debug/log/test")
+def debug_log_test():
+    log.debug("debug: hello from /debug/log/test")
+    log.info("info: hello from /debug/log/test")
+    log.warning("warn: hello from /debug/log/test")
+    return {"ok": True, "logged": True}
+
+@app.get("/debug/kraken")
+def debug_kraken():
+    key, sec, *_ = _kraken_creds()
+    out = {"ok": True, "public": None, "private": None, "creds_present": bool(key and sec)}
+    try:
+        r = kraken_public("Time", {})
+        out["public"] = {"ok": True, "result_keys": list((r or {}).keys())[:4]}
+        log.info("/debug/kraken public ok: keys=%s", out["public"]["result_keys"])
+    except Exception as e:
+        out["public"] = {"ok": False, "error": str(e)}
+        log.warning("/debug/kraken public err: %s", e)
+    if key and sec:
+        try:
+            r = kraken_private("Balance", {}, key, sec)
+            out["private"] = {"ok": True, "result_keys": list((r.get("result") or {}).keys())[:1]}
+            log.info("/debug/kraken private ok")
+        except Exception as e:
+            out["private"] = {"ok": False, "error": str(e)}
+            log.warning("/debug/kraken private err: %s", e)
+    else:
+        out["private"] = {"ok": False, "error": "no_creds_in_env"}
+    return out
 @app.get("/pnl/summary")
 def pnl_summary():
     conn = _db()
@@ -973,3 +999,187 @@ if __name__ == "__main__":
     import uvicorn
     port = int(os.getenv("PORT", "10000"))
     uvicorn.run("app:app", host="0.0.0.0", port=port, reload=False)
+
+@app.post("/journal/enrich")
+def journal_enrich(payload: Dict[str, Any] = Body(...)):
+    dry_run = bool(payload.get("dry_run", False))
+    batch_size = int(payload.get("batch_size", 40) or 40)
+    max_rows   = int(payload.get("max_rows", 5000) or 5000)
+    apply_rules = bool(payload.get("apply_rules", True))
+    log.info("enrich start: dry_run=%s batch=%s max_rows=%s apply_rules=%s", dry_run, batch_size, max_rows, apply_rules)
+
+    conn = _db(); cur = conn.cursor()
+    try:
+        cur.execute("SELECT txid, ts, symbol, raw FROM trades WHERE strategy IS NULL OR TRIM(strategy)='' LIMIT ?", (max_rows,))
+        rows = cur.fetchall()
+    finally:
+        conn.close()
+
+    scanned = len(rows)
+    if scanned == 0:
+        return {"ok": True, "scanned": 0, "orders_checked": 0, "updated": 0,
+                "api_labeled": 0, "rules_labeled": 0, "ambiguous": 0, "missing_order": 0,
+                "apply_rules": apply_rules, "batch_size": batch_size, "max_rows": max_rows}
+
+    def _j(x):
+        try:
+            return json.loads(x) if isinstance(x, str) else (x or {})
+        except Exception:
+            return {}
+
+    trade_info = {}
+    trade_ids = []
+    for txid, ts, symbol, raw in rows:
+        txid = str(txid)
+        trade_ids.append(txid)
+        trade_info[txid] = {"ts": ts, "symbol": symbol, "raw": _j(raw)}
+    log.info("unlabeled scanned=%d trade_ids=%d", scanned, len(trade_ids))
+
+    key, sec, *_ = _kraken_creds()
+
+    # Stage A: trades -> order ids
+    trade_meta = {}
+    order_to_trades = {}
+    if key and sec and trade_ids:
+        for i in range(0, len(trade_ids), batch_size):
+            chunk = trade_ids[i:i+batch_size]
+            try:
+                resp = kraken_private("QueryTrades", {"txid": ",".join(chunk)}, key, sec)
+                res = (resp.get("result") or {}) if isinstance(resp, dict) else {}
+                if isinstance(res, dict):
+                    trade_meta.update(res)
+            except Exception as e:
+                log.warning("QueryTrades failed for %d txids: %s", len(chunk), e)
+        for txid in trade_ids:
+            meta = trade_meta.get(txid, {})
+            otx = meta.get("ordertxid")
+            if isinstance(otx, list):
+                otx = otx[0] if otx else None
+            if otx:
+                order_to_trades.setdefault(str(otx), []).append(txid)
+    else:
+        log.warning("journal_enrich: Kraken creds missing or no trade_ids; skipping API enrichment")
+
+    all_order_ids = list(order_to_trades.keys())
+    log.info("order_to_trades size=%d (unique orders)", len(all_order_ids))
+
+    # Stage B: orders -> strategy
+    orders_meta = {}
+    if key and sec and all_order_ids:
+        for i in range(0, len(all_order_ids), batch_size):
+            chunk = all_order_ids[i:i+batch_size]
+            try:
+                resp = kraken_private("QueryOrdersInfo", {"txid": ",".join(chunk)}, key, sec)
+                res = (resp.get("result") or {}) if isinstance(resp, dict) else {}
+                if isinstance(res, dict):
+                    orders_meta.update(res)
+            except Exception as e:
+                log.warning("QueryOrdersInfo failed for %d orders: %s", len(chunk), e)
+    log.info("orders_meta fetched=%d", len(orders_meta))
+
+    import re as _re, datetime as _dt, pytz, json as _json
+    def infer_from_order(o):
+        if not isinstance(o, dict): return None
+        u = o.get("userref")
+        if isinstance(u, str) and _re.fullmatch(r"c[1-9]", u.lower()): return u.lower()
+        if isinstance(u, int) and 1 <= u <= 9: return f"c{u}"
+        d = o.get("descr") or {}
+        for val in d.values():
+            if not isinstance(val, str): continue
+            m = _re.search(r"\b(c[1-9])\b", val.lower())
+            if m: return m.group(1)
+            m = _re.search(r"strat\s*[:=]\s*(c[1-9])", val.lower())
+            if m: return m.group(1)
+        return None
+
+    # Load rules
+    whitelist = {}
+    windows = {}
+    try:
+        whitelist = json.load(open(DATA_DIR / "whitelist.json", "r", encoding="utf-8"))
+    except Exception:
+        try:
+            whitelist = json.load(open("whitelist.json", "r", encoding="utf-8"))
+        except Exception:
+            pass
+    try:
+        windows = json.load(open(DATA_DIR / "windows.json", "r", encoding="utf-8"))
+    except Exception:
+        try:
+            windows = json.load(open("windows.json", "r", encoding="utf-8"))
+        except Exception:
+            pass
+
+    tzname = os.getenv("TZ", "America/Chicago")
+    try:
+        tz = pytz.timezone(tzname)
+    except Exception:
+        import pytz as _p; tz = _p.UTC
+
+    def allowed_by_rules(strat, symbol, ts):
+        syms = whitelist.get(strat)
+        if syms and ("*" not in syms) and (symbol not in syms): return False
+        win = windows.get(strat) or {}
+        days = set([d[:3].title() for d in (win.get("days") or [])])
+        hours = set(win.get("hours") or [])
+        if not days and not hours: return True
+        try:
+            t = _dt.datetime.fromtimestamp(float(ts), tz)
+            if days and t.strftime("%a") not in days: return False
+            if hours and t.hour not in set(int(h) for h in hours): return False
+            return True
+        except Exception:
+            return False
+
+    to_update = {}
+    api_labeled = rules_labeled = ambiguous = missing_order = 0
+
+    for oid, txs in order_to_trades.items():
+        strat = infer_from_order(orders_meta.get(oid) or {})
+        if strat:
+            for tx in txs: to_update[tx] = strat
+            api_labeled += len(txs)
+        else:
+            missing_order += len(txs)
+
+    if apply_rules and (whitelist or windows):
+        all_strats = list(set(list(whitelist.keys()) + list(windows.keys())))
+        for txid, info in trade_info.items():
+            if txid in to_update: continue
+            sym, ts = info.get("symbol"), info.get("ts")
+            if not sym or ts is None: continue
+            cands = [s for s in all_strats if allowed_by_rules(s, sym, ts)]
+            if len(cands) == 1:
+                to_update[txid] = cands[0]; rules_labeled += 1
+            else:
+                ambiguous += 1
+
+    if dry_run:
+        sample = dict(list(to_update.items())[:10])
+        return {"ok": True, "dry_run": True, "scanned": scanned, "orders_checked": len(all_order_ids),
+                "to_update_count": len(to_update), "sample_updates": sample}
+
+    updated = 0
+    if to_update:
+        conn = _db(); cur = conn.cursor()
+        for txid, strat in to_update.items():
+            try:
+                cur.execute("UPDATE trades SET strategy=? WHERE txid=?", (str(strat), str(txid)))
+                updated += cur.rowcount
+            except Exception as e:
+                log.warning("update failed txid=%s: %s", txid, e)
+        conn.commit(); conn.close()
+
+    return {
+        "ok": True,
+        "scanned": scanned,
+        "orders_checked": len(all_order_ids),
+        "updated": updated,
+        "api_labeled": api_labeled,
+        "rules_labeled": rules_labeled,
+        "ambiguous": ambiguous,
+        "missing_order": missing_order,
+        "apply_rules": apply_rules,
+        "batch_size": batch_size,
+        "max_rows": max_rows,
+    }
