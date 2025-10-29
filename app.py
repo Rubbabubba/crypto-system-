@@ -46,21 +46,6 @@ import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-import requests
-from fastapi import Body, FastAPI, HTTPException, Query
-
-# --- logging baseline for Render stdout ---
-import logging, sys, os as _os
-LOG_LEVEL = _os.getenv("LOG_LEVEL", "INFO").upper()
-logging.basicConfig(
-    level=getattr(logging, LOG_LEVEL, logging.INFO),
-    format="%(asctime)s %(levelname)s %(name)s :: %(message)s",
-    handlers=[logging.StreamHandler(sys.stdout)],
-    force=True,
-)
-log = logging.getLogger("crypto-system")
-log.info("Logging initialized at level %s", LOG_LEVEL)
-__version__ = '2.3.3'
 # Routes:
 #  - /
 #  - /health
@@ -82,12 +67,30 @@ __version__ = '2.3.3'
 #  - /debug/log/test
 #  - /debug/kraken
 #  - /debug/db
+#  - /debug/kraken/trades
 #  - /pnl/summary
 #  - /kpis
 #  - /scheduler/status
 #  - /scheduler/start
 #  - /scheduler/stop
 #  - /scheduler/run
+
+import requests
+from fastapi import Body, FastAPI, HTTPException, Query
+
+# --- logging baseline for Render stdout ---
+import logging, sys, os as _os
+LOG_LEVEL = _os.getenv("LOG_LEVEL", "INFO").upper()
+logging.basicConfig(
+    level=getattr(logging, LOG_LEVEL, logging.INFO),
+    format="%(asctime)s %(levelname)s %(name)s :: %(message)s",
+    handlers=[logging.StreamHandler(sys.stdout)],
+    force=True,
+)
+log = logging.getLogger("crypto-system")
+log.info("Logging initialized at level %s", LOG_LEVEL)
+__version__ = '2.3.4'
+
 
 
 from fastapi.middleware.cors import CORSMiddleware
@@ -971,6 +974,62 @@ def debug_db():
         info["error"] = str(e)
     return info
 
+
+@app.get("/debug/kraken/trades")
+def debug_kraken_trades(since_hours: int = 720, limit: int = 50000):
+    """
+    Diagnostic: pull Kraken TradesHistory (paginated) without DB writes.
+    """
+    import time
+    key, sec, *_ = _kraken_creds()
+    out = {"ok": True, "creds_present": bool(key and sec), "pages": 0, "pulled": 0, "count": None,
+           "first_ts": None, "last_ts": None, "sample_txids": []}
+    if not (key and sec):
+        out["ok"] = False
+        out["error"] = "no_creds"
+        return out
+    start_ts = int(time.time() - since_hours * 3600)
+    ofs = 0
+    sample = []
+    first_ts = None
+    last_ts = None
+    total_seen = 0
+    total_count = None
+    while True:
+        try:
+            resp = kraken_private("TradesHistory", {"start": start_ts, "ofs": ofs}, key, sec)
+            res = resp.get("result") or {}
+            trades = res.get("trades") or {}
+            total_count = res.get("count", total_count)
+            keys = list(trades.keys())
+            if not keys:
+                break
+            for tx in keys[:10]:
+                if len(sample) < 20:
+                    sample.append(tx)
+            for tx in keys:
+                t = trades[tx].get("time")
+                if t is not None:
+                    if first_ts is None or t < first_ts: first_ts = t
+                    if last_ts is None or t > last_ts: last_ts = t
+            n = len(keys)
+            total_seen += n
+            out["pages"] += 1
+            if total_count is not None and total_seen >= total_count:
+                break
+            ofs += n
+            if out["pages"] > 60:
+                break
+        except Exception as e:
+            out["ok"] = False
+            out["error"] = str(e)
+            break
+    out["pulled"] = total_seen
+    out["count"] = total_count
+    out["first_ts"] = first_ts
+    out["last_ts"] = last_ts
+    out["sample_txids"] = sample
+    return out
 @app.get("/pnl/summary")
 def pnl_summary():
     conn = _db()
