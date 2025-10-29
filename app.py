@@ -68,6 +68,7 @@ from typing import Any, Dict, List, Optional, Tuple
 #  - /debug/kraken
 #  - /debug/db
 #  - /debug/kraken/trades
+#  - /debug/kraken/trades2
 #  - /pnl/summary
 #  - /kpis
 #  - /scheduler/status
@@ -591,29 +592,23 @@ def journal_sync(payload: Dict[str, Any] = Body(...)):
       - limit: int (default 50000) maximum rows to write this call
       - dry_run: bool (optional) if true, do not write
 
-    Behavior:
-      - Paginates with 'ofs' until Kraken's 'count' reached or 'limit' cap hit
-      - Upsert on txid; preserves existing 'strategy' if already labeled
-      - Stores: txid, ts, symbol (pair), side (type), price, volume (vol), fee, raw (json)
+    Strategy:
+      1) Try offset paging (ofs).
+      2) If it plateaus early (e.g., always ~600), auto-fallback to time-cursor paging:
+         advance start:= last_seen_ts and reset ofs=0 until no new trades.
     """
-    import time, json as _json
-    dry_run = bool(payload.get("dry_run", False))
+    import time, json as _json, math as _math
+
+    dry_run     = bool(payload.get("dry_run", False))
     since_hours = int(payload.get("since_hours", 72) or 72)
-    hard_limit = int(payload.get("limit", 50000) or 50000)
+    hard_limit  = int(payload.get("limit", 50000) or 50000)
+    min_delay   = float(os.getenv("KRAKEN_MIN_DELAY", "0.35") or 0.35)
 
     key, sec, *_ = _kraken_creds()
     if not (key and sec):
         return {"ok": False, "error": "missing_credentials"}
 
-    start_ts = int(time.time() - since_hours * 3600)
-    ofs = 0
-    pulled = 0
-    pages = 0
-    kraken_count = None
-
-    # Accumulate and write in batches
-    batch = []
-    wrote_rows = 0
+    start_ts0 = int(time.time() - since_hours * 3600)
 
     UPSERT_SQL = """
     INSERT INTO trades (txid, ts, symbol, side, price, volume, fee, strategy, raw)
@@ -625,77 +620,142 @@ def journal_sync(payload: Dict[str, Any] = Body(...)):
         price   = excluded.price,
         volume  = excluded.volume,
         fee     = excluded.fee,
-        -- keep existing strategy if present; otherwise take new one (which is NULL for sync)
         strategy= COALESCE(trades.strategy, excluded.strategy),
         raw     = excluded.raw
     """
 
-    def flush_batch():
-        nonlocal batch, wrote_rows
+    def flush_batch(batch):
         if dry_run or not batch:
-            batch.clear()
-            return
+            return 0
         conn = _db(); cur = conn.cursor()
         cur.executemany(UPSERT_SQL, batch)
         conn.commit()
-        wrote_rows += len(batch)
+        n = len(batch)
         conn.close()
-        batch.clear()
+        return n
+
+    def map_row(txid, t):
+        # Map Kraken trade fields safely
+        try: ts = float(t.get("time")) if t.get("time") is not None else None
+        except: ts = None
+        symbol = t.get("pair")
+        side   = t.get("type")
+        try: price = float(t.get("price")) if t.get("price") is not None else None
+        except: price = None
+        try: volume = float(t.get("vol")) if t.get("vol") is not None else None
+        except: volume = None
+        try: fee    = float(t.get("fee")) if t.get("fee") is not None else None
+        except: fee = None
+        raw = _json.dumps(t, separators=(",", ":"), ensure_ascii=False)
+        return (str(txid), ts, symbol, side, price, volume, fee, None, raw)
+
+    total_writes = 0
+    total_pulled = 0
+    pages        = 0
+    kraken_count = None
+    last_seen_ts = None
+    notes        = []
+
+    # ---------- Phase A: ofs paging ----------
+    start_ts = start_ts0
+    ofs      = 0
+    plateau  = False
 
     while True:
-        try:
-            resp = kraken_private("TradesHistory", {"start": start_ts, "ofs": ofs}, key, sec)
-            res = resp.get("result") or {}
-            trades = res.get("trades") or {}
-            kraken_count = res.get("count", kraken_count)
-            keys = list(trades.keys())
-        except Exception as e:
-            log.warning("TradesHistory page error ofs=%s: %s", ofs, e)
+        time.sleep(min_delay)
+        resp = kraken_private("TradesHistory", {"start": start_ts, "ofs": ofs}, key, sec)
+        if isinstance(resp, dict) and resp.get("error"):
+            notes.append({"phase":"ofs", "ofs":ofs, "error": resp.get("error")})
+            # break to fallback if error list present (rate limit, etc.)
+            plateau = True
             break
 
+        res    = (resp.get("result") or {}) if isinstance(resp, dict) else {}
+        trades = res.get("trades") or {}
+        kraken_count = res.get("count", kraken_count)
+        keys = list(trades.keys())
         if not keys:
+            # no more pages in ofs mode
             break
 
         pages += 1
-        pulled += len(keys)
+        total_pulled += len(keys)
 
+        batch = [map_row(txid, trades[txid]) for txid in keys]
+        wrote = flush_batch(batch)
+        total_writes += wrote
+
+        # track cursor (max ts seen)
         for txid in keys:
-            t = trades.get(txid) or {}
-            # Map fields with safe coercion
-            try: ts = float(t.get("time")) if t.get("time") is not None else None
-            except: ts = None
-            symbol = t.get("pair")
-            side   = t.get("type")
-            try: price = float(t.get("price")) if t.get("price") is not None else None
-            except: price = None
-            try: volume = float(t.get("vol")) if t.get("vol") is not None else None
-            except: volume = None
-            try: fee    = float(t.get("fee")) if t.get("fee") is not None else None
-            except: fee = None
-
-            raw = _json.dumps(t, separators=(",", ":"), ensure_ascii=False)
-            # We do NOT set a strategy during sync (leave as None so enrich can label)
-            batch.append((str(txid), ts, symbol, side, price, volume, fee, None, raw))
-
-            # Flush in chunks and respect limit
-            if len(batch) >= 1000:
-                flush_batch()
-                if hard_limit and wrote_rows >= hard_limit:
-                    break
-
-        if hard_limit and wrote_rows >= hard_limit:
-            break
+            t = trades[txid]
+            try:
+                ts = float(t.get("time")) if t.get("time") is not None else None
+                if ts is not None:
+                    if last_seen_ts is None or ts > last_seen_ts:
+                        last_seen_ts = ts
+            except:
+                pass
 
         ofs += len(keys)
-        # stop if we've paged through everything Kraken says exists
-        if kraken_count is not None and ofs >= kraken_count:
-            break
-        # safety guard for runaway pagination
-        if pages > 200:
+
+        if hard_limit and total_writes >= hard_limit:
             break
 
-    # final flush
-    flush_batch()
+        # If we consistently get exactly the same window (e.g., 50 per page and then empties),
+        # we'll break out to cursor mode next.
+        if pages > 0 and total_pulled >= 600 and (kraken_count or 0) and total_pulled < (kraken_count or 999999):
+            plateau = True
+            break
+
+        # hard safety
+        if pages > 300:
+            plateau = True
+            break
+
+    # ---------- Phase B: time-cursor fallback ----------
+    # If ofs mode plateaued before hitting kraken_count, walk forward by time.
+    if plateau:
+        cursor = (last_seen_ts or start_ts0)
+        # Move slightly backward to avoid gaps (Kraken times can be identical across many rows)
+        backoff = 0.5
+        cursor  = max(cursor - backoff, 0)
+        cursor_pages = 0
+
+        while True:
+            time.sleep(min_delay)
+            resp = kraken_private("TradesHistory", {"start": int(_math.floor(cursor)), "ofs": 0}, key, sec)
+            if isinstance(resp, dict) and resp.get("error"):
+                notes.append({"phase":"cursor", "cursor":cursor, "error": resp.get("error")})
+                break
+
+            res    = (resp.get("result") or {}) if isinstance(resp, dict) else {}
+            trades = res.get("trades") or {}
+            keys   = list(trades.keys())
+            if not keys:
+                # no more beyond cursor
+                break
+
+            # sort keys by trade time to advance cursor deterministically
+            keys.sort(key=lambda k: trades[k].get("time") or 0)
+            pages        += 1
+            cursor_pages += 1
+            total_pulled += len(keys)
+
+            batch = [map_row(txid, trades[txid]) for txid in keys]
+            wrote = flush_batch(batch)
+            total_writes += wrote
+
+            # advance cursor to strictly greater than the max time we just saw
+            max_ts = max([trades[k].get("time") or 0 for k in keys]) if keys else cursor
+            # nudge forward to avoid re-reading same page
+            cursor = (float(max_ts) + 0.5)
+
+            if hard_limit and total_writes >= hard_limit:
+                break
+            if cursor_pages > 600:
+                # safety guard
+                notes.append({"phase":"cursor", "stopped":"cursor_pages_guard"})
+                break
 
     # Count rows post-write for sanity
     try:
@@ -704,22 +764,23 @@ def journal_sync(payload: Dict[str, Any] = Body(...)):
         conn.close()
     except Exception as e:
         total_rows = None
-        log.warning("journal_sync count error: %s", e)
+        notes.append({"post_count_error": str(e)})
 
     return {
         "ok": True,
         "dry_run": dry_run,
-        "count": wrote_rows,
+        "count": total_writes,
         "debug": {
             "creds_present": True,
             "since_hours": since_hours,
-            "start_ts": start_ts,
-            "start_iso": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(start_ts)),
+            "start_ts": start_ts0,
+            "start_iso": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(start_ts0)),
             "pages": pages,
-            "pulled": pulled,
+            "pulled": total_pulled,
             "kraken_count": kraken_count,
             "hard_limit": hard_limit,
-            "post_total_rows": total_rows
+            "post_total_rows": total_rows,
+            "notes": notes
         }
     }
 
@@ -1091,6 +1152,64 @@ def debug_kraken_trades(since_hours: int = 720, limit: int = 50000):
     out["first_ts"] = first_ts
     out["last_ts"] = last_ts
     out["sample_txids"] = sample
+    return out
+
+@app.get("/debug/kraken/trades2")
+def debug_kraken_trades2(since_hours: int = 200000, mode: str = "cursor", max_pages: int = 300):
+    """
+    Diagnostic: list how many we can pull by mode.
+      - mode=ofs: plain ofs pagination
+      - mode=cursor: advance start by last_seen_ts
+    """
+    import time, math as _math
+    key, sec, *_ = _kraken_creds()
+    out = {"ok": True, "creds_present": bool(key and sec), "mode": mode,
+           "pages": 0, "pulled": 0, "count": None, "first_ts": None, "last_ts": None, "errors": []}
+    if not (key and sec):
+        out["ok"] = False; out["error"] = "no_creds"; return out
+
+    start_ts = int(time.time() - since_hours * 3600)
+    min_delay = float(os.getenv("KRAKEN_MIN_DELAY", "0.35") or 0.35)
+
+    def upd(ts):
+        if ts is None: return
+        if out["first_ts"] is None or ts < out["first_ts"]: out["first_ts"] = ts
+        if out["last_ts"]  is None or ts > out["last_ts"]:  out["last_ts"]  = ts
+
+    if mode == "ofs":
+        ofs = 0
+        while out["pages"] < max_pages:
+            time.sleep(min_delay)
+            resp = kraken_private("TradesHistory", {"start": start_ts, "ofs": ofs}, key, sec)
+            if isinstance(resp, dict) and resp.get("error"):
+                out["errors"].append({"ofs":ofs,"error":resp.get("error")}); break
+            res = (resp.get("result") or {}) if isinstance(resp, dict) else {}
+            out["count"] = res.get("count", out["count"])
+            trades = res.get("trades") or {}
+            keys = list(trades.keys())
+            if not keys: break
+            out["pages"] += 1; out["pulled"] += len(keys)
+            for k in keys: upd(trades[k].get("time"))
+            ofs += len(keys)
+    else:
+        cursor = start_ts
+        pages = 0
+        while pages < max_pages:
+            time.sleep(min_delay)
+            resp = kraken_private("TradesHistory", {"start": int(_math.floor(cursor)), "ofs": 0}, key, sec)
+            if isinstance(resp, dict) and resp.get("error"):
+                out["errors"].append({"cursor":cursor,"error":resp.get("error")}); break
+            res = (resp.get("result") or {}) if isinstance(resp, dict) else {}
+            out["count"] = res.get("count", out["count"])
+            trades = res.get("trades") or {}
+            keys = list(trades.keys())
+            if not keys: break
+            # sort by time to move cursor forward
+            keys.sort(key=lambda k: trades[k].get("time") or 0)
+            pages += 1; out["pages"] += 1; out["pulled"] += len(keys)
+            for k in keys: upd(trades[k].get("time"))
+            cursor = (float(trades[keys[-1]].get("time") or cursor) + 0.5)
+
     return out
 
 @app.get("/pnl/summary")
