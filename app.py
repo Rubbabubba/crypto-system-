@@ -1,5 +1,5 @@
 """
-crypto-system-api (app.py) — v2.3.3
+crypto-system-api (app.py) — v2.3.6
 ------------------------------------
 Full drop-in FastAPI app.
 
@@ -583,86 +583,145 @@ def journal_backfill(payload: Dict[str, Any] = Body(...)):
 
 @app.post("/journal/sync")
 def journal_sync(payload: Dict[str, Any] = Body(...)):
-    since_hours = int(payload.get("since_hours", 24 * 90))
-    limit = int(payload.get("limit", 50000))
-    start_ts = hours_to_start_ts(since_hours)
+    """
+    Pull trades from Kraken TradesHistory and upsert into sqlite.
 
-    inserted, seen, last_error = _pull_trades_from_kraken(since_hours, limit)
+    Payload:
+      - since_hours: int (default 72)
+      - limit: int (default 50000) maximum rows to write this call
+      - dry_run: bool (optional) if true, do not write
+
+    Behavior:
+      - Paginates with 'ofs' until Kraken's 'count' reached or 'limit' cap hit
+      - Upsert on txid; preserves existing 'strategy' if already labeled
+      - Stores: txid, ts, symbol (pair), side (type), price, volume (vol), fee, raw (json)
+    """
+    import time, json as _json
+    dry_run = bool(payload.get("dry_run", False))
+    since_hours = int(payload.get("since_hours", 72) or 72)
+    hard_limit = int(payload.get("limit", 50000) or 50000)
+
+    key, sec, *_ = _kraken_creds()
+    if not (key and sec):
+        return {"ok": False, "error": "missing_credentials"}
+
+    start_ts = int(time.time() - since_hours * 3600)
+    ofs = 0
+    pulled = 0
+    pages = 0
+    kraken_count = None
+
+    # Accumulate and write in batches
+    batch = []
+    wrote_rows = 0
+
+    UPSERT_SQL = """
+    INSERT INTO trades (txid, ts, symbol, side, price, volume, fee, strategy, raw)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(txid) DO UPDATE SET
+        ts      = excluded.ts,
+        symbol  = excluded.symbol,
+        side    = excluded.side,
+        price   = excluded.price,
+        volume  = excluded.volume,
+        fee     = excluded.fee,
+        -- keep existing strategy if present; otherwise take new one (which is NULL for sync)
+        strategy= COALESCE(trades.strategy, excluded.strategy),
+        raw     = excluded.raw
+    """
+
+    def flush_batch():
+        nonlocal batch, wrote_rows
+        if dry_run or not batch:
+            batch.clear()
+            return
+        conn = _db(); cur = conn.cursor()
+        cur.executemany(UPSERT_SQL, batch)
+        conn.commit()
+        wrote_rows += len(batch)
+        conn.close()
+        batch.clear()
+
+    while True:
+        try:
+            resp = kraken_private("TradesHistory", {"start": start_ts, "ofs": ofs}, key, sec)
+            res = resp.get("result") or {}
+            trades = res.get("trades") or {}
+            kraken_count = res.get("count", kraken_count)
+            keys = list(trades.keys())
+        except Exception as e:
+            log.warning("TradesHistory page error ofs=%s: %s", ofs, e)
+            break
+
+        if not keys:
+            break
+
+        pages += 1
+        pulled += len(keys)
+
+        for txid in keys:
+            t = trades.get(txid) or {}
+            # Map fields with safe coercion
+            try: ts = float(t.get("time")) if t.get("time") is not None else None
+            except: ts = None
+            symbol = t.get("pair")
+            side   = t.get("type")
+            try: price = float(t.get("price")) if t.get("price") is not None else None
+            except: price = None
+            try: volume = float(t.get("vol")) if t.get("vol") is not None else None
+            except: volume = None
+            try: fee    = float(t.get("fee")) if t.get("fee") is not None else None
+            except: fee = None
+
+            raw = _json.dumps(t, separators=(",", ":"), ensure_ascii=False)
+            # We do NOT set a strategy during sync (leave as None so enrich can label)
+            batch.append((str(txid), ts, symbol, side, price, volume, fee, None, raw))
+
+            # Flush in chunks and respect limit
+            if len(batch) >= 1000:
+                flush_batch()
+                if hard_limit and wrote_rows >= hard_limit:
+                    break
+
+        if hard_limit and wrote_rows >= hard_limit:
+            break
+
+        ofs += len(keys)
+        # stop if we've paged through everything Kraken says exists
+        if kraken_count is not None and ofs >= kraken_count:
+            break
+        # safety guard for runaway pagination
+        if pages > 200:
+            break
+
+    # final flush
+    flush_batch()
+
+    # Count rows post-write for sanity
+    try:
+        conn = _db(); cur = conn.cursor()
+        total_rows = cur.execute("SELECT COUNT(*) FROM trades").fetchone()[0]
+        conn.close()
+    except Exception as e:
+        total_rows = None
+        log.warning("journal_sync count error: %s", e)
+
     return {
         "ok": True,
-        "updated": inserted,
-        "count": seen,
+        "dry_run": dry_run,
+        "count": wrote_rows,
         "debug": {
-            "creds_present": all(_kraken_creds()[:2]),
+            "creds_present": True,
             "since_hours": since_hours,
             "start_ts": start_ts,
-            "start_iso": dt.datetime.utcfromtimestamp(start_ts).isoformat() + "Z" if start_ts else None,
-            "limit": limit,
+            "start_iso": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(start_ts)),
+            "pages": pages,
+            "pulled": pulled,
+            "kraken_count": kraken_count,
+            "hard_limit": hard_limit,
+            "post_total_rows": total_rows
         }
     }
-
-def _fetch_prices(symbols: List[str]) -> Dict[str, float]:
-    prices = {}
-    for sym in symbols:
-        try:
-            base, quote = sym.split("/")
-            data = price_ticker(base, quote)
-            prices[sym] = float(data.get("price", 0.0))
-        except Exception:
-            prices[sym] = 0.0
-    return prices
-
-def _compute_fifo_pnl(rows: List[Dict[str, Any]], prices: Dict[str, float]):
-    # rows: must contain symbol, side, price, volume, fee, strategy
-    per = {}  # (strategy, symbol) -> dict
-    for r in sorted(rows, key=lambda x: x.get("ts", 0)):
-        strat = (r.get("strategy") or "misc")
-        sym = r.get("symbol")
-        side = (r.get("side") or "").lower()
-        price = float(r.get("price") or 0.0)
-        vol = float(r.get("volume") or 0.0)
-        fee = float(r.get("fee") or 0.0)
-        key = (strat, sym)
-        d = per.setdefault(key, {"qty":0.0, "avg":0.0, "realized":0.0, "fees":0.0})
-        d["fees"] += fee
-        if side == "buy":
-            new_qty = d["qty"] + vol
-            if new_qty > 0:
-                d["avg"] = (d["qty"]*d["avg"] + vol*price) / new_qty
-            d["qty"] = new_qty
-        elif side == "sell":
-            close = min(vol, d["qty"])
-            if close > 0:
-                d["realized"] += (price - d["avg"]) * close
-                d["qty"] -= close
-        else:
-            continue
-    per_strategy = {}
-    per_symbol = {}
-    total = {"realized":0.0, "unrealized":0.0, "fees":0.0, "equity":0.0}
-    out_per_strategy = []
-    out_per_symbol = []
-    for (strat, sym), d in per.items():
-        mkt = prices.get(sym, 0.0)
-        unreal = (mkt - d["avg"]) * d["qty"] if d["qty"] != 0 else 0.0
-        realized = d["realized"]
-        fees = d["fees"]
-        equity = realized + unreal - fees
-        S = per_strategy.setdefault(strat, {"realized":0.0,"unrealized":0.0,"fees":0.0,"equity":0.0})
-        for k,v in [("realized",realized),("unrealized",unreal),("fees",fees),("equity",equity)]:
-            S[k] += v
-        P = per_symbol.setdefault(sym, {"realized":0.0,"unrealized":0.0,"fees":0.0,"equity":0.0})
-        for k,v in [("realized",realized),("unrealized",unreal),("fees",fees),("equity",equity)]:
-            P[k] += v
-        total["realized"] += realized
-        total["unrealized"] += unreal
-        total["fees"] += fees
-        total["equity"] += equity
-    for strat, vals in per_strategy.items():
-        out_per_strategy.append({"strategy": strat, **vals})
-    for sym, vals in per_symbol.items():
-        out_per_symbol.append({"symbol": sym, **vals})
-    return {"total": total, "per_strategy": out_per_strategy, "per_symbol": out_per_symbol}
 
 DAILY_JSON = os.path.join(DATA_DIR, "daily.json")
 
