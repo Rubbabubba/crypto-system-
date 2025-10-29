@@ -764,7 +764,8 @@ def journal_counts():
 def journal_enrich(payload: Dict[str, Any] = Body(...)):
     """
     Label unlabeled trades with strategy using Kraken metadata + optional rules.
-    - Authoritative path: QueryTrades -> QueryOrdersInfo
+    - Authoritative path: (raw.ordertxid if present) OR QueryTrades -> ordertxid
+    - Then QueryOrdersInfo -> infer strategy via userref/descr
     - Fallback rules: whitelist.json + windows.json (optional)
     - Safe: dry_run support; preserves existing non-empty strategies
     """
@@ -803,53 +804,61 @@ def journal_enrich(payload: Dict[str, Any] = Body(...)):
 
     trade_info = {}
     trade_ids  = []
+    txid_to_order = {}
+
     for txid, ts, symbol, raw in rows:
         txid = str(txid)
+        meta = _j(raw)
+        trade_info[txid] = {"ts": ts, "symbol": symbol, "raw": meta}
         trade_ids.append(txid)
-        trade_info[txid] = {"ts": ts, "symbol": symbol, "raw": _j(raw)}
-    log.info("enrich: scanned=%d unlabeled=%d", scanned, len(trade_ids))
+        # Some Kraken trade rows already contain ordertxid in the trade body:
+        otx = meta.get("ordertxid")
+        if isinstance(otx, list): 
+            otx = otx[0] if otx else None
+        if otx:
+            txid_to_order[txid] = str(otx)
 
-    # 2) QueryTrades -> map each trade to its ordertxid
+    log.info("enrich: scanned=%d unlabeled=%d with_raw_ordertxid=%d", scanned, len(trade_ids), len(txid_to_order))
+
     key, sec, *_ = _kraken_creds()
-    order_to_trades = {}
-    if key and sec and trade_ids:
-        trade_meta = {}
-        for i in range(0, len(trade_ids), batch_size):
-            chunk = trade_ids[i:i+batch_size]
+
+    # 2) For trades missing ordertxid, fetch via QueryTrades
+    if key and sec:
+        missing = [t for t in trade_ids if t not in txid_to_order]
+        for i in range(0, len(missing), batch_size):
+            chunk = missing[i:i+batch_size]
             try:
                 resp = kraken_private("QueryTrades", {"txid": ",".join(chunk)}, key, sec)
                 res = (resp.get("result") or {}) if isinstance(resp, dict) else {}
-                trade_meta.update(res)
+                for t in chunk:
+                    m = res.get(t) or {}
+                    otx = m.get("ordertxid")
+                    if isinstance(otx, list): otx = otx[0] if otx else None
+                    if otx:
+                        txid_to_order[t] = str(otx)
             except Exception as e:
                 log.warning("QueryTrades failed for %d txids: %s", len(chunk), e)
-        for txid in trade_ids:
-            meta = trade_meta.get(txid, {})
-            otx  = meta.get("ordertxid")
-            if isinstance(otx, list): otx = otx[0] if otx else None
-            if otx:
-                order_to_trades.setdefault(str(otx), []).append(txid)
     else:
-        log.warning("enrich: missing creds or empty trade_ids; skipping Kraken metadata")
+        log.warning("enrich: missing creds; skipping QueryTrades/QueryOrdersInfo")
 
-    all_order_ids = list(order_to_trades.keys())
+    order_ids = sorted(set(txid_to_order.values()))
+    orders_meta = {}
 
     # 3) QueryOrdersInfo -> infer strategy from userref / descr
-    orders_meta = {}
-    if key and sec and all_order_ids:
-        for i in range(0, len(all_order_ids), batch_size):
-            chunk = all_order_ids[i:i+batch_size]
+    if key and sec and order_ids:
+        for i in range(0, len(order_ids), batch_size):
+            chunk = order_ids[i:i+batch_size]
             try:
                 resp = kraken_private("QueryOrdersInfo", {"txid": ",".join(chunk)}, key, sec)
                 res = (resp.get("result") or {}) if isinstance(resp, dict) else {}
                 orders_meta.update(res)
             except Exception as e:
                 log.warning("QueryOrdersInfo failed for %d orders: %s", len(chunk), e)
-    log.info("enrich: orders_meta_fetched=%d", len(orders_meta))
 
     def infer_from_order(o: Dict[str, Any]):
         if not isinstance(o, dict): return None
         u = o.get("userref")
-        # userref can be an int or small string like "c3"
+        # userref can be an int or str like "c3"
         if isinstance(u, str) and _re.fullmatch(r"c[1-9]", u.lower()): return u.lower()
         if isinstance(u, int) and 1 <= u <= 9: return f"c{u}"
         d = o.get("descr") or {}
@@ -863,18 +872,14 @@ def journal_enrich(payload: Dict[str, Any] = Body(...)):
 
     # 4) optional fallback rules
     whitelist, windows = {}, {}
-    for path in ("whitelist.json", ):
-        try:
-            whitelist = json.load(open(path, "r", encoding="utf-8")); break
-        except Exception: pass
-    for path in ("windows.json", ):
-        try:
-            windows = json.load(open(path, "r", encoding="utf-8")); break
-        except Exception: pass
+    try: whitelist = json.load(open("whitelist.json", "r", encoding="utf-8"))
+    except Exception: pass
+    try: windows = json.load(open("windows.json", "r", encoding="utf-8"))
+    except Exception: pass
 
     tzname = os.getenv("TZ", "America/Chicago")
     try: tz = pytz.timezone(tzname)
-    except Exception:
+    except Exception: 
         tz = pytz.UTC
 
     def allowed_by_rules(strat, symbol, ts):
@@ -886,7 +891,7 @@ def journal_enrich(payload: Dict[str, Any] = Body(...)):
         if not days and not hours: return True
         try:
             t = _dt.datetime.fromtimestamp(float(ts), tz)
-            if days  and t.strftime("%a") not in days:   return False
+            if days  and t.strftime("%a") not in days: return False
             if hours and t.hour not in set(int(h) for h in hours): return False
             return True
         except Exception:
@@ -896,13 +901,13 @@ def journal_enrich(payload: Dict[str, Any] = Body(...)):
     to_update = {}
     api_labeled = rules_labeled = ambiguous = missing_order = 0
 
-    for oid, txs in order_to_trades.items():
+    for txid, oid in txid_to_order.items():
         strat = infer_from_order(orders_meta.get(oid) or {})
         if strat:
-            for tx in txs: to_update[tx] = strat
-            api_labeled += len(txs)
+            to_update[txid] = strat
+            api_labeled += 1
         else:
-            missing_order += len(txs)
+            missing_order += 1
 
     if apply_rules and (whitelist or windows):
         all_strats = sorted(set(list(whitelist.keys()) + list(windows.keys())))
@@ -918,7 +923,7 @@ def journal_enrich(payload: Dict[str, Any] = Body(...)):
 
     if dry_run:
         sample = dict(list(to_update.items())[:10])
-        return {"ok": True, "dry_run": True, "scanned": scanned, "orders_checked": len(all_order_ids),
+        return {"ok": True, "dry_run": True, "scanned": scanned, "orders_checked": len(order_ids),
                 "to_update_count": len(to_update), "sample_updates": sample}
 
     # 6) write updates (preserve existing non-empty strategy)
@@ -941,7 +946,7 @@ def journal_enrich(payload: Dict[str, Any] = Body(...)):
     return {
         "ok": True,
         "scanned": scanned,
-        "orders_checked": len(all_order_ids),
+        "orders_checked": len(order_ids),
         "updated": updated,
         "api_labeled": api_labeled,
         "rules_labeled": rules_labeled,
