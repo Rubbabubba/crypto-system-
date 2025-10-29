@@ -1087,19 +1087,104 @@ def debug_kraken_trades(since_hours: int = 720, limit: int = 50000):
     out["last_ts"] = last_ts
     out["sample_txids"] = sample
     return out
+
 @app.get("/pnl/summary")
 def pnl_summary():
-    conn = _db()
-    cur = conn.cursor()
-    cur.execute("SELECT ts, symbol, side, price, volume, fee, COALESCE(strategy, 'misc') as strategy FROM trades")
-    rows = [
-        {"ts": r[0], "symbol": r[1], "side": r[2], "price": r[3], "volume": r[4], "fee": r[5], "strategy": r[6]} for r in cur.fetchall()
-    ]
-    symbols = sorted({r["symbol"] for r in rows})
-    prices = _fetch_prices(symbols)
-    roll = _compute_fifo_pnl(rows, prices)
-    roll.update({"ok": True, "counts": {"journal_rows": len(rows)}})
-    return roll
+    """
+    Compute realized/unrealized, fees, equity by strategy and by symbol.
+    Safe on empty/unlabeled journals.
+    """
+    import json
+    conn = _db(); cur = conn.cursor()
+
+    # Pull minimal fields
+    try:
+        cur.execute("SELECT symbol, side, price, volume, fee, strategy, raw FROM trades")
+        rows = cur.fetchall()
+    except Exception as e:
+        conn.close()
+        return {"ok": False, "error": f"db_read: {e}"}
+
+    conn.close()
+
+    # group by symbol FIFO to estimate realized P&L; unrealized = 0 for journal-only view
+    from collections import defaultdict, deque
+
+    lots = defaultdict(deque)  # symbol -> queue of (qty, price)
+    realized = defaultdict(float)
+    fees     = defaultdict(float)
+
+    def add_fee(sym, f):
+        try: fees[sym] += float(f or 0)
+        except: pass
+
+    for symbol, side, price, volume, fee, strategy, raw in rows:
+        if not symbol or price is None or volume is None:
+            add_fee(symbol or "UNKNOWN", fee)
+            continue
+        qty  = float(volume)
+        prc  = float(price)
+        sym  = str(symbol)
+
+        # side: 'buy' adds to inventory; 'sell' reduces FIFO and realizes P&L
+        if (side or "").lower() == "buy":
+            lots[sym].append([qty, prc])
+        elif (side or "").lower() == "sell":
+            remain = qty
+            while remain > 1e-12 and lots[sym]:
+                lot_qty, lot_price = lots[sym][0]
+                take = min(remain, lot_qty)
+                realized[sym] += (prc - lot_price) * take
+                lot_qty -= take
+                remain  -= take
+                if lot_qty <= 1e-12:
+                    lots[sym].popleft()
+                else:
+                    lots[sym][0][0] = lot_qty
+        add_fee(sym, fee)
+
+    # pack totals
+    total_realized = sum(realized.values())
+    total_fees     = sum(fees.values())
+    total_unreal   = 0.0
+    total_equity   = total_realized + total_unreal - total_fees
+
+    # per strategy = aggregate over rows (using realized-by-symbol split)
+    # If you want exact realized per strategy, you’ll need per-trade pairing; for now, split realized to 'misc' if unlabeled.
+    per_strategy = defaultdict(lambda: {"realized":0.0,"unrealized":0.0,"fees":0.0,"equity":0.0})
+    per_symbol   = []
+
+    # fees per symbol already tracked; distribute to strategy buckets by row fees
+    for symbol, side, price, volume, fee, strategy, raw in rows:
+        strat = (str(strategy).strip() if strategy else "misc")
+        per_strategy[strat]["fees"] += float(fee or 0)
+
+    for sym in sorted(set([r[0] for r in rows if r[0]])):
+        r = float(realized.get(sym, 0.0))
+        f = float(fees.get(sym, 0.0))
+        per_symbol.append({"symbol": sym, "realized": r, "unrealized": 0.0, "fees": f, "equity": r - f})
+
+    # Put all realized into 'misc' unless you later compute per-strategy pairing
+    per_strategy["misc"]["realized"]   += total_realized
+    per_strategy["misc"]["unrealized"] += 0.0
+    per_strategy["misc"]["equity"]     += total_realized - per_strategy["misc"]["fees"]
+
+    return {
+        "total": {
+            "realized": total_realized,
+            "unrealized": total_unreal,
+            "fees": total_fees,
+            "equity": total_equity
+        },
+        "per_strategy": [
+            {"strategy": k, **v} for k, v in sorted(per_strategy.items(), key=lambda x: x[0])
+        ],
+        "per_symbol": per_symbol,
+        "ok": True,
+        "counts": {
+            "journal_rows": len(rows)
+        }
+    }
 
 @app.get("/kpis")
 def kpis():
