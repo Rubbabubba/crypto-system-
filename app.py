@@ -1,5 +1,5 @@
 """
-crypto-system-api (app.py) — v2.3.3
+crypto-system-api (app.py) — v2.4.0
 ------------------------------------
 Full drop-in FastAPI app.
 
@@ -46,21 +46,6 @@ import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-import requests
-from fastapi import Body, FastAPI, HTTPException, Query
-
-# --- logging baseline for Render stdout ---
-import logging, sys, os as _os
-LOG_LEVEL = _os.getenv("LOG_LEVEL", "INFO").upper()
-logging.basicConfig(
-    level=getattr(logging, LOG_LEVEL, logging.INFO),
-    format="%(asctime)s %(levelname)s %(name)s :: %(message)s",
-    handlers=[logging.StreamHandler(sys.stdout)],
-    force=True,
-)
-log = logging.getLogger("crypto-system")
-log.info("Logging initialized at level %s", LOG_LEVEL)
-__version__ = '2.3.3'
 # Routes:
 #  - /
 #  - /health
@@ -82,12 +67,31 @@ __version__ = '2.3.3'
 #  - /debug/log/test
 #  - /debug/kraken
 #  - /debug/db
+#  - /debug/kraken/trades
+#  - /debug/kraken/trades2
 #  - /pnl/summary
 #  - /kpis
 #  - /scheduler/status
 #  - /scheduler/start
 #  - /scheduler/stop
 #  - /scheduler/run
+
+import requests
+from fastapi import Body, FastAPI, HTTPException, Query
+
+# --- logging baseline for Render stdout ---
+import logging, sys, os as _os
+LOG_LEVEL = _os.getenv("LOG_LEVEL", "INFO").upper()
+logging.basicConfig(
+    level=getattr(logging, LOG_LEVEL, logging.INFO),
+    format="%(asctime)s %(levelname)s %(name)s :: %(message)s",
+    handlers=[logging.StreamHandler(sys.stdout)],
+    force=True,
+)
+log = logging.getLogger("crypto-system")
+log.info("Logging initialized at level %s", LOG_LEVEL)
+__version__ = '2.3.4'
+
 
 
 from fastapi.middleware.cors import CORSMiddleware
@@ -99,7 +103,7 @@ from pydantic import BaseModel
 # Version / Logging
 # --------------------------------------------------------------------------------------
 
-APP_VERSION = "1.12.6"
+APP_VERSION = "1.12.7"
 
 logging.basicConfig(
     level=logging.INFO,
@@ -580,86 +584,215 @@ def journal_backfill(payload: Dict[str, Any] = Body(...)):
 
 @app.post("/journal/sync")
 def journal_sync(payload: Dict[str, Any] = Body(...)):
-    since_hours = int(payload.get("since_hours", 24 * 90))
-    limit = int(payload.get("limit", 50000))
-    start_ts = hours_to_start_ts(since_hours)
+    """
+    Pull trades from Kraken TradesHistory and upsert into sqlite.
 
-    inserted, seen, last_error = _pull_trades_from_kraken(since_hours, limit)
+    Payload:
+      - since_hours: int (default 72)
+      - limit: int (default 50000) maximum rows to write this call
+      - dry_run: bool (optional) if true, do not write
+
+    Strategy:
+      1) ofs paging
+      2) if plateau or rate-limited, fallback to time-cursor paging
+      Both phases use retry with exponential backoff on 'EAPI:Rate limit exceeded'
+    """
+    import time, json as _json, math as _math
+
+    dry_run     = bool(payload.get("dry_run", False))
+    since_hours = int(payload.get("since_hours", 72) or 72)
+    hard_limit  = int(payload.get("limit", 50000) or 50000)
+
+    key, sec, *_ = _kraken_creds()
+    if not (key and sec):
+        return {"ok": False, "error": "missing_credentials"}
+
+    # pacing + retries from env
+    min_delay   = float(os.getenv("KRAKEN_MIN_DELAY", "0.35") or 0.35)   # base delay between calls
+    max_retries = int(os.getenv("KRAKEN_MAX_RETRIES", "6") or 6)         # backoff retries per call
+
+    def _sleep_base():
+        time.sleep(min_delay)
+
+    def _kraken_call(payload):
+        """TradesHistory with backoff on rate limit"""
+        delay = min_delay
+        for attempt in range(max_retries + 1):
+            resp = kraken_private("TradesHistory", payload, key, sec)
+            if not (isinstance(resp, dict) and resp.get("error")):
+                return resp
+            errs = resp.get("error") or []
+            is_rl = any("rate limit" in str(e).lower() for e in errs)
+            if not is_rl:
+                # non rate-limit error: return as-is
+                return resp
+            # rate limited -> exponential backoff with jitter
+            time.sleep(delay)
+            delay = min(delay * 1.7, 8.0)
+        return resp  # return last resp (still error)
+
+    start_ts0 = int(time.time() - since_hours * 3600)
+
+    UPSERT_SQL = """
+    INSERT INTO trades (txid, ts, symbol, side, price, volume, fee, strategy, raw)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(txid) DO UPDATE SET
+        ts      = excluded.ts,
+        symbol  = excluded.symbol,
+        side    = excluded.side,
+        price   = excluded.price,
+        volume  = excluded.volume,
+        fee     = excluded.fee,
+        strategy= COALESCE(trades.strategy, excluded.strategy),
+        raw     = excluded.raw
+    """
+
+    def flush_batch(batch):
+        if dry_run or not batch:
+            return 0
+        conn = _db(); cur = conn.cursor()
+        cur.executemany(UPSERT_SQL, batch)
+        conn.commit()
+        n = len(batch)
+        conn.close()
+        return n
+
+    def map_row(txid, t):
+        try: ts = float(t.get("time")) if t.get("time") is not None else None
+        except: ts = None
+        symbol = t.get("pair")
+        side   = t.get("type")
+        try: price = float(t.get("price")) if t.get("price") is not None else None
+        except: price = None
+        try: volume = float(t.get("vol")) if t.get("vol") is not None else None
+        except: volume = None
+        try: fee    = float(t.get("fee")) if t.get("fee") is not None else None
+        except: fee = None
+        raw = _json.dumps(t, separators=(",", ":"), ensure_ascii=False)
+        return (str(txid), ts, symbol, side, price, volume, fee, None, raw)
+
+    total_writes = 0
+    total_pulled = 0
+    pages        = 0
+    kraken_count = None
+    last_seen_ts = None
+    notes        = []
+
+    # ---------- Phase A: ofs paging ----------
+    start_ts = start_ts0
+    ofs      = 0
+    plateau  = False
+
+    while True:
+        _sleep_base()
+        resp = _kraken_call({"start": start_ts, "ofs": ofs})
+        if isinstance(resp, dict) and resp.get("error"):
+            notes.append({"phase":"ofs","ofs":ofs,"error":resp.get("error")})
+            plateau = True
+            break
+
+        res    = (resp.get("result") or {}) if isinstance(resp, dict) else {}
+        trades = res.get("trades") or {}
+        kraken_count = res.get("count", kraken_count)
+        keys = list(trades.keys())
+        if not keys:
+            break
+
+        pages += 1
+        total_pulled += len(keys)
+
+        batch = [map_row(txid, trades[txid]) for txid in keys]
+        total_writes += flush_batch(batch)
+
+        # track max ts for cursor fallback
+        for txid in keys:
+            t = trades[txid]
+            try:
+                ts = float(t.get("time")) if t.get("time") is not None else None
+                if ts is not None:
+                    if last_seen_ts is None or ts > last_seen_ts:
+                        last_seen_ts = ts
+            except:
+                pass
+
+        ofs += len(keys)
+
+        if hard_limit and total_writes >= hard_limit:
+            break
+
+        # if we’ve pulled a significant chunk but kraken_count indicates more, fallback
+        if total_pulled >= 600 and (kraken_count or 0) and total_pulled < (kraken_count or 999999):
+            plateau = True
+            break
+        if pages > 300:
+            plateau = True
+            break
+
+    # ---------- Phase B: time-cursor fallback ----------
+    if plateau:
+        cursor = (last_seen_ts or start_ts0)
+        # slight backoff to avoid missing trades with identical timestamps
+        cursor = max((cursor - 0.5) if cursor else start_ts0, 0.0)
+        cursor_pages = 0
+
+        while True:
+            _sleep_base()
+            payload = {"start": int(_math.floor(cursor)), "ofs": 0}
+            resp = _kraken_call(payload)
+            if isinstance(resp, dict) and resp.get("error"):
+                notes.append({"phase":"cursor","cursor":cursor,"error":resp.get("error")})
+                break
+
+            res    = (resp.get("result") or {}) if isinstance(resp, dict) else {}
+            trades = res.get("trades") or {}
+            keys   = list(trades.keys())
+            if not keys:
+                break
+
+            # sort by time so we can advance cursor deterministically
+            keys.sort(key=lambda k: trades[k].get("time") or 0)
+            pages        += 1
+            cursor_pages += 1
+            total_pulled += len(keys)
+
+            batch = [map_row(txid, trades[txid]) for txid in keys]
+            total_writes += flush_batch(batch)
+
+            max_ts = max([trades[k].get("time") or cursor for k in keys])
+            cursor = float(max_ts) + 0.5  # nudge ahead
+
+            if hard_limit and total_writes >= hard_limit:
+                break
+            if cursor_pages > 600:
+                notes.append({"phase":"cursor","stopped":"cursor_pages_guard"})
+                break
+
+    # Count rows post-write
+    try:
+        conn = _db(); cur = conn.cursor()
+        total_rows = cur.execute("SELECT COUNT(*) FROM trades").fetchone()[0]
+        conn.close()
+    except Exception as e:
+        total_rows = None
+        notes.append({"post_count_error": str(e)})
+
     return {
         "ok": True,
-        "updated": inserted,
-        "count": seen,
+        "dry_run": dry_run,
+        "count": total_writes,
         "debug": {
-            "creds_present": all(_kraken_creds()[:2]),
+            "creds_present": True,
             "since_hours": since_hours,
-            "start_ts": start_ts,
-            "start_iso": dt.datetime.utcfromtimestamp(start_ts).isoformat() + "Z" if start_ts else None,
-            "limit": limit,
+            "start_ts": start_ts0,
+            "start_iso": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(start_ts0)),
+            "pages": pages,
+            "pulled": total_pulled,
+            "kraken_count": kraken_count,
+            "hard_limit": hard_limit,
+            "post_total_rows": total_rows,
+            "notes": notes
         }
     }
-
-def _fetch_prices(symbols: List[str]) -> Dict[str, float]:
-    prices = {}
-    for sym in symbols:
-        try:
-            base, quote = sym.split("/")
-            data = price_ticker(base, quote)
-            prices[sym] = float(data.get("price", 0.0))
-        except Exception:
-            prices[sym] = 0.0
-    return prices
-
-def _compute_fifo_pnl(rows: List[Dict[str, Any]], prices: Dict[str, float]):
-    # rows: must contain symbol, side, price, volume, fee, strategy
-    per = {}  # (strategy, symbol) -> dict
-    for r in sorted(rows, key=lambda x: x.get("ts", 0)):
-        strat = (r.get("strategy") or "misc")
-        sym = r.get("symbol")
-        side = (r.get("side") or "").lower()
-        price = float(r.get("price") or 0.0)
-        vol = float(r.get("volume") or 0.0)
-        fee = float(r.get("fee") or 0.0)
-        key = (strat, sym)
-        d = per.setdefault(key, {"qty":0.0, "avg":0.0, "realized":0.0, "fees":0.0})
-        d["fees"] += fee
-        if side == "buy":
-            new_qty = d["qty"] + vol
-            if new_qty > 0:
-                d["avg"] = (d["qty"]*d["avg"] + vol*price) / new_qty
-            d["qty"] = new_qty
-        elif side == "sell":
-            close = min(vol, d["qty"])
-            if close > 0:
-                d["realized"] += (price - d["avg"]) * close
-                d["qty"] -= close
-        else:
-            continue
-    per_strategy = {}
-    per_symbol = {}
-    total = {"realized":0.0, "unrealized":0.0, "fees":0.0, "equity":0.0}
-    out_per_strategy = []
-    out_per_symbol = []
-    for (strat, sym), d in per.items():
-        mkt = prices.get(sym, 0.0)
-        unreal = (mkt - d["avg"]) * d["qty"] if d["qty"] != 0 else 0.0
-        realized = d["realized"]
-        fees = d["fees"]
-        equity = realized + unreal - fees
-        S = per_strategy.setdefault(strat, {"realized":0.0,"unrealized":0.0,"fees":0.0,"equity":0.0})
-        for k,v in [("realized",realized),("unrealized",unreal),("fees",fees),("equity",equity)]:
-            S[k] += v
-        P = per_symbol.setdefault(sym, {"realized":0.0,"unrealized":0.0,"fees":0.0,"equity":0.0})
-        for k,v in [("realized",realized),("unrealized",unreal),("fees",fees),("equity",equity)]:
-            P[k] += v
-        total["realized"] += realized
-        total["unrealized"] += unreal
-        total["fees"] += fees
-        total["equity"] += equity
-    for strat, vals in per_strategy.items():
-        out_per_strategy.append({"strategy": strat, **vals})
-    for sym, vals in per_symbol.items():
-        out_per_symbol.append({"symbol": sym, **vals})
-    return {"total": total, "per_strategy": out_per_strategy, "per_symbol": out_per_symbol}
 
 DAILY_JSON = os.path.join(DATA_DIR, "daily.json")
 
@@ -701,17 +834,21 @@ def journal_counts():
 @app.post("/journal/enrich")
 def journal_enrich(payload: Dict[str, Any] = Body(...)):
     """
-    Backfill strategies for unlabeled trades:
-    A) Kraken QueryTrades (trade txid -> ordertxid)
-    B) Kraken QueryOrdersInfo (ordertxid -> userref/descr -> strategy)
-    C) Optional rules fallback (whitelist/windows) when unambiguous
-    Body: { "batch_size": 40, "max_rows": 5000, "apply_rules": true }
+    Label unlabeled trades with strategy using Kraken metadata + optional rules.
+    - Authoritative path: (raw.ordertxid if present) OR QueryTrades -> ordertxid
+    - Then QueryOrdersInfo -> infer strategy via userref/descr
+    - Fallback rules: whitelist.json + windows.json (optional)
+    - Safe: dry_run support; preserves existing non-empty strategies
     """
-    batch_size = int(payload.get("batch_size", 40) or 40)
-    max_rows   = int(payload.get("max_rows", 5000) or 5000)
+    import json, re as _re, datetime as _dt
+    import pytz
+
+    dry_run     = bool(payload.get("dry_run", False))
+    batch_size  = int(payload.get("batch_size", 40) or 40)
+    max_rows    = int(payload.get("max_rows", 5000) or 5000)
     apply_rules = bool(payload.get("apply_rules", True))
 
-    # 1) Load unlabeled trades
+    # 1) load unlabeled trades
     conn = _db(); cur = conn.cursor()
     try:
         cur.execute("""
@@ -730,65 +867,69 @@ def journal_enrich(payload: Dict[str, Any] = Body(...)):
                 "api_labeled": 0, "rules_labeled": 0, "ambiguous": 0, "missing_order": 0,
                 "apply_rules": apply_rules, "batch_size": batch_size, "max_rows": max_rows}
 
-    # 2) Prepare trade info
     def _j(x):
         try:
             return json.loads(x) if isinstance(x, str) else (x or {})
         except Exception:
             return {}
 
-    trade_info: Dict[str, Dict[str, Any]] = {}
-    trade_ids: List[str] = []
+    trade_info = {}
+    trade_ids  = []
+    txid_to_order = {}
+
     for txid, ts, symbol, raw in rows:
         txid = str(txid)
+        meta = _j(raw)
+        trade_info[txid] = {"ts": ts, "symbol": symbol, "raw": meta}
         trade_ids.append(txid)
-        trade_info[txid] = {"ts": ts, "symbol": symbol, "raw": _j(raw)}
+        # Some Kraken trade rows already contain ordertxid in the trade body:
+        otx = meta.get("ordertxid")
+        if isinstance(otx, list): 
+            otx = otx[0] if otx else None
+        if otx:
+            txid_to_order[txid] = str(otx)
 
-    # 3) Kraken creds
-    key, sec, _, _ = _kraken_creds()
+    log.info("enrich: scanned=%d unlabeled=%d with_raw_ordertxid=%d", scanned, len(trade_ids), len(txid_to_order))
 
-    # 4) Stage A: trades -> order ids (QueryTrades)
-    trade_meta: Dict[str, Dict[str, Any]] = {}
-    order_to_trades: Dict[str, List[str]] = {}
+    key, sec, *_ = _kraken_creds()
+
+    # 2) For trades missing ordertxid, fetch via QueryTrades
     if key and sec:
-        for i in range(0, len(trade_ids), batch_size):
-            chunk = trade_ids[i:i+batch_size]
+        missing = [t for t in trade_ids if t not in txid_to_order]
+        for i in range(0, len(missing), batch_size):
+            chunk = missing[i:i+batch_size]
             try:
                 resp = kraken_private("QueryTrades", {"txid": ",".join(chunk)}, key, sec)
                 res = (resp.get("result") or {}) if isinstance(resp, dict) else {}
-                if isinstance(res, dict):
-                    trade_meta.update(res)  # keys: trade txid
+                for t in chunk:
+                    m = res.get(t) or {}
+                    otx = m.get("ordertxid")
+                    if isinstance(otx, list): otx = otx[0] if otx else None
+                    if otx:
+                        txid_to_order[t] = str(otx)
             except Exception as e:
-                log.warning(f"QueryTrades failed for {len(chunk)} txids: {e}")
-        # Build order -> trades map
-        for txid in trade_ids:
-            meta = trade_meta.get(txid, {})
-            otx = meta.get("ordertxid")
-            if isinstance(otx, list): otx = otx[0] if otx else None
-            if otx:
-                order_to_trades.setdefault(str(otx), []).append(txid)
+                log.warning("QueryTrades failed for %d txids: %s", len(chunk), e)
     else:
-        log.warning("journal_enrich: Kraken creds missing; skipping API enrichment")
+        log.warning("enrich: missing creds; skipping QueryTrades/QueryOrdersInfo")
 
-    all_order_ids = list(order_to_trades.keys())
+    order_ids = sorted(set(txid_to_order.values()))
+    orders_meta = {}
 
-    # 5) Stage B: orders -> strategy (QueryOrdersInfo)
-    orders_meta: Dict[str, Dict[str, Any]] = {}
-    if key and sec and all_order_ids:
-        for i in range(0, len(all_order_ids), batch_size):
-            chunk = all_order_ids[i:i+batch_size]
+    # 3) QueryOrdersInfo -> infer strategy from userref / descr
+    if key and sec and order_ids:
+        for i in range(0, len(order_ids), batch_size):
+            chunk = order_ids[i:i+batch_size]
             try:
                 resp = kraken_private("QueryOrdersInfo", {"txid": ",".join(chunk)}, key, sec)
                 res = (resp.get("result") or {}) if isinstance(resp, dict) else {}
-                if isinstance(res, dict):
-                    orders_meta.update(res)  # keys: order ids
+                orders_meta.update(res)
             except Exception as e:
-                log.warning(f"QueryOrdersInfo failed for {len(chunk)} orders: {e}")
+                log.warning("QueryOrdersInfo failed for %d orders: %s", len(chunk), e)
 
-    import re as _re, datetime as _dt, pytz
-    def infer_from_order(o: Dict[str, Any]) -> Optional[str]:
+    def infer_from_order(o: Dict[str, Any]):
         if not isinstance(o, dict): return None
         u = o.get("userref")
+        # userref can be an int or str like "c3"
         if isinstance(u, str) and _re.fullmatch(r"c[1-9]", u.lower()): return u.lower()
         if isinstance(u, int) and 1 <= u <= 9: return f"c{u}"
         d = o.get("descr") or {}
@@ -800,61 +941,47 @@ def journal_enrich(payload: Dict[str, Any] = Body(...)):
             if m: return m.group(1)
         return None
 
-    # Load rules
-    whitelist = {}
-    windows = {}
-    try:
-        whitelist = json.load(open(DATA_DIR / "whitelist.json", "r", encoding="utf-8"))
-    except Exception:
-        try:
-            whitelist = json.load(open("whitelist.json", "r", encoding="utf-8"))
-        except Exception:
-            pass
-    try:
-        windows = json.load(open(DATA_DIR / "windows.json", "r", encoding="utf-8"))
-    except Exception:
-        try:
-            windows = json.load(open("windows.json", "r", encoding="utf-8"))
-        except Exception:
-            pass
+    # 4) optional fallback rules
+    whitelist, windows = {}, {}
+    try: whitelist = json.load(open("whitelist.json", "r", encoding="utf-8"))
+    except Exception: pass
+    try: windows = json.load(open("windows.json", "r", encoding="utf-8"))
+    except Exception: pass
 
     tzname = os.getenv("TZ", "America/Chicago")
-    try:
-        tz = pytz.timezone(tzname)
-    except Exception:
-        import pytz as _p; tz = _p.UTC
+    try: tz = pytz.timezone(tzname)
+    except Exception: 
+        tz = pytz.UTC
 
-    def allowed_by_rules(strat: str, symbol: str, ts: float) -> bool:
+    def allowed_by_rules(strat, symbol, ts):
         syms = whitelist.get(strat)
         if syms and ("*" not in syms) and (symbol not in syms): return False
         win = windows.get(strat) or {}
-        days = set([d[:3].title() for d in (win.get("days") or [])])
+        days  = set([d[:3].title() for d in (win.get("days") or [])])
         hours = set(win.get("hours") or [])
         if not days and not hours: return True
         try:
             t = _dt.datetime.fromtimestamp(float(ts), tz)
-            if days and t.strftime("%a") not in days: return False
+            if days  and t.strftime("%a") not in days: return False
             if hours and t.hour not in set(int(h) for h in hours): return False
             return True
         except Exception:
             return False
 
-    # 6) Decide labels
-    to_update: Dict[str, str] = {}
+    # 5) decide labels
+    to_update = {}
     api_labeled = rules_labeled = ambiguous = missing_order = 0
 
-    # Authoritative (orders)
-    for oid, txs in order_to_trades.items():
+    for txid, oid in txid_to_order.items():
         strat = infer_from_order(orders_meta.get(oid) or {})
         if strat:
-            for tx in txs: to_update[tx] = strat
-            api_labeled += len(txs)
+            to_update[txid] = strat
+            api_labeled += 1
         else:
-            missing_order += len(txs)
+            missing_order += 1
 
-    # Rules (only for still-unlabeled)
     if apply_rules and (whitelist or windows):
-        all_strats = list(set(list(whitelist.keys()) + list(windows.keys())))
+        all_strats = sorted(set(list(whitelist.keys()) + list(windows.keys())))
         for txid, info in trade_info.items():
             if txid in to_update: continue
             sym, ts = info.get("symbol"), info.get("ts")
@@ -865,22 +992,32 @@ def journal_enrich(payload: Dict[str, Any] = Body(...)):
             else:
                 ambiguous += 1
 
-    # 7) Write updates
+    if dry_run:
+        sample = dict(list(to_update.items())[:10])
+        return {"ok": True, "dry_run": True, "scanned": scanned, "orders_checked": len(order_ids),
+                "to_update_count": len(to_update), "sample_updates": sample}
+
+    # 6) write updates (preserve existing non-empty strategy)
     updated = 0
     if to_update:
         conn = _db(); cur = conn.cursor()
         for txid, strat in to_update.items():
             try:
-                cur.execute("UPDATE trades SET strategy=? WHERE txid=?", (str(strat), str(txid)))
+                cur.execute("""
+                    UPDATE trades
+                       SET strategy = ?
+                     WHERE txid     = ?
+                       AND (strategy IS NULL OR TRIM(strategy)='')
+                """, (str(strat), str(txid)))
                 updated += cur.rowcount
             except Exception as e:
-                log.warning(f"update failed txid={txid}: {e}")
+                log.warning("update failed txid=%s: %s", txid, e)
         conn.commit(); conn.close()
 
     return {
         "ok": True,
         "scanned": scanned,
-        "orders_checked": len(all_order_ids),
+        "orders_checked": len(order_ids),
         "updated": updated,
         "api_labeled": api_labeled,
         "rules_labeled": rules_labeled,
@@ -890,7 +1027,6 @@ def journal_enrich(payload: Dict[str, Any] = Body(...)):
         "batch_size": batch_size,
         "max_rows": max_rows,
     }
-
 
 @app.get("/price/{base}/{quote}")
 def price_endpoint(base: str, quote: str):
@@ -971,19 +1107,188 @@ def debug_db():
         info["error"] = str(e)
     return info
 
+
+@app.get("/debug/kraken/trades")
+def debug_kraken_trades(since_hours: int = 720, limit: int = 50000):
+    """
+    Diagnostic: pull Kraken TradesHistory (paginated) without DB writes.
+    """
+    import time
+    key, sec, *_ = _kraken_creds()
+    out = {"ok": True, "creds_present": bool(key and sec), "pages": 0, "pulled": 0, "count": None,
+           "first_ts": None, "last_ts": None, "sample_txids": []}
+    if not (key and sec):
+        out["ok"] = False
+        out["error"] = "no_creds"
+        return out
+    start_ts = int(time.time() - since_hours * 3600)
+    ofs = 0
+    sample = []
+    first_ts = None
+    last_ts = None
+    total_seen = 0
+    total_count = None
+    while True:
+        try:
+            resp = kraken_private("TradesHistory", {"start": start_ts, "ofs": ofs}, key, sec)
+            res = resp.get("result") or {}
+            trades = res.get("trades") or {}
+            total_count = res.get("count", total_count)
+            keys = list(trades.keys())
+            if not keys:
+                break
+            for tx in keys[:10]:
+                if len(sample) < 20:
+                    sample.append(tx)
+            for tx in keys:
+                t = trades[tx].get("time")
+                if t is not None:
+                    if first_ts is None or t < first_ts: first_ts = t
+                    if last_ts is None or t > last_ts: last_ts = t
+            n = len(keys)
+            total_seen += n
+            out["pages"] += 1
+            if total_count is not None and total_seen >= total_count:
+                break
+            ofs += n
+            if out["pages"] > 60:
+                break
+        except Exception as e:
+            out["ok"] = False
+            out["error"] = str(e)
+            break
+    out["pulled"] = total_seen
+    out["count"] = total_count
+    out["first_ts"] = first_ts
+    out["last_ts"] = last_ts
+    out["sample_txids"] = sample
+    return out
+
+@app.get("/debug/kraken/trades2")
+def debug_kraken_trades2(since_hours: int = 200000, mode: str = "cursor", max_pages: int = 300):
+    """
+    Diagnostic: list how many we can pull by mode.
+      - mode=ofs: plain ofs pagination
+      - mode=cursor: advance start by last_seen_ts
+    """
+    import time, math as _math
+    key, sec, *_ = _kraken_creds()
+    out = {"ok": True, "creds_present": bool(key and sec), "mode": mode,
+           "pages": 0, "pulled": 0, "count": None, "first_ts": None, "last_ts": None, "errors": []}
+    if not (key and sec):
+        out["ok"] = False; out["error"] = "no_creds"; return out
+
+    start_ts = int(time.time() - since_hours * 3600)
+    min_delay = float(os.getenv("KRAKEN_MIN_DELAY", "0.35") or 0.35)
+
+    def upd(ts):
+        if ts is None: return
+        if out["first_ts"] is None or ts < out["first_ts"]: out["first_ts"] = ts
+        if out["last_ts"]  is None or ts > out["last_ts"]:  out["last_ts"]  = ts
+
+    if mode == "ofs":
+        ofs = 0
+        while out["pages"] < max_pages:
+            time.sleep(min_delay)
+            resp = kraken_private("TradesHistory", {"start": start_ts, "ofs": ofs}, key, sec)
+            if isinstance(resp, dict) and resp.get("error"):
+                out["errors"].append({"ofs":ofs,"error":resp.get("error")}); break
+            res = (resp.get("result") or {}) if isinstance(resp, dict) else {}
+            out["count"] = res.get("count", out["count"])
+            trades = res.get("trades") or {}
+            keys = list(trades.keys())
+            if not keys: break
+            out["pages"] += 1; out["pulled"] += len(keys)
+            for k in keys: upd(trades[k].get("time"))
+            ofs += len(keys)
+    else:
+        cursor = start_ts
+        pages = 0
+        while pages < max_pages:
+            time.sleep(min_delay)
+            resp = kraken_private("TradesHistory", {"start": int(_math.floor(cursor)), "ofs": 0}, key, sec)
+            if isinstance(resp, dict) and resp.get("error"):
+                out["errors"].append({"cursor":cursor,"error":resp.get("error")}); break
+            res = (resp.get("result") or {}) if isinstance(resp, dict) else {}
+            out["count"] = res.get("count", out["count"])
+            trades = res.get("trades") or {}
+            keys = list(trades.keys())
+            if not keys: break
+            # sort by time to move cursor forward
+            keys.sort(key=lambda k: trades[k].get("time") or 0)
+            pages += 1; out["pages"] += 1; out["pulled"] += len(keys)
+            for k in keys: upd(trades[k].get("time"))
+            cursor = (float(trades[keys[-1]].get("time") or cursor) + 0.5)
+
+    return out
+
 @app.get("/pnl/summary")
 def pnl_summary():
-    conn = _db()
-    cur = conn.cursor()
-    cur.execute("SELECT ts, symbol, side, price, volume, fee, COALESCE(strategy, 'misc') as strategy FROM trades")
-    rows = [
-        {"ts": r[0], "symbol": r[1], "side": r[2], "price": r[3], "volume": r[4], "fee": r[5], "strategy": r[6]} for r in cur.fetchall()
-    ]
-    symbols = sorted({r["symbol"] for r in rows})
-    prices = _fetch_prices(symbols)
-    roll = _compute_fifo_pnl(rows, prices)
-    roll.update({"ok": True, "counts": {"journal_rows": len(rows)}})
-    return roll
+    # Fresh recompute from DB; include 'misc' only if unlabeled rows exist
+    try:
+        conn = _db() if '_db' in globals() else db() if 'db' in globals() else None
+        if conn is None:
+            import sqlite3
+            import os as _os
+            _db_path = _os.getenv("DB_PATH", "data/journal.db")
+            conn = sqlite3.connect(_db_path)
+        cur = conn.cursor()
+
+        cur.execute("SELECT COUNT(*) FROM trades WHERE strategy IS NULL OR strategy=''")
+        unlabeled_count = cur.fetchone()[0]
+
+        cur.execute("""
+            SELECT symbol,
+                   SUM(CASE WHEN side='sell' THEN price*volume ELSE -price*volume END) AS realized,
+                   SUM(COALESCE(fee,0)) AS fees
+              FROM trades
+          GROUP BY symbol
+        """)
+        sym_rows = cur.fetchall()
+
+        cur.execute("""
+            SELECT CASE WHEN strategy IS NULL OR strategy='' THEN 'misc' ELSE strategy END AS strategy,
+                   SUM(CASE WHEN side='sell' THEN price*volume ELSE -price*volume END) AS realized,
+                   SUM(COALESCE(fee,0)) AS fees
+              FROM trades
+          GROUP BY CASE WHEN strategy IS NULL OR strategy='' THEN 'misc' ELSE strategy END
+        """)
+        strat_rows = cur.fetchall()
+
+        if not unlabeled_count:
+            strat_rows = [r for r in strat_rows if r[0] != 'misc']
+
+        total_realized = float(sum((r[1] or 0.0) for r in sym_rows))
+        total_fees     = float(sum((r[2] or 0.0) for r in sym_rows))
+        total_unreal   = 0.0
+        total_equity   = total_realized + total_unreal - total_fees
+
+        per_symbol = [{"symbol": str(r[0]),
+                       "realized": float(r[1] or 0.0),
+                       "unrealized": 0.0,
+                       "fees": float(r[2] or 0.0),
+                       "equity": float((r[1] or 0.0) - (r[2] or 0.0))} for r in sym_rows]
+
+        per_strategy = [{"strategy": str(r[0]),
+                         "realized": float(r[1] or 0.0),
+                         "unrealized": 0.0,
+                         "fees": float(r[2] or 0.0),
+                         "equity": float((r[1] or 0.0) - (r[2] or 0.0))} for r in strat_rows]
+
+        cur.execute("SELECT COUNT(*) FROM trades")
+        journal_rows = int(cur.fetchone()[0])
+
+        conn.close()
+        return {"total": {"realized": total_realized,
+                          "unrealized": total_unreal,
+                          "fees": total_fees,
+                          "equity": total_equity},
+                "per_strategy": per_strategy,
+                "per_symbol": per_symbol,
+                "ok": True,
+                "counts": {"journal_rows": journal_rows}}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
 
 @app.get("/kpis")
 def kpis():
@@ -1016,6 +1321,33 @@ def scheduler_stop():
 
 @app.post("/scheduler/run")
 def scheduler_run(payload: Dict[str, Any] = Body(...)):
+# unified dry-run resolution: JSON body overrides env SCHED_DRY
+_payload = None
+try:
+    if 'payload' in locals():
+        _payload = payload
+    elif 'body' in locals():
+        _payload = body
+except Exception:
+    _payload = None
+_env_dry = str(os.getenv("SCHED_DRY", "0")).lower() in ("1","true","yes")
+_dry_req = None
+try:
+    if _payload is not None:
+        if hasattr(_payload, "dict"):
+            _dry_req = _payload.dict().get("dry_run", None)
+        elif isinstance(_payload, dict):
+            _dry_req = _payload.get("dry_run", None)
+    elif 'request' in locals():
+        try:
+            _json = request.json() if callable(getattr(request, "json", None)) else None
+            if isinstance(_json, dict):
+                _dry_req = _json.get("dry_run", None)
+        except Exception:
+            pass
+except Exception:
+    _dry_req = None
+_dry = _env_dry if _dry_req is None else bool(_dry_req)
     dry = bool(payload.get("dry", True))
     tf = payload.get("tf", "5Min")
     strats = str(payload.get("strats", "c1,c2,c3"))
@@ -1248,3 +1580,12 @@ def journal_enrich(payload: Dict[str, Any] = Body(...)):
         "batch_size": batch_size,
         "max_rows": max_rows,
     }
+
+@app.get("/debug/env")
+def debug_env():
+    keys = [
+        "APP_VERSION","SCHED_DRY","SCHED_ON","SCHED_TIMEFRAME","SCHED_LIMIT","SCHED_NOTIONAL",
+        "BROKER","TRADING_ENABLED","TZ","PORT","DEFAULT_LIMIT","DEFAULT_NOTIONAL","DEFAULT_TIMEFRAME"
+    ]
+    env = {k: os.getenv(k) for k in keys}
+    return {"ok": True, "env": env}
