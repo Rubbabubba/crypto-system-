@@ -1,5 +1,5 @@
 """
-crypto-system-api (app.py) — v2.3.6
+crypto-system-api (app.py) — v2.4.0
 ------------------------------------
 Full drop-in FastAPI app.
 
@@ -103,7 +103,7 @@ from pydantic import BaseModel
 # Version / Logging
 # --------------------------------------------------------------------------------------
 
-APP_VERSION = "1.12.6"
+APP_VERSION = "1.12.7"
 
 logging.basicConfig(
     level=logging.INFO,
@@ -1224,101 +1224,71 @@ def debug_kraken_trades2(since_hours: int = 200000, mode: str = "cursor", max_pa
 
 @app.get("/pnl/summary")
 def pnl_summary():
-    """
-    Compute realized/unrealized, fees, equity by strategy and by symbol.
-    Safe on empty/unlabeled journals.
-    """
-    import json
-    conn = _db(); cur = conn.cursor()
-
-    # Pull minimal fields
+    # Fresh recompute from DB; include 'misc' only if unlabeled rows exist
     try:
-        cur.execute("SELECT symbol, side, price, volume, fee, strategy, raw FROM trades")
-        rows = cur.fetchall()
-    except Exception as e:
+        conn = _db() if '_db' in globals() else db() if 'db' in globals() else None
+        if conn is None:
+            import sqlite3
+            import os as _os
+            _db_path = _os.getenv("DB_PATH", "data/journal.db")
+            conn = sqlite3.connect(_db_path)
+        cur = conn.cursor()
+
+        cur.execute("SELECT COUNT(*) FROM trades WHERE strategy IS NULL OR strategy=''")
+        unlabeled_count = cur.fetchone()[0]
+
+        cur.execute("""
+            SELECT symbol,
+                   SUM(CASE WHEN side='sell' THEN price*volume ELSE -price*volume END) AS realized,
+                   SUM(COALESCE(fee,0)) AS fees
+              FROM trades
+          GROUP BY symbol
+        """)
+        sym_rows = cur.fetchall()
+
+        cur.execute("""
+            SELECT CASE WHEN strategy IS NULL OR strategy='' THEN 'misc' ELSE strategy END AS strategy,
+                   SUM(CASE WHEN side='sell' THEN price*volume ELSE -price*volume END) AS realized,
+                   SUM(COALESCE(fee,0)) AS fees
+              FROM trades
+          GROUP BY CASE WHEN strategy IS NULL OR strategy='' THEN 'misc' ELSE strategy END
+        """)
+        strat_rows = cur.fetchall()
+
+        if not unlabeled_count:
+            strat_rows = [r for r in strat_rows if r[0] != 'misc']
+
+        total_realized = float(sum((r[1] or 0.0) for r in sym_rows))
+        total_fees     = float(sum((r[2] or 0.0) for r in sym_rows))
+        total_unreal   = 0.0
+        total_equity   = total_realized + total_unreal - total_fees
+
+        per_symbol = [{"symbol": str(r[0]),
+                       "realized": float(r[1] or 0.0),
+                       "unrealized": 0.0,
+                       "fees": float(r[2] or 0.0),
+                       "equity": float((r[1] or 0.0) - (r[2] or 0.0))} for r in sym_rows]
+
+        per_strategy = [{"strategy": str(r[0]),
+                         "realized": float(r[1] or 0.0),
+                         "unrealized": 0.0,
+                         "fees": float(r[2] or 0.0),
+                         "equity": float((r[1] or 0.0) - (r[2] or 0.0))} for r in strat_rows]
+
+        cur.execute("SELECT COUNT(*) FROM trades")
+        journal_rows = int(cur.fetchone()[0])
+
         conn.close()
-        return {"ok": False, "error": f"db_read: {e}"}
-
-    conn.close()
-
-    # group by symbol FIFO to estimate realized P&L; unrealized = 0 for journal-only view
-    from collections import defaultdict, deque
-
-    lots = defaultdict(deque)  # symbol -> queue of (qty, price)
-    realized = defaultdict(float)
-    fees     = defaultdict(float)
-
-    def add_fee(sym, f):
-        try: fees[sym] += float(f or 0)
-        except: pass
-
-    for symbol, side, price, volume, fee, strategy, raw in rows:
-        if not symbol or price is None or volume is None:
-            add_fee(symbol or "UNKNOWN", fee)
-            continue
-        qty  = float(volume)
-        prc  = float(price)
-        sym  = str(symbol)
-
-        # side: 'buy' adds to inventory; 'sell' reduces FIFO and realizes P&L
-        if (side or "").lower() == "buy":
-            lots[sym].append([qty, prc])
-        elif (side or "").lower() == "sell":
-            remain = qty
-            while remain > 1e-12 and lots[sym]:
-                lot_qty, lot_price = lots[sym][0]
-                take = min(remain, lot_qty)
-                realized[sym] += (prc - lot_price) * take
-                lot_qty -= take
-                remain  -= take
-                if lot_qty <= 1e-12:
-                    lots[sym].popleft()
-                else:
-                    lots[sym][0][0] = lot_qty
-        add_fee(sym, fee)
-
-    # pack totals
-    total_realized = sum(realized.values())
-    total_fees     = sum(fees.values())
-    total_unreal   = 0.0
-    total_equity   = total_realized + total_unreal - total_fees
-
-    # per strategy = aggregate over rows (using realized-by-symbol split)
-    # If you want exact realized per strategy, you’ll need per-trade pairing; for now, split realized to 'misc' if unlabeled.
-    per_strategy = defaultdict(lambda: {"realized":0.0,"unrealized":0.0,"fees":0.0,"equity":0.0})
-    per_symbol   = []
-
-    # fees per symbol already tracked; distribute to strategy buckets by row fees
-    for symbol, side, price, volume, fee, strategy, raw in rows:
-        strat = (str(strategy).strip() if strategy else "misc")
-        per_strategy[strat]["fees"] += float(fee or 0)
-
-    for sym in sorted(set([r[0] for r in rows if r[0]])):
-        r = float(realized.get(sym, 0.0))
-        f = float(fees.get(sym, 0.0))
-        per_symbol.append({"symbol": sym, "realized": r, "unrealized": 0.0, "fees": f, "equity": r - f})
-
-    # Put all realized into 'misc' unless you later compute per-strategy pairing
-    per_strategy["misc"]["realized"]   += total_realized
-    per_strategy["misc"]["unrealized"] += 0.0
-    per_strategy["misc"]["equity"]     += total_realized - per_strategy["misc"]["fees"]
-
-    return {
-        "total": {
-            "realized": total_realized,
-            "unrealized": total_unreal,
-            "fees": total_fees,
-            "equity": total_equity
-        },
-        "per_strategy": [
-            {"strategy": k, **v} for k, v in sorted(per_strategy.items(), key=lambda x: x[0])
-        ],
-        "per_symbol": per_symbol,
-        "ok": True,
-        "counts": {
-            "journal_rows": len(rows)
-        }
-    }
+        return {"total": {"realized": total_realized,
+                          "unrealized": total_unreal,
+                          "fees": total_fees,
+                          "equity": total_equity},
+                "per_strategy": per_strategy,
+                "per_symbol": per_symbol,
+                "ok": True,
+                "counts": {"journal_rows": journal_rows}}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
 
 @app.get("/kpis")
 def kpis():
@@ -1351,6 +1321,33 @@ def scheduler_stop():
 
 @app.post("/scheduler/run")
 def scheduler_run(payload: Dict[str, Any] = Body(...)):
+# unified dry-run resolution: JSON body overrides env SCHED_DRY
+_payload = None
+try:
+    if 'payload' in locals():
+        _payload = payload
+    elif 'body' in locals():
+        _payload = body
+except Exception:
+    _payload = None
+_env_dry = str(os.getenv("SCHED_DRY", "0")).lower() in ("1","true","yes")
+_dry_req = None
+try:
+    if _payload is not None:
+        if hasattr(_payload, "dict"):
+            _dry_req = _payload.dict().get("dry_run", None)
+        elif isinstance(_payload, dict):
+            _dry_req = _payload.get("dry_run", None)
+    elif 'request' in locals():
+        try:
+            _json = request.json() if callable(getattr(request, "json", None)) else None
+            if isinstance(_json, dict):
+                _dry_req = _json.get("dry_run", None)
+        except Exception:
+            pass
+except Exception:
+    _dry_req = None
+_dry = _env_dry if _dry_req is None else bool(_dry_req)
     dry = bool(payload.get("dry", True))
     tf = payload.get("tf", "5Min")
     strats = str(payload.get("strats", "c1,c2,c3"))
@@ -1583,3 +1580,12 @@ def journal_enrich(payload: Dict[str, Any] = Body(...)):
         "batch_size": batch_size,
         "max_rows": max_rows,
     }
+
+@app.get("/debug/env")
+def debug_env():
+    keys = [
+        "APP_VERSION","SCHED_DRY","SCHED_ON","SCHED_TIMEFRAME","SCHED_LIMIT","SCHED_NOTIONAL",
+        "BROKER","TRADING_ENABLED","TZ","PORT","DEFAULT_LIMIT","DEFAULT_NOTIONAL","DEFAULT_TIMEFRAME"
+    ]
+    env = {k: os.getenv(k) for k in keys}
+    return {"ok": True, "env": env}
