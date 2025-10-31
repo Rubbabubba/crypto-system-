@@ -103,7 +103,7 @@ from pydantic import BaseModel
 # Version / Logging
 # --------------------------------------------------------------------------------------
 
-APP_VERSION = "1.12.7"
+APP_VERSION = "1.12.9"
 
 logging.basicConfig(
     level=logging.INFO,
@@ -1321,34 +1321,29 @@ def scheduler_stop():
 
 @app.post("/scheduler/run")
 def scheduler_run(payload: Dict[str, Any] = Body(...)):
-# unified dry-run resolution: JSON body overrides env SCHED_DRY
-_payload = None
-try:
-    if 'payload' in locals():
-        _payload = payload
-    elif 'body' in locals():
-        _payload = body
-except Exception:
-    _payload = None
-_env_dry = str(os.getenv("SCHED_DRY", "0")).lower() in ("1","true","yes")
-_dry_req = None
-try:
-    if _payload is not None:
-        if hasattr(_payload, "dict"):
-            _dry_req = _payload.dict().get("dry_run", None)
-        elif isinstance(_payload, dict):
-            _dry_req = _payload.get("dry_run", None)
-    elif 'request' in locals():
+    # --- PATCH v1.12.9 begin: dry-run override (indent is critical) ---
+    import os as _os
+
+    def _resolve_dry(_p):
+        _env = str(_os.getenv("SCHED_DRY", "0")).lower() in ("1", "true", "yes")
         try:
-            _json = request.json() if callable(getattr(request, "json", None)) else None
-            if isinstance(_json, dict):
-                _dry_req = _json.get("dry_run", None)
+            if _p is None:
+                return _env
+            if hasattr(_p, "dict"):
+                v = _p.dict().get("dry_run", None)
+            elif isinstance(_p, dict):
+                v = _p.get("dry_run", None)
+            else:
+                v = None
+            return _env if v is None else bool(v)
         except Exception:
-            pass
-except Exception:
-    _dry_req = None
-_dry = _env_dry if _dry_req is None else bool(_dry_req)
-    dry = bool(payload.get("dry", True))
+            return _env
+
+    # try to grab whatever your function names the incoming JSON body/payload
+    _dry = _resolve_dry(locals().get("payload") or locals().get("body"))
+    # --- PATCH v1.12.9 end ---
+
+    dry = _dry
     tf = payload.get("tf", "5Min")
     strats = str(payload.get("strats", "c1,c2,c3"))
     symbols_csv = str(payload.get("symbols", "BTC/USD,ETH/USD"))
