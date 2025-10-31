@@ -539,27 +539,81 @@ def journal_peek(limit: int = Query(25, ge=1, le=1000), offset: int = Query(0, g
 
     rows = fetch_rows(limit=limit, offset=offset)
     return {"ok": True, "count": count_rows(), "rows": rows}
+    
 @app.post("/journal/attach")
-def journal_attach(payload: Dict[str, Any] = Body(...)):
-    txid = payload.get("txid")
-    strategy = payload.get("strategy")
-    if not txid or not strategy:
-        raise HTTPException(status_code=400, detail="txid and strategy required")
-    conn = _db()
-    cur = conn.cursor()
-    cur.execute("UPDATE trades SET strategy=? WHERE txid=?", (str(strategy), str(txid)))
-    conn.commit()
-    return {"ok": True, "updated": cur.rowcount}
+def journal_attach(payload: dict = Body(...)):
+    """
+    Attach strategy labels to trades.
+
+    Accepts either:
+      - {"strategy": "c3", "txid": "T..."}         # single
+      - {"strategy": "c3", "txids": ["T...","T..."]} # bulk
+
+    Returns: {"ok": true, "updated": <int>}
+    """
+    strategy = (payload or {}).get("strategy")
+    txid     = (payload or {}).get("txid")
+    txids    = (payload or {}).get("txids")
+
+    if not strategy or (not txid and not txids):
+        raise HTTPException(status_code=400, detail="txid or txids and strategy required")
+
+    targets = []
+    if txid:
+        targets.append(str(txid))
+    if isinstance(txids, list):
+        targets.extend([str(t) for t in txids if t])
+
+    if not targets:
+        return {"ok": True, "updated": 0}
+
+    updated = 0
+    conn = _get_db_conn()
+    try:
+        cur = conn.cursor()
+        for t in targets:
+            cur.execute("UPDATE trades SET strategy = ? WHERE txid = ?", (strategy, t))
+            updated += cur.rowcount
+        conn.commit()
+    finally:
+        try: conn.close()
+        except: pass
+
+    return {"ok": True, "updated": int(updated)}
 
 @app.get("/fills")
-def get_fills(limit: int = Query(100, ge=1, le=1000)):
-    conn = _db()
-    cur = conn.cursor()
-    cur.execute("SELECT txid, ts, symbol, side, price, volume, fee, strategy FROM trades ORDER BY ts DESC LIMIT ?", (limit,))
-    rows = [dict(txid=r[0], ts=r[1], symbol=r[2], side=r[3], price=r[4], volume=r[5], fee=r[6], strategy=r[7]) for r in cur.fetchall()]
-    return {"ok": True, "rows": rows, "count": len(rows)}
-    rows = fetch_rows(limit=limit, offset=offset)
-    return {"ok": True, "count": count_rows(), "rows": rows}
+def get_fills(limit: int = 100):
+    """
+    Recent fills from journal (backed by SQLite 'trades').
+    Server-caps limit to max_limit to avoid validation 422s on large values.
+    """
+    import os, sqlite3
+    max_limit = 1000  # hard cap
+    if limit is None or limit <= 0:
+        limit = 100
+    if limit > max_limit:
+        limit = max_limit
+
+    db_path = os.getenv("DB_PATH", "data/journal.db")
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT txid, ts, symbol, side, price, volume, fee, strategy
+            FROM trades
+            ORDER BY ts DESC
+            LIMIT ?
+            """,
+            (limit,),
+        )
+        rows = [dict(r) for r in cur.fetchall()]
+    finally:
+        try: conn.close()
+        except: pass
+
+    return {"ok": True, "rows": rows}
 
 @app.post("/journal/backfill")
 def journal_backfill(payload: Dict[str, Any] = Body(...)):
