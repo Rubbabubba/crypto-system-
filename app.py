@@ -103,7 +103,7 @@ from pydantic import BaseModel
 # Version / Logging
 # --------------------------------------------------------------------------------------
 
-APP_VERSION = "1.12.8"
+APP_VERSION = "1.12.7"
 
 logging.basicConfig(
     level=logging.INFO,
