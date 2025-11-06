@@ -353,6 +353,24 @@ def price_ticker(base: str, quote: str) -> Dict[str, Any]:
 # --- Kraken public REST helper (no auth) ---
 import requests as _rq
 
+# --- internal helper to open the journal DB safely (idempotent) ---
+def _get_db_conn():
+    import os, sqlite3
+    data_dir = os.getenv("DATA_DIR", "/var/data")
+    os.makedirs(data_dir, exist_ok=True)
+    db_path = os.path.join(data_dir, "journal.db")
+    conn = sqlite3.connect(db_path, check_same_thread=False)
+    try:
+        cur = conn.cursor()
+        cur.execute("PRAGMA journal_mode=WAL;")
+        cur.execute("PRAGMA synchronous=NORMAL;")
+        conn.commit()
+    except Exception:
+        pass
+    return conn
+# --- end helper ---
+
+
 def kraken_public(endpoint: str, params: dict) -> dict:
     """
     Minimal public API caller for Kraken.
@@ -592,7 +610,8 @@ def get_fills(limit: int = 50, offset: int = 0):
             FROM trades
             ORDER BY ts DESC
             LIMIT ? OFFSET ?
-            """, (limit, offset)
+            """,
+            (limit, offset),
         )
         rows = [
             {
