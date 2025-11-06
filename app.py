@@ -353,6 +353,24 @@ def price_ticker(base: str, quote: str) -> Dict[str, Any]:
 # --- Kraken public REST helper (no auth) ---
 import requests as _rq
 
+# --- internal helper to open the journal DB safely (idempotent) ---
+def _get_db_conn():
+    import os, sqlite3
+    data_dir = os.getenv("DATA_DIR", "/var/data")
+    os.makedirs(data_dir, exist_ok=True)
+    db_path = os.path.join(data_dir, "journal.db")
+    conn = sqlite3.connect(db_path, check_same_thread=False)
+    try:
+        cur = conn.cursor()
+        cur.execute("PRAGMA journal_mode=WAL;")
+        cur.execute("PRAGMA synchronous=NORMAL;")
+        conn.commit()
+    except Exception:
+        pass
+    return conn
+# --- end helper ---
+
+
 def kraken_public(endpoint: str, params: dict) -> dict:
     """
     Minimal public API caller for Kraken.
@@ -582,38 +600,29 @@ def journal_attach(payload: dict = Body(...)):
     return {"ok": True, "updated": int(updated)}
 
 @app.get("/fills")
-def get_fills(limit: int = 100):
-    """
-    Recent fills from journal (backed by SQLite 'trades').
-    Server-caps limit to max_limit to avoid validation 422s on large values.
-    """
-    import os, sqlite3
-    max_limit = 1000  # hard cap
-    if limit is None or limit <= 0:
-        limit = 100
-    if limit > max_limit:
-        limit = max_limit
-
-    db_path = os.getenv("DB_PATH", "data/journal.db")
-    conn = sqlite3.connect(db_path)
-    conn.row_factory = sqlite3.Row
+def get_fills(limit: int = 50, offset: int = 0):
+    conn = _get_db_conn()
     try:
         cur = conn.cursor()
         cur.execute(
             """
-            SELECT txid, ts, symbol, side, price, volume, fee, strategy
+            SELECT txid, ts, pair, symbol, side, price, volume, fee, cost, strategy
             FROM trades
             ORDER BY ts DESC
-            LIMIT ?
+            LIMIT ? OFFSET ?
             """,
-            (limit,),
+            (limit, offset),
         )
-        rows = [dict(r) for r in cur.fetchall()]
+        rows = [
+            {
+                "txid": r[0], "ts": r[1], "pair": r[2], "symbol": r[3], "side": r[4],
+                "price": r[5], "volume": r[6], "fee": r[7], "cost": r[8], "strategy": r[9]
+            }
+            for r in cur.fetchall()
+        ]
+        return {"ok": True, "rows": rows}
     finally:
-        try: conn.close()
-        except: pass
-
-    return {"ok": True, "rows": rows}
+        conn.close()
 
 @app.post("/journal/backfill")
 def journal_backfill(payload: Dict[str, Any] = Body(...)):
