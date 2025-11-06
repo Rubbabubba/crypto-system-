@@ -595,7 +595,7 @@ def get_fills(limit: int = 100):
         limit = max_limit
 
     db_path = os.getenv("DB_PATH", "data/journal.db")
-    conn = db_conn()
+    conn = sqlite3.connect(db_path)
     conn.row_factory = sqlite3.Row
     try:
         cur = conn.cursor()
@@ -712,19 +712,28 @@ def journal_sync(payload: Dict[str, Any] = Body(...)):
         return n
 
     def map_row(txid, t):
-        try: ts = float(t.get("time")) if t.get("time") is not None else None
-        except: ts = None
-        pair_raw = t.get('pair') or ''
+    try:
+        ts = float(t.get("time")) if t.get("time") is not None else None
+    except:
+        ts = None
+    pair_raw = t.get("pair") or ""
     symbol = from_kraken_pair_to_app(pair_raw)
-        side   = t.get("type")
-        try: price = float(t.get("price")) if t.get("price") is not None else None
-        except: price = None
-        try: volume = float(t.get("vol")) if t.get("vol") is not None else None
-        except: volume = None
-        try: fee    = float(t.get("fee")) if t.get("fee") is not None else None
-        except: fee = None
-        raw = _json.dumps(t, separators=(",", ":"), ensure_ascii=False)
-        return (str(txid), ts, symbol, side, price, volume, fee, None, raw)
+    side = t.get("type")
+    try:
+        price = float(t.get("price")) if t.get("price") is not None else None
+    except:
+        price = None
+    try:
+        volume = float(t.get("vol")) if t.get("vol") is not None else None
+    except:
+        volume = None
+    try:
+        fee = float(t.get("fee")) if t.get("fee") is not None else None
+    except:
+        fee = None
+    raw = _json.dumps(t, separators=(",", ":"), ensure_ascii=False)
+    return (str(txid), ts, symbol, side, price, volume, fee, None, raw)
+
 
     total_writes = 0
     total_pulled = 0
