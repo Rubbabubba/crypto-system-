@@ -19,6 +19,7 @@ from __future__ import annotations
 __version__ = "2.0.0"
 
 import os
+import re
 import time
 import math
 import hmac
@@ -26,6 +27,18 @@ import base64
 import hashlib
 import threading
 from typing import Any, Dict, List, Optional
+
+def _userref_for_strategy(strategy: Optional[str]) -> int:
+    try:
+        if isinstance(strategy, str) and re.fullmatch(r"c[1-9]", strategy.strip().lower()):
+            return int(strategy.strip().lower()[1])
+    except Exception:
+        pass
+    import time
+    minute = int(time.time() // 60)
+    h = hash((strategy or 'x', minute))
+    return int(h & 0x7fffffff)
+
 
 import requests
 
@@ -300,7 +313,7 @@ def _ensure_price(symbol: str) -> float:
         raise RuntimeError(f"no price available for {symbol}")
     return p
 
-def market_notional(symbol: str, side: str, notional: float) -> Dict[str, Any]:
+def market_notional(symbol: str, side: str, notional: float, strategy: Optional[str] = None) -> Dict[str, Any]:
     """
     Market order by USD notional:
       volume(base) = notional(quote USD) / last_price
@@ -321,7 +334,9 @@ def market_notional(symbol: str, side: str, notional: float) -> Dict[str, Any]:
         "pair": pair,
         "type": "buy" if side == "buy" else "sell",
         "ordertype": "market",
-        "volume": f"{volume:.8f}",
+        "volume": f"{volume:.8f
+        \"userref\": str(_userref_for_strategy(strategy)),
+    }",
         "userref": str(_userref(ui, side, float(notional))),
     }
     res = _priv("AddOrder", payload)
