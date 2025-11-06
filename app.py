@@ -103,7 +103,7 @@ from pydantic import BaseModel
 # Version / Logging
 # --------------------------------------------------------------------------------------
 
-APP_VERSION = "1.12.8"
+APP_VERSION = "1.12.9"
 
 logging.basicConfig(
     level=logging.INFO,
@@ -539,27 +539,81 @@ def journal_peek(limit: int = Query(25, ge=1, le=1000), offset: int = Query(0, g
 
     rows = fetch_rows(limit=limit, offset=offset)
     return {"ok": True, "count": count_rows(), "rows": rows}
+    
 @app.post("/journal/attach")
-def journal_attach(payload: Dict[str, Any] = Body(...)):
-    txid = payload.get("txid")
-    strategy = payload.get("strategy")
-    if not txid or not strategy:
-        raise HTTPException(status_code=400, detail="txid and strategy required")
-    conn = _db()
-    cur = conn.cursor()
-    cur.execute("UPDATE trades SET strategy=? WHERE txid=?", (str(strategy), str(txid)))
-    conn.commit()
-    return {"ok": True, "updated": cur.rowcount}
+def journal_attach(payload: dict = Body(...)):
+    """
+    Attach strategy labels to trades.
+
+    Accepts either:
+      - {"strategy": "c3", "txid": "T..."}         # single
+      - {"strategy": "c3", "txids": ["T...","T..."]} # bulk
+
+    Returns: {"ok": true, "updated": <int>}
+    """
+    strategy = (payload or {}).get("strategy")
+    txid     = (payload or {}).get("txid")
+    txids    = (payload or {}).get("txids")
+
+    if not strategy or (not txid and not txids):
+        raise HTTPException(status_code=400, detail="txid or txids and strategy required")
+
+    targets = []
+    if txid:
+        targets.append(str(txid))
+    if isinstance(txids, list):
+        targets.extend([str(t) for t in txids if t])
+
+    if not targets:
+        return {"ok": True, "updated": 0}
+
+    updated = 0
+    conn = _get_db_conn()
+    try:
+        cur = conn.cursor()
+        for t in targets:
+            cur.execute("UPDATE trades SET strategy = ? WHERE txid = ?", (strategy, t))
+            updated += cur.rowcount
+        conn.commit()
+    finally:
+        try: conn.close()
+        except: pass
+
+    return {"ok": True, "updated": int(updated)}
 
 @app.get("/fills")
-def get_fills(limit: int = Query(100, ge=1, le=1000)):
-    conn = _db()
-    cur = conn.cursor()
-    cur.execute("SELECT txid, ts, symbol, side, price, volume, fee, strategy FROM trades ORDER BY ts DESC LIMIT ?", (limit,))
-    rows = [dict(txid=r[0], ts=r[1], symbol=r[2], side=r[3], price=r[4], volume=r[5], fee=r[6], strategy=r[7]) for r in cur.fetchall()]
-    return {"ok": True, "rows": rows, "count": len(rows)}
-    rows = fetch_rows(limit=limit, offset=offset)
-    return {"ok": True, "count": count_rows(), "rows": rows}
+def get_fills(limit: int = 100):
+    """
+    Recent fills from journal (backed by SQLite 'trades').
+    Server-caps limit to max_limit to avoid validation 422s on large values.
+    """
+    import os, sqlite3
+    max_limit = 1000  # hard cap
+    if limit is None or limit <= 0:
+        limit = 100
+    if limit > max_limit:
+        limit = max_limit
+
+    db_path = os.getenv("DB_PATH", "data/journal.db")
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT txid, ts, symbol, side, price, volume, fee, strategy
+            FROM trades
+            ORDER BY ts DESC
+            LIMIT ?
+            """,
+            (limit,),
+        )
+        rows = [dict(r) for r in cur.fetchall()]
+    finally:
+        try: conn.close()
+        except: pass
+
+    return {"ok": True, "rows": rows}
 
 @app.post("/journal/backfill")
 def journal_backfill(payload: Dict[str, Any] = Body(...)):
@@ -831,202 +885,6 @@ def journal_counts():
     return {"ok": True, "total": total, "labeled": labeled, "unlabeled": unlabeled, "per_strategy": per_strategy}
 
 
-@app.post("/journal/enrich")
-def journal_enrich(payload: Dict[str, Any] = Body(...)):
-    """
-    Label unlabeled trades with strategy using Kraken metadata + optional rules.
-    - Authoritative path: (raw.ordertxid if present) OR QueryTrades -> ordertxid
-    - Then QueryOrdersInfo -> infer strategy via userref/descr
-    - Fallback rules: whitelist.json + windows.json (optional)
-    - Safe: dry_run support; preserves existing non-empty strategies
-    """
-    import json, re as _re, datetime as _dt
-    import pytz
-
-    dry_run     = bool(payload.get("dry_run", False))
-    batch_size  = int(payload.get("batch_size", 40) or 40)
-    max_rows    = int(payload.get("max_rows", 5000) or 5000)
-    apply_rules = bool(payload.get("apply_rules", True))
-
-    # 1) load unlabeled trades
-    conn = _db(); cur = conn.cursor()
-    try:
-        cur.execute("""
-            SELECT txid, ts, symbol, raw
-            FROM trades
-            WHERE strategy IS NULL OR TRIM(strategy)=''
-            LIMIT ?
-        """, (max_rows,))
-        rows = cur.fetchall()
-    finally:
-        conn.close()
-
-    scanned = len(rows)
-    if scanned == 0:
-        return {"ok": True, "scanned": 0, "orders_checked": 0, "updated": 0,
-                "api_labeled": 0, "rules_labeled": 0, "ambiguous": 0, "missing_order": 0,
-                "apply_rules": apply_rules, "batch_size": batch_size, "max_rows": max_rows}
-
-    def _j(x):
-        try:
-            return json.loads(x) if isinstance(x, str) else (x or {})
-        except Exception:
-            return {}
-
-    trade_info = {}
-    trade_ids  = []
-    txid_to_order = {}
-
-    for txid, ts, symbol, raw in rows:
-        txid = str(txid)
-        meta = _j(raw)
-        trade_info[txid] = {"ts": ts, "symbol": symbol, "raw": meta}
-        trade_ids.append(txid)
-        # Some Kraken trade rows already contain ordertxid in the trade body:
-        otx = meta.get("ordertxid")
-        if isinstance(otx, list): 
-            otx = otx[0] if otx else None
-        if otx:
-            txid_to_order[txid] = str(otx)
-
-    log.info("enrich: scanned=%d unlabeled=%d with_raw_ordertxid=%d", scanned, len(trade_ids), len(txid_to_order))
-
-    key, sec, *_ = _kraken_creds()
-
-    # 2) For trades missing ordertxid, fetch via QueryTrades
-    if key and sec:
-        missing = [t for t in trade_ids if t not in txid_to_order]
-        for i in range(0, len(missing), batch_size):
-            chunk = missing[i:i+batch_size]
-            try:
-                resp = kraken_private("QueryTrades", {"txid": ",".join(chunk)}, key, sec)
-                res = (resp.get("result") or {}) if isinstance(resp, dict) else {}
-                for t in chunk:
-                    m = res.get(t) or {}
-                    otx = m.get("ordertxid")
-                    if isinstance(otx, list): otx = otx[0] if otx else None
-                    if otx:
-                        txid_to_order[t] = str(otx)
-            except Exception as e:
-                log.warning("QueryTrades failed for %d txids: %s", len(chunk), e)
-    else:
-        log.warning("enrich: missing creds; skipping QueryTrades/QueryOrdersInfo")
-
-    order_ids = sorted(set(txid_to_order.values()))
-    orders_meta = {}
-
-    # 3) QueryOrdersInfo -> infer strategy from userref / descr
-    if key and sec and order_ids:
-        for i in range(0, len(order_ids), batch_size):
-            chunk = order_ids[i:i+batch_size]
-            try:
-                resp = kraken_private("QueryOrdersInfo", {"txid": ",".join(chunk)}, key, sec)
-                res = (resp.get("result") or {}) if isinstance(resp, dict) else {}
-                orders_meta.update(res)
-            except Exception as e:
-                log.warning("QueryOrdersInfo failed for %d orders: %s", len(chunk), e)
-
-    def infer_from_order(o: Dict[str, Any]):
-        if not isinstance(o, dict): return None
-        u = o.get("userref")
-        # userref can be an int or str like "c3"
-        if isinstance(u, str) and _re.fullmatch(r"c[1-9]", u.lower()): return u.lower()
-        if isinstance(u, int) and 1 <= u <= 9: return f"c{u}"
-        d = o.get("descr") or {}
-        for val in d.values():
-            if not isinstance(val, str): continue
-            m = _re.search(r"\b(c[1-9])\b", val.lower())
-            if m: return m.group(1)
-            m = _re.search(r"strat\s*[:=]\s*(c[1-9])", val.lower())
-            if m: return m.group(1)
-        return None
-
-    # 4) optional fallback rules
-    whitelist, windows = {}, {}
-    try: whitelist = json.load(open("whitelist.json", "r", encoding="utf-8"))
-    except Exception: pass
-    try: windows = json.load(open("windows.json", "r", encoding="utf-8"))
-    except Exception: pass
-
-    tzname = os.getenv("TZ", "America/Chicago")
-    try: tz = pytz.timezone(tzname)
-    except Exception: 
-        tz = pytz.UTC
-
-    def allowed_by_rules(strat, symbol, ts):
-        syms = whitelist.get(strat)
-        if syms and ("*" not in syms) and (symbol not in syms): return False
-        win = windows.get(strat) or {}
-        days  = set([d[:3].title() for d in (win.get("days") or [])])
-        hours = set(win.get("hours") or [])
-        if not days and not hours: return True
-        try:
-            t = _dt.datetime.fromtimestamp(float(ts), tz)
-            if days  and t.strftime("%a") not in days: return False
-            if hours and t.hour not in set(int(h) for h in hours): return False
-            return True
-        except Exception:
-            return False
-
-    # 5) decide labels
-    to_update = {}
-    api_labeled = rules_labeled = ambiguous = missing_order = 0
-
-    for txid, oid in txid_to_order.items():
-        strat = infer_from_order(orders_meta.get(oid) or {})
-        if strat:
-            to_update[txid] = strat
-            api_labeled += 1
-        else:
-            missing_order += 1
-
-    if apply_rules and (whitelist or windows):
-        all_strats = sorted(set(list(whitelist.keys()) + list(windows.keys())))
-        for txid, info in trade_info.items():
-            if txid in to_update: continue
-            sym, ts = info.get("symbol"), info.get("ts")
-            if not sym or ts is None: continue
-            cands = [s for s in all_strats if allowed_by_rules(s, sym, ts)]
-            if len(cands) == 1:
-                to_update[txid] = cands[0]; rules_labeled += 1
-            else:
-                ambiguous += 1
-
-    if dry_run:
-        sample = dict(list(to_update.items())[:10])
-        return {"ok": True, "dry_run": True, "scanned": scanned, "orders_checked": len(order_ids),
-                "to_update_count": len(to_update), "sample_updates": sample}
-
-    # 6) write updates (preserve existing non-empty strategy)
-    updated = 0
-    if to_update:
-        conn = _db(); cur = conn.cursor()
-        for txid, strat in to_update.items():
-            try:
-                cur.execute("""
-                    UPDATE trades
-                       SET strategy = ?
-                     WHERE txid     = ?
-                       AND (strategy IS NULL OR TRIM(strategy)='')
-                """, (str(strat), str(txid)))
-                updated += cur.rowcount
-            except Exception as e:
-                log.warning("update failed txid=%s: %s", txid, e)
-        conn.commit(); conn.close()
-
-    return {
-        "ok": True,
-        "scanned": scanned,
-        "orders_checked": len(order_ids),
-        "updated": updated,
-        "api_labeled": api_labeled,
-        "rules_labeled": rules_labeled,
-        "ambiguous": ambiguous,
-        "missing_order": missing_order,
-        "apply_rules": apply_rules,
-        "batch_size": batch_size,
-        "max_rows": max_rows,
-    }
 
 @app.get("/price/{base}/{quote}")
 def price_endpoint(base: str, quote: str):
@@ -1290,6 +1148,90 @@ def pnl_summary():
     except Exception as e:
         return {"ok": False, "error": str(e)}
 
+@app.get("/pnl/fifo")
+def pnl_fifo():
+    """Accounting-grade FIFO realized/unrealized/fees by (strategy, symbol)."""
+    rows = fetch_rows(limit=1_000_000, offset=0)
+    fills = []
+    for r in rows:
+        side = (r.get("side") or "").lower()
+        if side not in ("buy", "sell"):
+            continue
+        try:
+            fills.append({
+                "t": float(r.get("ts") or 0),
+                "sym": str(r.get("symbol") or "").upper(),
+                "side": side,
+                "price": float(r.get("price") or 0),
+                "vol": float(r.get("volume") or 0),
+                "fee": float(r.get("fee") or 0),
+                "strategy": (r.get("strategy") or "misc").lower()
+            })
+        except Exception:
+            pass
+    fills.sort(key=lambda x: x["t"])
+    lots = {}
+    stat = {}
+    def key(s, y): return f"{s}||{y}"
+    for f in fills:
+        k = key(f["strategy"], f["sym"])
+        lots.setdefault(k, [])
+        stat.setdefault(k, {"realized": 0.0, "fees": 0.0, "qty": 0.0})
+        if f["side"] == "buy":
+            lots[k].append({"q": f["vol"], "px": f["price"]})
+            stat[k]["qty"] += f["vol"]
+            stat[k]["fees"] += f["fee"]
+        else:
+            rem = f["vol"]; realized = 0.0
+            L = lots[k]
+            while rem > 1e-12 and L:
+                head = L[0]
+                take = min(head["q"], rem)
+                realized += (f["price"] - head["px"]) * take
+                head["q"] -= take
+                rem -= take
+                if head["q"] <= 1e-12:
+                    L.pop(0)
+            stat[k]["qty"] -= f["vol"]
+            stat[k]["realized"] += realized
+            stat[k]["fees"] += f["fee"]
+
+    symbols = sorted({f["sym"] for f in fills})
+    px_map = {}
+    for s in symbols:
+        try:
+            base, quote = (s[:-3], "USD") if s.endswith("USD") else (s, "USD")
+            pr = price_ticker(base, quote)
+            px_map[s] = float(pr.get("price") or 0)
+        except Exception:
+            px_map[s] = 0.0
+
+    per_strategy, per_symbol = {}, {}
+    Treal = Tunreal = Tfees = 0.0
+    for k, S in stat.items():
+        strat, sym = k.split("||")
+        unreal = 0.0
+        mkt = px_map.get(sym) or 0.0
+        for lot in lots.get(k, []):
+            if mkt > 0:
+                unreal += (mkt - lot["px"]) * lot["q"]
+        equity = S["realized"] + unreal - S["fees"]
+
+        ps = per_strategy.setdefault(strat, {"strategy": strat, "realized": 0.0, "unrealized": 0.0, "fees": 0.0, "equity": 0.0})
+        ps["realized"] += S["realized"]; ps["unrealized"] += unreal; ps["fees"] += S["fees"]; ps["equity"] += equity
+
+        py = per_symbol.setdefault(sym, {"symbol": sym, "realized": 0.0, "unrealized": 0.0, "fees": 0.0, "equity": 0.0})
+        py["realized"] += S["realized"]; py["unrealized"] += unreal; py["fees"] += S["fees"]; py["equity"] += equity
+
+        Treal += S["realized"]; Tunreal += unreal; Tfees += S["fees"]
+
+    return {
+        "ok": True,
+        "total": {"realized": Treal, "unrealized": Tunreal, "fees": Tfees, "equity": Treal + Tunreal - Tfees},
+        "per_strategy": sorted(per_strategy.values(), key=lambda r: r["equity"], reverse=True),
+        "per_symbol": sorted(per_symbol.values(), key=lambda r: r["equity"], reverse=True)
+    }
+
 @app.get("/kpis")
 def kpis():
     return {
@@ -1321,34 +1263,29 @@ def scheduler_stop():
 
 @app.post("/scheduler/run")
 def scheduler_run(payload: Dict[str, Any] = Body(...)):
-# unified dry-run resolution: JSON body overrides env SCHED_DRY
-_payload = None
-try:
-    if 'payload' in locals():
-        _payload = payload
-    elif 'body' in locals():
-        _payload = body
-except Exception:
-    _payload = None
-_env_dry = str(os.getenv("SCHED_DRY", "0")).lower() in ("1","true","yes")
-_dry_req = None
-try:
-    if _payload is not None:
-        if hasattr(_payload, "dict"):
-            _dry_req = _payload.dict().get("dry_run", None)
-        elif isinstance(_payload, dict):
-            _dry_req = _payload.get("dry_run", None)
-    elif 'request' in locals():
+    # --- PATCH v1.12.9 begin: dry-run override (indent is critical) ---
+    import os as _os
+
+    def _resolve_dry(_p):
+        _env = str(_os.getenv("SCHED_DRY", "0")).lower() in ("1", "true", "yes")
         try:
-            _json = request.json() if callable(getattr(request, "json", None)) else None
-            if isinstance(_json, dict):
-                _dry_req = _json.get("dry_run", None)
+            if _p is None:
+                return _env
+            if hasattr(_p, "dict"):
+                v = _p.dict().get("dry_run", None)
+            elif isinstance(_p, dict):
+                v = _p.get("dry_run", None)
+            else:
+                v = None
+            return _env if v is None else bool(v)
         except Exception:
-            pass
-except Exception:
-    _dry_req = None
-_dry = _env_dry if _dry_req is None else bool(_dry_req)
-    dry = bool(payload.get("dry", True))
+            return _env
+
+    # try to grab whatever your function names the incoming JSON body/payload
+    _dry = _resolve_dry(locals().get("payload") or locals().get("body"))
+    # --- PATCH v1.12.9 end ---
+
+    dry = _dry
     tf = payload.get("tf", "5Min")
     strats = str(payload.get("strats", "c1,c2,c3"))
     symbols_csv = str(payload.get("symbols", "BTC/USD,ETH/USD"))
