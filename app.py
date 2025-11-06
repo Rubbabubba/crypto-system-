@@ -582,38 +582,24 @@ def journal_attach(payload: dict = Body(...)):
     return {"ok": True, "updated": int(updated)}
 
 @app.get("/fills")
-def get_fills(limit: int = 100):
-    """
-    Recent fills from journal (backed by SQLite 'trades').
-    Server-caps limit to max_limit to avoid validation 422s on large values.
-    """
-    import os, sqlite3
-    max_limit = 1000  # hard cap
-    if limit is None or limit <= 0:
-        limit = 100
-    if limit > max_limit:
-        limit = max_limit
-
-    db_path = os.getenv("DB_PATH", "data/journal.db")
-    conn = sqlite3.connect(db_path)
-    conn.row_factory = sqlite3.Row
-    try:
-        cur = conn.cursor()
-        cur.execute(
-            """
-            SELECT txid, ts, symbol, side, price, volume, fee, strategy
-            FROM trades
-            ORDER BY ts DESC
-            LIMIT ?
-            """,
-            (limit,),
-        )
-        rows = [dict(r) for r in cur.fetchall()]
-    finally:
-        try: conn.close()
-        except: pass
-
+def get_fills(limit: int = 50, offset: int = 0):
+conn = db_conn()
+try:
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT txid, ts, pair, symbol, side, price, volume, fee, cost, strategy
+        FROM trades ORDER BY ts DESC LIMIT ? OFFSET ?
+        """, (limit, offset)
+    )
+    rows = [
+        {"txid": r[0], "ts": r[1], "pair": r[2], "symbol": r[3], "side": r[4],
+         "price": r[5], "volume": r[6], "fee": r[7], "cost": r[8], "strategy": r[9]}
+        for r in cur.fetchall()
+    ]
     return {"ok": True, "rows": rows}
+finally:
+    conn.close()
 
 @app.post("/journal/backfill")
 def journal_backfill(payload: Dict[str, Any] = Body(...)):
@@ -718,22 +704,27 @@ def journal_sync(payload: Dict[str, Any] = Body(...)):
             ts = None
         pair_raw = t.get('pair') or ''
         symbol = from_kraken_pair_to_app(pair_raw)
-        side = t.get('type')
+        side = (t.get('type') or t.get('side') or '').lower()
         try:
             price = float(t.get('price')) if t.get('price') is not None else None
         except Exception:
             price = None
         try:
-            volume = float(t.get('vol')) if t.get('vol') is not None else None
+            volume = float(t.get('vol') or t.get('volume')) if (t.get('vol') or t.get('volume')) is not None else None
         except Exception:
             volume = None
         try:
             fee = float(t.get('fee')) if t.get('fee') is not None else None
         except Exception:
             fee = None
+        cost = t.get('cost')
+        try:
+            cost = float(cost) if cost is not None else None
+        except Exception:
+            cost = None
+        strat = t.get('strategy')
         raw = _json.dumps(t, separators=(',', ':'), ensure_ascii=False)
-        return (str(txid), ts, symbol, side, price, volume, fee, None, raw)
-
+        return (str(txid), ts, pair_raw, symbol, side, price, volume, fee, cost, strat, raw)
     total_writes = 0
     total_pulled = 0
     pages        = 0
@@ -1342,6 +1333,11 @@ if __name__ == "__main__":
     import uvicorn
     port = int(os.getenv("PORT", "10000"))
     uvicorn.run("app:app", host="0.0.0.0", port=port, reload=False)
+    if int(os.getenv("SCHED_ON", "0")) == 1:
+        started = start_scheduler(interval=int(os.getenv("SCHED_SLEEP","60")),
+                                  strategies=os.getenv("SCHED_STRATS",""), autostart=True)
+        log.info("scheduler autostart=%s interval=%s strategies=%s", started,
+                 os.getenv("SCHED_SLEEP","60"), os.getenv("SCHED_STRATS","(none)"))
 
 @app.post("/journal/enrich")
 def journal_enrich(payload: Dict[str, Any] = Body(...)):
