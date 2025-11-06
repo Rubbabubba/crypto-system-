@@ -45,6 +45,8 @@ import sys
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
+import threading
+import time
 
 # Routes:
 #  - /
@@ -1315,6 +1317,36 @@ def scheduler_run(payload: Dict[str, Any] = Body(...)):
     actions = []
     return {"ok": True, "message": msg, "actions": actions}
 
+
+# --------------------------------------------------------------------------------------
+# Background scheduler loop
+# --------------------------------------------------------------------------------------
+def _scheduler_loop():
+    """Background loop honoring _SCHED_ENABLED and _SCHED_SLEEP.
+    Builds payload from env so Render env toggles work without redeploy.
+    """
+    global _SCHED_ENABLED
+    tick = 0
+    while True:
+        try:
+            if _SCHED_ENABLED:
+                # Build payload from env on each pass
+                payload = {
+                    "tf": os.getenv("SCHED_TIMEFRAME", os.getenv("DEFAULT_TIMEFRAME","5Min") or "5Min"),
+                    "strats": os.getenv("SCHED_STRATS", "c1,c2,c3,c4,c5,c6"),
+                    "symbols": os.getenv("SYMBOLS","BTC/USD,ETH/USD"),
+                    "limit": int(os.getenv("SCHED_LIMIT", os.getenv("DEFAULT_LIMIT","300") or "300")),
+                    "notional": float(os.getenv("SCHED_NOTIONAL", os.getenv("DEFAULT_NOTIONAL","25") or "25")),
+                    "dry_run": str(os.getenv("SCHED_DRY","0")).lower() in ("1","true","yes"),
+                }
+                # call the same function our route uses
+                _ = scheduler_run(payload)
+                tick += 1
+                log.info("scheduler tick #%s ok", tick)
+        except Exception as e:
+            log.exception("scheduler loop error: %s", e)
+        # sleep regardless to prevent tight loop if disabled
+        time.sleep(_SCHED_SLEEP)
 # --------------------------------------------------------------------------------------
 # Startup log
 # --------------------------------------------------------------------------------------
@@ -1342,6 +1374,13 @@ def _startup():
     _ = _db()
     _ensure_strategy_column()
     log.info(f"Data dir: {DATA_DIR} | DB: {DB_PATH}")
+    global _SCHED_THREAD
+    if _SCHED_ENABLED and _SCHED_THREAD is None:
+        _SCHED_THREAD = threading.Thread(target=_scheduler_loop, daemon=True, name="scheduler")
+        _SCHED_THREAD.start()
+        log.info("Scheduler thread started: sleep=%s enabled=%s", _SCHED_SLEEP, _SCHED_ENABLED)
+    else:
+        log.info("Scheduler thread not started: enabled=%s existing=%s", _SCHED_ENABLED, bool(_SCHED_THREAD))
 
 # --------------------------------------------------------------------------------------
 # Entrypoint (for local runs; Render uses 'python app.py')
