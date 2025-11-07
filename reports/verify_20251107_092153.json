@@ -1,0 +1,43 @@
+﻿{
+    "base_url":  "https://crypto-system-z605.onrender.com",
+    "status":  {
+                   "ok":  true,
+                   "enabled":  true,
+                   "interval_secs":  30
+               },
+    "generated":  "2025-11-07T09:21:53.8791092-06:00",
+    "response":  {
+                     "ok":  true,
+                     "message":  "Scheduler pass: strats=[\u0027c1\u0027, \u0027c2\u0027, \u0027c3\u0027, \u0027c4\u0027, \u0027c5\u0027, \u0027c6\u0027] tf=5Min limit=300 notional=25.0 dry=False symbols=[\u0027AVAX/USD\u0027, \u0027BCH/USD\u0027, \u0027BTC/USD\u0027, \u0027DOGE/USD\u0027, \u0027ETH/USD\u0027, \u0027LINK/USD\u0027, \u0027LTC/USD\u0027, \u0027SOL/USD\u0027, \u0027XRP/USD\u0027]",
+                     "actions":  [
+
+                                 ]
+                 },
+    "requested":  {
+                      "guard":  true,
+                      "window":  "live",
+                      "notional":  25,
+                      "limit":  300,
+                      "strats":  [
+                                     "c1",
+                                     "c2",
+                                     "c3",
+                                     "c4",
+                                     "c5",
+                                     "c6"
+                                 ],
+                      "tf":  "5Min",
+                      "symbols":  [
+                                      "AVAX/USD",
+                                      "BCH/USD",
+                                      "BTC/USD",
+                                      "DOGE/USD",
+                                      "ETH/USD",
+                                      "LINK/USD",
+                                      "LTC/USD",
+                                      "SOL/USD",
+                                      "XRP/USD"
+                                  ],
+                      "dry":  true
+                  }
+}
