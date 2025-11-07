@@ -45,6 +45,8 @@ import sys
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
+import threading
+import time
 
 # Routes:
 #  - /
@@ -134,6 +136,14 @@ def _pick_data_dir() -> Path:
 
 DATA_DIR = _pick_data_dir()
 DB_PATH = DATA_DIR / "journal.db"
+
+# --------------------------------------------------------------------------------------
+# Scheduler globals
+# --------------------------------------------------------------------------------------
+_SCHED_ENABLED = bool(int(os.getenv("SCHED_ON", os.getenv("SCHED_ENABLED", "1") or "1")))
+_SCHED_SLEEP = int(os.getenv("SCHED_SLEEP", "30") or "30")
+_SCHED_THREAD = None  # type: Optional[threading.Thread]
+
 
 # --------------------------------------------------------------------------------------
 # Kraken credentials & normalization helpers
@@ -559,7 +569,7 @@ def journal_peek(limit: int = Query(25, ge=1, le=1000), offset: int = Query(0, g
     return {"ok": True, "count": count_rows(), "rows": rows}
     
 @app.post("/journal/attach")
-def journal_attach(payload: dict = Body(...)):
+def journal_attach(payload: dict = Body(default=None)):
     """
     Attach strategy labels to trades.
 
@@ -625,7 +635,7 @@ def get_fills(limit: int = 50, offset: int = 0):
         conn.close()
 
 @app.post("/journal/backfill")
-def journal_backfill(payload: Dict[str, Any] = Body(...)):
+def journal_backfill(payload: Dict[str, Any] = Body(default=None)):
     since_hours = int(payload.get("since_hours", 24 * 365))
     limit = int(payload.get("limit", 100000))
     start_ts = hours_to_start_ts(since_hours)
@@ -646,7 +656,7 @@ def journal_backfill(payload: Dict[str, Any] = Body(...)):
     }
 
 @app.post("/journal/sync")
-def journal_sync(payload: Dict[str, Any] = Body(...)):
+def journal_sync(payload: Dict[str, Any] = Body(default=None)):
     """
     Pull trades from Kraken TradesHistory and upsert into sqlite.
 
@@ -878,7 +888,7 @@ def advisor_daily():
     return {"ok": True, **data}
 
 @app.post("/advisor/apply")
-def advisor_apply(payload: Dict[str, Any] = Body(...)):
+def advisor_apply(payload: Dict[str, Any] = Body(default=None)):
     data = {
         "date": payload.get("date") or dt.date.today().isoformat(),
         "notes": payload.get("notes") or "",
@@ -1280,15 +1290,14 @@ def scheduler_stop():
 # ---- Scheduler (stub) ----------------------------------------------------------------
 
 @app.post("/scheduler/run")
-def scheduler_run(payload: Dict[str, Any] = Body(...)):
-    # --- PATCH v1.12.9 begin: dry-run override (indent is critical) ---
+def scheduler_run(payload: Dict[str, Any] = Body(default=None)):
+    payload = payload or {}
+    # --- DRY resolver (unchanged) ---
     import os as _os
-
     def _resolve_dry(_p):
-        _env = str(_os.getenv("SCHED_DRY", "0")).lower() in ("1", "true", "yes")
+        _env = str(_os.getenv("SCHED_DRY", "0")).lower() in ("1","true","yes")
         try:
-            if _p is None:
-                return _env
+            if _p is None: return _env
             if hasattr(_p, "dict"):
                 v = _p.dict().get("dry_run", None)
             elif isinstance(_p, dict):
@@ -1299,22 +1308,45 @@ def scheduler_run(payload: Dict[str, Any] = Body(...)):
         except Exception:
             return _env
 
-    # try to grab whatever your function names the incoming JSON body/payload
-    _dry = _resolve_dry(locals().get("payload") or locals().get("body"))
-    # --- PATCH v1.12.9 end ---
-
-    dry = _dry
+    dry = _resolve_dry(payload)
     tf = payload.get("tf", "5Min")
     strats = str(payload.get("strats", "c1,c2,c3"))
     symbols_csv = str(payload.get("symbols", "BTC/USD,ETH/USD"))
     limit = int(payload.get("limit", 300))
     notional = float(payload.get("notional", 25.0))
-
     msg = f"Scheduler pass: strats={strats} tf={tf} limit={limit} notional={notional} dry={dry} symbols={symbols_csv}"
     log.info(msg)
-    actions = []
-    return {"ok": True, "message": msg, "actions": actions}
+    return {"ok": True, "message": msg, "actions": []}
 
+# --------------------------------------------------------------------------------------
+# Background scheduler loop
+# --------------------------------------------------------------------------------------
+def _scheduler_loop():
+    """Background loop honoring _SCHED_ENABLED and _SCHED_SLEEP.
+    Builds payload from env so Render env toggles work without redeploy.
+    """
+    global _SCHED_ENABLED
+    tick = 0
+    while True:
+        try:
+            if _SCHED_ENABLED:
+                # Build payload from env on each pass
+                payload = {
+                    "tf": os.getenv("SCHED_TIMEFRAME", os.getenv("DEFAULT_TIMEFRAME","5Min") or "5Min"),
+                    "strats": os.getenv("SCHED_STRATS", "c1,c2,c3,c4,c5,c6"),
+                    "symbols": os.getenv("SYMBOLS","BTC/USD,ETH/USD"),
+                    "limit": int(os.getenv("SCHED_LIMIT", os.getenv("DEFAULT_LIMIT","300") or "300")),
+                    "notional": float(os.getenv("SCHED_NOTIONAL", os.getenv("DEFAULT_NOTIONAL","25") or "25")),
+                    "dry_run": str(os.getenv("SCHED_DRY","0")).lower() in ("1","true","yes"),
+                }
+                # call the same function our route uses
+                _ = scheduler_run(payload)
+                tick += 1
+                log.info("scheduler tick #%s ok", tick)
+        except Exception as e:
+            log.exception("scheduler loop error: %s", e)
+        # sleep regardless to prevent tight loop if disabled
+        time.sleep(_SCHED_SLEEP)
 # --------------------------------------------------------------------------------------
 # Startup log
 # --------------------------------------------------------------------------------------
@@ -1342,6 +1374,13 @@ def _startup():
     _ = _db()
     _ensure_strategy_column()
     log.info(f"Data dir: {DATA_DIR} | DB: {DB_PATH}")
+    global _SCHED_THREAD
+    if _SCHED_ENABLED and _SCHED_THREAD is None:
+        _SCHED_THREAD = threading.Thread(target=_scheduler_loop, daemon=True, name="scheduler")
+        _SCHED_THREAD.start()
+        log.info("Scheduler thread started: sleep=%s enabled=%s", _SCHED_SLEEP, _SCHED_ENABLED)
+    else:
+        log.info("Scheduler thread not started: enabled=%s existing=%s", _SCHED_ENABLED, bool(_SCHED_THREAD))
 
 # --------------------------------------------------------------------------------------
 # Entrypoint (for local runs; Render uses 'python app.py')
@@ -1353,7 +1392,7 @@ if __name__ == "__main__":
     uvicorn.run("app:app", host="0.0.0.0", port=port, reload=False)
 
 @app.post("/journal/enrich")
-def journal_enrich(payload: Dict[str, Any] = Body(...)):
+def journal_enrich(payload: Dict[str, Any] = Body(default=None)):
     dry_run = bool(payload.get("dry_run", False))
     batch_size = int(payload.get("batch_size", 40) or 40)
     max_rows   = int(payload.get("max_rows", 5000) or 5000)
