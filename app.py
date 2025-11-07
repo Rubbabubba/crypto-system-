@@ -143,6 +143,9 @@ DB_PATH = DATA_DIR / "journal.db"
 _SCHED_ENABLED = bool(int(os.getenv("SCHED_ON", os.getenv("SCHED_ENABLED", "1") or "1")))
 _SCHED_SLEEP = int(os.getenv("SCHED_SLEEP", "30") or "30")
 _SCHED_THREAD = None  # type: Optional[threading.Thread]
+_SCHED_TICKS = 0  # number of background scheduler passes completed
+_SCHED_LAST = {}
+
 
 
 # --------------------------------------------------------------------------------------
@@ -1273,7 +1276,28 @@ def kpis():
 _SCHED_ENABLED = bool(int(os.getenv("SCHED_ON", os.getenv("SCHED_ENABLED","1") or "1")))
 @app.get("/scheduler/status")
 def scheduler_status():
-    return { "ok": True, "enabled": _SCHED_ENABLED, "interval_secs": int(os.getenv("SCHED_SLEEP","30") or "30") }
+    symbols = os.getenv("SYMBOLS", os.getenv("DEFAULT_SYMBOLS", "BTC/USD,ETH/USD")).strip()
+    strats = os.getenv("SCHED_STRATS", "c1,c2,c3,c4,c5,c6").strip()
+    timeframe = os.getenv("SCHED_TIMEFRAME", os.getenv("DEFAULT_TIMEFRAME", "5Min")).strip()
+    limit = int(os.getenv("SCHED_LIMIT", os.getenv("DEFAULT_LIMIT", "300") or 300))
+    notional = float(os.getenv("SCHED_NOTIONAL", os.getenv("DEFAULT_NOTIONAL", "25") or 25))
+    guard_enabled = bool(int(os.getenv("TRADING_ENABLED", "1") or 1))
+    window = os.getenv("TRADING_WINDOW", os.getenv("WINDOW", "live")).strip()
+    return {
+        "ok": True,
+        "enabled": _SCHED_ENABLED,
+        "interval_secs": int(os.getenv("SCHED_SLEEP", "30") or 30),
+        "symbols": symbols,
+        "strats": strats,
+        "timeframe": timeframe,
+        "limit": limit,
+        "notional": notional,
+        "guard_enabled": guard_enabled,
+        "window": window,
+        "ticks": _SCHED_TICKS,
+        "last": _SCHED_LAST,
+    }
+
 
 @app.post("/scheduler/start")
 def scheduler_start():
@@ -1292,6 +1316,7 @@ def scheduler_stop():
 @app.post("/scheduler/run")
 def scheduler_run(payload: Dict[str, Any] = Body(default=None)):
     payload = payload or {}
+    global _SCHED_LAST
     # --- DRY resolver (unchanged) ---
     import os as _os
     def _resolve_dry(_p):
@@ -1315,6 +1340,7 @@ def scheduler_run(payload: Dict[str, Any] = Body(default=None)):
     limit = int(payload.get("limit", 300))
     notional = float(payload.get("notional", 25.0))
     msg = f"Scheduler pass: strats={strats} tf={tf} limit={limit} notional={notional} dry={dry} symbols={symbols_csv}"
+     _SCHED_LAST = {"tf": tf, "strats": strats, "symbols": symbols_csv, "limit": limit, "notional": notional, "dry_run": dry}
     log.info(msg)
     return {"ok": True, "message": msg, "actions": []}
 
@@ -1327,6 +1353,7 @@ def _scheduler_loop():
     """
     global _SCHED_ENABLED
     tick = 0
+    global _SCHED_TICKS
     while True:
         try:
             if _SCHED_ENABLED:
@@ -1342,6 +1369,7 @@ def _scheduler_loop():
                 # call the same function our route uses
                 _ = scheduler_run(payload)
                 tick += 1
+                _SCHED_TICKS = tick
                 log.info("scheduler tick #%s ok", tick)
         except Exception as e:
             log.exception("scheduler loop error: %s", e)
@@ -1583,3 +1611,7 @@ def debug_env():
     ]
     env = {k: os.getenv(k) for k in keys}
     return {"ok": True, "env": env}
+
+@app.get("/scheduler/last")
+def scheduler_last():
+    return {"ok": True, "last": _SCHED_LAST}
