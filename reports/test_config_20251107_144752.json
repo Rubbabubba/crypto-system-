@@ -1,0 +1,42 @@
+﻿{
+    "ok":  true,
+    "base_url":  "https://crypto-system-z605.onrender.com",
+    "sent_body":  {
+                      "guard":  true,
+                      "window":  "live",
+                      "notional":  25,
+                      "limit":  300,
+                      "strats":  [
+                                     "c1",
+                                     "c2",
+                                     "c3",
+                                     "c4",
+                                     "c5",
+                                     "c6"
+                                 ],
+                      "symbols":  [
+                                      "AVAX/USD",
+                                      "BCH/USD",
+                                      "BTC/USD",
+                                      "DOGE/USD",
+                                      "ETH/USD",
+                                      "LINK/USD",
+                                      "LTC/USD",
+                                      "SOL/USD",
+                                      "XRP/USD"
+                                  ],
+                      "dry":  true,
+                      "timeframe":  "5Min"
+                  },
+    "observed":  {
+                     "symbols":  null,
+                     "strats":  null,
+                     "timeframe":  null,
+                     "limit":  null,
+                     "notional":  null,
+                     "dry":  null,
+                     "window":  null,
+                     "guard":  null
+                 },
+    "timestamp":  "2025-11-07T14:47:52.3859333-06:00"
+}

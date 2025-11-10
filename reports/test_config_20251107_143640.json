@@ -1,0 +1,92 @@
+﻿{
+    "ok":  false,
+    "base_url":  "https://crypto-system-z605.onrender.com",
+    "sent_body":  {
+                      "symbols":  [
+                                      "AVAX/USD",
+                                      "BCH/USD",
+                                      "BTC/USD",
+                                      "DOGE/USD",
+                                      "ETH/USD",
+                                      "LINK/USD",
+                                      "LTC/USD",
+                                      "SOL/USD",
+                                      "XRP/USD"
+                                  ],
+                      "strats":  [
+                                     "c1",
+                                     "c2",
+                                     "c3",
+                                     "c4",
+                                     "c5",
+                                     "c6"
+                                 ],
+                      "notional":  25,
+                      "dry":  true,
+                      "limit":  300,
+                      "window":  "live",
+                      "guard":  true,
+                      "timeframe":  "5Min"
+                  },
+    "observed":  {
+                     "strats":  "",
+                     "symbols":  "",
+                     "timeframe":  "",
+                     "limit":  null,
+                     "notional":  null,
+                     "dry":  null,
+                     "window":  "live",
+                     "guard":  true
+                 },
+    "checks":  [
+                   {
+                       "name":  "Whitelist (symbols)",
+                       "expected":  "AVAX/USD, BCH/USD, BTC/USD, DOGE/USD, ETH/USD, LINK/USD, LTC/USD, SOL/USD, XRP/USD",
+                       "actual":  "",
+                       "pass":  false
+                   },
+                   {
+                       "name":  "Strategies",
+                       "expected":  "c1, c2, c3, c4, c5, c6",
+                       "actual":  "",
+                       "pass":  false
+                   },
+                   {
+                       "name":  "Timeframe",
+                       "expected":  "5Min",
+                       "actual":  "",
+                       "pass":  false
+                   },
+                   {
+                       "name":  "Limit",
+                       "expected":  300,
+                       "actual":  null,
+                       "pass":  false
+                   },
+                   {
+                       "name":  "Notional",
+                       "expected":  25,
+                       "actual":  null,
+                       "pass":  false
+                   },
+                   {
+                       "name":  "DryRun",
+                       "expected":  true,
+                       "actual":  false,
+                       "pass":  false
+                   },
+                   {
+                       "name":  "Window",
+                       "expected":  "live",
+                       "actual":  "live",
+                       "pass":  true
+                   },
+                   {
+                       "name":  "Guard Enabled",
+                       "expected":  true,
+                       "actual":  true,
+                       "pass":  true
+                   }
+               ],
+    "timestamp":  "2025-11-07T14:36:41.1549013-06:00"
+}
