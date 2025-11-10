@@ -1759,7 +1759,7 @@ def scheduler_run(payload: Dict[str, Any] = Body(default=None)):
 
         for r in res:
             edge_pct = float(r.atr_pct or 0.0) * 100.0  # rank pct 0..1 → 0..100 proxy
-            fee_pct = taker_fee_bps / 100.0
+            fee_pct = taker_fee_bps / 10000.0
             guard_ok = True
             guard_reason = None
             if r.action not in ("buy","sell"):
