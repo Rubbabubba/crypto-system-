@@ -1,3 +1,5 @@
+DEFAULT_MIN_ATR_PCT = float(os.getenv('MIN_ATR_PCT', '0.08'))
+import os
 # strategies/book.py
 from __future__ import annotations
 from dataclasses import dataclass
@@ -83,7 +85,7 @@ def compute_regimes(close, high, low) -> Regimes:
 
 # ====== raw signals ======
 def sig_c1_adaptive_rsi(close, regimes: Regimes,
-                        rsi_len=14, band_lookback=100, k=0.7, min_atr_pct=0.25):
+                        rsi_len=14, band_lookback=100, k=0.7, min_atr_pct=DEFAULT_MIN_ATR_PCT):
     r = _rsi(close, rsi_len)
     s = pd.Series(r).rolling(max(30, band_lookback)).std(ddof=0).to_numpy()
     i = len(close) - 1
@@ -104,7 +106,7 @@ def sig_c1_adaptive_rsi(close, regimes: Regimes,
     return action, score, reason
 
 def sig_c2_trend(close, regimes: Regimes,
-                 f=20, s=60, pullback=5, min_atr_pct=0.35):
+                 f=20, s=60, pullback=5, min_atr_pct=DEFAULT_MIN_ATR_PCT):
     i = len(close) - 1
     if (regimes.atr_pct or 0.0) < min_atr_pct:
         return "flat", 0.0, "filt_vol_too_low"
@@ -121,7 +123,7 @@ def sig_c2_trend(close, regimes: Regimes,
     return "flat", 0.0, "no_raw_signal"
 
 def sig_c3_momentum(close, regimes: Regimes,
-                    roc_len=12, rsi_slope_len=7, min_atr_pct=0.30):
+                    roc_len=12, rsi_slope_len=7, min_atr_pct=DEFAULT_MIN_ATR_PCT):
     if (regimes.atr_pct or 0.0) < min_atr_pct:
         return "flat", 0.0, "filt_vol_too_low"
     roc = _roc(close, roc_len)
@@ -136,7 +138,7 @@ def sig_c3_momentum(close, regimes: Regimes,
     return "flat", 0.0, "no_raw_signal"
 
 def sig_c4_breakout(close, regimes: Regimes,
-                    don_len=20, min_bandwidth=0.75, min_atr_pct=0.30):
+                    don_len=20, min_bandwidth=0.75, min_atr_pct=DEFAULT_MIN_ATR_PCT):
     if (regimes.atr_pct or 0.0) < min_atr_pct:
         return "flat", 0.0, "filt_vol_too_low"
     s = pd.Series(close)
@@ -153,15 +155,15 @@ def sig_c4_breakout(close, regimes: Regimes,
     return "flat", 0.0, "range_no_break"
 
 def sig_c5_alt_mom(close, regimes: Regimes):
-    return sig_c3_momentum(close, regimes, roc_len=20, rsi_slope_len=9, min_atr_pct=0.30)
+    return sig_c3_momentum(close, regimes, roc_len=20, rsi_slope_len=9, min_atr_pct=DEFAULT_MIN_ATR_PCT)
 
 def sig_c6_rel_to_btc(close, regimes: Regimes, ref_close_btc: Optional[np.ndarray] = None):
     if ref_close_btc is None:
-        return sig_c3_momentum(close, regimes, roc_len=10, rsi_slope_len=5, min_atr_pct=0.25)
+        return sig_c3_momentum(close, regimes, roc_len=10, rsi_slope_len=5, min_atr_pct=DEFAULT_MIN_ATR_PCT)
     rel = (pd.Series(close) / pd.Series(ref_close_btc)).to_numpy()
     r = Regimes(trend_z=regimes.trend_z, atr=regimes.atr, atr_pct=regimes.atr_pct,
                 sma_fast=regimes.sma_fast, sma_slow=regimes.sma_slow)
-    return sig_c3_momentum(rel, r, roc_len=12, rsi_slope_len=7, min_atr_pct=0.25)
+    return sig_c3_momentum(rel, r, roc_len=12, rsi_slope_len=7, min_atr_pct=DEFAULT_MIN_ATR_PCT)
 
 def mtf_confirm(action: str, reg5: Regimes) -> bool:
     if action == "buy":  return reg5.sma_fast > reg5.sma_slow
