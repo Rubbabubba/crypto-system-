@@ -1334,49 +1334,6 @@ def scheduler_last():
         raise HTTPException(status_code=404, detail="No last scheduler payload yet")
     with _SCHED_LAST_LOCK:
         return dict(_SCHED_LAST)
-@app.post("/scheduler/run")
-def scheduler_run(payload: Dict[str, Any] = Body(default=None)):
-    payload = payload or {}
-    # --- DRY resolver (unchanged) ---
-    import os as _os
-    def _resolve_dry(_p):
-        _env = str(_os.getenv("SCHED_DRY", "0")).lower() in ("1","true","yes")
-        try:
-            if _p is None: return _env
-            if hasattr(_p, "dict"):
-                v = _p.dict().get("dry_run", None)
-            elif isinstance(_p, dict):
-                v = _p.get("dry_run", None)
-            else:
-                v = None
-            return _env if v is None else bool(v)
-        except Exception:
-            return _env
-
-    dry = _resolve_dry(payload)
-    tf = payload.get("tf", "5Min")
-    strats = str(payload.get("strats", "c1,c2,c3"))
-    symbols_csv = str(payload.get("symbols", "BTC/USD,ETH/USD"))
-    limit = int(payload.get("limit", 300))
-    notional = float(payload.get("notional", 25.0))
-    msg = f"Scheduler pass: strats={strats} tf={tf} limit={limit} notional={notional} dry={dry} symbols={symbols_csv}"
-    log.info(msg)
-
-    # capture last-run parameters for external tools
-    try:
-        with _SCHED_LAST_LOCK:
-            _SCHED_LAST = {
-                "tf": tf,
-                "strats": strats,
-                "symbols": symbols_csv,
-                "limit": limit,
-                "notional": notional,
-                "dry_run": dry,
-                "ts": datetime.datetime.utcnow().isoformat() + "Z",
-            }
-    except Exception as e:
-        log.warning("could not set _SCHED_LAST: %s", e)
-    return {"ok": True, "message": msg, "actions": []}
 
 # --------------------------------------------------------------------------------------
 # Background scheduler loop
@@ -1651,3 +1608,189 @@ def debug_env():
     ]
     env = {k: os.getenv(k) for k in keys}
     return {"ok": True, "env": env}
+
+# ---- Scan all (no orders) ------------------------------------------------------------
+@app.get("/scan/all")
+def scan_all(tf: str = "5Min", symbols: str = "BTC/USD,ETH/USD", strats: str = "c1,c2,c3",
+             limit: int = 300, notional: float = 25.0):
+    """
+    Preload bars for requested symbols/timeframe(s), run each strategy scan, and return intents
+    without placing orders. Useful for diagnosing "why no action?".
+    """
+    try:
+        import br_router as br
+    except Exception as e:
+        return {"ok": False, "error": f"import br_router failed: {e}"}
+    try:
+        from book import StrategyBook, ScanRequest
+    except Exception as e:
+        return {"ok": False, "error": f"import book failed: {e}"}
+
+    syms = [s.strip().upper() for s in (symbols or "").split(",") if s.strip()]
+    mods = [m.strip().lower() for m in (strats or "").split(",") if m.strip()]
+    tf = str(tf or "5Min")
+    limit = int(limit or 300)
+    notional = float(notional or 25.0)
+
+    # Env-tunable book params (defaults)
+    topk = int(os.getenv("BOOK_TOPK", "2") or 2)
+    min_score = float(os.getenv("BOOK_MIN_SCORE", "0.07") or 0.07)
+    atr_stop_mult = float(os.getenv("ATR_STOP_MULT", "1.0") or 1.0)
+
+    # Preload bars: 1Min and main tf
+    bars_cache = {}
+    for sym in syms:
+        try:
+            one = br.get_bars(sym, timeframe="1Min", limit=limit)
+            five = br.get_bars(sym, timeframe=tf, limit=limit)
+            def series(bars, key):
+                return [row.get(key) for row in (bars or [])]
+            bars_cache[sym] = {
+                "one":  {"close": series(one,"c"), "high": series(one,"h"), "low": series(one,"l")},
+                "five": {"close": series(five,"c"), "high": series(five,"h"), "low": series(five,"l")},
+            }
+        except Exception as e:
+            bars_cache[sym] = {"error": str(e)}
+
+    out = {"ok": True, "tf": tf, "symbols": syms, "strats": mods, "results": {}}
+    for mod in mods:
+        req = ScanRequest(strat=mod, timeframe=tf, limit=limit, topk=topk, min_score=min_score, notional=notional)
+        book = StrategyBook(topk=topk, min_score=min_score, atr_stop_mult=atr_stop_mult)
+        try:
+            res = book.scan(req, bars_cache)
+            out["results"][mod] = [r.__dict__ for r in res]
+        except Exception as e:
+            out["results"][mod] = [{"error": str(e)}]
+    return out
+
+
+@app.post("/scheduler/run")
+def scheduler_run(payload: Dict[str, Any] = Body(default=None)):
+    """
+    Real scheduler: fetch bars once, run StrategyBook on requested strats/symbols,
+    and (optionally) place market orders via br_router.market_notional.
+    """
+    payload = payload or {}
+    try:
+        import br_router as br
+    except Exception as e:
+        msg = f"import br_router failed: {e}"
+        log.warning(msg)
+        return {"ok": False, "message": msg, "actions": []}
+    try:
+        from book import StrategyBook, ScanRequest
+    except Exception as e:
+        msg = f"import book failed: {e}"
+        log.warning(msg)
+        return {"ok": False, "message": msg, "actions": []}
+
+    # Resolve inputs
+    def _resolve_dry(_p):
+        _env = str(os.getenv("SCHED_DRY", "1")).lower() in ("1","true","yes")
+        try:
+            if _p is None: return _env
+            if isinstance(_p, dict):
+                v = _p.get("dry_run", None)
+            else:
+                v = None
+            return _env if v is None else bool(v)
+        except Exception:
+            return _env
+
+    dry = _resolve_dry(payload)
+    tf = str(payload.get("tf", os.getenv("SCHED_TIMEFRAME", "5Min")))
+    strats = [s.strip().lower() for s in str(payload.get("strats", os.getenv("SCHED_STRATS","c1,c2,c3"))).split(",") if s.strip()]
+    symbols_csv = str(payload.get("symbols", os.getenv("SYMBOLS","BTC/USD,ETH/USD")))
+    syms = [s.strip().upper() for s in symbols_csv.split(",") if s.strip()]
+    limit = int(payload.get("limit", int(os.getenv("SCHED_LIMIT", "300") or 300)))
+    notional = float(payload.get("notional", float(os.getenv("SCHED_NOTIONAL", "25") or 25)))
+    msg = f"Scheduler pass: strats={','.join(strats)} tf={tf} limit={limit} notional={notional} dry={dry} symbols={symbols_csv}"
+    log.info(msg)
+
+    # Record last-run
+    try:
+        with _SCHED_LAST_LOCK:
+            _SCHED_LAST.clear()
+            _SCHED_LAST.update({
+                "tf": tf, "strats": ",".join(strats), "symbols": symbols_csv,
+                "limit": limit, "notional": notional, "dry_run": dry,
+                "ts": dt.datetime.utcnow().isoformat() + "Z",
+            })
+    except Exception as e:
+        log.warning("could not set _SCHED_LAST: %s", e)
+
+    # Env-tunable book params
+    topk = int(os.getenv("BOOK_TOPK", "2") or 2)
+    min_score = float(os.getenv("BOOK_MIN_SCORE", "0.07") or 0.07)
+    atr_stop_mult = float(os.getenv("ATR_STOP_MULT", "1.0") or 1.0)
+
+    # Fee/edge guard envs
+    taker_fee_bps = float(os.getenv("KRAKEN_TAKER_FEE_BPS", "26") or 26.0)  # 0.26% typical
+    fee_multiple = float(os.getenv("EDGE_MULTIPLE_VS_FEE", "2.0") or 2.0)   # require edge >= 2x fee
+    min_notional = float(os.getenv("MIN_ORDER_NOTIONAL_USD", "10") or 10.0) # skip under min
+
+    # Preload bars once
+    contexts = {}
+    for sym in syms:
+        try:
+            one = br.get_bars(sym, timeframe="1Min", limit=limit)
+            five = br.get_bars(sym, timeframe=tf, limit=limit)
+            def series(bars, key):
+                return [row.get(key) for row in (bars or [])]
+            contexts[sym] = {
+                "one":  {"close": series(one,"c"), "high": series(one,"h"), "low": series(one,"l")},
+                "five": {"close": series(five,"c"), "high": series(five,"h"), "low": series(five,"l")},
+            }
+        except Exception as e:
+            contexts[sym] = None
+            log.warning("bars preload error for %s: %s", sym, e)
+
+    actions = []
+    telemetry = []
+
+    for strat in strats:
+        book = StrategyBook(topk=topk, min_score=min_score, atr_stop_mult=atr_stop_mult)
+        req = ScanRequest(strat=strat, timeframe=tf, limit=limit, topk=topk, min_score=min_score, notional=notional)
+        try:
+            res = book.scan(req, contexts)
+        except Exception as e:
+            telemetry.append({"strategy": strat, "error": str(e)})
+            continue
+
+        for r in res:
+            edge_pct = float(r.atr_pct or 0.0) * 100.0  # rank pct 0..1 → 0..100 proxy
+            fee_pct = taker_fee_bps / 100.0
+            guard_ok = True
+            guard_reason = None
+            if r.action not in ("buy","sell"):
+                guard_ok = False; guard_reason = r.reason or "flat"
+            elif r.notional < max(min_notional, 0.0):
+                guard_ok = False; guard_reason = f"notional_below_min:{r.notional:.2f}"
+            elif edge_pct < (fee_multiple * fee_pct * 100.0):
+                guard_ok = False; guard_reason = f"edge_vs_fee_low:{edge_pct:.3f}pct"
+
+            telemetry.append({
+                "strategy": strat, "symbol": r.symbol, "raw_action": r.action, "reason": r.reason,
+                "score": r.score, "atr": r.atr, "atr_pct": r.atr_pct,
+                "qty": r.qty, "notional": r.notional,
+                "guard_ok": guard_ok, "guard_reason": guard_reason
+            })
+
+            if guard_ok and r.action in ("buy","sell"):
+                act = {
+                    "symbol": r.symbol, "side": r.action, "strategy": strat,
+                    "notional": float(r.notional if r.notional > 0 else notional),
+                }
+                if dry:
+                    act["status"] = "dry_ok"
+                else:
+                    try:
+                        resp = br.market_notional(r.symbol, r.action, act["notional"], strategy=strat)
+                        act["status"] = "live_ok"
+                        act["broker"] = resp
+                    except Exception as e:
+                        act["status"] = "live_err"
+                        act["error"] = str(e)
+                actions.append(act)
+
+    return {"ok": True, "message": msg, "actions": actions, "telemetry": telemetry}
