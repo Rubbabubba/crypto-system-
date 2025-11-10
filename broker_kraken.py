@@ -334,9 +334,7 @@ def market_notional(symbol: str, side: str, notional: float, strategy: Optional[
         "pair": pair,
         "type": "buy" if side == "buy" else "sell",
         "ordertype": "market",
-        "volume": f"{volume:.8f
-        \"userref\": str(_userref_for_strategy(strategy)),
-    }",
+        "volume": f"{volume:.8f}",
         "userref": str(_userref(ui, side, float(notional))),
     }
     res = _priv("AddOrder", payload)

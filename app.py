@@ -1,3 +1,4 @@
+from datetime import datetime
 from threading import Lock
 """
 crypto-system-api (app.py) — v2.4.0
@@ -1642,3 +1643,30 @@ def debug_env():
     ]
     env = {k: os.getenv(k) for k in keys}
     return {"ok": True, "env": env}
+from importlib import import_module
+import br_router as br
+
+@app.get("/scan/all")
+def scan_all(tf: str = None, symbols: str = None, strats: str = None, limit: int = 300, notional: float = 25.0):
+    tf = str(tf or os.getenv("SCHED_TIMEFRAME", "5Min"))
+    syms = [s.strip().upper() for s in (symbols or os.getenv("SYMBOLS","BTC/USD,ETH/USD")).split(",") if s.strip()]
+    mods = [m.strip() for m in (strats or os.getenv("SCHED_STRATS","c1,c2,c3,c4,c5,c6")).split(",") if m.strip()]
+
+    bars_cache = {}
+    for sym in syms:
+        try:
+            bars_cache[sym] = br.get_bars(sym, timeframe=tf, limit=limit)
+        except Exception as e:
+            bars_cache[sym] = {"error": str(e)}
+
+    out = []
+    for mod in mods:
+        try:
+            scan = import_module(mod.lower()).scan
+            req = {"timeframe": tf, "limit": limit, "symbols": syms, "notional": notional}
+            ctx = {"timeframe": tf, "limit": limit, "symbols": syms, "notional": notional, "preloaded_bars": bars_cache}
+            res = scan(req=req, ctx=ctx) or []
+            out.extend(res)
+        except Exception as e:
+            out.append({"strategy": mod, "error": str(e)})
+    return {"tf": tf, "symbols": syms, "strats": mods, "intents": out}
