@@ -141,10 +141,12 @@ DB_PATH = DATA_DIR / "journal.db"
 # Scheduler globals
 # --------------------------------------------------------------------------------------
 _SCHED_ENABLED = bool(int(os.getenv("SCHED_ON", os.getenv("SCHED_ENABLED", "1") or "1")))
-_SCHED_LAST = {}
-
 _SCHED_SLEEP = int(os.getenv("SCHED_SLEEP", "30") or "30")
 _SCHED_THREAD = None  # type: Optional[threading.Thread]
+_SCHED_TICKS = 0
+_SCHED_LAST = {}
+_SCHED_LAST_LOCK = threading.Lock()
+  # number of background scheduler passes completed
 
 
 # --------------------------------------------------------------------------------------
@@ -1275,12 +1277,26 @@ def kpis():
 _SCHED_ENABLED = bool(int(os.getenv("SCHED_ON", os.getenv("SCHED_ENABLED","1") or "1")))
 @app.get("/scheduler/status")
 def scheduler_status():
-    return { "ok": True,  "ok": True, "enabled": _SCHED_ENABLED, "interval_secs": int(os.getenv("SCHED_SLEEP","30") or "30") , "last": _SCHED_LAST }@app.get("/scheduler/last")
-def scheduler_last():
-    try:
-        return {"ok": True, "last": _SCHED_LAST}
-    except NameError:
-        return {"ok": False, "last": {}}
+    symbols = os.getenv("SYMBOLS", os.getenv("DEFAULT_SYMBOLS", "BTC/USD,ETH/USD")).strip()
+    strats = os.getenv("SCHED_STRATS", "c1,c2,c3,c4,c5,c6").strip()
+    timeframe = os.getenv("SCHED_TIMEFRAME", os.getenv("DEFAULT_TIMEFRAME", "5Min")).strip()
+    limit = int(os.getenv("SCHED_LIMIT", os.getenv("DEFAULT_LIMIT", "300") or 300))
+    notional = float(os.getenv("SCHED_NOTIONAL", os.getenv("DEFAULT_NOTIONAL", "25") or 25))
+    guard_enabled = bool(int(os.getenv("TRADING_ENABLED", "1") or 1))
+    window = os.getenv("TRADING_WINDOW", os.getenv("WINDOW", "live")).strip()
+    return {
+        "ok": True,
+        "enabled": _SCHED_ENABLED,
+        "interval_secs": int(os.getenv("SCHED_SLEEP", "30") or 30),
+        "symbols": symbols,
+        "strats": strats,
+        "timeframe": timeframe,
+        "limit": limit,
+        "notional": notional,
+        "guard_enabled": guard_enabled,
+        "window": window,
+        "ticks": _SCHED_TICKS,
+    }
 
 
 @app.post("/scheduler/start")
@@ -1297,6 +1313,17 @@ def scheduler_stop():
 
 # ---- Scheduler (stub) ----------------------------------------------------------------
 
+
+@app.get("/scheduler/last")
+def scheduler_last():
+    """
+    Returns the parameters of the most recent scheduler run (manual or background).
+    """
+    global _SCHED_LAST
+    if not _SCHED_LAST:
+        raise HTTPException(status_code=404, detail="No last scheduler payload yet")
+    with _SCHED_LAST_LOCK:
+        return dict(_SCHED_LAST)
 @app.post("/scheduler/run")
 def scheduler_run(payload: Dict[str, Any] = Body(default=None)):
     payload = payload or {}
@@ -1324,6 +1351,21 @@ def scheduler_run(payload: Dict[str, Any] = Body(default=None)):
     notional = float(payload.get("notional", 25.0))
     msg = f"Scheduler pass: strats={strats} tf={tf} limit={limit} notional={notional} dry={dry} symbols={symbols_csv}"
     log.info(msg)
+
+    # capture last-run parameters for external tools
+    try:
+        with _SCHED_LAST_LOCK:
+            _SCHED_LAST = {
+                "tf": tf,
+                "strats": strats,
+                "symbols": symbols_csv,
+                "limit": limit,
+                "notional": notional,
+                "dry_run": dry,
+                "ts": datetime.datetime.utcnow().isoformat() + "Z",
+            }
+    except Exception as e:
+        log.warning("could not set _SCHED_LAST: %s", e)
     return {"ok": True, "message": msg, "actions": []}
 
 # --------------------------------------------------------------------------------------
@@ -1335,6 +1377,7 @@ def _scheduler_loop():
     """
     global _SCHED_ENABLED
     tick = 0
+    global _SCHED_TICKS
     while True:
         try:
             if _SCHED_ENABLED:
@@ -1347,9 +1390,16 @@ def _scheduler_loop():
                     "notional": float(os.getenv("SCHED_NOTIONAL", os.getenv("DEFAULT_NOTIONAL","25") or "25")),
                     "dry_run": str(os.getenv("SCHED_DRY","0")).lower() in ("1","true","yes"),
                 }
+                try:
+                    with _SCHED_LAST_LOCK:
+                        _SCHED_LAST = dict(payload) | {"ts": datetime.datetime.utcnow().isoformat() + "Z"}
+                except Exception as e:
+                    log.warning("could not set _SCHED_LAST (loop): %s", e)
+
                 # call the same function our route uses
                 _ = scheduler_run(payload)
                 tick += 1
+                _SCHED_TICKS = tick
                 log.info("scheduler tick #%s ok", tick)
         except Exception as e:
             log.exception("scheduler loop error: %s", e)
