@@ -1,7 +1,7 @@
-from __future__ import annotations
-import os
 DEFAULT_MIN_ATR_PCT = float(os.getenv('MIN_ATR_PCT', '0.08'))
+import os
 # strategies/book.py
+from __future__ import annotations
 from dataclasses import dataclass
 from typing import Dict, Any, List, Optional, Tuple
 import numpy as np
@@ -179,7 +179,11 @@ def size_from_atr(price: float, atr: float, target_risk_usd: float = 10.0, atr_m
     return float(max(0.0, qty)), float(max(0.0, notional))
 
 class StrategyBook:
-    def __init__(self, topk=2, min_score=0.10, risk_target_usd=10.0, atr_stop_mult=1.5):
+    \1
+        # Env-tunable thresholds with sane defaults
+        self.topk = int(locals().get('topk') or int(os.getenv('BOOK_TOPK', '2')))
+        self.min_score = float(locals().get('min_score') or float(os.getenv('BOOK_MIN_SCORE', '0.07')))
+        self.atr_stop_mult = float(locals().get('atr_stop_mult') or float(os.getenv('ATR_STOP_MULT', '1.0')))
         self.topk = int(topk)
         self.min_score = float(min_score)
         self.risk_target_usd = float(risk_target_usd)
