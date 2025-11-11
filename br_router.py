@@ -56,7 +56,10 @@ _KRAKEN_PUBLIC_MAP = {
 }
 
 
-def market_notional(symbol, requested_notional, side, preload=None):
+def market_notional(symbol, requested_notional=None, side=None, preload=None, **kwargs):
+    # Ignore unsupported kwargs (e.g., strategy, tf, reason, etc.)
+    kwargs = kwargs or {}
+
     """Router wrapper that guarantees a price via _resolve_price and adapts to broker signature.
     """
     price = _resolve_price(symbol, preload=preload)
