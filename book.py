@@ -114,7 +114,7 @@ def sig_c2_trend(close, regimes: Regimes,
     sma_s = _roll_mean(close, s)
     up = sma_f[i] > sma_s[i]
     dn = sma_f[i] < sma_s[i]
-    pb = close[i] < pd.Series(close).rolling(pullback).max().to_numpy()[i] if up else \
+    pb = close[i] < pd.Series(close).rolling(pullback).max().to_numpy()[i] if up else 
          close[i] > pd.Series(close).rolling(pullback).min().to_numpy()[i] if dn else False
     if up and pb:
         return "buy", float(abs(regimes.trend_z)), "trend_up_pb"
