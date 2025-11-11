@@ -1,3 +1,7 @@
+import logging
+logger = logging.getLogger(__name__)
+import requests
+import importlib
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
@@ -22,8 +26,6 @@ Notes
 __version__ = "2.0.0"
 
 import os
-import logging
-logger = logging.getLogger(__name__)
 
 BROKER_ENV = (os.getenv("BROKER", "kraken") or "").lower()
 HAS_KRAKEN_CREDS = bool(os.getenv("KRAKEN_KEY") and os.getenv("KRAKEN_SECRET"))
@@ -39,99 +41,43 @@ else:
     ACTIVE_BROKER_MODULE = "broker"
 
 
-def _normalize_symbol(symbol: str) -> str:
-    sym = symbol.replace("-", "/").upper().strip()
-    try:
-        import symbol_map
-        if hasattr(symbol_map, "to_broker"):
-            mapped = symbol_map.to_broker(sym)
-            if mapped:
-                return mapped
-    except Exception:
-        pass
-    return sym
+# Common Kraken public pair codes for USD
+_KRAKEN_PUBLIC_MAP = {
+    "BTC/USD": "XXBTZUSD",
+    "XBT/USD": "XXBTZUSD",
+    "ETH/USD": "XETHZUSD",
+    "SOL/USD": "SOLUSD",
+    "LTC/USD": "XLTCZUSD",
+    "BCH/USD": "BCHUSD",
+    "XRP/USD": "XXRPZUSD",
+    "DOGE/USD": "XDGUSD",
+    "AVAX/USD": "AVAXUSD",
+    "LINK/USD": "LINKUSD",
+}
 
 
-def _kraken_variants(sym: str):
-    s = sym.upper().replace("-", "/").strip()
-    # hard-prioritize Kraken BTC aliases first
-    if s.startswith("BTC") or s.startswith("XBT"):
-        ordered = ["XBT/USD", "XBTUSD", "XXBTZUSD", "BTC/USD", "BTCUSD"]
-    else:
-        ordered = [s, s.replace("/", "")]
-    # de-dupe, keep order
-    seen, out = set(), []
-    for a in ordered:
-        if a not in seen:
-            seen.add(a); out.append(a)
-    return out
-
-
-def _resolve_price(symbol, preload=None):
-    candidates = _kraken_variants(symbol)
-
-    # 1) Broker ticker (primary)
-    try:
-        from broker_kraken import get_ticker_price
-    except Exception:
-        get_ticker_price = None
-    if get_ticker_price:
-        for c in candidates:
+def market_notional(symbol, requested_notional, side, preload=None):
+    """Router wrapper that guarantees a price via _resolve_price and adapts to broker signature.
+    """
+    price = _resolve_price(symbol, preload=preload)
+    if price is None:
+        raise ValueError(f"no price available for {symbol}")
+    import importlib
+    mod = importlib.import_module(ACTIVE_BROKER_MODULE)
+    # Try broker's market_notional with price kw
+    if hasattr(mod, "market_notional"):
+        try:
+            return mod.market_notional(symbol, requested_notional, side, price=price)
+        except TypeError:
             try:
-                px = get_ticker_price(c)
-                if px:
-                    logger.debug(f"price resolver: broker OK {c} -> {px}")
-                    return float(px)
-            except Exception as e:
-                logger.debug(f"price resolver: broker fail {c}: {e}")
-
-    # 2) Preloaded bars (works with several shapes)
-    try:
-        if preload:
-            # A) preload[sym]['tf_5Min'] or ['5Min']
-            for c in candidates:
-                d = preload.get(c) if isinstance(preload, dict) else None
-                if isinstance(d, dict):
-                    bars = d.get("tf_5Min") or d.get("5Min")
-                    if bars:
-                        last = bars[-1]
-                        close = last["close"] if isinstance(last, dict) else getattr(last, "close", None)
-                        if close is not None:
-                            logger.debug(f"price resolver: preload A {c} -> {close}")
-                            return float(close)
-            # B) preload['5Min'][sym]
-            if isinstance(preload, dict) and isinstance(preload.get("5Min"), dict):
-                for c in candidates:
-                    b = preload["5Min"].get(c)
-                    if b:
-                        last = b[-1]
-                        close = last["close"] if isinstance(last, dict) else getattr(last, "close", None)
-                        if close is not None:
-                            logger.debug(f"price resolver: preload B {c} -> {close}")
-                            return float(close)
-    except Exception as e:
-        logger.debug(f"price resolver: preload exception {e}")
-
-    # 3) Book fallbacks
-    try:
-        import book
-        for fn in ("get_last_price", "get_last_close"):
-            if hasattr(book, fn):
-                px = getattr(book, fn)(symbol)
-                if px:
-                    logger.debug(f"price resolver: book {fn} {symbol} -> {px}")
-                    return float(px)
-        for fn in ("get_bars", "load_bars"):
-            if hasattr(book, fn):
-                bars = getattr(book, fn)(symbol, tf="5Min", limit=1)
-                if bars:
-                    last = bars[-1] if isinstance(bars, (list, tuple)) else list(bars)[-1]
-                    close = last["close"] if isinstance(last, dict) else getattr(last, "close", None)
-                    if close is not None:
-                        logger.debug(f"price resolver: book {fn} last close {symbol} -> {close}")
-                        return float(close)
-    except Exception as e:
-        logger.debug(f"price resolver: book exception {e}")
-
-    logger.debug(f"price resolver: NO PRICE for {symbol} (candidates={candidates})")
-    return None
+                return mod.market_notional(symbol, requested_notional, side)
+            except Exception:
+                pass
+    # Fallback: compute qty and use market(...)
+    qty = float(requested_notional) / float(price)
+    if hasattr(mod, "market"):
+        return mod.market(symbol, side, qty)
+    # Last resort: place limit at price if available
+    if hasattr(mod, "limit"):
+        return mod.limit(symbol, side, qty, price=price)
+    raise RuntimeError("Active broker does not expose market_notional/market/limit")
