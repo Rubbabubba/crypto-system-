@@ -5,8 +5,13 @@ from dataclasses import dataclass
 from typing import Dict, Any, List, Optional, Tuple
 import numpy as np
 import pandas as pd
-import math
+
+# ---- Defaults (kept consistent with your current behavior) ----
 DEFAULT_MIN_ATR_PCT = float(os.getenv('MIN_ATR_PCT', '0.08'))  # default 8% for 5m
+DEFAULT_BOOK_TOPK = int(float(os.getenv("BOOK_TOPK", "2")))
+DEFAULT_BOOK_MIN_SCORE = float(os.getenv("BOOK_MIN_SCORE", "0.10"))
+DEFAULT_ATR_STOP_MULT = float(os.getenv("ATR_STOP_MULT", "1.5"))
+DEFAULT_MTF_CONFIRM = (str(os.getenv("MTF_CONFIRM", "true")).lower() in ("1","true","yes","on"))
 
 # ====== utilities ======
 def _roll_mean(a, n): return pd.Series(a).rolling(n).mean().to_numpy()
@@ -35,6 +40,49 @@ def _rsi(values, n=14):
 def _roc(values, n=12):
     v = pd.Series(values)
     return (v / v.shift(n) - 1.0).to_numpy()
+
+# ====== small config helpers (per-strategy override -> global -> default) ======
+def _cfg_bool(key: str, strat: Optional[str], default: bool) -> bool:
+    if strat:
+        v = os.getenv(f"{strat.upper()}_{key}")
+        if v is not None:
+            return str(v).lower() in ("1", "true", "yes", "on")
+    v = os.getenv(key)
+    if v is not None:
+        return str(v).lower() in ("1", "true", "yes", "on")
+    return default
+
+def _cfg_float(key: str, strat: Optional[str], default: float) -> float:
+    if strat:
+        v = os.getenv(f"{strat.upper()}_{key}")
+        if v is not None:
+            try:
+                return float(v)
+            except Exception:
+                pass
+    v = os.getenv(key)
+    if v is not None:
+        try:
+            return float(v)
+        except Exception:
+            pass
+    return default
+
+def _cfg_int(key: str, strat: Optional[str], default: int) -> int:
+    if strat:
+        v = os.getenv(f"{strat.upper()}_{key}")
+        if v is not None:
+            try:
+                return int(float(v))
+            except Exception:
+                pass
+    v = os.getenv(key)
+    if v is not None:
+        try:
+            return int(float(v))
+        except Exception:
+            pass
+    return default
 
 # ====== data classes ======
 @dataclass
@@ -72,6 +120,7 @@ def compute_regimes(close, high, low) -> Regimes:
     sma_s = _roll_mean(close, 60)
     trend_z = _zscore(sma_f - sma_s, 60)
     atr = _atr(high, low, close, 14)
+    # Percentile of ATR over 200 bars, used as a "volatility percentile"
     atr_pct = pd.Series(atr).rolling(200).rank(pct=True).to_numpy()
     i = len(close) - 1
     def last(x): return float(x[i]) if len(x) else float("nan")
@@ -114,10 +163,12 @@ def sig_c2_trend(close, regimes: Regimes,
     sma_s = _roll_mean(close, s)
     up = sma_f[i] > sma_s[i]
     dn = sma_f[i] < sma_s[i]
-    pb = close[i] < pd.Series(close).rolling(pullback).max().to_numpy()[i] if up else close[i] > pd.Series(close).rolling(pullback).min().to_numpy()[i] if dn else False
-    if up and pb:
+    s_close = pd.Series(close)
+    pb_up = s_close[i] < s_close.rolling(pullback).max().to_numpy()[i] if up else False
+    pb_dn = s_close[i] > s_close.rolling(pullback).min().to_numpy()[i] if dn else False
+    if up and pb_up:
         return "buy", float(abs(regimes.trend_z)), "trend_up_pb"
-    if dn and pb:
+    if dn and pb_dn:
         return "sell", float(abs(regimes.trend_z)), "trend_down_pb"
     return "flat", 0.0, "no_raw_signal"
 
@@ -153,16 +204,16 @@ def sig_c4_breakout(close, regimes: Regimes,
         return "sell", float(bandwidth), "breakout_low"
     return "flat", 0.0, "range_no_break"
 
-def sig_c5_alt_mom(close, regimes: Regimes):
-    return sig_c3_momentum(close, regimes, roc_len=20, rsi_slope_len=9, min_atr_pct=DEFAULT_MIN_ATR_PCT)
+def sig_c5_alt_mom(close, regimes: Regimes, min_atr_pct=DEFAULT_MIN_ATR_PCT):
+    return sig_c3_momentum(close, regimes, roc_len=20, rsi_slope_len=9, min_atr_pct=min_atr_pct)
 
-def sig_c6_rel_to_btc(close, regimes: Regimes, ref_close_btc: Optional[np.ndarray] = None):
+def sig_c6_rel_to_btc(close, regimes: Regimes, ref_close_btc: Optional[np.ndarray] = None, min_atr_pct=DEFAULT_MIN_ATR_PCT):
     if ref_close_btc is None:
-        return sig_c3_momentum(close, regimes, roc_len=10, rsi_slope_len=5, min_atr_pct=DEFAULT_MIN_ATR_PCT)
+        return sig_c3_momentum(close, regimes, roc_len=10, rsi_slope_len=5, min_atr_pct=min_atr_pct)
     rel = (pd.Series(close) / pd.Series(ref_close_btc)).to_numpy()
     r = Regimes(trend_z=regimes.trend_z, atr=regimes.atr, atr_pct=regimes.atr_pct,
                 sma_fast=regimes.sma_fast, sma_slow=regimes.sma_slow)
-    return sig_c3_momentum(rel, r, roc_len=12, rsi_slope_len=7, min_atr_pct=DEFAULT_MIN_ATR_PCT)
+    return sig_c3_momentum(rel, r, roc_len=12, rsi_slope_len=7, min_atr_pct=min_atr_pct)
 
 def mtf_confirm(action: str, reg5: Regimes) -> bool:
     if action == "buy":  return reg5.sma_fast > reg5.sma_slow
@@ -173,18 +224,38 @@ def size_from_atr(price: float, atr: float, target_risk_usd: float = 10.0, atr_m
     if not np.isfinite(atr) or atr <= 0 or not np.isfinite(price) or price <= 0:
         return 0.0, 0.0
     risk_per_unit = atr * atr_mult
+    if risk_per_unit <= 0:
+        return 0.0, 0.0
     qty = target_risk_usd / risk_per_unit
     notional = qty * price
     return float(max(0.0, qty)), float(max(0.0, notional))
 
 class StrategyBook:
-    def __init__(self, topk=2, min_score=0.10, risk_target_usd=10.0, atr_stop_mult=1.5):
+    def __init__(self, topk: int = DEFAULT_BOOK_TOPK, min_score: float = DEFAULT_BOOK_MIN_SCORE,
+                 risk_target_usd: float = 10.0, atr_stop_mult: float = DEFAULT_ATR_STOP_MULT,
+                 min_atr_pct_5m: Optional[float] = None, mtf_confirm_flag: Optional[bool] = None):
         self.topk = int(topk)
         self.min_score = float(min_score)
         self.risk_target_usd = float(risk_target_usd)
         self.atr_stop_mult = float(atr_stop_mult)
+        self.min_atr_pct_5m = float(min_atr_pct_5m) if min_atr_pct_5m is not None else None
+        self.mtf_confirm_flag = bool(mtf_confirm_flag) if mtf_confirm_flag is not None else None
+
+    def _resolve_knobs_for_strat(self, strat: str):
+        s = strat.strip().lower()
+        topk          = _cfg_int("BOOK_TOPK", s, DEFAULT_BOOK_TOPK)
+        min_score     = _cfg_float("BOOK_MIN_SCORE", s, DEFAULT_BOOK_MIN_SCORE)
+        atr_stop_mult = _cfg_float("ATR_STOP_MULT", s, DEFAULT_ATR_STOP_MULT)
+        min_atr_5m    = _cfg_float("VOL_MIN_ATR_PCT_5M", s, DEFAULT_MIN_ATR_PCT)
+        mtf_ok        = _cfg_bool("MTF_CONFIRM", s, DEFAULT_MTF_CONFIRM)
+        return topk, min_score, atr_stop_mult, min_atr_5m, mtf_ok
 
     def scan(self, req: ScanRequest, contexts: Dict[str, Optional[Dict[str, Any]]]) -> List[ScanResult]:
+        topk, min_score, atr_stop_mult, min_atr_5m, mtf_ok = self._resolve_knobs_for_strat(req.strat)
+        self.topk = topk
+        self.min_score = min_score
+        self.atr_stop_mult = atr_stop_mult
+
         results: List[ScanResult] = []
         ref_btc = None
         if "BTC/USD" in contexts and contexts["BTC/USD"]:
@@ -205,29 +276,29 @@ class StrategyBook:
             reg5 = compute_regimes(close5, high5, low5)
 
             action, score, reason = "flat", 0.0, "no_raw_signal"
-            s = req.strat.lower()
+            s = req.strat.strip().lower()
             if s == "c1":
-                action, score, reason = sig_c1_adaptive_rsi(close1, reg1)
+                action, score, reason = sig_c1_adaptive_rsi(close1, reg1, min_atr_pct=min_atr_5m)
             elif s == "c2":
-                action, score, reason = sig_c2_trend(close1, reg1)
+                action, score, reason = sig_c2_trend(close1, reg1, min_atr_pct=min_atr_5m)
             elif s == "c3":
-                action, score, reason = sig_c3_momentum(close1, reg1)
+                action, score, reason = sig_c3_momentum(close1, reg1, min_atr_pct=min_atr_5m)
             elif s == "c4":
-                action, score, reason = sig_c4_breakout(close1, reg1)
+                action, score, reason = sig_c4_breakout(close1, reg1, min_atr_pct=min_atr_5m)
             elif s == "c5":
-                action, score, reason = sig_c5_alt_mom(close1, reg1)
+                action, score, reason = sig_c5_alt_mom(close1, reg1, min_atr_pct=min_atr_5m)
             elif s == "c6":
-                action, score, reason = sig_c6_rel_to_btc(close1, reg1, ref_btc)
+                action, score, reason = sig_c6_rel_to_btc(close1, reg1, ref_btc, min_atr_pct=min_atr_5m)
             else:
                 action, score, reason = "flat", 0.0, "unknown_strategy"
 
-            if action in ("buy", "sell") and not mtf_confirm(action, reg5):
+            if (action in ("buy", "sell")) and mtf_ok and (not mtf_confirm(action, reg5)):
                 action, score, reason = "flat", 0.0, "filt_mtf_disagree"
 
             price = float(close1[-1])
             qty, notional = (0.0, 0.0)
             if action in ("buy", "sell") and score >= self.min_score:
-                qty, notional = size_from_atr(price, reg1.atr, self.risk_target_usd, atr_mult=1.0)
+                qty, notional = size_from_atr(price, reg1.atr, self.risk_target_usd, atr_mult=self.atr_stop_mult)
 
             results.append(ScanResult(
                 symbol=sym, action=action, reason=reason,
