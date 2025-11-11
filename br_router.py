@@ -22,6 +22,8 @@ Notes
 __version__ = "2.0.0"
 
 import os
+import logging
+logger = logging.getLogger(__name__)
 
 BROKER_ENV = (os.getenv("BROKER", "kraken") or "").lower()
 HAS_KRAKEN_CREDS = bool(os.getenv("KRAKEN_KEY") and os.getenv("KRAKEN_SECRET"))
@@ -51,80 +53,85 @@ def _normalize_symbol(symbol: str) -> str:
 
 
 def _kraken_variants(sym: str):
-    s = sym.upper()
-    alts = set([s])
-    base, quote = (s.split("/") + [""])[:2] if "/" in s else (s[:-3], s[-3:])
-    if base == "BTC":
-        base_alts = ["BTC", "XBT"]
+    s = sym.upper().replace("-", "/").strip()
+    # hard-prioritize Kraken BTC aliases first
+    if s.startswith("BTC") or s.startswith("XBT"):
+        ordered = ["XBT/USD", "XBTUSD", "XXBTZUSD", "BTC/USD", "BTCUSD"]
     else:
-        base_alts = [base]
-    quote_alts = [quote or "USD"]
-    for b in base_alts:
-        for q in quote_alts:
-            alts.add(f"{b}/{q}")
-            alts.add(f"{b}{q}")
-    more = set()
-    for a in list(alts):
-        if a.endswith("USD"):
-            more.add(a.replace("USD", "ZUSD"))
-        if a.startswith("BTC") or a.startswith("XBT"):
-            more.add(a.replace("BTC", "XBT"))
-    alts |= more
-    return list(alts)
+        ordered = [s, s.replace("/", "")]
+    # de-dupe, keep order
+    seen, out = set(), []
+    for a in ordered:
+        if a not in seen:
+            seen.add(a); out.append(a)
+    return out
 
 
 def _resolve_price(symbol, preload=None):
+    candidates = _kraken_variants(symbol)
+
+    # 1) Broker ticker (primary)
     try:
         from broker_kraken import get_ticker_price
     except Exception:
         get_ticker_price = None
-    candidates = _kraken_variants(_normalize_symbol(symbol))
-    for c in candidates:
-        try:
-            if get_ticker_price:
+    if get_ticker_price:
+        for c in candidates:
+            try:
                 px = get_ticker_price(c)
                 if px:
+                    logger.debug(f"price resolver: broker OK {c} -> {px}")
                     return float(px)
-        except Exception:
-            pass
+            except Exception as e:
+                logger.debug(f"price resolver: broker fail {c}: {e}")
+
+    # 2) Preloaded bars (works with several shapes)
     try:
         if preload:
+            # A) preload[sym]['tf_5Min'] or ['5Min']
             for c in candidates:
                 d = preload.get(c) if isinstance(preload, dict) else None
-                if d and isinstance(d, dict):
+                if isinstance(d, dict):
                     bars = d.get("tf_5Min") or d.get("5Min")
-                    if bars and len(bars) > 0:
+                    if bars:
                         last = bars[-1]
-                        val = last['close'] if isinstance(last, dict) else getattr(last, 'close', None)
-                        if val is not None:
-                            return float(val)
-            if isinstance(preload, dict) and '5Min' in preload and isinstance(preload['5Min'], dict):
+                        close = last["close"] if isinstance(last, dict) else getattr(last, "close", None)
+                        if close is not None:
+                            logger.debug(f"price resolver: preload A {c} -> {close}")
+                            return float(close)
+            # B) preload['5Min'][sym]
+            if isinstance(preload, dict) and isinstance(preload.get("5Min"), dict):
                 for c in candidates:
-                    b = preload['5Min'].get(c)
-                    if b and len(b) > 0:
+                    b = preload["5Min"].get(c)
+                    if b:
                         last = b[-1]
-                        val = last['close'] if isinstance(last, dict) else getattr(last, 'close', None)
-                        if val is not None:
-                            return float(val)
-    except Exception:
-        pass
+                        close = last["close"] if isinstance(last, dict) else getattr(last, "close", None)
+                        if close is not None:
+                            logger.debug(f"price resolver: preload B {c} -> {close}")
+                            return float(close)
+    except Exception as e:
+        logger.debug(f"price resolver: preload exception {e}")
+
+    # 3) Book fallbacks
     try:
         import book
-        for fn in ('get_last_price', 'get_last_close'):
+        for fn in ("get_last_price", "get_last_close"):
             if hasattr(book, fn):
                 px = getattr(book, fn)(symbol)
                 if px:
+                    logger.debug(f"price resolver: book {fn} {symbol} -> {px}")
                     return float(px)
-        for fn in ('get_bars', 'load_bars'):
+        for fn in ("get_bars", "load_bars"):
             if hasattr(book, fn):
-                bars = getattr(book, fn)(symbol, tf='5Min', limit=1)
-                if bars and len(bars) > 0:
+                bars = getattr(book, fn)(symbol, tf="5Min", limit=1)
+                if bars:
                     last = bars[-1] if isinstance(bars, (list, tuple)) else list(bars)[-1]
-                    if isinstance(last, dict) and 'close' in last and last['close'] is not None:
-                        return float(last['close'])
-                    close = getattr(last, 'close', None)
+                    close = last["close"] if isinstance(last, dict) else getattr(last, "close", None)
                     if close is not None:
+                        logger.debug(f"price resolver: book {fn} last close {symbol} -> {close}")
                         return float(close)
-    except Exception:
-        pass
+    except Exception as e:
+        logger.debug(f"price resolver: book exception {e}")
+
+    logger.debug(f"price resolver: NO PRICE for {symbol} (candidates={candidates})")
     return None
