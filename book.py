@@ -1,7 +1,7 @@
+from __future__ import annotations
 DEFAULT_MIN_ATR_PCT = float(os.getenv('MIN_ATR_PCT', '0.08'))
 import os
 # strategies/book.py
-from __future__ import annotations
 from dataclasses import dataclass
 from typing import Dict, Any, List, Optional, Tuple
 import numpy as np
