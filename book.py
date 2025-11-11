@@ -1,12 +1,12 @@
-DEFAULT_MIN_ATR_PCT = float(os.getenv('MIN_ATR_PCT', '0.08'))
-import os
 # strategies/book.py
 from __future__ import annotations
+import os
 from dataclasses import dataclass
 from typing import Dict, Any, List, Optional, Tuple
 import numpy as np
 import pandas as pd
 import math
+DEFAULT_MIN_ATR_PCT = float(os.getenv('MIN_ATR_PCT', '0.08'))  # default 8% for 5m
 
 # ====== utilities ======
 def _roll_mean(a, n): return pd.Series(a).rolling(n).mean().to_numpy()
@@ -114,8 +114,7 @@ def sig_c2_trend(close, regimes: Regimes,
     sma_s = _roll_mean(close, s)
     up = sma_f[i] > sma_s[i]
     dn = sma_f[i] < sma_s[i]
-    pb = close[i] < pd.Series(close).rolling(pullback).max().to_numpy()[i] if up else \
-         close[i] > pd.Series(close).rolling(pullback).min().to_numpy()[i] if dn else False
+    pb = close[i] < pd.Series(close).rolling(pullback).max().to_numpy()[i] if up else close[i] > pd.Series(close).rolling(pullback).min().to_numpy()[i] if dn else False
     if up and pb:
         return "buy", float(abs(regimes.trend_z)), "trend_up_pb"
     if dn and pb:
@@ -179,11 +178,7 @@ def size_from_atr(price: float, atr: float, target_risk_usd: float = 10.0, atr_m
     return float(max(0.0, qty)), float(max(0.0, notional))
 
 class StrategyBook:
-    \1
-        # Env-tunable thresholds with sane defaults
-        self.topk = int(locals().get('topk') or int(os.getenv('BOOK_TOPK', '2')))
-        self.min_score = float(locals().get('min_score') or float(os.getenv('BOOK_MIN_SCORE', '0.07')))
-        self.atr_stop_mult = float(locals().get('atr_stop_mult') or float(os.getenv('ATR_STOP_MULT', '1.0')))
+    def __init__(self, topk=2, min_score=0.10, risk_target_usd=10.0, atr_stop_mult=1.5):
         self.topk = int(topk)
         self.min_score = float(min_score)
         self.risk_target_usd = float(risk_target_usd)
