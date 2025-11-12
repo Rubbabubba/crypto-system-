@@ -1794,3 +1794,125 @@ def scheduler_run(payload: Dict[str, Any] = Body(default=None)):
                 actions.append(act)
 
     return {"ok": True, "message": msg, "actions": actions, "telemetry": telemetry}
+
+# ==== BEGIN PATCH v1.0.0: P&L aggregation endpoints =============================================
+from typing import Optional, Any, List, Dict, Tuple
+import sqlite3 as _sqlite3
+import os as _os
+from datetime import datetime as _dt
+
+_JOURNAL_DB_PATH = "/var/data/journal.db"
+
+def _pnl__parse_bool(v: Optional[str], default: bool=True) -> bool:
+    if v is None:
+        return default
+    s = str(v).strip().lower()
+    return s in ("1","true","t","yes","y","on")
+
+def _pnl__parse_ts(s: Optional[str]) -> Optional[str]:
+    if not s:
+        return None
+    try:
+        s2 = s.replace("Z","").strip()
+        # Accept 'YYYY-MM-DD' or ISO with time
+        if len(s2) == 10 and s2.count("-")==2:
+            s2 = s2 + "T00:00:00"
+        _dt.fromisoformat(s2)  # validate
+        return s2
+    except Exception:
+        return None
+
+def _pnl__connect() -> _sqlite3.Connection:
+    if not _os.path.exists(_JOURNAL_DB_PATH):
+        raise FileNotFoundError(f"journal db not found at: {_JOURNAL_DB_PATH}")
+    con = _sqlite3.connect(_JOURNAL_DB_PATH)
+    con.row_factory = _sqlite3.Row
+    return con
+
+def _pnl__detect_table(con: _sqlite3.Connection) -> str:
+    cur = con.execute("SELECT name FROM sqlite_master WHERE type='table'")
+    names = [r[0] for r in cur.fetchall()]
+    # Preferred names first
+    for nm in ("journal","trades","fills","orders","executions"):
+        if nm in names:
+            return nm
+    # Fallback: first table with strategy+symbol+timestamp
+    for nm in names:
+        try:
+            cols = {r[1] for r in con.execute(f"PRAGMA table_info({nm})").fetchall()}
+            if {"timestamp","strategy","symbol"}.issubset(cols):
+                return nm
+        except Exception:
+            pass
+    return names[0] if names else ""
+
+def _pnl__columns(con: _sqlite3.Connection, table: str) -> List[str]:
+    return [r[1] for r in con.execute(f"PRAGMA table_info({table})")]
+
+def _pnl__where(start_iso: Optional[str], end_iso: Optional[str]) -> Tuple[str, List[Any]]:
+    w, p = [], []
+    if start_iso:
+        w.append("timestamp >= ?")
+        p.append(start_iso)
+    if end_iso:
+        w.append("timestamp <= ?")
+        p.append(end_iso)
+    return ((" WHERE " + " AND ".join(w)) if w else ""), p
+
+def _pnl__build_sql(table: str, group_fields: List[str], have_cols: List[str], realized_only: bool) -> str:
+    realized = "COALESCE(SUM(realized_pnl),0.0)" if "realized_pnl" in have_cols else "0.0"
+    fees     = "COALESCE(SUM(fee),0.0)" if "fee" in have_cols else "0.0"
+    unreal   = "COALESCE(SUM(unrealized_pnl),0.0)" if (not realized_only and "unrealized_pnl" in have_cols) else "0.0"
+    equity   = f"({realized} + {unreal} - {fees})"
+    sel_grp  = ", ".join(group_fields) if group_fields else "'_all' AS group_key"
+    grp_by   = (" GROUP BY " + ", ".join(group_fields)) if group_fields else ""
+    return f"""
+        SELECT
+            {sel_grp},
+            {realized} AS realized_pnl,
+            {unreal} AS unrealized_pnl,
+            {fees} AS fees,
+            {equity} AS equity,
+            COUNT(*) AS trades
+        FROM {table}{{WHERE}}
+        {grp_by}
+        ORDER BY equity DESC
+    """
+
+def _pnl__agg(group_fields: List[str], start: Optional[str], end: Optional[str], realized_only: bool):
+    s = _pnl__parse_ts(start)
+    e = _pnl__parse_ts(end)
+    with _pnl__connect() as con:
+        table = _pnl__detect_table(con)
+        if not table:
+            return {"ok": False, "error": "no tables found in journal"}
+        have = _pnl__columns(con, table)
+        where, params = _pnl__where(s, e)
+        sql = _pnl__build_sql(table, group_fields, have, realized_only).replace("{WHERE}", where)
+        rows = [dict(r) for r in con.execute(sql, params).fetchall()]
+        return {"ok": True, "table": table, "start": s, "end": e, "realized_only": realized_only, "count": len(rows), "rows": rows}
+
+@app.get("/pnl/by_strategy")
+def pnl_by_strategy(start: Optional[str] = None, end: Optional[str] = None,
+                    realized_only: Optional[str] = "true", tz: Optional[str] = "UTC"):
+    try:
+        return _pnl__agg(["strategy"], start, end, _pnl__parse_bool(realized_only, True))
+    except Exception as e:
+        return {"ok": False, "error": f"/pnl/by_strategy failed: {e.__class__.__name__}: {e}"}
+
+@app.get("/pnl/by_symbol")
+def pnl_by_symbol(start: Optional[str] = None, end: Optional[str] = None,
+                  realized_only: Optional[str] = "true", tz: Optional[str] = "UTC"):
+    try:
+        return _pnl__agg(["symbol"], start, end, _pnl__parse_bool(realized_only, True))
+    except Exception as e:
+        return {"ok": False, "error": f"/pnl/by_symbol failed: {e.__class__.__name__}: {e}"}
+
+@app.get("/pnl/combined")
+def pnl_combined(start: Optional[str] = None, end: Optional[str] = None,
+                 realized_only: Optional[str] = "true", tz: Optional[str] = "UTC"):
+    try:
+        return _pnl__agg(["strategy","symbol"], start, end, _pnl__parse_bool(realized_only, True))
+    except Exception as e:
+        return {"ok": False, "error": f"/pnl/combined failed: {e.__class__.__name__}: {e}"}
+# ==== END PATCH v1.0.0 ===========================================================================
