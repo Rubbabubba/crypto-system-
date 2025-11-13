@@ -116,18 +116,29 @@ class Regimes:
     sma_slow: float
 
 def compute_regimes(close, high, low) -> Regimes:
+    """Compute regime stats for a single symbol.
+
+    - trend_z: z-score of short vs long SMA (20 vs 60)
+    - atr: 14-period ATR in price units
+    - atr_pct: latest ATR as a percentage of price (100 * ATR / close)
+    """
     sma_f = _roll_mean(close, 20)
     sma_s = _roll_mean(close, 60)
-    trend_z = _zscore(sma_f - sma_s, 60)
+    spread = sma_f - sma_s
+    trend_z = _zscore(spread, 60)
     atr = _atr(high, low, close, 14)
-    # Percentile of ATR over 200 bars, used as a "volatility percentile"
-    atr_pct = pd.Series(atr).rolling(200).rank(pct=True).to_numpy()
+
+    close_arr = np.asarray(close, dtype=float)
+    atr_arr = np.asarray(atr, dtype=float)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        atr_pct_arr = np.where(close_arr > 0, (atr_arr / close_arr) * 100.0, 0.0)
+
     i = len(close) - 1
     def last(x): return float(x[i]) if len(x) else float("nan")
     return Regimes(
         trend_z=last(trend_z),
         atr=last(atr),
-        atr_pct=last(atr_pct),
+        atr_pct=last(atr_pct_arr),
         sma_fast=last(sma_f),
         sma_slow=last(sma_s),
     )
