@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 <!doctype html>
 <html lang="en">
 <head>
@@ -477,4 +478,485 @@
     document.addEventListener('DOMContentLoaded', init);
   </script>
 </body>
+=======
+<!doctype html>
+<html lang="en">
+<head>
+  <!-- Crypto System Dashboard UI v1.4.5 -->
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>{SERVICE_NAME} — Dashboard</title>
+  <style>
+    :root{--bg:#0c0f14;--card-bg:#121720;--border:#223041;--text:#e8eef7;--muted:#9bb0c3;--btn-bg:#111722;--accent:#4ea7ff;--ok:#2e7d32;--warn:#c62828}
+    *{box-sizing:border-box}
+    html,body{margin:0;padding:0;background:var(--bg);color:var(--text);font:14px/1.45 system-ui,-apple-system,Segoe UI,Roboto,Ubuntu,Cantarell,Arial,sans-serif}
+    a{color:var(--accent);text-decoration:none}
+    .wrap-page{width:100%;padding:16px 18px}
+    header{display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:16px}
+    header h1{font-size:20px;margin:0}
+    header .meta{color:var(--muted);font-size:13px;display:flex;gap:10px;align-items:center;flex-wrap:wrap}
+    .badge{display:inline-flex;align-items:center;gap:6px;border:1px solid var(--border);padding:4px 8px;border-radius:999px}
+
+    .card{border:1px solid var(--border);border-radius:12px;background:var(--card-bg);padding:14px}
+    .card-header{display:flex;justify-content:space-between;gap:12px;flex-wrap:wrap;align-items:baseline;margin-bottom:8px}
+    .subtext{opacity:.85;color:var(--muted);font-size:13px;display:flex;gap:6px;align-items:center;flex-wrap:wrap}
+    .dot::before{content:"•";opacity:.6}
+
+    .grid{display:grid;gap:16px;grid-template-areas:"control" "prices" "pnl" "calendar" "console"}
+    @media(min-width:900px){
+      .grid{grid-template-columns:1fr 1fr 1fr;grid-template-areas:"control prices pnl" "calendar calendar calendar" "console console console"}
+    }
+    #control-panel{grid-area:control} #live-prices{grid-area:prices} #pnl{grid-area:pnl}
+    #calendar-pnl{grid-area:calendar} #console-card{grid-area:console}
+
+    .row{display:flex;gap:10px;align-items:center;margin:8px 0;flex-wrap:wrap}
+    .btn{padding:8px 12px;border:1px solid var(--border);background:var(--btn-bg);color:var(--text);border-radius:8px;cursor:pointer}
+    .btn:hover{filter:brightness(1.05)} .btn:disabled{opacity:.55;cursor:not-allowed}
+    .btn.success{border-color:var(--ok)} .btn.danger{border-color:var(--warn)}
+    .link-open{font-size:12px;color:var(--muted);margin-left:6px}
+
+    .mini-meta{margin-top:10px;padding:8px;border:1px dashed var(--border);border-radius:8px;color:var(--muted);font-size:12px}
+    .mini-meta code{white-space:pre-wrap;word-break:break-word}
+
+    table{width:100%;border-collapse:collapse;font-size:13px;background:transparent;border:1px solid var(--border);border-radius:10px;overflow:hidden}
+    th,td{padding:8px;border-bottom:1px solid var(--border);text-align:left}
+    th{color:var(--muted);background:rgba(255,255,255,0.03)}
+    td.mono{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
+
+    .stat-tiles{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:10px}
+    @media(min-width:600px){.stat-tiles{grid-template-columns:repeat(4,1fr)}}
+    .tile{border:1px solid var(--border);border-radius:10px;padding:10px;background:rgba(255,255,255,0.02)}
+    .tile .label{color:var(--muted);font-size:12px}.tile .val{font-size:18px;font-weight:700;margin-top:4px}
+
+    /* Calendar */
+    .cal-head{display:flex;justify-content:space-between;align-items:center;gap:10px;margin-bottom:8px}
+    .nav-btn{background:none;border:1px solid var(--border);border-radius:8px;padding:4px 8px;color:var(--text);cursor:pointer}
+    .cal-title{font-weight:700}
+    .cal-grid{display:grid;grid-template-columns:repeat(7,1fr);gap:8px}
+    .cal-dow{color:var(--muted);font-size:12px;text-align:center}
+    .cal-cell{border:1px solid var(--border);border-radius:12px;min-height:110px;padding:8px;display:flex;flex-direction:column;gap:6px;background:rgba(255,255,255,0.02);cursor:pointer}
+    .cal-cell:hover{filter:brightness(1.2)}
+    .cal-cell.muted{opacity:.35;pointer-events:none}
+    .cal-date{font-size:12px;color:var(--muted)}
+    .cal-pnl{font-weight:700}
+    .cal-metric{font-size:12px;color:var(--muted)}
+    .cal-detail{margin-top:12px;border-top:1px solid var(--border);padding-top:10px;font-size:13px}
+    .cal-detail table{font-size:12px}
+
+    pre.console{width:100%;min-height:260px;max-height:520px;overflow:auto;background:#0a0e16;border:1px solid var(--border);border-radius:10px;padding:12px;margin:0;white-space:pre-wrap}
+  </style>
+</head>
+<body>
+  <div class="wrap-page">
+    <header>
+      <h1>Crypto System</h1>
+      <div class="meta">
+        <span class="badge">Broker: <strong>{BROKER_TEXT}</strong></span>
+        <span class="badge">App v{APP_VERSION}</span>
+        <span class="badge">UI v1.4.5</span>
+      </div>
+    </header>
+
+    <div class="grid">
+      <!-- CONTROL PANEL -->
+      <section id="control-panel" class="card">
+        <div class="card-header"><h2>Control Panel</h2><div class="subtext">Crypto System • v2.0.0 • kraken</div></div>
+        <div class="row"><button class="btn" onclick="fetchAndLog('/health')">GET /health</button><a class="link-open" href="/health" target="_blank">open</a></div>
+        <div class="row"><button class="btn" onclick="fetchAndLog('/diag/broker')">GET /diag/broker</button><a class="link-open" href="/diag/broker" target="_blank">open</a></div>
+        <div class="row"><button class="btn" onclick="fetchAndLog('/version')">GET /version</button><a class="link-open" href="/version" target="_blank">open</a></div>
+        <div class="row"><button class="btn" onclick="fetchAndLog('/config')">GET /config</button><a class="link-open" href="/config" target="_blank">open</a></div>
+        <div class="row"><button class="btn" onclick="fetchAndLog('/fills')">GET /fills</button><a class="link-open" href="/fills" target="_blank">open</a></div>
+        <div class="row" style="margin-top:6px"><button id="btn_sched_status" class="btn" onclick="schedulerStatus()">GET /scheduler/status</button><a class="link-open" href="/scheduler/status" target="_blank">open</a></div>
+        <div class="row"><button id="btn_sched_start" class="btn success" onclick="schedulerStart()">/scheduler/start</button><button id="btn_sched_stop" class="btn danger" onclick="schedulerStop()">/scheduler/stop</button></div>
+
+        <!-- Advisor controls (added inside Control Panel) -->
+        <div class="row" style="margin-top:6px;border-top:1px dashed var(--border);padding-top:8px">
+          <label for="adv_date">Advisor Date</label>
+          <input id="adv_date" type="date" />
+          <button class="btn" onclick="runAdvisor()">GET /advisor/daily</button>
+          <button class="btn" onclick="applyAdvisor(true)">Apply (dry-run)</button>
+          <button class="btn danger" onclick="applyAdvisor(false)">Apply (live)</button>
+          <a class="link-open" href="/advisor/daily" target="_blank">open</a>
+        </div>
+
+        <div class="mini-meta"><div><strong>Symbols:</strong> <code id="meta_symbols">—</code></div><div><strong>Strategies:</strong> <code id="meta_strategies">—</code></div></div>
+      </section>
+
+      <!-- LIVE PRICES -->
+      <section id="live-prices" class="card">
+        <div class="card-header"><h2>Live Prices</h2><div class="subtext">From /price/* — 30s auto-refresh</div></div>
+        <table><thead><tr><th>Symbol</th><th>Price</th><th>Spark</th><th>Updated</th></tr></thead><tbody id="prices_tbody"></tbody></table>
+        <div class="row" style="margin-top:10px"><button class="btn" onclick="refreshPrices(true)">Refresh now</button></div>
+      </section>
+
+      <!-- P&L -->
+      <section id="pnl" class="card">
+        <div class="card-header"><h2>P&amp;L</h2><div class="subtext">Primary: /pnl/summary • Fallback: journal-based FIFO + prices</div></div>
+        <div class="stat-tiles">
+          <div class="tile"><div class="label">Realized</div><div id="tile_realized" class="val">$0</div></div>
+          <div class="tile"><div class="label">Unrealized</div><div id="tile_unrealized" class="val">$0</div></div>
+          <div class="tile"><div class="label">Fees</div><div id="tile_fees" class="val">$0</div></div>
+          <div class="tile"><div class="label">Equity</div><div id="tile_equity" class="val">$0</div></div>
+        </div>
+        <div class="row">
+          <div style="flex:1">
+            <h3 style="margin:6px 0">By Strategy (Top 5)</h3>
+            <table id="tbl_strategy"><thead><tr><th>Strategy</th><th>Realized</th><th>Unrealized</th><th>Fees</th><th>Equity</th></tr></thead><tbody></tbody></table>
+          </div>
+          <div>
+            <h3 style="margin:6px 0">By Symbol (Top 5)</h3>
+            <table id="tbl_symbol"><thead><tr><th>Symbol</th><th>Realized</th><th>Unrealized</th><th>Fees</th><th>Equity</th></tr></thead><tbody></tbody></table>
+          </div>
+        </div>
+        <div class="row" style="margin-top:10px">
+          <button class="btn" onclick="refreshPnL()">Refresh P&amp;L</button>
+          <button class="btn" onclick="syncFills()">Sync fills</button>
+          <a class="link-open" href="/pnl/summary" target="_blank">open</a>
+        </div>
+      </section>
+
+      <!-- CALENDAR P&L -->
+      <section id="calendar-pnl" class="card">
+        <div class="card-header"><h2>Calendar P&amp;L</h2><div class="subtext">Journal-based FIFO realized attribution (per-day)</div></div>
+        <div class="cal-head">
+          <button class="nav-btn" id="prev_month">&#9664; Prev</button>
+          <div class="cal-title" id="cal_title">—</div>
+          <button class="nav-btn" id="next_month">Next &#9654;</button>
+        </div>
+        <div class="cal-grid" id="cal_grid"></div>
+        <div class="cal-detail" id="cal_detail"></div>
+      </section>
+
+      <!-- CONSOLE -->
+      <section id="console-card" class="card">
+        <div class="card-header"><h2>Console</h2></div>
+        <pre id="console_log" class="console"></pre>
+      </section>
+    </div>
+
+    <footer><div>© <span id="year"></span> {SERVICE_NAME}</div>
+      <div>Broker: <strong>{BROKER_TEXT}</strong> · App v{APP_VERSION} · UI v1.4.5</div></footer>
+  </div>
+
+  <script>
+    /* ===== Console & diagnostics ===== */
+    const $ = s => document.querySelector(s);
+    const log = (t, d='') => { const el=$('#console_log'); if(!el) return; const body=typeof d==='string'?d:JSON.stringify(d,null,2); el.textContent+=`[${new Date().toISOString()}] ${t}\n${body}\n\n`; el.scrollTop=el.scrollHeight; };
+    window.onerror = (m,src,l,c,e)=>log('window.onerror',{m,src,l,c,err:String(e)});
+    window.onunhandledrejection = ev=>log('unhandledrejection',String(ev));
+    const money=v=>(v<0?'-':'')+'$'+Math.abs(Number(v||0)).toLocaleString(undefined,{maximumFractionDigits:2});
+
+    async function fetchJSON(path){
+      try{
+        const r = await fetch(path,{cache:'no-store'}); const text = await r.text(); let data;
+        try{ data=JSON.parse(text); }catch{ data={raw:text}; }
+        if(!r.ok){ log(`HTTP ${r.status} ${path}`, data); throw new Error(`HTTP ${r.status}`); }
+        return data;
+      }catch(e){ log(`FETCH FAIL ${path}`, String(e)); throw e; }
+    }
+    async function fetchAndLog(path){ const j=await fetchJSON(path); log(`GET ${path}`, j); return j; }
+	
+	async function syncFills(){
+      try{
+        // Update any existing journal rows that already have txids
+        let r = await fetch('/journal/sync', {method:'POST'}).catch(()=>null);
+        let j = r ? await r.json() : {ok:false};
+        log('POST /journal/sync', j);
+
+        // If the journal is empty (count === 0), populate it from full broker history
+        if (!j || j.count === 0) {
+          const r2 = await fetch('/journal/backfill', {method:'POST'});
+          const j2 = await r2.json();
+          log('POST /journal/backfill', j2);
+        }
+
+        // Refresh P&L tiles/tables and rebuild the calendar view
+        await refreshPnL();
+        await (async()=>{ let off=0; await buildCalendar(0); })();
+      }catch(e){
+        log('syncFills error', String(e));
+      }
+    }
+
+    /* ===== Control Panel ===== */
+    async function schedulerStatus(){ try{ return await fetchAndLog('/scheduler/status'); }catch(e){} }
+    async function schedulerStart(){ try{ return await fetchAndLog('/scheduler/start'); }catch(e){} }
+    async function schedulerStop(){  try{ return await fetchAndLog('/scheduler/stop'); }catch(e){} }
+
+    // ---- Advisor controls ----
+    let LAST_ADVISOR = null;
+    function defaultAdvisorDateISO(){
+      const now = new Date();
+      // set default to today in local (CT): yyyy-mm-dd
+      const yyyy = now.getFullYear();
+      const mm = String(now.getMonth()+1).padStart(2,'0');
+      const dd = String(now.getDate()).padStart(2,'0');
+      return `${yyyy}-${mm}-${dd}`;
+    }
+    async function runAdvisor(){
+      const v = $('#adv_date').value || defaultAdvisorDateISO();
+      const j = await fetchAndLog(`/advisor/daily?date=${encodeURIComponent(v)}`);
+      LAST_ADVISOR = j;
+    }
+    async function applyAdvisor(dry=true){
+      if(!LAST_ADVISOR || !LAST_ADVISOR.recommendations){ log('advisor/apply','No recommendations loaded yet. Click GET first.'); return; }
+      const body = { dry: !!dry, recommendations: LAST_ADVISOR.recommendations };
+      const r = await fetch('/advisor/apply',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+      const j = await r.json();
+      log('POST /advisor/apply', j);
+    }
+
+    /* ===== Config / Symbols ===== */
+    let SYMBOLS=[];
+    async function initFromConfig(){
+      try{
+        const cfg = await fetchJSON('/config');
+        const syms=(cfg.SYMBOLS||cfg.symbols||[]).map(s=>String(s).toUpperCase());
+        const strats=cfg.STRATEGIES||cfg.strategies||[];
+        SYMBOLS=syms; $('#meta_symbols').textContent=syms.join(', ')||'—'; $('#meta_strategies').textContent=(strats||[]).join(', ')||'—';
+        buildPriceRows(syms);
+      }catch(e){
+        SYMBOLS=[]; buildPriceRows([]);
+      }
+    }
+
+    /* ===== Prices ===== */
+    const SERIES={}; const MAX_POINTS=60;
+    function buildPriceRows(syms){
+      const tbody=$('#prices_tbody'); if(!tbody) return; tbody.innerHTML='';
+      (syms||[]).forEach(sym=>{
+        SERIES[sym]=SERIES[sym]||[];
+        const tr=document.createElement('tr');
+        tr.innerHTML = `<td class="mono">${sym}</td>
+                        <td class="mono" id="px_${sym}">—</td>
+                        <td><svg viewBox="0 0 120 28" width="120" height="28"><path id="line_${sym}" stroke="${getComputedStyle(document.body).getPropertyValue('--accent')||'#82b1ff'}" fill="none" stroke-width="1.5"/></svg></td>
+                        <td class="mono" id="ts_${sym}" style="color:var(--muted)">—</td>`;
+        tbody.appendChild(tr);
+      });
+    }
+    function splitSymbol(sym){ const s=sym.replace(/\s+/g,'').toUpperCase(); if(s.includes('/')){const [b,q]=s.split('/'); return [b,q];} if(s.endsWith('USD')) return [s.slice(0,-3),'USD']; return [s,'USD']; }
+    async function fetchPriceFor(sym){
+      const [b,q]=splitSymbol(sym);
+      try{ const j=await fetchJSON(`/price/${encodeURIComponent(b)}/${encodeURIComponent(q)}`); if(j && j.price!=null) return j; }catch(_){}
+      return await fetchJSON(`/price/${encodeURIComponent(sym)}`);
+    }
+    function sparkPath(points,w=120,h=28,pad=2){ if(!points.length) return ''; const n=points.length,lo=Math.min(...points),hi=Math.max(...points),rng=(hi-lo)||1e-9;
+      const x=i=>pad+(i/(n-1))*(w-pad*2), y=v=>pad+(h-pad*2)-((v-lo)/rng)*(h-pad*2); let d=`M ${x(0)} ${y(points[0])}`; for(let i=1;i<n;i++) d+=` L ${x(i)} ${y(points[i])}`; return d; }
+    async function refreshPrices(forceLog=false){
+      for(const sym of SYMBOLS){
+        try{
+          const j=await fetchPriceFor(sym); const px=Number(j.price);
+          if(Number.isFinite(px)){ const arr=SERIES[sym]; arr.push(px); if(arr.length>MAX_POINTS) arr.shift();
+            document.getElementById(`px_${sym}`).textContent=px; document.getElementById(`line_${sym}`).setAttribute('d',sparkPath(arr));
+            document.getElementById(`ts_${sym}`).textContent=new Date().toISOString(); if(forceLog) log(`price ${sym}`, j);
+          }
+        }catch(e){ log(`price ${sym} error`, String(e)); }
+      }
+    }
+
+    /* ===== Journal-based P&L fallback ===== */
+    function parseJournalRow(r){
+      return {
+        side:String(r.side||'').toLowerCase(),
+        sym:String(r.symbol||'').toUpperCase(),
+        price:+(r.price||0),
+        vol:+(r.vol||0),
+        fee:+(r.fee||0),
+        strategy:String(r.strategy||'misc'),
+        t:+(r.filled_ts||r.ts||0)
+      };
+    }
+    async function computePnLFromJournal(){
+      const resp = await fetchJSON('/journal?limit=5000');
+      const rows = (resp.rows||[]).map(parseJournalRow)
+        .filter(f=>f.t && f.vol>0 && f.price>0 && (f.side==='buy'||f.side==='sell'))
+        .sort((a,b)=>a.t-b.t);
+
+      // FIFO by (strategy, symbol) for realized; mark-to-market uses latest price
+      const lots = new Map(); // key -> [{q,px}]
+      const stat = new Map(); // key -> {realized, fees, qty}
+      const keyOf = (f)=>`${f.strategy}||${f.sym}`;
+      for(const f of rows){
+        const k = keyOf(f);
+        if(!lots.has(k)) lots.set(k, []);
+        if(!stat.has(k)) stat.set(k, {realized:0, fees:0, qty:0});
+        const L = lots.get(k), S = stat.get(k);
+        if(f.side==='buy'){
+          L.push({q:f.vol, px:f.price});
+          S.qty += f.vol; S.fees += f.fee||0;
+        }else{
+          let rem=f.vol, real=0;
+          while(rem>1e-12 && L.length){
+            const head=L[0], take=Math.min(head.q,rem);
+            real += (f.price-head.px)*take;
+            head.q -= take; rem -= take;
+            if(head.q<=1e-12) L.shift();
+          }
+          S.qty -= f.vol; S.realized += real; S.fees += f.fee||0;
+        }
+      }
+
+      // Latest prices for unrealized
+      const syms = Array.from(new Set(rows.map(r=>r.sym)));
+      const pxMap = {};
+      for(const s of syms){
+        try{ const j=await fetchPriceFor(s); pxMap[s]=+j.price; }catch(_){ pxMap[s]=0; }
+      }
+
+      const per_strategy = {};
+      const per_symbol = {};
+      let Treal=0, Tunreal=0, Tfees=0;
+
+      for(const [k,S] of stat.entries()){
+        const [strategy, sym] = k.split('||');
+        let unreal=0;
+        const L = lots.get(k)||[];
+        const mkt = +pxMap[sym]||0;
+        if(mkt>0 && L.length){
+          for(const lot of L){ unreal += (mkt - lot.px) * lot.q; }
+        }
+        const equity = S.realized + unreal - S.fees;
+
+        if(!per_strategy[strategy]) per_strategy[strategy]={strategy, realized:0, unrealized:0, fees:0, equity:0};
+        per_strategy[strategy].realized  += S.realized;
+        per_strategy[strategy].unrealized+= unreal;
+        per_strategy[strategy].fees      += S.fees;
+        per_strategy[strategy].equity    += equity;
+
+        if(!per_symbol[sym]) per_symbol[sym]={symbol:sym, realized:0, unrealized:0, fees:0, equity:0};
+        per_symbol[sym].realized  += S.realized;
+        per_symbol[sym].unrealized+= unreal;
+        per_symbol[sym].fees      += S.fees;
+        per_symbol[sym].equity    += equity;
+
+        Treal += S.realized; Tunreal += unreal; Tfees += S.fees;
+      }
+
+      return {
+        total: { realized:Treal, unrealized:Tunreal, fees:Tfees, equity: (Treal+Tunreal-Tfees) },
+        per_strategy: Object.values(per_strategy).sort((a,b)=>b.equity-a.equity),
+        per_symbol:   Object.values(per_symbol).sort((a,b)=>b.equity-a.equity),
+      };
+    }
+
+    function fillPnLTables(summary){
+      $('#tile_realized').textContent  = money(summary.total.realized);
+      $('#tile_unrealized').textContent= money(summary.total.unrealized);
+      $('#tile_fees').textContent      = money(summary.total.fees);
+      $('#tile_equity').textContent    = money(summary.total.equity);
+
+      const tbS = $('#tbl_strategy tbody'); tbS.innerHTML='';
+      (summary.per_strategy||[]).slice(0,5).forEach(r=>{
+        const tr=document.createElement('tr');
+        tr.innerHTML=`<td>${r.strategy}</td><td class="mono">${money(r.realized)}</td><td class="mono">${money(r.unrealized||0)}</td><td class="mono">${money(r.fees||0)}</td><td class="mono">${money(r.equity)}</td>`;
+        tbS.appendChild(tr);
+      });
+
+      const tbY = $('#tbl_symbol tbody'); tbY.innerHTML='';
+      (summary.per_symbol||[]).slice(0,5).forEach(r=>{
+        const tr=document.createElement('tr');
+        tr.innerHTML=`<td>${r.symbol}</td><td class="mono">${money(r.realized)}</td><td class="mono">${money(r.unrealized)}</td><td class="mono">${money(r.fees)}</td><td class="mono">${money(r.equity)}</td>`;
+        tbY.appendChild(tr);
+      });
+    }
+
+    async function refreshPnL(){
+      // Server truth first (journal-based)
+      try{
+        const j = await fetchJSON('/pnl/summary');
+        const t = j.total || {realized:0,unrealized:0,fees:0,equity:0};
+        const isAllZero = !t.realized && !t.unrealized && !t.fees && !t.equity;
+        if(!isAllZero){
+          log('pnl/summary', j);
+          fillPnLTables(j);
+          return;
+        }
+        log('pnl/summary all zeros — using journal fallback');
+      }catch(e){
+        log('pnl/summary failed — using journal fallback', String(e));
+      }
+
+      // Journal-based fallback
+      try{
+        const computed = await computePnLFromJournal();
+        log('pnl/fallback (journal)', computed.total);
+        fillPnLTables(computed);
+      }catch(e){
+        log('pnl/fallback error', String(e));
+      }
+    }
+
+    /* ===== Calendar (journal-based, daily realized) ===== */
+    function dayStartUTC(ts){ const d=new Date(ts*1000); return Date.UTC(d.getUTCFullYear(),d.getUTCMonth(),d.getUTCDate())/1000; }
+    function calColor(v){ if(v>0){const g=Math.min(255,100+Math.log10(v+1)*80);return `rgba(40,${g},60,0.25)`;} if(v<0){const r=Math.min(255,100+Math.log10(-v+1)*80);return `rgba(${r},60,60,0.25)`;} return 'rgba(255,255,255,0.02)'; }
+
+    function parseJournalForCalendar(r){
+      const side=String(r.side||'').toLowerCase(), sym=String(r.symbol||'').toUpperCase();
+      const price=+r.price||0, vol=+r.vol||0, fee=+r.fee||0, t=+(r.filled_ts||r.ts||0);
+      return {side,sym,price,vol,fee,t};
+    }
+
+    function fifoDailyFromJournal(rows){
+      const fills = rows.map(parseJournalForCalendar)
+        .filter(f=>f.t && f.vol>0 && f.price>0 && (f.side==='buy'||f.side==='sell'))
+        .sort((a,b)=>a.t-b.t);
+      const lotBySym=new Map(), daily={}, byDay={};
+      for(const f of fills){
+        (byDay[dayStartUTC(f.t)] ||= []).push(f);
+        if(f.side==='buy'){ (lotBySym.get(f.sym)||lotBySym.set(f.sym,[]).get(f.sym)).push({q:f.vol,px:f.price}); continue; }
+        let rem=f.vol, real=0; const L=lotBySym.get(f.sym)||[];
+        while(rem>1e-12 && L.length){ const head=L[0], take=Math.min(head.q,rem); real+=(f.price-head.px)*take; head.q-=take; rem-=take; if(head.q<=1e-12) L.shift(); }
+        const k=dayStartUTC(f.t); (daily[k] ||= {p:0,t:0,w:0}); daily[k].p += (real - f.fee); daily[k].t++; if((real - f.fee)>0) daily[k].w++;
+      }
+      return {daily,byDay};
+    }
+
+    async function buildCalendar(offset=0){
+      try{
+        const now=new Date(), baseUTC=new Date(Date.UTC(now.getUTCFullYear(),now.getUTCMonth()+offset,1));
+        const y=baseUTC.getUTCFullYear(), m=baseUTC.getUTCMonth();
+        $('#cal_title').textContent = baseUTC.toLocaleString(undefined,{month:'long',year:'numeric'});
+
+        // Pull journal (enough rows to cover a month)
+        const j = await fetchJSON('/journal?limit=5000');
+        const {daily,byDay} = fifoDailyFromJournal(j.rows||[]);
+
+        const firstDow=new Date(Date.UTC(y,m,1)).getUTCDay(); const daysIn=new Date(Date.UTC(y,m+1,0)).getUTCDate();
+        const grid=$('#cal_grid'); grid.innerHTML=''; ['Sun','Mon','Tue','Wed','Thu','Fri','Sat'].forEach(d=>{const e=document.createElement('div');e.className='cal-dow';e.textContent=d;grid.appendChild(e);});
+        for(let i=0;i<firstDow;i++){const c=document.createElement('div');c.className='cal-cell muted';grid.appendChild(c);}
+        for(let d=1;d<=daysIn;d++){
+          const k=Date.UTC(y,m,d)/1000, v=daily[k]?.p||0, t=daily[k]?.t||0, w=daily[k]?.w||0, wr=t?((w/t)*100).toFixed(1)+'%':'—';
+          const c=document.createElement('div'); c.className='cal-cell'; c.style.background=calColor(v);
+          c.innerHTML=`<div class="cal-date">${d}</div><div class="cal-pnl">${money(v)}</div><div class="cal-metric">${t} trades · ${wr}</div>`;
+          c.onclick=()=>showDayDetail(k, byDay[k]||[]);
+          grid.appendChild(c);
+        }
+        $('#cal_detail').innerHTML='';
+      }catch(e){ log('calendar error', String(e)); }
+    }
+
+    function showDayDetail(day, fills){
+      if(!fills.length){ $('#cal_detail').innerHTML='<em>No trades this day.</em>'; return; }
+      const rows=['<table><thead><tr><th>Time (UTC)</th><th>Symbol</th><th>Side</th><th>Qty</th><th>Price</th><th>Fee</th></tr></thead><tbody>'];
+      fills.forEach(f=>rows.push(`<tr><td>${new Date(f.t*1000).toISOString()}</td><td>${f.sym}</td><td>${f.side}</td><td>${f.vol}</td><td>${f.price}</td><td>${f.fee}</td></tr>`)); rows.push('</tbody></table>');
+      $('#cal_detail').innerHTML=rows.join('');
+    }
+
+    /* ===== Boot ===== */
+    async function init(){
+      $('#year').textContent=new Date().getFullYear();
+      const d = $('#adv_date'); if(d) d.value = (new Date()).toISOString().slice(0,10);
+      await initFromConfig();
+      await Promise.allSettled([
+        (async()=>{ await refreshPrices(true); setInterval(refreshPrices,30000); })(),
+        (async()=>{ await refreshPnL(); setInterval(refreshPnL,30000); })(),
+        (async()=>{ let off=0; await buildCalendar(0); $('#prev_month').onclick=()=>{off--;buildCalendar(off)}; $('#next_month').onclick=()=>{off++;buildCalendar(off)}; })(),
+        schedulerStatus()
+      ]);
+      log('UI','ready');
+    }
+    document.addEventListener('DOMContentLoaded', init);
+  </script>
+</body>
+>>>>>>> aaad261e04c14004f76931029016af8c5533c084
 </html>
