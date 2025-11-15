@@ -1,4 +1,4 @@
-# book.py
+# strategies/book.py
 from __future__ import annotations
 import os
 from dataclasses import dataclass
@@ -116,29 +116,18 @@ class Regimes:
     sma_slow: float
 
 def compute_regimes(close, high, low) -> Regimes:
-    """Compute regime stats for a single symbol.
-
-    - trend_z: z-score of short vs long SMA (20 vs 60)
-    - atr: 14-period ATR in price units
-    - atr_pct: latest ATR as a percentage of price (100 * ATR / close)
-    """
     sma_f = _roll_mean(close, 20)
     sma_s = _roll_mean(close, 60)
-    spread = sma_f - sma_s
-    trend_z = _zscore(spread, 60)
+    trend_z = _zscore(sma_f - sma_s, 60)
     atr = _atr(high, low, close, 14)
-
-    close_arr = np.asarray(close, dtype=float)
-    atr_arr = np.asarray(atr, dtype=float)
-    with np.errstate(divide="ignore", invalid="ignore"):
-        atr_pct_arr = np.where(close_arr > 0, (atr_arr / close_arr) * 100.0, 0.0)
-
+    # Percentile of ATR over 200 bars, used as a "volatility percentile"
+    atr_pct = pd.Series(atr).rolling(200).rank(pct=True).to_numpy()
     i = len(close) - 1
     def last(x): return float(x[i]) if len(x) else float("nan")
     return Regimes(
         trend_z=last(trend_z),
         atr=last(atr),
-        atr_pct=last(atr_pct_arr),
+        atr_pct=last(atr_pct),
         sma_fast=last(sma_f),
         sma_slow=last(sma_s),
     )
@@ -231,14 +220,41 @@ def mtf_confirm(action: str, reg5: Regimes) -> bool:
     if action == "sell": return reg5.sma_fast < reg5.sma_slow
     return True
 
-def size_from_atr(price: float, atr: float, target_risk_usd: float = 10.0, atr_mult: float = 1.0):
-    if not np.isfinite(atr) or atr <= 0 or not np.isfinite(price) or price <= 0:
+def size_from_atr(price: float, atr_pct: float, target_risk_usd: float = 10.0, atr_mult: float = 1.0, max_notional: float = 30000.0):
+    """Position sizing using ATR%% as a risk proxy.
+
+    We approximate percentage risk on the position as:
+
+        effective_risk_pct ~= atr_mult * atr_pct
+
+    where `atr_pct` is expressed as a decimal (e.g. 0.05 for 5%%).
+
+    For a desired dollar risk `target_risk_usd`, we solve:
+
+        notional = target_risk_usd / effective_risk_pct
+        qty      = notional / price
+
+    and clamp position notional to `max_notional` to avoid outsized trades.
+    """
+    # Basic sanity checks
+    if (not np.isfinite(price)) or price <= 0:
         return 0.0, 0.0
-    risk_per_unit = atr * atr_mult
-    if risk_per_unit <= 0:
+    if (not np.isfinite(atr_pct)) or atr_pct <= 0:
         return 0.0, 0.0
-    qty = target_risk_usd / risk_per_unit
-    notional = qty * price
+    if (not np.isfinite(target_risk_usd)) or target_risk_usd <= 0:
+        return 0.0, 0.0
+
+    # Floor risk so that extremely tiny ATR%% cannot explode size.
+    effective_risk_pct = max(atr_mult * atr_pct, 1e-4)
+
+    # Target notional based on desired dollar risk.
+    notional = target_risk_usd / effective_risk_pct
+
+    # Optional hard cap.
+    if notional > max_notional:
+        notional = max_notional
+
+    qty = notional / price
     return float(max(0.0, qty)), float(max(0.0, notional))
 
 class StrategyBook:
@@ -309,7 +325,7 @@ class StrategyBook:
             price = float(close1[-1])
             qty, notional = (0.0, 0.0)
             if action in ("buy", "sell") and score >= self.min_score:
-                qty, notional = size_from_atr(price, reg1.atr, self.risk_target_usd, atr_mult=self.atr_stop_mult)
+                qty, notional = size_from_atr(price, reg1.atr_pct, self.risk_target_usd, atr_mult=self.atr_stop_mult)
 
             results.append(ScanResult(
                 symbol=sym, action=action, reason=reason,
