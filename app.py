@@ -3,34 +3,50 @@ crypto-system-api (app.py) — v2.4.0
 ------------------------------------
 Full drop-in FastAPI app.
 
-# Routes (human overview)
-#   GET   /                      -> root info/version
-#   GET   /health                -> service heartbeat
-#   GET   /routes                -> list available routes (helper)
-#   GET   /policy                -> example whitelist policy
-#   GET   /price/{base}/{quote}  -> public spot price via Kraken (normalized)
-#   GET   /dashboard             -> serves ./static/dashboard.html if present
-#   [Static] /static/*           -> static assets if ./static exists
-#   GET   /debug/config          -> shows env-detection + time (no secrets)
+# Routes (human overview — synced with FastAPI app)
+#   GET   /                        -> root info / basic status
+#   GET   /health                  -> service heartbeat
+#   GET   /routes                  -> list available routes (helper)
+#   GET   /dashboard               -> HTML dashboard UI
+#   GET   /policy                  -> example policy payload (stub)
+#   GET   /price/{base}/{quote}    -> live price via Kraken (normalized pair)
+#   GET   /config                  -> app config (symbols, strategies, version, etc.)
+#   GET   /debug/config            -> env detection + time (no secrets)
 #
-#   GET   /journal               -> peek journal rows (limit=, offset=)
-#   POST  /journal/backfill      -> pull long history from Kraken (since_hours, limit)
-#   POST  /journal/sync          -> pull recent history from Kraken (since_hours, limit)
-#   POST  /journal/enrich        -> no-op enrich (OK shape for tests)
-#   POST  /journal/enrich/deep   -> no-op deep enrich
-#   POST  /journal/sanity        -> light checks over stored rows
+#   GET   /journal                 -> peek journal rows (limit, offset)
+#   POST  /journal/attach          -> attach/update labels/notes for a row
+#   POST  /journal/backfill        -> full backfill from broker fills
+#   POST  /journal/sync            -> incremental sync from broker fills
+#   GET   /journal/counts          -> counts by strategy / unlabeled
+#   POST  /journal/enrich          -> no-op enrich placeholder
 #
-#   GET   /pnl/summary           -> tiny PnL-style rollup from journal
-#   GET   /kpis                  -> basic counters
+#   GET   /fills                   -> recent raw broker fills (via broker_kraken)
 #
-#   POST  /scheduler/run         -> stub scheduler (dry-run supported)
-
-# Notes
-# - Kraken credentials: accepts either naming scheme:
-#       KRAKEN_API_KEY   or  KRAKEN_KEY
-#       KRAKEN_API_SECRET or KRAKEN_SECRET
-# - Data dir: respects DATA_DIR (default ./data). Falls back to temp if not writeable.
-# - Pair normalization: BTC->XBT, and common USD pairs mapped to Kraken altnames for public/private calls.
+#   GET   /advisor/daily           -> advisor summary + recommendations
+#   POST  /advisor/apply           -> apply advisor recommendations to policy_config
+#
+#   GET   /debug/log/test          -> simple log/test endpoint
+#   GET   /debug/kraken            -> basic Kraken connectivity test
+#   GET   /debug/db                -> simple DB/journal sanity checks
+#   GET   /debug/kraken/trades     -> recent trades/fills from Kraken (variant 1)
+#   GET   /debug/kraken/trades2    -> recent trades/fills from Kraken (variant 2)
+#   GET   /debug/env               -> safe dump of non-secret env/config
+#
+#   GET   /pnl/summary             -> P&L summary (possibly using journal fallback)
+#   GET   /pnl/fifo                -> FIFO P&L breakdown
+#   GET   /pnl/by_strategy         -> P&L grouped by strategy
+#   GET   /pnl/by_symbol           -> P&L grouped by symbol
+#   GET   /pnl/combined            -> combined P&L view
+#
+#   GET   /kpis                    -> key performance indicators summary
+#
+#   GET   /scheduler/status        -> scheduler status (enabled, thread, last run)
+#   POST  /scheduler/start         -> start background scheduler
+#   POST  /scheduler/stop          -> stop background scheduler
+#   GET   /scheduler/last          -> last scheduler run summary
+#   POST  /scheduler/run           -> run scheduler once with optional overrides
+#
+#   [Static] /static/*             -> static assets if ./static mounted
 """
 
 import base64
@@ -59,34 +75,51 @@ import threading
 import time
 
 # Routes:
-#  - /
-#  - /health
-#  - /routes
-#  - /dashboard
-#  - /policy
-#  - /config
-#  - /debug/config
-#  - /journal
-#  - /journal/attach
-#  - /fills
-#  - /journal/backfill
-#  - /journal/sync
-#  - /advisor/daily
-#  - /advisor/apply
-#  - /journal/counts
-#  - /journal/enrich
-#  - /price/{base}/{quote}
-#  - /debug/log/test
-#  - /debug/kraken
-#  - /debug/db
-#  - /debug/kraken/trades
-#  - /debug/kraken/trades2
-#  - /pnl/summary
-#  - /kpis
-#  - /scheduler/status
-#  - /scheduler/start
-#  - /scheduler/stop
-#  - /scheduler/run
+#   - /
+#   - /health
+#   - /routes
+#   - /dashboard
+#   - /policy
+#   - /config
+#   - /debug/config
+#
+#   - /price/{base}/{quote}
+#
+#   - /journal
+#   - /journal/attach
+#   - /journal/backfill
+#   - /journal/sync
+#   - /journal/counts
+#   - /journal/enrich
+#
+#   - /fills
+#
+#   - /advisor/daily
+#   - /advisor/apply
+#
+#   - /debug/log/test
+#   - /debug/kraken
+#   - /debug/db
+#   - /debug/kraken/trades
+#   - /debug/kraken/trades2
+#   - /debug/env
+#
+#   - /pnl/summary
+#   - /pnl/fifo
+#   - /pnl/by_strategy
+#   - /pnl/by_symbol
+#   - /pnl/combined
+#
+#   - /kpis
+#
+#   - /scheduler/status
+#   - /scheduler/start
+#   - /scheduler/stop
+#   - /scheduler/last
+#   - /scheduler/run
+#
+#   - /scan/all
+
 
 import requests
 from fastapi import Body, FastAPI, HTTPException, Query
@@ -425,10 +458,17 @@ def routes():
 
 @app.get("/dashboard")
 def dashboard():
-    # Serve ./static/dashboard.html if present; else redirect to root.
+    # Prefer ./static/dashboard.html if present; else fall back to repo root.
     dash = STATIC_DIR / "dashboard.html"
+    if not dash.exists():
+        alt = Path(__file__).resolve().parent / "dashboard.html"
+        if alt.exists():
+            dash = alt
+
     if dash.exists():
         return FileResponse(str(dash))
+
+    # If we still don't have a dashboard file, just go to root
     return RedirectResponse(url="/")
 
 # ---- Policy (sample whitelist) -------------------------------------------------------
