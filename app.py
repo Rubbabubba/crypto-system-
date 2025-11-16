@@ -73,9 +73,8 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 import threading
 import time
-
-
 from symbol_map import KRAKEN_PAIR_MAP
+
 
 # Routes:
 #   - /
@@ -218,6 +217,39 @@ def _kraken_creds():
     except Exception:
         pass
     return key, sec, user, pwd
+
+
+# ------------------------------------------------------------------------------
+# Symbol normalization: Kraken pair -> app UI symbol
+# ------------------------------------------------------------------------------
+_REV_KRAKEN_PAIR_MAP = {v.upper(): k for k, v in KRAKEN_PAIR_MAP.items()}
+
+def from_kraken_pair_to_app(pair_raw: str) -> str:
+    """
+    Convert Kraken pair strings (e.g. 'XBTUSD', 'ETHUSD') into UI symbols
+    (e.g. 'BTC/USD', 'ETH/USD').
+
+    Uses symbol_map.KRAKEN_PAIR_MAP as the source of truth and falls back
+    to a simple 'BASE/USD' rule with XBT->BTC if needed.
+    """
+    if not pair_raw:
+        return ""
+
+    s = str(pair_raw).upper()
+
+    # 1) Exact match from our configured map (recommended pairs)
+    if s in _REV_KRAKEN_PAIR_MAP:
+        return _REV_KRAKEN_PAIR_MAP[s]
+
+    # 2) Generic USD pairs (e.g. XBTUSD, ETHUSD, SOLUSD, etc.)
+    if s.endswith("USD"):
+        base = s[:-3]
+        if base == "XBT":
+            base = "BTC"
+        return f"{base}/USD"
+
+    # 3) Fallback – just return the raw pair if we don't know it
+    return pair_raw
 
 # --------------------------------------------------------------------------------------
 # Kraken API client (public & private)
@@ -547,40 +579,6 @@ def debug_config():
 
 # ---- Journal endpoints ---------------------------------------------------------------
 
-# ----------------------------------------------------------------------
-# Symbol normalization: Kraken pair -> app UI symbol
-# ----------------------------------------------------------------------
-_REV_KRAKEN_PAIR_MAP = {v.upper(): k for k, v in KRAKEN_PAIR_MAP.items()}
-
-def from_kraken_pair_to_app(pair_raw: str) -> str:
-    """
-    Convert Kraken pair strings (e.g. 'XBTUSD', 'ETHUSD') into UI symbols
-    (e.g. 'BTC/USD', 'ETH/USD').
-
-    Uses symbol_map.KRAKEN_PAIR_MAP as the source of truth and falls back
-    to a simple 'BASE/USD' rule with XBT->BTC if needed.
-    """
-    if not pair_raw:
-        return ""
-
-    s = str(pair_raw).upper()
-
-    # 1) Exact match from our configured map (recommended pairs)
-    if s in _REV_KRAKEN_PAIR_MAP:
-        return _REV_KKEN_PAIR_MAP[s]
-
-    # 2) Generic USD pairs (e.g. XBTUSD, ETHUSD, SOLUSD, etc.)
-    if s.endswith("USD"):
-        base = s[:-3]
-        if base == "XBT":
-            base = "BTC"
-        return f"{base}/USD"
-
-    # 3) Fallback – just return the raw pair if we don't know it
-    return pair_raw
-
-
-
 def _pull_trades_from_kraken(since_hours: int, hard_limit: int) -> Tuple[int, int, Optional[str]]:
     """
     Pull trades via private TradesHistory and insert into SQLite.
@@ -749,7 +747,6 @@ def journal_backfill(payload: Dict[str, Any] = Body(default=None)):
 
 @app.post("/journal/sync")
 def journal_sync(payload: Dict[str, Any] = Body(default=None)):
-    payload = payload or {}
     """
     Pull trades from Kraken TradesHistory and upsert into sqlite.
 
@@ -765,6 +762,7 @@ def journal_sync(payload: Dict[str, Any] = Body(default=None)):
     """
     import time, json as _json, math as _math
 
+    payload     = payload or {}
     dry_run     = bool(payload.get("dry_run", False))
     since_hours = int(payload.get("since_hours", 72) or 72)
     hard_limit  = int(payload.get("limit", 50000) or 50000)
