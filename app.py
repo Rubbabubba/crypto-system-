@@ -73,7 +73,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 import threading
 import time
-from symbol_map import KRAKEN_PAIR_MAP
+from symbol_map import KRAKEN_PAIR_MAP, to_kraken
 
 
 # Routes:
@@ -522,8 +522,8 @@ def policy():
 
 @app.get("/price/{base}/{quote}", response_model=PriceResponse)
 def price(base: str, quote: str):
-    sym_app = f"{base.upper()}/{quote.upper()}"
-    alt = to_kraken_alt_pair(base, quote)  # e.g., BTC/USD -> XBTUSD
+    sym_app = f"{base.upper()}/{quote.upper()}"        # e.g. AVAX/USD
+    alt = to_kraken(sym_app)                           # e.g. XBTUSD, AVAXUSD, etc.
     try:
         data = kraken_public_ticker(alt)
         err = _kraken_error_str(data)
@@ -532,9 +532,8 @@ def price(base: str, quote: str):
         result = data.get("result") or {}
         if not result:
             raise HTTPException(status_code=502, detail="No ticker data")
-        # the only key is the pair, unknown exact spelling, pick first
-        k = next(iter(result.keys()))
-        last_trade = result[k]["c"][0]  # 'c' -> last trade price [price, lot]
+        k = next(iter(result.keys()))                  # the only key is the pair
+        last_trade = result[k]["c"][0]                 # 'c' -> last trade price [price, lot]
         px = float(last_trade)
         return PriceResponse(ok=True, symbol=sym_app, price=px)
     except requests.HTTPError as e:
