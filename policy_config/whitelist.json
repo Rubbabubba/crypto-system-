@@ -1,8 +1,8 @@
 {
-  "c1": ["BTC/USD","ETH/USD","SOL/USD","LINK/USD","AVAX/USD","BCH/USD"],
-  "c2": ["BTC/USD","ETH/USD","SOL/USD","LINK/USD","AVAX/USD","BCH/USD"],
-  "c3": ["BTC/USD","ETH/USD","SOL/USD","LINK/USD","AVAX/USD","BCH/USD"],
-  "c4": ["BTC/USD","ETH/USD","SOL/USD","LINK/USD","AVAX/USD","BCH/USD"],
-  "c5": ["BTC/USD","ETH/USD","SOL/USD","LINK/USD","AVAX/USD","BCH/USD"],
-  "c6": ["BTC/USD","ETH/USD","SOL/USD","LINK/USD","AVAX/USD","BCH/USD"]
+  "c1": ["BTC/USD", "ETH/USD"],
+  "c2": ["BTC/USD", "SOL/USD"],
+  "c3": ["SOL/USD", "AVAX/USD"],
+  "c4": ["AVAX/USD", "LINK/USD"],
+  "c5": ["LINK/USD", "BCH/USD"],
+  "c6": ["ETH/USD", "BCH/USD"]
 }
