@@ -10,16 +10,16 @@ USERREF_MAP_PATH = Path(os.getenv("POLICY_CFG_DIR", "policy_config")) / "userref
 
 
 def _load_userref_to_strategy() -> Dict[str, str]:
-    """
-    Load mapping from Kraken userref to internal strategy name.
+"""
+Load mapping from Kraken userref to internal strategy name.
 
-    Supports both of these JSON shapes in policy_config/userref_map.json:
+Supports both of these JSON shapes in policy_config/userref_map.json:
 
-      1. {"c1": 201, "c2": 202, ...}
-      2. {"201": "c1", "202": "c2", ...}
+  1. {"c1": 201, "c2": 202, ...}
+  2. {"201": "c1", "202": "c2", ...}
 
-    Returns a dict mapping userref (as string) -> strategy (as string).
-    """
+Returns a dict mapping userref (as string) -> strategy (as string).
+"""
     try:
         with USERREF_MAP_PATH.open("r", encoding="utf-8") as f:
             cfg = json.load(f)
@@ -52,7 +52,7 @@ _USERREF_TO_STRATEGY: Dict[str, str] = _load_userref_to_strategy()
 
 
 def _strategy_from_raw_trade(raw: Dict[str, Any]) -> Optional[str]:
-    """Infer strategy name from a raw Kraken trade dict via 'userref'."""
+"""Infer strategy name from a raw Kraken trade dict via 'userref'."""
     if not raw:
         return None
     userref = raw.get("userref")
