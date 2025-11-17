@@ -382,14 +382,16 @@
     async function refreshPnL(){
       // Server truth first (journal-based)
       try{
-        const j = await fetchJSON('/pnl/summary');
-        const t = j.total || {realized:0,unrealized:0,fees:0,equity:0};
-        const isAllZero = !t.realized && !t.unrealized && !t.fees && !t.equity;
-        if(!isAllZero){
-          log('pnl/summary', j);
-          fillPnLTables(j);
-          return;
-        }
+        // Compute today's date as YYYY-MM-DD in local time
+		const today = new Date().toISOString().slice(0, 10);  // e.g. "2025-11-16"
+		const j = await fetchJSON(`/pnl/summary?start=${today}`);
+		const t = j.total || {realized:0,unrealized:0,fees:0,equity:0};
+		const isAllZero = !t.realized && !t.unrealized && !t.fees && !t.equity;
+		if(!isAllZero){
+		  log('pnl/summary', j);
+		  fillPnLTables(j);
+		  return;
+		}
         log('pnl/summary all zeros — using journal fallback');
       }catch(e){
         log('pnl/summary failed — using journal fallback', String(e));

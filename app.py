@@ -1926,14 +1926,31 @@ def _pnl__columns(con: _sqlite3.Connection, table: str) -> List[str]:
     return [r[1] for r in con.execute(f"PRAGMA table_info({table})")]
 
 def _pnl__where(start_iso: Optional[str], end_iso: Optional[str]) -> Tuple[str, List[Any]]:
-    w, p = [], []
+    """
+    Build a WHERE clause over the trades table using ISO date strings.
+
+    start_iso / end_iso are ISO strings like '2025-11-16' or
+    '2025-11-16T00:00:00' (already validated/normalized by _pnl__parse_ts).
+
+    We store trade time in 'ts' as a Unix timestamp (seconds since epoch),
+    so we compare against strftime('%s', ?) which converts the ISO string
+    to epoch seconds inside SQLite.
+    """
+    where_parts: List[str] = []
+    params: List[Any] = []
+
     if start_iso:
-        w.append("timestamp >= ?")
-        p.append(start_iso)
+        # ts >= epoch_seconds(start_iso)
+        where_parts.append("ts >= strftime('%s', ?)")
+        params.append(start_iso)
+
     if end_iso:
-        w.append("timestamp <= ?")
-        p.append(end_iso)
-    return ((" WHERE " + " AND ".join(w)) if w else ""), p
+        # ts <= epoch_seconds(end_iso)
+        where_parts.append("ts <= strftime('%s', ?)")
+        params.append(end_iso)
+
+    where_sql = f" WHERE {' AND '.join(where_parts)}" if where_parts else ""
+    return where_sql, params
 
 def _pnl__build_sql(table: str, group_fields: List[str], have_cols: List[str], realized_only: bool) -> str:
     realized = "COALESCE(SUM(realized_pnl),0.0)" if "realized_pnl" in have_cols else "0.0"
