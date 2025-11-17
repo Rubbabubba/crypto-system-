@@ -26,18 +26,69 @@ import hmac
 import base64
 import hashlib
 import threading
+import json
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-def _userref_for_strategy(strategy: Optional[str]) -> int:
+
+def _load_strategy_to_userref() -> Dict[str, int]:
+    """Load mapping from strategy name -> Kraken userref (int).
+
+    Supports both of these JSON shapes in policy_config/userref_map.json:
+
+      1. {"c1": 101, "c2": 102, ...}
+      2. {"101": "c1", "102": "c2", ...}
+    """
+    cfg_path = Path(os.getenv("POLICY_CFG_DIR", "policy_config")) / "userref_map.json"
     try:
-        if isinstance(strategy, str) and re.fullmatch(r"c[1-9]", strategy.strip().lower()):
-            return int(strategy.strip().lower()[1])
+        with cfg_path.open("r", encoding="utf-8") as f:
+            cfg = json.load(f)
     except Exception:
-        pass
-    import time
+        return {}
+
+    if not isinstance(cfg, dict) or not cfg:
+        return {}
+
+    mapping: Dict[str, int] = {}
+
+    first_value = next(iter(cfg.values()))
+    if isinstance(first_value, int):
+        # Shape 1: strategy -> int userref
+        for strat, ref in cfg.items():
+            try:
+                mapping[str(strat)] = int(ref)
+            except Exception:
+                continue
+    else:
+        # Shape 2: userref string -> strategy
+        for ref, strat in cfg.items():
+            try:
+                mapping[str(strat)] = int(ref)
+            except Exception:
+                continue
+
+    return mapping
+
+
+_STRATEGY_TO_USERREF: Dict[str, int] = _load_strategy_to_userref()
+
+
+def _userref_for_strategy(strategy: Optional[str]) -> int:
+    """Resolve a stable Kraken userref for a given strategy.
+
+    If a mapping is present in policy_config/userref_map.json, use it.
+    Otherwise, fall back to a deterministic minute-based hash so orders
+    still get some userref for correlation.
+    """
+    if isinstance(strategy, str):
+        key = strategy.strip()
+        if key in _STRATEGY_TO_USERREF:
+            return _STRATEGY_TO_USERREF[key]
+
+    # Fallback: deterministic per-minute hash on strategy name
     minute = int(time.time() // 60)
-    h = hash((strategy or 'x', minute))
-    return int(h & 0x7fffffff)
+    h = hash(((strategy or "x"), minute))
+    return int(h & 0x7FFFFFFF)
 
 
 import requests
@@ -335,7 +386,7 @@ def market_notional(symbol: str, side: str, notional: float, strategy: Optional[
         "type": "buy" if side == "buy" else "sell",
         "ordertype": "market",
         "volume": f"{volume:.8f}",
-        "userref": str(_userref(ui, side, float(notional))),
+        "userref": str(_userref_for_strategy(strategy) if strategy is not None else _userref(ui, side, float(notional))),
     }
     res = _priv("AddOrder", payload)
 

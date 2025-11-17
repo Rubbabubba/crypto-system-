@@ -2,6 +2,66 @@
 crypto-system-api (app.py) — v2.4.0
 ------------------------------------
 Full drop-in FastAPI app.
+# ------------------------------------------------------------------------------
+# Userref → strategy mapping for journal enrichment
+# ------------------------------------------------------------------------------
+
+USERREF_MAP_PATH = Path(os.getenv("POLICY_CFG_DIR", "policy_config")) / "userref_map.json"
+
+
+def _load_userref_to_strategy() -> Dict[str, str]:
+    """
+    Load mapping from Kraken userref to internal strategy name.
+
+    Supports both of these JSON shapes in policy_config/userref_map.json:
+
+      1. {"c1": 201, "c2": 202, ...}
+      2. {"201": "c1", "202": "c2", ...}
+
+    Returns a dict mapping userref (as string) -> strategy (as string).
+    """
+    try:
+        with USERREF_MAP_PATH.open("r", encoding="utf-8") as f:
+            cfg = json.load(f)
+    except Exception:
+        return {}
+
+    if not isinstance(cfg, dict) or not cfg:
+        return {}
+
+    mapping: Dict[str, str] = {}
+
+    # Peek at one value to detect the shape
+    first_value = next(iter(cfg.values()))
+    if isinstance(first_value, int):
+        # Shape 1: strategy -> int userref
+        for strat, ref in cfg.items():
+            try:
+                mapping[str(int(ref))] = str(strat)
+            except Exception:
+                continue
+    else:
+        # Shape 2: userref string -> strategy
+        for ref, strat in cfg.items():
+            mapping[str(ref)] = str(strat)
+
+    return mapping
+
+
+_USERREF_TO_STRATEGY: Dict[str, str] = _load_userref_to_strategy()
+
+
+def _strategy_from_raw_trade(raw: Dict[str, Any]) -> Optional[str]:
+    """Infer strategy name from a raw Kraken trade dict via 'userref'."""
+    if not raw:
+        return None
+    userref = raw.get("userref")
+    if userref is None:
+        return None
+    return _USERREF_TO_STRATEGY.get(str(userref))
+
+
+
 
 # Routes (human overview — synced with FastAPI app)
 #   GET   /                        -> root info / basic status
@@ -73,8 +133,6 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 import threading
 import time
-from symbol_map import KRAKEN_PAIR_MAP, to_kraken
-
 
 # Routes:
 #   - /
@@ -218,39 +276,6 @@ def _kraken_creds():
         pass
     return key, sec, user, pwd
 
-
-# ------------------------------------------------------------------------------
-# Symbol normalization: Kraken pair -> app UI symbol
-# ------------------------------------------------------------------------------
-_REV_KRAKEN_PAIR_MAP = {v.upper(): k for k, v in KRAKEN_PAIR_MAP.items()}
-
-def from_kraken_pair_to_app(pair_raw: str) -> str:
-    """
-    Convert Kraken pair strings (e.g. 'XBTUSD', 'ETHUSD') into UI symbols
-    (e.g. 'BTC/USD', 'ETH/USD').
-
-    Uses symbol_map.KRAKEN_PAIR_MAP as the source of truth and falls back
-    to a simple 'BASE/USD' rule with XBT->BTC if needed.
-    """
-    if not pair_raw:
-        return ""
-
-    s = str(pair_raw).upper()
-
-    # 1) Exact match from our configured map (recommended pairs)
-    if s in _REV_KRAKEN_PAIR_MAP:
-        return _REV_KRAKEN_PAIR_MAP[s]
-
-    # 2) Generic USD pairs (e.g. XBTUSD, ETHUSD, SOLUSD, etc.)
-    if s.endswith("USD"):
-        base = s[:-3]
-        if base == "XBT":
-            base = "BTC"
-        return f"{base}/USD"
-
-    # 3) Fallback – just return the raw pair if we don't know it
-    return pair_raw
-
 # --------------------------------------------------------------------------------------
 # Kraken API client (public & private)
 # --------------------------------------------------------------------------------------
@@ -316,8 +341,8 @@ def insert_trades(rows: List[Dict[str, Any]]) -> int:
     cur = conn.cursor()
     ins = """
         INSERT OR IGNORE INTO trades
-        (txid, ts, pair, symbol, side, price, volume, cost, fee, raw)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        (txid, ts, pair, symbol, side, price, volume, cost, fee, strategy, raw)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """
     count = 0
     for r in rows:
@@ -332,6 +357,7 @@ def insert_trades(rows: List[Dict[str, Any]]) -> int:
                 float(r.get("volume", 0) or 0),
                 float(r.get("cost", 0) or 0),
                 float(r.get("fee", 0) or 0),
+                _strategy_from_raw_trade(r),
                 json.dumps(r, separators=(",", ":")),
             ))
             count += cur.rowcount
@@ -522,8 +548,8 @@ def policy():
 
 @app.get("/price/{base}/{quote}", response_model=PriceResponse)
 def price(base: str, quote: str):
-    sym_app = f"{base.upper()}/{quote.upper()}"        # e.g. AVAX/USD
-    alt = to_kraken(sym_app)                           # e.g. XBTUSD, AVAXUSD, etc.
+    sym_app = f"{base.upper()}/{quote.upper()}"
+    alt = to_kraken_alt_pair(base, quote)  # e.g., BTC/USD -> XBTUSD
     try:
         data = kraken_public_ticker(alt)
         err = _kraken_error_str(data)
@@ -532,8 +558,9 @@ def price(base: str, quote: str):
         result = data.get("result") or {}
         if not result:
             raise HTTPException(status_code=502, detail="No ticker data")
-        k = next(iter(result.keys()))                  # the only key is the pair
-        last_trade = result[k]["c"][0]                 # 'c' -> last trade price [price, lot]
+        # the only key is the pair, unknown exact spelling, pick first
+        k = next(iter(result.keys()))
+        last_trade = result[k]["c"][0]  # 'c' -> last trade price [price, lot]
         px = float(last_trade)
         return PriceResponse(ok=True, symbol=sym_app, price=px)
     except requests.HTTPError as e:
@@ -724,7 +751,6 @@ def get_fills(limit: int = 50, offset: int = 0):
 
 @app.post("/journal/backfill")
 def journal_backfill(payload: Dict[str, Any] = Body(default=None)):
-    payload = payload or {}
     since_hours = int(payload.get("since_hours", 24 * 365))
     limit = int(payload.get("limit", 100000))
     start_ts = hours_to_start_ts(since_hours)
@@ -761,7 +787,6 @@ def journal_sync(payload: Dict[str, Any] = Body(default=None)):
     """
     import time, json as _json, math as _math
 
-    payload     = payload or {}
     dry_run     = bool(payload.get("dry_run", False))
     since_hours = int(payload.get("since_hours", 72) or 72)
     hard_limit  = int(payload.get("limit", 50000) or 50000)
@@ -1925,6 +1950,7 @@ def _pnl__detect_table(con: _sqlite3.Connection) -> str:
 def _pnl__columns(con: _sqlite3.Connection, table: str) -> List[str]:
     return [r[1] for r in con.execute(f"PRAGMA table_info({table})")]
 
+
 def _pnl__where(start_iso: Optional[str], end_iso: Optional[str]) -> Tuple[str, List[Any]]:
     """
     Build a WHERE clause over the trades table using ISO date strings.
@@ -1951,6 +1977,7 @@ def _pnl__where(start_iso: Optional[str], end_iso: Optional[str]) -> Tuple[str, 
 
     where_sql = f" WHERE {' AND '.join(where_parts)}" if where_parts else ""
     return where_sql, params
+
 
 def _pnl__build_sql(table: str, group_fields: List[str], have_cols: List[str], realized_only: bool) -> str:
     realized = "COALESCE(SUM(realized_pnl),0.0)" if "realized_pnl" in have_cols else "0.0"
