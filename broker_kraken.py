@@ -30,7 +30,6 @@ import json
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-
 def _load_strategy_to_userref() -> Dict[str, int]:
     """Load mapping from strategy name -> Kraken userref (int).
 
