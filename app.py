@@ -2,66 +2,6 @@
 crypto-system-api (app.py) — v2.4.0
 ------------------------------------
 Full drop-in FastAPI app.
-# ------------------------------------------------------------------------------
-# Userref → strategy mapping for journal enrichment
-# ------------------------------------------------------------------------------
-
-USERREF_MAP_PATH = Path(os.getenv("POLICY_CFG_DIR", "policy_config")) / "userref_map.json"
-
-
-def _load_userref_to_strategy() -> Dict[str, str]:
-"""
-Load mapping from Kraken userref to internal strategy name.
-
-Supports both of these JSON shapes in policy_config/userref_map.json:
-
-  1. {"c1": 201, "c2": 202, ...}
-  2. {"201": "c1", "202": "c2", ...}
-
-Returns a dict mapping userref (as string) -> strategy (as string).
-"""
-    try:
-        with USERREF_MAP_PATH.open("r", encoding="utf-8") as f:
-            cfg = json.load(f)
-    except Exception:
-        return {}
-
-    if not isinstance(cfg, dict) or not cfg:
-        return {}
-
-    mapping: Dict[str, str] = {}
-
-    # Peek at one value to detect the shape
-    first_value = next(iter(cfg.values()))
-    if isinstance(first_value, int):
-        # Shape 1: strategy -> int userref
-        for strat, ref in cfg.items():
-            try:
-                mapping[str(int(ref))] = str(strat)
-            except Exception:
-                continue
-    else:
-        # Shape 2: userref string -> strategy
-        for ref, strat in cfg.items():
-            mapping[str(ref)] = str(strat)
-
-    return mapping
-
-
-_USERREF_TO_STRATEGY: Dict[str, str] = _load_userref_to_strategy()
-
-
-def _strategy_from_raw_trade(raw: Dict[str, Any]) -> Optional[str]:
-"""Infer strategy name from a raw Kraken trade dict via 'userref'."""
-    if not raw:
-        return None
-    userref = raw.get("userref")
-    if userref is None:
-        return None
-    return _USERREF_TO_STRATEGY.get(str(userref))
-
-
-
 
 # Routes (human overview — synced with FastAPI app)
 #   GET   /                        -> root info / basic status
@@ -108,6 +48,68 @@ def _strategy_from_raw_trade(raw: Dict[str, Any]) -> Optional[str]:
 #
 #   [Static] /static/*             -> static assets if ./static mounted
 """
+# ------------------------------------------------------------------------------
+# Userref → strategy mapping for journal enrichment
+# ------------------------------------------------------------------------------
+
+import os
+import json
+from pathlib import Path
+from typing import Any, Dict, Optional
+
+USERREF_MAP_PATH = Path(os.getenv("POLICY_CFG_DIR", "policy_config")) / "userref_map.json"
+
+
+def _load_userref_to_strategy() -> Dict[str, str]:
+    """
+    Load mapping from Kraken userref to internal strategy name.
+
+    Supports both of these JSON shapes in policy_config/userref_map.json:
+
+      1. {"c1": 201, "c2": 202, ...}
+      2. {"201": "c1", "202": "c2", ...}
+
+    Returns a dict mapping userref (as string) -> strategy (as string).
+    """
+    try:
+        with USERREF_MAP_PATH.open("r", encoding="utf-8") as f:
+            cfg = json.load(f)
+    except Exception:
+        return {}
+
+    if not isinstance(cfg, dict) or not cfg:
+        return {}
+
+    mapping: Dict[str, str] = {}
+
+    # Peek at one value to detect the shape
+    first_value = next(iter(cfg.values()))
+    if isinstance(first_value, int):
+        # Shape 1: strategy -> int userref
+        for strat, ref in cfg.items():
+            try:
+                mapping[str(int(ref))] = str(strat)
+            except Exception:
+                continue
+    else:
+        # Shape 2: userref string -> strategy
+        for ref, strat in cfg.items():
+            mapping[str(ref)] = str(strat)
+
+    return mapping
+
+
+_USERREF_TO_STRATEGY: Dict[str, str] = _load_userref_to_strategy()
+
+
+def _strategy_from_raw_trade(raw: Dict[str, Any]) -> Optional[str]:
+    """Infer strategy name from a raw Kraken trade dict via 'userref'."""
+    if not raw:
+        return None
+    userref = raw.get("userref")
+    if userref is None:
+        return None
+    return _USERREF_TO_STRATEGY.get(str(userref))
 
 import base64
 import datetime as dt
