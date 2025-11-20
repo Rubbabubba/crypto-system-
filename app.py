@@ -2044,10 +2044,17 @@ def _pnl__agg(group_fields: List[str], start: Optional[str], end: Optional[str],
 def _load_symbol_strategy_map() -> Dict[str, str]:
     """
     Load symbol→strategy mapping from policy_config/whitelist.json (or POLICY_CFG_DIR env).
-    Each symbol will be mapped to the *first* strategy that lists it.
 
-    We register both 'BASE/USD' and 'BASEUSD' forms so that journal symbols
-    like 'AVAX/USD' and 'AVAXUSD' both map correctly.
+    We normalize symbols so that both of these forms map correctly:
+      - "BTC/USD"
+      - "BTCUSD"
+
+    For each whitelist symbol S we create mappings for:
+      - S (uppercased as-is)
+      - If it contains "/", also S with the slash removed, e.g. "BTC/USD" -> "BTCUSD"
+      - If it endswith "USD" without slash, also BASE+"/USD", e.g. "BTCUSD" -> "BTC/USD"
+
+    If a symbol appears under multiple strategies, the first one wins (with a warning).
     """
     cfg_dir = os.getenv("POLICY_CFG_DIR", "policy_config")
     path = Path(cfg_dir) / "whitelist.json"
@@ -2066,8 +2073,8 @@ def _load_symbol_strategy_map() -> Dict[str, str]:
         log.warning("whitelist.json at %s is not an object/dict; got %r", path, type(data))
         return {}
 
-    def _register(sym_raw: str, strat_id: str) -> None:
-        s = sym_raw.strip().upper()
+    def _add(sym: str, strat_id: str) -> None:
+        s = sym.strip().upper()
         if not s:
             return
         if s in mapping and mapping[s] != strat_id:
@@ -2089,14 +2096,26 @@ def _load_symbol_strategy_map() -> Dict[str, str]:
             raw = str(sym or "").strip()
             if not raw:
                 continue
+            up = raw.upper()
 
-            # Canonical form: with slash (e.g. 'AVAX/USD')
-            sym_with_slash = raw.upper()
-            # No-slash form: 'AVAXUSD'
-            sym_no_slash = sym_with_slash.replace("/", "")
+            # 1) As-is
+            _add(up, strat_id)
 
-            _register(sym_with_slash, strat_id)
-            _register(sym_no_slash, strat_id)
+            # 2) If "BASE/USD" -> also "BASEUSD"
+            if "/" in up:
+                base, quote = up.split("/", 1)
+                base = base.strip()
+                quote = quote.strip()
+                if base and quote:
+                    compact = f"{base}{quote}"
+                    _add(compact, strat_id)
+
+            # 3) If "BASEUSD" -> also "BASE/USD"
+            if up.endswith("USD") and "/" not in up:
+                base = up[:-3]
+                if base:
+                    slashy = f"{base}/USD"
+                    _add(slashy, strat_id)
 
     log.info("loaded %d symbol→strategy mappings from %s", len(mapping), path)
     return mapping
