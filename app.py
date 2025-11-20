@@ -2038,6 +2038,52 @@ def _pnl__agg(group_fields: List[str], start: Optional[str], end: Optional[str],
         sql = _pnl__build_sql(table, group_fields, have, realized_only).replace("{WHERE}", where)
         rows = [dict(r) for r in con.execute(sql, params).fetchall()]
         return {"ok": True, "table": table, "start": s, "end": e, "realized_only": realized_only, "count": len(rows), "rows": rows}
+        
+# --- PnL attribution via whitelist symbol → strategy map ---
+
+def _load_symbol_strategy_map() -> Dict[str, str]:
+    """
+    Load symbol→strategy mapping from policy_config/whitelist.json (or POLICY_CFG_DIR env).
+    Each symbol will be mapped to the *first* strategy that lists it.
+    """
+    cfg_dir = os.getenv("POLICY_CFG_DIR", "policy_config")
+    path = Path(cfg_dir) / "whitelist.json"
+    mapping: Dict[str, str] = {}
+    try:
+        with open(path, "r") as f:
+            data = json.load(f) or {}
+    except FileNotFoundError:
+        log.warning("whitelist.json not found at %s; symbol→strategy attribution will be empty", path)
+        return {}
+    except Exception as e:
+        log.warning("failed to load whitelist.json from %s: %s", path, e)
+        return {}
+
+    if not isinstance(data, dict):
+        log.warning("whitelist.json at %s is not an object/dict; got %r", path, type(data))
+        return {}
+
+    for strat, symbols in data.items():
+        if not isinstance(symbols, list):
+            continue
+        strat_id = str(strat).strip()
+        if not strat_id:
+            continue
+        for sym in symbols:
+            s = str(sym).strip().upper()
+            if not s:
+                continue
+            # if symbol appears under multiple strategies, keep the first mapping and warn
+            if s in mapping and mapping[s] != strat_id:
+                log.warning(
+                    "symbol %s appears in multiple whitelists: %s and %s; keeping first=%s",
+                    s, mapping[s], strat_id, mapping[s],
+                )
+                continue
+            mapping[s] = strat_id
+
+    log.info("loaded %d symbol→strategy mappings from %s", len(mapping), path)
+    return mapping
 
 @app.get("/pnl/by_strategy")
 def pnl_by_strategy(start: Optional[str] = None, end: Optional[str] = None,
@@ -2054,6 +2100,103 @@ def pnl_by_symbol(start: Optional[str] = None, end: Optional[str] = None,
         return _pnl__agg(["symbol"], start, end, _pnl__parse_bool(realized_only, True))
     except Exception as e:
         return {"ok": False, "error": f"/pnl/by_symbol failed: {e.__class__.__name__}: {e}"}
+        
+@app.get("/pnl/by_strategy_from_symbols")
+def pnl_by_strategy_from_symbols(
+    start: Optional[str] = None,
+    end: Optional[str] = None,
+    realized_only: Optional[str] = "true",
+    tz: Optional[str] = "UTC",
+):
+    """
+    Aggregate PnL by *strategy*, where strategy attribution comes from
+    policy_config/whitelist.json (symbol→strategy mapping), not from the
+    'strategy' column in the journal.
+
+    This is perfect for your current setup where:
+      - C2 owns a fixed basket of symbols
+      - C3 owns a different fixed basket
+    and you want "per-strategy" PnL even if journal.strategy is null/misc.
+    """
+    try:
+        # First, get PnL aggregated by symbol using the existing machinery
+        base = _pnl__agg(
+            ["symbol"],
+            start,
+            end,
+            _pnl__parse_bool(realized_only, True),
+        )
+        if not base.get("ok", False):
+            return base
+
+        rows = base.get("rows", []) or []
+        sym_map = _load_symbol_strategy_map()
+
+        # Aggregate by strategy derived from symbol
+        grouped: Dict[str, Dict[str, Any]] = {}
+
+        for r in rows:
+            sym = str(r.get("symbol") or "").upper()
+            strat = sym_map.get(sym, "unmapped")
+
+            g = grouped.setdefault(
+                strat,
+                {
+                    "strategy": strat,
+                    "realized_pnl": 0.0,
+                    "unrealized_pnl": 0.0,
+                    "fees": 0.0,
+                    "equity": 0.0,
+                    "trades": 0,
+                    "symbols": [],
+                },
+            )
+
+            realized = float(r.get("realized_pnl") or 0.0)
+            unreal   = float(r.get("unrealized_pnl") or 0.0)
+            fees     = float(r.get("fees") or 0.0)
+            equity   = float(r.get("equity") or (realized + unreal - fees))
+            trades   = int(r.get("trades") or 0)
+
+            g["realized_pnl"]   += realized
+            g["unrealized_pnl"] += unreal
+            g["fees"]           += fees
+            g["equity"]         += equity
+            g["trades"]         += trades
+            if sym:
+                g["symbols"].append(sym)
+
+        out_rows: List[Dict[str, Any]] = []
+        for g in grouped.values():
+            # Deduplicate and sort symbol list for readability
+            syms = sorted(set(g.get("symbols") or []))
+            g["symbols"] = syms
+            out_rows.append(g)
+
+        # Sort rows by equity descending (same spirit as _pnl__build_sql)
+        out_rows.sort(key=lambda x: x.get("equity", 0.0), reverse=True)
+
+        # Build response, preserving base metadata except rows/count
+        resp = {
+            k: v
+            for k, v in base.items()
+            if k not in ("rows", "count")
+        }
+        resp.update(
+            {
+                "ok": True,
+                "grouping": "whitelist_strategy",
+                "count": len(out_rows),
+                "rows": out_rows,
+            }
+        )
+        return resp
+
+    except Exception as e:
+        return {
+            "ok": False,
+            "error": f"/pnl/by_strategy_from_symbols failed: {e.__class__.__name__}: {e}",
+        }
 
 @app.get("/pnl/combined")
 def pnl_combined(start: Optional[str] = None, end: Optional[str] = None,
