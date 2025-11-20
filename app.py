@@ -2038,7 +2038,26 @@ def _pnl__agg(group_fields: List[str], start: Optional[str], end: Optional[str],
         sql = _pnl__build_sql(table, group_fields, have, realized_only).replace("{WHERE}", where)
         rows = [dict(r) for r in con.execute(sql, params).fetchall()]
         return {"ok": True, "table": table, "start": s, "end": e, "realized_only": realized_only, "count": len(rows), "rows": rows}
-        
+
+def _normalize_symbol(sym: str) -> str:
+    """
+    Normalize symbols into the format BASE/USD.
+    Accepts:
+      - BTC/USD
+      - BTCUSD
+      - btcusd
+    Returns always BASE/USD.
+    """
+    s = (sym or "").upper().strip()
+    if not s:
+        return s
+    if "/" in s:
+        return s
+    if s.endswith("USD"):
+        base = s[:-3]
+        return f"{base}/USD"
+    return s
+
 # --- PnL attribution via whitelist symbol → strategy map ---
 
 def _load_symbol_strategy_map() -> Dict[str, str]:
@@ -2199,7 +2218,7 @@ def pnl_by_strategy_from_symbols(
             g["equity"]         += equity
             g["trades"]         += trades
             if sym:
-                g["symbols"].append(sym)
+                g["symbols"].append(_normalize_symbol(sym))
 
         out_rows: List[Dict[str, Any]] = []
         for g in grouped.values():
@@ -2241,3 +2260,4 @@ def pnl_combined(start: Optional[str] = None, end: Optional[str] = None,
     except Exception as e:
         return {"ok": False, "error": f"/pnl/combined failed: {e.__class__.__name__}: {e}"}
 # ==== END PATCH v1.0.0 ===========================================================================
+
