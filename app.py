@@ -2045,6 +2045,9 @@ def _load_symbol_strategy_map() -> Dict[str, str]:
     """
     Load symbol→strategy mapping from policy_config/whitelist.json (or POLICY_CFG_DIR env).
     Each symbol will be mapped to the *first* strategy that lists it.
+
+    We register both 'BASE/USD' and 'BASEUSD' forms so that journal symbols
+    like 'AVAX/USD' and 'AVAXUSD' both map correctly.
     """
     cfg_dir = os.getenv("POLICY_CFG_DIR", "policy_config")
     path = Path(cfg_dir) / "whitelist.json"
@@ -2063,24 +2066,37 @@ def _load_symbol_strategy_map() -> Dict[str, str]:
         log.warning("whitelist.json at %s is not an object/dict; got %r", path, type(data))
         return {}
 
+    def _register(sym_raw: str, strat_id: str) -> None:
+        s = sym_raw.strip().upper()
+        if not s:
+            return
+        if s in mapping and mapping[s] != strat_id:
+            log.warning(
+                "symbol %s appears in multiple whitelists: %s and %s; keeping first=%s",
+                s, mapping[s], strat_id, mapping[s],
+            )
+            return
+        mapping[s] = strat_id
+
     for strat, symbols in data.items():
         if not isinstance(symbols, list):
             continue
         strat_id = str(strat).strip()
         if not strat_id:
             continue
+
         for sym in symbols:
-            s = str(sym).strip().upper()
-            if not s:
+            raw = str(sym or "").strip()
+            if not raw:
                 continue
-            # if symbol appears under multiple strategies, keep the first mapping and warn
-            if s in mapping and mapping[s] != strat_id:
-                log.warning(
-                    "symbol %s appears in multiple whitelists: %s and %s; keeping first=%s",
-                    s, mapping[s], strat_id, mapping[s],
-                )
-                continue
-            mapping[s] = strat_id
+
+            # Canonical form: with slash (e.g. 'AVAX/USD')
+            sym_with_slash = raw.upper()
+            # No-slash form: 'AVAXUSD'
+            sym_no_slash = sym_with_slash.replace("/", "")
+
+            _register(sym_with_slash, strat_id)
+            _register(sym_no_slash, strat_id)
 
     log.info("loaded %d symbol→strategy mappings from %s", len(mapping), path)
     return mapping
