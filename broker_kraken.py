@@ -201,6 +201,16 @@ def _priv(path: str, params: Dict[str, Any] | None = None) -> Dict[str, Any]:
                 continue
             raise RuntimeError(f"HTTP private error: {e}") from e
     return {}
+    
+def close_notional_for_qty(symbol: str, qty: float) -> float:
+    """
+    Helper for position-aware scheduler: compute notional needed to close `qty` at current price.
+    """
+    px = last_price(symbol)
+    if px <= 0:
+        raise RuntimeError(f"last_price for {symbol} is <= 0")
+    return abs(qty) * px
+
 
 # ---------------------------------------------------------------------------
 # Kraken key → UI symbol heuristics (for robustness)

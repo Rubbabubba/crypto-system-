@@ -76,7 +76,7 @@ import time
 from symbol_map import KRAKEN_PAIR_MAP, to_kraken
 from position_engine import PositionEngine, Fill
 import broker_kraken
-
+from position_manager import load_net_positions, Position
 
 
 # Routes:
@@ -1785,6 +1785,10 @@ def scheduler_run(payload: Dict[str, Any] = Body(default=None)):
     notional = float(payload.get("notional", float(os.getenv("SCHED_NOTIONAL", "25") or 25)))
     msg = f"Scheduler pass: strats={','.join(strats)} tf={tf} limit={limit} notional={notional} dry={dry} symbols={symbols_csv}"
     log.info(msg)
+    # Load current open positions from trades table (symbol x strategy).
+    # We default to not using the 'strategy' column, since your attribution is symbol-based.
+    positions = _load_open_positions_from_trades(use_strategy_col=False)
+
 
     # Record last-run
     try:
@@ -1855,22 +1859,99 @@ def scheduler_run(payload: Dict[str, Any] = Body(default=None)):
                 "guard_ok": guard_ok, "guard_reason": guard_reason
             })
 
-            if guard_ok and r.action in ("buy","sell"):
+            # --- Position-aware execution -----------------------------------
+            # We interpret:
+            #   buy  -> want to be long
+            #   sell -> want to be short
+            #   flat -> want to be flat (close any open position)
+            if not guard_ok:
+                continue
+
+            sym = r.symbol
+            # Lookup current position snapshot (by symbol, strategy or 'misc')
+            pos = _position_for(sym, strat, positions)
+            current_qty = float(pos.qty) if pos is not None else 0.0
+
+            # Helper to send an order
+            def _send(symbol: str, side: str, notional_value: float, intent: str) -> None:
                 act = {
-                    "symbol": r.symbol, "side": r.action, "strategy": strat,
-                    "notional": float(r.notional if r.notional > 0 else notional),
+                    "symbol": symbol,
+                    "side": side,
+                    "strategy": strat,
+                    "notional": float(notional_value),
+                    "intent": intent,  # open_long, open_short, close_long, close_short, flip_long_to_short, etc.
                 }
                 if dry:
                     act["status"] = "dry_ok"
                 else:
                     try:
-                        resp = br.market_notional(r.symbol, r.action, act["notional"], strategy=strat)
+                        resp = br.market_notional(symbol, side, notional_value, strategy=strat)
                         act["status"] = "live_ok"
                         act["broker"] = resp
                     except Exception as e:
                         act["status"] = "live_err"
                         act["error"] = str(e)
                 actions.append(act)
+
+            # Helper: compute notional from qty using live price
+            def _notional_for_qty(symbol: str, qty: float) -> float:
+                try:
+                    px = float(broker_kraken.last_price(symbol) or 0.0)
+                except Exception:
+                    px = 0.0
+                return abs(qty) * px if px > 0 else 0.0
+
+            desired = r.action
+
+            # Case 0: Already flat
+            if abs(current_qty) < 1e-10:
+                if desired in ("buy", "sell"):
+                    target_notional = float(r.notional if r.notional and r.notional > 0 else notional)
+                    _send(sym, desired, target_notional, intent=f"open_{desired}")
+                    # We don't update `positions` here (we rely on journal + next run),
+                    # but we could approximate if needed.
+                # desired == "flat" and already flat: do nothing
+                continue
+
+            # Case 1: Currently long
+            if current_qty > 0:
+                if desired == "buy":
+                    # Already long; for now, we do NOT pyramid.
+                    continue
+                # Need to close the long size
+                close_notional = _notional_for_qty(sym, current_qty)
+                if close_notional <= 0:
+                    continue
+
+                if desired == "flat":
+                    _send(sym, "sell", close_notional, intent="close_long")
+                    continue
+                elif desired == "sell":
+                    # Flip: close long then open short of target size
+                    _send(sym, "sell", close_notional, intent="flip_close_long")
+                    target_notional = float(r.notional if r.notional and r.notional > 0 else notional)
+                    _send(sym, "sell", target_notional, intent="flip_open_short")
+                    continue
+
+            # Case 2: Currently short
+            if current_qty < 0:
+                if desired == "sell":
+                    # Already short; no pyramiding for now.
+                    continue
+                close_notional = _notional_for_qty(sym, current_qty)
+                if close_notional <= 0:
+                    continue
+
+                if desired == "flat":
+                    _send(sym, "buy", close_notional, intent="close_short")
+                    continue
+                elif desired == "buy":
+                    # Flip: close short then open long
+                    _send(sym, "buy", close_notional, intent="flip_close_short")
+                    target_notional = float(r.notional if r.notional and r.notional > 0 else notional)
+                    _send(sym, "buy", target_notional, intent="flip_open_long")
+                    continue
+
 
     return {"ok": True, "message": msg, "actions": actions, "telemetry": telemetry}
 
@@ -2036,6 +2117,27 @@ def _pnl__agg(group_fields: List[str], start: Optional[str], end: Optional[str],
         sql = _pnl__build_sql(table, group_fields, have, realized_only).replace("{WHERE}", where)
         rows = [dict(r) for r in con.execute(sql, params).fetchall()]
         return {"ok": True, "table": table, "start": s, "end": e, "realized_only": realized_only, "count": len(rows), "rows": rows}
+
+def _load_open_positions_from_trades(use_strategy_col: bool = False) -> Dict[Tuple[str, str], Position]:
+    """
+    Load net positions from the trades/journal table, using the same DB the PnL uses.
+    Returns a dict keyed by (symbol, strategy).
+    """
+    con = _db()
+    try:
+        table = _pnl__detect_table(con)
+        return load_net_positions(con, table=table, use_strategy_col=use_strategy_col)
+    finally:
+        con.close()
+
+
+def _position_for(symbol: str, strategy: str, positions: Dict[Tuple[str, str], Position]) -> Position | None:
+    key = (symbol, strategy)
+    if key in positions:
+        return positions[key]
+    # Fallback if strategy col not used: look for (symbol, 'misc')
+    key2 = (symbol, "misc")
+    return positions.get(key2)
 
 @app.get("/pnl/by_strategy")
 def pnl_by_strategy(start: Optional[str] = None, end: Optional[str] = None,
