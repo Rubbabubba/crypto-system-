@@ -1687,6 +1687,50 @@ def debug_env():
     ]
     env = {k: os.getenv(k) for k in keys}
     return {"ok": True, "env": env}
+    
+@app.get("/debug/positions")
+def debug_positions(use_strategy: bool = True):
+    """
+    Inspect the unified Position Manager view of current positions
+    pulled directly from the trades journal (same as PnL Engine).
+
+    use_strategy = True  -> returns (symbol, strategy) level positions
+    use_strategy = False -> collapses unlabeled rows into 'misc'
+    """
+    try:
+        con = _db()
+        table = None
+        try:
+            table = _pnl__detect_table(con)
+        except:
+            table = "trades"
+
+        positions = load_net_positions(
+            con,
+            table=table,
+            use_strategy_col=bool(use_strategy)
+        )
+
+        out = []
+        for (symbol, strategy), pos in positions.items():
+            side = "long" if pos.qty > 0 else ("short" if pos.qty < 0 else "flat")
+            out.append({
+                "symbol": symbol,
+                "strategy": strategy,
+                "qty": pos.qty,
+                "avg_price": pos.avg_price,
+                "side": side
+            })
+
+        return {
+            "ok": True,
+            "use_strategy": bool(use_strategy),
+            "count": len(out),
+            "positions": sorted(out, key=lambda x: (x["symbol"], x["strategy"]))
+        }
+
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
 
 # ---- Scan all (no orders) ------------------------------------------------------------
 @app.get("/scan/all")
