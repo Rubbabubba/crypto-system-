@@ -76,7 +76,13 @@ import time
 from symbol_map import KRAKEN_PAIR_MAP, to_kraken
 from position_engine import PositionEngine, Fill
 import broker_kraken
-from position_manager import load_net_positions, Position
+from position_manager import (
+    load_net_positions,
+    Position,
+    OrderIntent,
+    plan_position_adjustment,
+)
+
 
 
 # Routes:
@@ -1787,7 +1793,7 @@ def scheduler_run(payload: Dict[str, Any] = Body(default=None)):
     log.info(msg)
     # Load current open positions from trades table (symbol x strategy).
     # We default to not using the 'strategy' column, since your attribution is symbol-based.
-    positions = _load_open_positions_from_trades(use_strategy_col=False)
+    positions = _load_open_positions_from_trades(use_strategy_col=True)
 
 
     # Record last-run
@@ -1901,37 +1907,34 @@ def scheduler_run(payload: Dict[str, Any] = Body(default=None)):
                     px = 0.0
                 return abs(qty) * px if px > 0 else 0.0
 
-            desired = r.action
+                        desired = r.action
 
-            # Case 0: Already flat
-            if abs(current_qty) < 1e-10:
-                if desired in ("buy", "sell"):
-                    target_notional = float(r.notional if r.notional and r.notional > 0 else notional)
-                    _send(sym, desired, target_notional, intent=f"open_{desired}")
-                    # We don't update `positions` here (we rely on journal + next run),
-                    # but we could approximate if needed.
-                # desired == "flat" and already flat: do nothing
-                continue
+            # Use unified Position Manager for open/close/flip logic
+            target_notional = float(r.notional if r.notional and r.notional > 0 else notional)
 
-            # Case 1: Currently long
-            if current_qty > 0:
-                if desired == "buy":
-                    # Already long; for now, we do NOT pyramid.
-                    continue
-                # Need to close the long size
-                close_notional = _notional_for_qty(sym, current_qty)
-                if close_notional <= 0:
-                    continue
+            def _price_lookup(symbol_for_px: str) -> float:
+                try:
+                    return float(broker_kraken.last_price(symbol_for_px) or 0.0)
+                except Exception:
+                    return 0.0
 
-                if desired == "flat":
-                    _send(sym, "sell", close_notional, intent="close_long")
-                    continue
-                elif desired == "sell":
-                    # Flip: close long then open short of target size
-                    _send(sym, "sell", close_notional, intent="flip_close_long")
-                    target_notional = float(r.notional if r.notional and r.notional > 0 else notional)
-                    _send(sym, "sell", target_notional, intent="flip_open_short")
-                    continue
+            intents = plan_position_adjustment(
+                symbol=sym,
+                strategy=strat,
+                current_qty=current_qty,
+                desired=desired,
+                target_notional=target_notional,
+                price_lookup=_price_lookup,
+            )
+
+            for intent_obj in intents:
+                _send(
+                    intent_obj.symbol,
+                    intent_obj.side,
+                    intent_obj.notional,
+                    intent=intent_obj.intent,
+                )
+
 
             # Case 2: Currently short
             if current_qty < 0:
