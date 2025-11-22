@@ -76,13 +76,7 @@ import time
 from symbol_map import KRAKEN_PAIR_MAP, to_kraken
 from position_engine import PositionEngine, Fill
 import broker_kraken
-from position_manager import (
-    load_net_positions,
-    Position,
-    OrderIntent,
-    plan_position_adjustment,
-)
-
+from position_manager import load_net_positions, Position
 
 
 # Routes:
@@ -1793,7 +1787,7 @@ def scheduler_run(payload: Dict[str, Any] = Body(default=None)):
     log.info(msg)
     # Load current open positions from trades table (symbol x strategy).
     # We default to not using the 'strategy' column, since your attribution is symbol-based.
-    positions = _load_open_positions_from_trades(use_strategy_col=True)
+    positions = _load_open_positions_from_trades(use_strategy_col=False)
 
 
     # Record last-run
@@ -1899,25 +1893,17 @@ def scheduler_run(payload: Dict[str, Any] = Body(default=None)):
                         act["error"] = str(e)
                 actions.append(act)
 
-            # Helper: compute notional from qty using live price
-            def _notional_for_qty(symbol: str, qty: float) -> float:
-                try:
-                    px = float(broker_kraken.last_price(symbol) or 0.0)
-                except Exception:
-                    px = 0.0
-                return abs(qty) * px if px > 0 else 0.0
-
-                        desired = r.action
-
-            # Use unified Position Manager for open/close/flip logic
-            target_notional = float(r.notional if r.notional and r.notional > 0 else notional)
-
+            # Price lookup for Position Manager
             def _price_lookup(symbol_for_px: str) -> float:
                 try:
                     return float(broker_kraken.last_price(symbol_for_px) or 0.0)
                 except Exception:
                     return 0.0
 
+            desired = r.action
+            target_notional = float(r.notional if r.notional and r.notional > 0 else notional)
+
+            # Unified Position Manager decides open/close/flip
             intents = plan_position_adjustment(
                 symbol=sym,
                 strategy=strat,
@@ -1934,27 +1920,6 @@ def scheduler_run(payload: Dict[str, Any] = Body(default=None)):
                     intent_obj.notional,
                     intent=intent_obj.intent,
                 )
-
-
-            # Case 2: Currently short
-            if current_qty < 0:
-                if desired == "sell":
-                    # Already short; no pyramiding for now.
-                    continue
-                close_notional = _notional_for_qty(sym, current_qty)
-                if close_notional <= 0:
-                    continue
-
-                if desired == "flat":
-                    _send(sym, "buy", close_notional, intent="close_short")
-                    continue
-                elif desired == "buy":
-                    # Flip: close short then open long
-                    _send(sym, "buy", close_notional, intent="flip_close_short")
-                    target_notional = float(r.notional if r.notional and r.notional > 0 else notional)
-                    _send(sym, "buy", target_notional, intent="flip_open_long")
-                    continue
-
 
     return {"ok": True, "message": msg, "actions": actions, "telemetry": telemetry}
 
