@@ -76,13 +76,7 @@ import time
 from symbol_map import KRAKEN_PAIR_MAP, to_kraken
 from position_engine import PositionEngine, Fill
 import broker_kraken
-from position_manager import (
-    load_net_positions,
-    Position,
-    OrderIntent,
-    plan_position_adjustment,
-)
-
+from position_manager import load_net_positions, Position
 
 
 # Routes:
@@ -294,21 +288,6 @@ def kraken_private(method: str, data: Dict[str, Any], key: str, secret_b64: str)
     r.raise_for_status()
     return r.json()
 
-
-# --------------------------------------------------------------------------------------
-# Userref -> strategy map (for trade attribution)
-# --------------------------------------------------------------------------------------
-USERREF_MAP = {}
-try:
-    from pathlib import Path as _Path
-    import json as _json
-    cfg_dir = os.getenv("POLICY_CFG_DIR", "policy_config")
-    _um_path = _Path(cfg_dir) / "userref_map.json"
-    if _um_path.exists():
-        USERREF_MAP = _json.loads(_um_path.read_text(encoding="utf-8"))
-except Exception:
-    USERREF_MAP = {}
-
 # --------------------------------------------------------------------------------------
 # SQLite Journal store
 # --------------------------------------------------------------------------------------
@@ -340,25 +319,12 @@ def insert_trades(rows: List[Dict[str, Any]]) -> int:
     cur = conn.cursor()
     ins = """
         INSERT OR IGNORE INTO trades
-        (txid, ts, pair, symbol, side, price, volume, cost, fee, strategy, raw)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        (txid, ts, pair, symbol, side, price, volume, cost, fee, raw)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """
     count = 0
     for r in rows:
         try:
-            # Determine strategy: explicit, userref-mapped, or misc
-            strategy = r.get("strategy")
-            if not strategy:
-                raw_obj = r
-                u = raw_obj.get("userref")
-                if u is not None:
-                    try:
-                        strategy = USERREF_MAP.get(str(int(u)))
-                    except Exception:
-                        strategy = None
-                if not strategy:
-                    strategy = "misc"
-
             cur.execute(ins, (
                 r.get("txid"),
                 float(r.get("ts", 0)),
@@ -369,7 +335,6 @@ def insert_trades(rows: List[Dict[str, Any]]) -> int:
                 float(r.get("volume", 0) or 0),
                 float(r.get("cost", 0) or 0),
                 float(r.get("fee", 0) or 0),
-                strategy,
                 json.dumps(r, separators=(",", ":")),
             ))
             count += cur.rowcount
@@ -378,6 +343,7 @@ def insert_trades(rows: List[Dict[str, Any]]) -> int:
     conn.commit()
     conn.close()
     return count
+
 def fetch_rows(limit: int = 25, offset: int = 0) -> List[Dict[str, Any]]:
     conn = _db()
     cur = conn.cursor()
@@ -649,21 +615,9 @@ def _pull_trades_from_kraken(since_hours: int, hard_limit: int) -> Tuple[int, in
 
             rows = []
             for txid, t in trades.items():
-                # t keys: ordertxid, pair, time, type, ordertype...misc, posstatus, cprice, ccost, cfee, cvol, cmargin, net, trades
+                # t keys: ordertxid, pair, time, type, ordertype, price, cost, fee, vol, margin, misc, posstatus, cprice, ccost, cfee, cvol, cmargin, net, trades
                 pair_raw = t.get("pair") or ""
                 symbol = from_kraken_pair_to_app(pair_raw)
-
-                # Strategy from Kraken userref via USERREF_MAP (fallback to misc)
-                strategy = None
-                u = t.get("userref")
-                if u is not None:
-                    try:
-                        strategy = USERREF_MAP.get(str(int(u)))
-                    except Exception:
-                        strategy = None
-                if not strategy:
-                    strategy = "misc"
-
                 rows.append({
                     "txid": txid,
                     "ts": float(t.get("time", 0)),
@@ -674,9 +628,10 @@ def _pull_trades_from_kraken(since_hours: int, hard_limit: int) -> Tuple[int, in
                     "volume": float(t.get("vol") or 0),
                     "cost": float(t.get("cost") or 0),
                     "fee": float(t.get("fee") or 0),
-                    "strategy": strategy,
+                    "strategy": None,
                     "raw": t,
                 })
+
             seen += len(rows)
             inserted += insert_trades(rows)
 
@@ -1734,48 +1689,6 @@ def debug_env():
     return {"ok": True, "env": env}
 
 # ---- Scan all (no orders) ------------------------------------------------------------
-
-@app.get("/debug/positions")
-def debug_positions(use_strategy: bool = True):
-    """
-    Inspect unified Position Manager view of current positions from trades journal.
-    use_strategy=True -> (symbol, strategy) positions
-    use_strategy=False -> collapse unlabeled rows into 'misc'
-    """
-    try:
-        con = _db()
-        # detect table (only trades now, kept for future flexibility)
-        table = "trades"
-        try:
-            table = _pnl__detect_table(con)
-        except Exception:
-            table = "trades"
-
-        positions = load_net_positions(
-            con,
-            table=table,
-            use_strategy_col=bool(use_strategy)
-        )
-
-        out = []
-        for (symbol, strategy), pos in positions.items():
-            side = "long" if pos.qty > 0 else ("short" if pos.qty < 0 else "flat")
-            out.append({
-                "symbol": symbol,
-                "strategy": strategy,
-                "qty": pos.qty,
-                "avg_price": pos.avg_price,
-                "side": side,
-            })
-
-        return {
-            "ok": True,
-            "use_strategy": bool(use_strategy),
-            "count": len(out),
-            "positions": sorted(out, key=lambda x: (x["symbol"], x["strategy"])),
-        }
-    except Exception as e:
-        return {"ok": False, "error": str(e)}
 @app.get("/scan/all")
 def scan_all(tf: str = "5Min", symbols: str = "BTC/USD,ETH/USD", strats: str = "c1,c2,c3",
              limit: int = 300, notional: float = 25.0):
@@ -1874,10 +1787,38 @@ def scheduler_run(payload: Dict[str, Any] = Body(default=None)):
     log.info(msg)
     # Load current open positions from trades table (symbol x strategy).
     # We default to not using the 'strategy' column, since your attribution is symbol-based.
-    positions = _load_open_positions_from_trades(use_strategy_col=True)
+    positions = _load_open_positions_from_trades(use_strategy_col=False)
 
+    # Load global risk policy config
+    try:
+        _risk_cfg = load_risk_config()
+    except Exception:
+        _risk_cfg = {}
+
+    daily_flat_cfg = (_risk_cfg.get("daily_flatten") or {})
+    risk_caps_cfg = (_risk_cfg.get("risk_caps") or {})
+    profit_lock_cfg = (_risk_cfg.get("profit_lock") or {})
+    loss_zone_cfg = (_risk_cfg.get("loss_zone") or {})
+
+    # Determine whether we are in daily flatten window (local time from TZ env)
+    flatten_mode = False
+    try:
+        if daily_flat_cfg.get("enabled"):
+            try:
+                from zoneinfo import ZoneInfo as _ZInfo  # py3.9+
+                _tz = os.getenv("TZ", "UTC")
+                _now_local = dt.datetime.now(_ZInfo(_tz))
+            except Exception:
+                _now_local = dt.datetime.utcnow()
+            _fh = int(daily_flat_cfg.get("flatten_hour_local", 23))
+            _fm = int(daily_flat_cfg.get("flatten_minute_local", 0))
+            if (_now_local.hour, _now_local.minute) >= (_fh, _fm):
+                flatten_mode = True
+    except Exception:
+        flatten_mode = False
 
     # Record last-run
+
     try:
         with _SCHED_LAST_LOCK:
             _SCHED_LAST.clear()
@@ -1943,7 +1884,7 @@ def scheduler_run(payload: Dict[str, Any] = Body(default=None)):
                 "strategy": strat, "symbol": r.symbol, "raw_action": r.action, "reason": r.reason,
                 "score": r.score, "atr": r.atr, "atr_pct": r.atr_pct,
                 "qty": r.qty, "notional": r.notional,
-                "guard_ok": guard_ok, "guard_reason": guard_reason,
+                "guard_ok": guard_ok, "guard_reason": guard_reason
             })
 
             # --- Position-aware execution -----------------------------------
@@ -1959,8 +1900,120 @@ def scheduler_run(payload: Dict[str, Any] = Body(default=None)):
             pos = _position_for(sym, strat, positions)
             current_qty = float(pos.qty) if pos is not None else 0.0
 
+            # Approximate unrealized PnL % for this position using last price
+            unrealized_pct = None
+            if pos is not None and pos.avg_price and abs(pos.qty) > 1e-10:
+                try:
+                    _px = float(broker_kraken.last_price(sym) or 0.0)
+                except Exception:
+                    _px = 0.0
+                try:
+                    _avg = float(pos.avg_price or 0.0)
+                except Exception:
+                    _avg = 0.0
+                if _px > 0.0 and _avg > 0.0:
+                    if pos.qty > 0:
+                        # long: positive when price > avg
+                        unrealized_pct = (_px - _avg) / _avg * 100.0
+                    else:
+                        # short: positive when price < avg
+                        unrealized_pct = (_avg - _px) / _avg * 100.0
+
+            # Apply no-rebuy-in-loss-zone: if deeply underwater, block new buys/adds
+            if unrealized_pct is not None:
+                _lz_cfg = (loss_zone_cfg or {})
+                _lz = _lz_cfg.get("no_rebuy_below_pct")
+                try:
+                    _lz = float(_lz) if _lz is not None else None
+                except Exception:
+                    _lz = None
+                if (
+                    _lz is not None and
+                    unrealized_pct <= _lz and
+                    current_qty > 0
+                    and r.action == "buy"
+                ):
+                    guard_ok = False
+                    guard_reason = f"loss_zone_block:{unrealized_pct:.2f}pct"
+                    telemetry.append({
+                        "strategy": strat,
+                        "symbol": r.symbol,
+                        "raw_action": r.action,
+                        "reason": r.reason,
+                        "loss_zone": True,
+                        "unrealized_pct": unrealized_pct,
+                        "loss_zone_threshold": _lz,
+                    })
+
             # Helper to send an order
             def _send(symbol: str, side: str, notional_value: float, intent: str) -> None:
+                # Apply per-symbol risk caps only for opening/adding exposure
+                try:
+                    if intent.startswith("open"):
+                        _rcfg = (risk_caps_cfg or {})
+                        _max_notional_map = (_rcfg.get("max_notional_per_symbol") or {})
+                        _max_units_map = (_rcfg.get("max_units_per_symbol") or {})
+                        _sym_key = symbol.upper()
+                        _sym_norm = "".join(ch for ch in _sym_key if ch.isalnum())
+                        _cap_notional = _max_notional_map.get(_sym_key, _max_notional_map.get(_sym_norm, _max_notional_map.get("default")))
+                        _cap_units = _max_units_map.get(_sym_key, _max_units_map.get(_sym_norm, _max_units_map.get("default")))
+                        if _cap_notional is not None or _cap_units is not None:
+                            _pos_here = _position_for(symbol, strat, positions)
+                            _qty_here = float(_pos_here.qty) if _pos_here is not None else 0.0
+                            try:
+                                _px_here = float(broker_kraken.last_price(symbol) or 0.0)
+                            except Exception:
+                                _px_here = 0.0
+                            _cur_notional = abs(_qty_here) * _px_here
+                            # Notional cap
+                            if _cap_notional is not None and _px_here > 0.0:
+                                _max_additional = float(_cap_notional) - float(_cur_notional)
+                                if _max_additional <= 0:
+                                    actions.append({
+                                        "symbol": symbol,
+                                        "side": side,
+                                        "strategy": strat,
+                                        "notional": 0.0,
+                                        "intent": intent,
+                                        "status": "blocked_cap",
+                                        "reason": f"cap_notional:{_cur_notional:.2f}>={_cap_notional}"
+                                    })
+                                    return
+                                if notional_value > _max_additional:
+                                    notional_value = _max_additional
+                            # Units cap
+                            if _cap_units is not None and _px_here > 0.0:
+                                _max_units_total = float(_cap_units)
+                                _max_units_add = _max_units_total - abs(_qty_here)
+                                if _max_units_add <= 0:
+                                    actions.append({
+                                        "symbol": symbol,
+                                        "side": side,
+                                        "strategy": strat,
+                                        "notional": 0.0,
+                                        "intent": intent,
+                                        "status": "blocked_cap",
+                                        "reason": f"cap_units:{abs(_qty_here):.6f}>={_max_units_total}"
+                                    })
+                                    return
+                                _max_notional_units = _max_units_add * _px_here
+                                if notional_value > _max_notional_units:
+                                    notional_value = _max_notional_units
+                        if notional_value <= 0:
+                            actions.append({
+                                "symbol": symbol,
+                                "side": side,
+                                "strategy": strat,
+                                "notional": 0.0,
+                                "intent": intent,
+                                "status": "blocked_cap",
+                                "reason": "notional_after_caps<=0",
+                            })
+                            return
+                except Exception:
+                    # Fail-open on caps errors (do not silently block trades)
+                    pass
+
                 act = {
                     "symbol": symbol,
                     "side": side,
@@ -1980,33 +2033,84 @@ def scheduler_run(payload: Dict[str, Any] = Body(default=None)):
                         act["error"] = str(e)
                 actions.append(act)
 
-            # Price lookup for Position Manager
-            def _price_lookup(symbol_for_px: str) -> float:
+            # Helper: compute notional from qty using live price
+            def _notional_for_qty(symbol: str, qty: float) -> float:
                 try:
-                    return float(broker_kraken.last_price(symbol_for_px) or 0.0)
+                    px = float(broker_kraken.last_price(symbol) or 0.0)
                 except Exception:
-                    return 0.0
+                    px = 0.0
+                return abs(qty) * px if px > 0 else 0.0
 
+            # Start from raw action, then apply flatten + profit-lock overrides
             desired = r.action
-            target_notional = float(r.notional if r.notional and r.notional > 0 else notional)
 
-            # Unified Position Manager decides open/close/flip
-            intents = plan_position_adjustment(
-                symbol=sym,
-                strategy=strat,
-                current_qty=current_qty,
-                desired=desired,
-                target_notional=target_notional,
-                price_lookup=_price_lookup,
-            )
+            # Daily flatten mode: force flat regardless of raw signal
+            if flatten_mode:
+                desired = "flat"
 
-            for intent_obj in intents:
-                _send(
-                    intent_obj.symbol,
-                    intent_obj.side,
-                    intent_obj.notional,
-                    intent=intent_obj.intent,
-                )
+            # Profit-lock: if unrealized PnL >= take_profit_pct, force an exit
+            if unrealized_pct is not None:
+                _tp_cfg = (profit_lock_cfg or {})
+                _tp = _tp_cfg.get("take_profit_pct")
+                try:
+                    _tp = float(_tp) if _tp is not None else None
+                except Exception:
+                    _tp = None
+                if _tp is not None and unrealized_pct >= _tp:
+                    if current_qty > 0:
+                        desired = "sell"
+                    elif current_qty < 0:
+                        desired = "buy"
+
+            # Case 0: Already flat
+            if abs(current_qty) < 1e-10:
+                if desired in ("buy", "sell"):
+                    target_notional = float(r.notional if r.notional and r.notional > 0 else notional)
+                    _send(sym, desired, target_notional, intent=f"open_{desired}")
+                    # We don't update `positions` here (we rely on journal + next run),
+                    # but we could approximate if needed.
+                # desired == "flat" and already flat: do nothing
+                continue
+
+            # Case 1: Currently long
+            if current_qty > 0:
+                if desired == "buy":
+                    # Already long; for now, we do NOT pyramid.
+                    continue
+                # Need to close the long size
+                close_notional = _notional_for_qty(sym, current_qty)
+                if close_notional <= 0:
+                    continue
+
+                if desired == "flat":
+                    _send(sym, "sell", close_notional, intent="close_long")
+                    continue
+                elif desired == "sell":
+                    # Flip: close long then open short of target size
+                    _send(sym, "sell", close_notional, intent="flip_close_long")
+                    target_notional = float(r.notional if r.notional and r.notional > 0 else notional)
+                    _send(sym, "sell", target_notional, intent="flip_open_short")
+                    continue
+
+            # Case 2: Currently short
+            if current_qty < 0:
+                if desired == "sell":
+                    # Already short; no pyramiding for now.
+                    continue
+                close_notional = _notional_for_qty(sym, current_qty)
+                if close_notional <= 0:
+                    continue
+
+                if desired == "flat":
+                    _send(sym, "buy", close_notional, intent="close_short")
+                    continue
+                elif desired == "buy":
+                    # Flip: close short then open long
+                    _send(sym, "buy", close_notional, intent="flip_close_short")
+                    target_notional = float(r.notional if r.notional and r.notional > 0 else notional)
+                    _send(sym, "buy", target_notional, intent="flip_open_long")
+                    continue
+
 
     return {"ok": True, "message": msg, "actions": actions, "telemetry": telemetry}
 
