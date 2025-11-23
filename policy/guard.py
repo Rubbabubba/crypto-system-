@@ -183,3 +183,21 @@ def filter_allowed_now(strategies: Iterable[str], symbols: Iterable[str], now: O
                 ok_syms.append(sym)
         res[strat] = ok_syms
     return res
+
+
+# ---------- Risk config loader ----------
+
+def load_risk_config(cfg_dir: Optional[str] = None) -> dict:
+    """
+    Load risk.json from the policy_config directory.
+    Returns an empty dict on error.
+    """
+    try:
+        cfg = Path(cfg_dir or os.getenv("POLICY_CFG_DIR", str(Path(__file__).parent / "policy_config")))
+        rpath = cfg / "risk.json"
+        if not rpath.exists():
+            return {}
+        data = _read_json(rpath)
+        return data or {}
+    except Exception:
+        return {}
