@@ -76,7 +76,13 @@ import time
 from symbol_map import KRAKEN_PAIR_MAP, to_kraken
 from position_engine import PositionEngine, Fill
 import broker_kraken
-from position_manager import load_net_positions, Position
+from position_manager import (
+    load_net_positions,
+    Position,
+    OrderIntent,
+    plan_position_adjustment,
+)
+
 
 
 # Routes:
@@ -288,6 +294,21 @@ def kraken_private(method: str, data: Dict[str, Any], key: str, secret_b64: str)
     r.raise_for_status()
     return r.json()
 
+
+# --------------------------------------------------------------------------------------
+# Userref -> strategy map (for trade attribution)
+# --------------------------------------------------------------------------------------
+USERREF_MAP = {}
+try:
+    from pathlib import Path as _Path
+    import json as _json
+    cfg_dir = os.getenv("POLICY_CFG_DIR", "policy_config")
+    _um_path = _Path(cfg_dir) / "userref_map.json"
+    if _um_path.exists():
+        USERREF_MAP = _json.loads(_um_path.read_text(encoding="utf-8"))
+except Exception:
+    USERREF_MAP = {}
+
 # --------------------------------------------------------------------------------------
 # SQLite Journal store
 # --------------------------------------------------------------------------------------
@@ -319,12 +340,25 @@ def insert_trades(rows: List[Dict[str, Any]]) -> int:
     cur = conn.cursor()
     ins = """
         INSERT OR IGNORE INTO trades
-        (txid, ts, pair, symbol, side, price, volume, cost, fee, raw)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        (txid, ts, pair, symbol, side, price, volume, cost, fee, strategy, raw)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """
     count = 0
     for r in rows:
         try:
+            # Determine strategy: explicit, userref-mapped, or misc
+            strategy = r.get("strategy")
+            if not strategy:
+                raw_obj = r
+                u = raw_obj.get("userref")
+                if u is not None:
+                    try:
+                        strategy = USERREF_MAP.get(str(int(u)))
+                    except Exception:
+                        strategy = None
+                if not strategy:
+                    strategy = "misc"
+
             cur.execute(ins, (
                 r.get("txid"),
                 float(r.get("ts", 0)),
@@ -335,6 +369,7 @@ def insert_trades(rows: List[Dict[str, Any]]) -> int:
                 float(r.get("volume", 0) or 0),
                 float(r.get("cost", 0) or 0),
                 float(r.get("fee", 0) or 0),
+                strategy,
                 json.dumps(r, separators=(",", ":")),
             ))
             count += cur.rowcount
@@ -343,7 +378,6 @@ def insert_trades(rows: List[Dict[str, Any]]) -> int:
     conn.commit()
     conn.close()
     return count
-
 def fetch_rows(limit: int = 25, offset: int = 0) -> List[Dict[str, Any]]:
     conn = _db()
     cur = conn.cursor()
@@ -615,9 +649,21 @@ def _pull_trades_from_kraken(since_hours: int, hard_limit: int) -> Tuple[int, in
 
             rows = []
             for txid, t in trades.items():
-                # t keys: ordertxid, pair, time, type, ordertype, price, cost, fee, vol, margin, misc, posstatus, cprice, ccost, cfee, cvol, cmargin, net, trades
+                # t keys: ordertxid, pair, time, type, ordertype...misc, posstatus, cprice, ccost, cfee, cvol, cmargin, net, trades
                 pair_raw = t.get("pair") or ""
                 symbol = from_kraken_pair_to_app(pair_raw)
+
+                # Strategy from Kraken userref via USERREF_MAP (fallback to misc)
+                strategy = None
+                u = t.get("userref")
+                if u is not None:
+                    try:
+                        strategy = USERREF_MAP.get(str(int(u)))
+                    except Exception:
+                        strategy = None
+                if not strategy:
+                    strategy = "misc"
+
                 rows.append({
                     "txid": txid,
                     "ts": float(t.get("time", 0)),
@@ -628,10 +674,9 @@ def _pull_trades_from_kraken(since_hours: int, hard_limit: int) -> Tuple[int, in
                     "volume": float(t.get("vol") or 0),
                     "cost": float(t.get("cost") or 0),
                     "fee": float(t.get("fee") or 0),
-                    "strategy": None,
+                    "strategy": strategy,
                     "raw": t,
                 })
-
             seen += len(rows)
             inserted += insert_trades(rows)
 
@@ -1687,22 +1732,23 @@ def debug_env():
     ]
     env = {k: os.getenv(k) for k in keys}
     return {"ok": True, "env": env}
-    
+
+# ---- Scan all (no orders) ------------------------------------------------------------
+
 @app.get("/debug/positions")
 def debug_positions(use_strategy: bool = True):
     """
-    Inspect the unified Position Manager view of current positions
-    pulled directly from the trades journal (same as PnL Engine).
-
-    use_strategy = True  -> returns (symbol, strategy) level positions
-    use_strategy = False -> collapses unlabeled rows into 'misc'
+    Inspect unified Position Manager view of current positions from trades journal.
+    use_strategy=True -> (symbol, strategy) positions
+    use_strategy=False -> collapse unlabeled rows into 'misc'
     """
     try:
         con = _db()
-        table = None
+        # detect table (only trades now, kept for future flexibility)
+        table = "trades"
         try:
             table = _pnl__detect_table(con)
-        except:
+        except Exception:
             table = "trades"
 
         positions = load_net_positions(
@@ -1719,20 +1765,17 @@ def debug_positions(use_strategy: bool = True):
                 "strategy": strategy,
                 "qty": pos.qty,
                 "avg_price": pos.avg_price,
-                "side": side
+                "side": side,
             })
 
         return {
             "ok": True,
             "use_strategy": bool(use_strategy),
             "count": len(out),
-            "positions": sorted(out, key=lambda x: (x["symbol"], x["strategy"]))
+            "positions": sorted(out, key=lambda x: (x["symbol"], x["strategy"])),
         }
-
     except Exception as e:
         return {"ok": False, "error": str(e)}
-
-# ---- Scan all (no orders) ------------------------------------------------------------
 @app.get("/scan/all")
 def scan_all(tf: str = "5Min", symbols: str = "BTC/USD,ETH/USD", strats: str = "c1,c2,c3",
              limit: int = 300, notional: float = 25.0):
@@ -1831,7 +1874,7 @@ def scheduler_run(payload: Dict[str, Any] = Body(default=None)):
     log.info(msg)
     # Load current open positions from trades table (symbol x strategy).
     # We default to not using the 'strategy' column, since your attribution is symbol-based.
-    positions = _load_open_positions_from_trades(use_strategy_col=False)
+    positions = _load_open_positions_from_trades(use_strategy_col=True)
 
 
     # Record last-run
@@ -1900,7 +1943,7 @@ def scheduler_run(payload: Dict[str, Any] = Body(default=None)):
                 "strategy": strat, "symbol": r.symbol, "raw_action": r.action, "reason": r.reason,
                 "score": r.score, "atr": r.atr, "atr_pct": r.atr_pct,
                 "qty": r.qty, "notional": r.notional,
-                "guard_ok": guard_ok, "guard_reason": guard_reason
+                "guard_ok": guard_ok, "guard_reason": guard_reason,
             })
 
             # --- Position-aware execution -----------------------------------
