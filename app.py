@@ -1687,6 +1687,183 @@ def debug_env():
     ]
     env = {k: os.getenv(k) for k in keys}
     return {"ok": True, "env": env}
+    
+@app.get("/debug/kraken/positions")
+def debug_kraken_positions(
+    use_strategy: bool = True,
+    include_legacy: bool = False,
+):
+    """
+    Cross-check live Kraken balances vs journal-derived positions.
+
+    - Kraken side: broker_kraken.positions() -> [{"asset": "AVAX", "qty": 1.23}, ...]
+    - Journal side: load_net_positions(...) from trades table.
+      * use_strategy=True  -> uses (symbol,strategy), then aggregates per asset
+      * include_legacy=False -> ignores strategy='legacy' (old history after reset)
+
+    Returns:
+      {
+        "ok": true,
+        "kraken": [...],
+        "journal_by_asset": [...],
+        "diff": [...]
+      }
+    """
+    try:
+        # --- Kraken side: live balances -----------------------------------
+        try:
+            kraken_raw = broker_kraken.positions()  # [{"asset": "AVAX","qty": 1.23}, ...] or [{"error": "..."}]
+        except Exception as e:
+            kraken_raw = [{"error": f"positions_error:{e}"}]
+
+        kraken_map = {}
+        kraken_list = []
+        for row in kraken_raw:
+            asset = str(row.get("asset", "")).upper()
+            if not asset:
+                # pass through errors or unknown shapes
+                kraken_list.append(row)
+                continue
+            try:
+                qty = float(row.get("qty", 0.0) or 0.0)
+            except Exception:
+                qty = 0.0
+            if qty == 0.0:
+                continue
+            kraken_map[asset] = kraken_map.get(asset, 0.0) + qty
+            kraken_list.append({"asset": asset, "qty": qty})
+
+        # --- Journal side: load positions from trades ---------------------
+        con = _db()
+        try:
+            # PnL helper detects the correct table; fallback to "trades"
+            try:
+                table = _pnl__detect_table(con)
+            except Exception:
+                table = "trades"
+
+            pos_dict = load_net_positions(
+                con,
+                table=table,
+                use_strategy_col=bool(use_strategy),
+            )
+        finally:
+            con.close()
+
+        journal_agg: Dict[str, float] = {}
+        journal_details: Dict[str, list] = {}
+
+        for (symbol, strategy), pos in pos_dict.items():
+            if not include_legacy and str(strategy).strip().lower() == "legacy":
+                # Ignore legacy history when include_legacy=False
+                continue
+
+            sym = str(symbol or "").upper()
+            if "/" in sym:
+                asset = sym.split("/", 1)[0].strip()
+            else:
+                # Fallback: treat full symbol as asset (e.g. "AVAXUSD" -> "AVAXUSD")
+                asset = sym
+
+            qty = float(pos.qty or 0.0)
+            if abs(qty) < 1e-12:
+                continue
+
+            journal_agg[asset] = journal_agg.get(asset, 0.0) + qty
+            journal_details.setdefault(asset, []).append({
+                "symbol": sym,
+                "strategy": strategy,
+                "qty": qty,
+                "side": "long" if qty > 0 else ("short" if qty < 0 else "flat"),
+            })
+
+        journal_list = []
+        for asset, total_qty in journal_agg.items():
+            journal_list.append({
+                "asset": asset,
+                "qty": total_qty,
+                "positions": journal_details.get(asset, []),
+            })
+
+        # --- Diff: kraken_qty - journal_qty --------------------------------
+        all_assets = set(kraken_map.keys()) | set(journal_agg.keys())
+        diff_list = []
+        for asset in sorted(all_assets):
+            kqty = float(kraken_map.get(asset, 0.0))
+            jq = float(journal_agg.get(asset, 0.0))
+            diff_list.append({
+                "asset": asset,
+                "kraken_qty": kqty,
+                "journal_qty": jq,
+                "delta": kqty - jq,
+            })
+
+        return {
+            "ok": True,
+            "use_strategy": bool(use_strategy),
+            "include_legacy": bool(include_legacy),
+            "kraken": kraken_list,
+            "journal_by_asset": sorted(journal_list, key=lambda x: x["asset"]),
+            "diff": diff_list,
+        }
+
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+    
+@app.get("/debug/global_policy")
+def debug_global_policy():
+    """
+    Shows the active global policy configuration as the scheduler
+    actually sees it — after loading risk.json and environment variables.
+
+    Includes:
+    - daily flatten logic
+    - per-symbol risk caps
+    - profit-lock parameters
+    - loss-zone parameters
+    - timezone + computed current local time
+    """
+    try:
+        from guard import load_risk_config
+        _risk_cfg = load_risk_config()
+
+        daily_flat = (_risk_cfg.get("daily_flatten") or {})
+        risk_caps = (_risk_cfg.get("risk_caps") or {})
+        profit_lock = (_risk_cfg.get("profit_lock") or {})
+        loss_zone = (_risk_cfg.get("loss_zone") or {})
+
+        # Compute local time using TZ
+        try:
+            from zoneinfo import ZoneInfo
+            _tzname = os.getenv("TZ", "UTC")
+            _now_local = dt.datetime.now(ZoneInfo(_tzname))
+        except Exception:
+            _tzname = "UTC"
+            _now_local = dt.datetime.utcnow()
+
+        # Compute flatten_mode flag just like scheduler_run
+        flatten_mode = False
+        try:
+            if daily_flat.get("enabled"):
+                fh = int(daily_flat.get("flatten_hour_local", 23))
+                fm = int(daily_flat.get("flatten_minute_local", 0))
+                if (_now_local.hour, _now_local.minute) >= (fh, fm):
+                    flatten_mode = True
+        except Exception:
+            flatten_mode = False
+
+        return {
+            "ok": True,
+            "timezone": _tzname,
+            "now_local": _now_local.isoformat(),
+            "daily_flatten": daily_flat,
+            "flatten_mode_active_now": flatten_mode,
+            "risk_caps": risk_caps,
+            "profit_lock": profit_lock,
+            "loss_zone": loss_zone,
+        }
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
 
 # ---- Scan all (no orders) ------------------------------------------------------------
 @app.get("/scan/all")
