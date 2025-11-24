@@ -18,8 +18,7 @@ Full drop-in FastAPI app.
 #   POST  /journal/backfill        -> full backfill from broker fills
 #   POST  /journal/sync            -> incremental sync from broker fills
 #   GET   /journal/counts          -> counts by strategy / unlabeled
-#   POST  /journal/enrich          -> no-op enrich placeholder
-#
+#   POST  /journal/enrich          -> enrich journal rows (placeholder / extension point)
 #   GET   /fills                   -> recent raw broker fills (via broker_kraken)
 #
 #   GET   /advisor/daily           -> advisor summary + recommendations
@@ -32,11 +31,15 @@ Full drop-in FastAPI app.
 #   GET   /debug/kraken/trades2    -> recent trades/fills from Kraken (variant 2)
 #   GET   /debug/env               -> safe dump of non-secret env/config
 #
-#   GET   /pnl/summary             -> P&L summary (possibly using journal fallback)
+#   GET   /pnl/summary             -> P&L summary (journal-backed)
 #   GET   /pnl/fifo                -> FIFO P&L breakdown
 #   GET   /pnl/by_strategy         -> P&L grouped by strategy
 #   GET   /pnl/by_symbol           -> P&L grouped by symbol
 #   GET   /pnl/combined            -> combined P&L view
+#
+#   GET   /pnl2/summary            -> P&L v2 summary (position engine / fills only)
+#   GET   /pnl2/by_strategy        -> P&L v2 grouped by strategy
+#   GET   /pnl2/by_symbol          -> P&L v2 grouped by symbol
 #
 #   GET   /kpis                    -> key performance indicators summary
 #
@@ -46,8 +49,9 @@ Full drop-in FastAPI app.
 #   GET   /scheduler/last          -> last scheduler run summary
 #   POST  /scheduler/run           -> run scheduler once with optional overrides
 #
-#   [Static] /static/*             -> static assets if ./static mounted
-"""
+#   GET   /scan/all                -> run strategies in scan-only mode (no orders)
+#
+#   [Static] /static/*             -> static assets if ./static mounted"""
 
 import base64
 import datetime as dt
@@ -81,50 +85,43 @@ from position_manager import load_net_positions, Position
 
 # Routes:
 #   - /
-#   - /health
-#   - /routes
-#   - /dashboard
-#   - /policy
+#   - /advisor/apply
+#   - /advisor/daily
 #   - /config
+#   - /dashboard
 #   - /debug/config
-#
-#   - /price/{base}/{quote}
-#
+#   - /debug/db
+#   - /debug/env
+#   - /debug/kraken
+#   - /debug/kraken/trades
+#   - /debug/kraken/trades2
+#   - /debug/log/test
+#   - /fills
+#   - /health
 #   - /journal
 #   - /journal/attach
 #   - /journal/backfill
-#   - /journal/sync
 #   - /journal/counts
 #   - /journal/enrich
-#
-#   - /fills
-#
-#   - /advisor/daily
-#   - /advisor/apply
-#
-#   - /debug/log/test
-#   - /debug/kraken
-#   - /debug/db
-#   - /debug/kraken/trades
-#   - /debug/kraken/trades2
-#   - /debug/env
-#
-#   - /pnl/summary
-#   - /pnl/fifo
+#   - /journal/sync
+#   - /kpis
 #   - /pnl/by_strategy
 #   - /pnl/by_symbol
 #   - /pnl/combined
-#
-#   - /kpis
-#
-#   - /scheduler/status
-#   - /scheduler/start
-#   - /scheduler/stop
+#   - /pnl/fifo
+#   - /pnl/summary
+#   - /pnl2/by_strategy
+#   - /pnl2/by_symbol
+#   - /pnl2/summary
+#   - /policy
+#   - /price/{base}/{quote}
+#   - /routes
+#   - /scan/all
 #   - /scheduler/last
 #   - /scheduler/run
-#
-#   - /scan/all
-
+#   - /scheduler/start
+#   - /scheduler/status
+#   - /scheduler/stop
 
 import requests
 from fastapi import Body, FastAPI, HTTPException, Query
