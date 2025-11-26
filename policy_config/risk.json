@@ -49,18 +49,14 @@
   "risk_caps": {
     "max_notional_per_symbol": {
       "default": 50.0,
-
       "BTCUSD": 200.0,
       "ETHUSD": 200.0,
-
       "SOLUSD": 180.0,
       "AVAXUSD": 180.0,
-
       "LINKUSD": 120.0,
       "DOTUSD": 120.0,
       "NEARUSD": 100.0,
       "SUIUSD": 100.0,
-
       "ADAUSD": 60.0,
       "XRPUSD": 60.0,
       "LTCUSD": 60.0,
