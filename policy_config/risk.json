@@ -2,9 +2,11 @@
   "fee_rate_pct": 0.26,
   "edge_multiple_vs_fee": 3.0,
   "atr_floor_pct": {
-    "tier1": 0.6,
-    "tier2": 0.9,
-    "tier3": 1.2
+    "tier1": {
+      "tier1": 0.6,
+      "tier2": 0.9,
+      "tier3": 1.2
+    }
   },
   "tiers": {
     "tier1": [
@@ -19,7 +21,10 @@
       "LTCUSD",
       "BCHUSD",
       "AVAXUSD",
-      "LINKUSD"
+      "LINKUSD",
+      "DOTUSD",
+      "NEARUSD",
+      "SUIUSD"
     ],
     "tier3": []
   },
@@ -28,7 +33,16 @@
   "mr_strategies": [
     "c1"
   ],
-  "avoid_pairs": [],
+  "avoid_pairs": [
+    "SHIBUSD",
+    "HBARUSD",
+    "TRXUSD",
+    "TONUSD",
+    "UNIUSD",
+    "APTUSD",
+    "BNBUSD",
+    "DOGEUSD"
+  ],
   "daily_flatten": {
     "enabled": true,
     "flatten_hour_local": 23,
