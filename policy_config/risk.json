@@ -2,11 +2,9 @@
   "fee_rate_pct": 0.26,
   "edge_multiple_vs_fee": 3.0,
   "atr_floor_pct": {
-    "tier1": {
-      "tier1": 0.6,
-      "tier2": 0.9,
-      "tier3": 1.2
-    }
+    "tier1": 0.6,
+    "tier2": 0.9,
+    "tier3": 1.2
   },
   "tiers": {
     "tier1": [
@@ -15,16 +13,16 @@
       "SOLUSD"
     ],
     "tier2": [
-      "XRPUSD",
       "ADAUSD",
-      "DOGEUSD",
-      "LTCUSD",
-      "BCHUSD",
       "AVAXUSD",
-      "LINKUSD",
+      "BCHUSD",
+      "DOGEUSD",
       "DOTUSD",
+      "LTCUSD",
+      "LINKUSD",
       "NEARUSD",
-      "SUIUSD"
+      "SUIUSD",
+      "XRPUSD"
     ],
     "tier3": []
   },
@@ -34,14 +32,14 @@
     "c1"
   ],
   "avoid_pairs": [
-    "SHIBUSD",
-    "HBARUSD",
-    "TRXUSD",
-    "TONUSD",
-    "UNIUSD",
     "APTUSD",
     "BNBUSD",
-    "DOGEUSD"
+    "DOGEUSD",
+    "HBARUSD",
+    "SHIBUSD",
+    "TONUSD",
+    "TRXUSD",
+    "UNIUSD"
   ],
   "daily_flatten": {
     "enabled": true,
@@ -50,7 +48,23 @@
   },
   "risk_caps": {
     "max_notional_per_symbol": {
-      "default": 50.0
+      "default": 50.0,
+
+      "BTCUSD": 200.0,
+      "ETHUSD": 200.0,
+
+      "SOLUSD": 180.0,
+      "AVAXUSD": 180.0,
+
+      "LINKUSD": 120.0,
+      "DOTUSD": 120.0,
+      "NEARUSD": 100.0,
+      "SUIUSD": 100.0,
+
+      "ADAUSD": 60.0,
+      "XRPUSD": 60.0,
+      "LTCUSD": 60.0,
+      "BCHUSD": 60.0
     },
     "max_units_per_symbol": {
       "default": null
@@ -61,5 +75,13 @@
   },
   "loss_zone": {
     "no_rebuy_below_pct": -3.0
+  },
+  "time_multipliers": {
+    "day_night": {
+      "day_start_hour_local": 6,
+      "night_start_hour_local": 19,
+      "day_multiplier": 0.7,
+      "night_multiplier": 1.5
+    }
   }
 }
