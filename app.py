@@ -18,7 +18,8 @@ Full drop-in FastAPI app.
 #   POST  /journal/backfill        -> full backfill from broker fills
 #   POST  /journal/sync            -> incremental sync from broker fills
 #   GET   /journal/counts          -> counts by strategy / unlabeled
-#   POST  /journal/enrich          -> enrich journal rows (placeholder / extension point)
+#   POST  /journal/enrich          -> no-op enrich placeholder
+#
 #   GET   /fills                   -> recent raw broker fills (via broker_kraken)
 #
 #   GET   /advisor/daily           -> advisor summary + recommendations
@@ -31,15 +32,11 @@ Full drop-in FastAPI app.
 #   GET   /debug/kraken/trades2    -> recent trades/fills from Kraken (variant 2)
 #   GET   /debug/env               -> safe dump of non-secret env/config
 #
-#   GET   /pnl/summary             -> P&L summary (journal-backed)
+#   GET   /pnl/summary             -> P&L summary (possibly using journal fallback)
 #   GET   /pnl/fifo                -> FIFO P&L breakdown
 #   GET   /pnl/by_strategy         -> P&L grouped by strategy
 #   GET   /pnl/by_symbol           -> P&L grouped by symbol
 #   GET   /pnl/combined            -> combined P&L view
-#
-#   GET   /pnl2/summary            -> P&L v2 summary (position engine / fills only)
-#   GET   /pnl2/by_strategy        -> P&L v2 grouped by strategy
-#   GET   /pnl2/by_symbol          -> P&L v2 grouped by symbol
 #
 #   GET   /kpis                    -> key performance indicators summary
 #
@@ -49,9 +46,8 @@ Full drop-in FastAPI app.
 #   GET   /scheduler/last          -> last scheduler run summary
 #   POST  /scheduler/run           -> run scheduler once with optional overrides
 #
-#   GET   /scan/all                -> run strategies in scan-only mode (no orders)
-#
-#   [Static] /static/*             -> static assets if ./static mounted"""
+#   [Static] /static/*             -> static assets if ./static mounted
+"""
 
 import base64
 import datetime as dt
@@ -85,43 +81,50 @@ from position_manager import load_net_positions, Position
 
 # Routes:
 #   - /
-#   - /advisor/apply
-#   - /advisor/daily
-#   - /config
-#   - /dashboard
-#   - /debug/config
-#   - /debug/db
-#   - /debug/env
-#   - /debug/kraken
-#   - /debug/kraken/trades
-#   - /debug/kraken/trades2
-#   - /debug/log/test
-#   - /fills
 #   - /health
+#   - /routes
+#   - /dashboard
+#   - /policy
+#   - /config
+#   - /debug/config
+#
+#   - /price/{base}/{quote}
+#
 #   - /journal
 #   - /journal/attach
 #   - /journal/backfill
+#   - /journal/sync
 #   - /journal/counts
 #   - /journal/enrich
-#   - /journal/sync
-#   - /kpis
+#
+#   - /fills
+#
+#   - /advisor/daily
+#   - /advisor/apply
+#
+#   - /debug/log/test
+#   - /debug/kraken
+#   - /debug/db
+#   - /debug/kraken/trades
+#   - /debug/kraken/trades2
+#   - /debug/env
+#
+#   - /pnl/summary
+#   - /pnl/fifo
 #   - /pnl/by_strategy
 #   - /pnl/by_symbol
 #   - /pnl/combined
-#   - /pnl/fifo
-#   - /pnl/summary
-#   - /pnl2/by_strategy
-#   - /pnl2/by_symbol
-#   - /pnl2/summary
-#   - /policy
-#   - /price/{base}/{quote}
-#   - /routes
-#   - /scan/all
+#
+#   - /kpis
+#
+#   - /scheduler/status
+#   - /scheduler/start
+#   - /scheduler/stop
 #   - /scheduler/last
 #   - /scheduler/run
-#   - /scheduler/start
-#   - /scheduler/status
-#   - /scheduler/stop
+#
+#   - /scan/all
+
 
 import requests
 from fastapi import Body, FastAPI, HTTPException, Query
@@ -1973,6 +1976,32 @@ def scheduler_run(payload: Dict[str, Any] = Body(default=None)):
     risk_caps_cfg = (_risk_cfg.get("risk_caps") or {})
     profit_lock_cfg = (_risk_cfg.get("profit_lock") or {})
     loss_zone_cfg = (_risk_cfg.get("loss_zone") or {})
+    # Day vs night time multiplier for risk caps (from risk.json -> time_multipliers.day_night)
+    time_mult = 1.0
+    try:
+        day_night_cfg = (_risk_cfg.get("time_multipliers") or {}).get("day_night") or {}
+        if day_night_cfg:
+            try:
+                from zoneinfo import ZoneInfo as _ZInfo
+                _tz_mult = os.getenv("TZ", "UTC")
+                _now_local_mult = dt.datetime.now(_ZInfo(_tz_mult))
+            except Exception:
+                _now_local_mult = dt.datetime.utcnow()
+
+            day_start = int(day_night_cfg.get("day_start_hour_local", 6))
+            night_start = int(day_night_cfg.get("night_start_hour_local", 19))
+            day_multiplier = float(day_night_cfg.get("day_multiplier", 1.0))
+            night_multiplier = float(day_night_cfg.get("night_multiplier", 1.0))
+            hour = _now_local_mult.hour
+
+            # Assume simple split: [day_start, night_start) = day, else = night
+            if day_start <= hour < night_start:
+                time_mult = day_multiplier
+            else:
+                time_mult = night_multiplier
+    except Exception:
+        time_mult = 1.0
+
 
     # Determine whether we are in daily flatten window (local time from TZ env)
     flatten_mode = False
@@ -2130,6 +2159,12 @@ def scheduler_run(payload: Dict[str, Any] = Body(default=None)):
                         _sym_key = symbol.upper()
                         _sym_norm = "".join(ch for ch in _sym_key if ch.isalnum())
                         _cap_notional = _max_notional_map.get(_sym_key, _max_notional_map.get(_sym_norm, _max_notional_map.get("default")))
+                        # Apply day/night multiplier to the notional cap
+                        if _cap_notional is not None:
+                            try:
+                                _cap_notional = float(_cap_notional) * float(time_mult or 1.0)
+                            except Exception:
+                                _cap_notional = float(_cap_notional)
                         _cap_units = _max_units_map.get(_sym_key, _max_units_map.get(_sym_norm, _max_units_map.get("default")))
                         if _cap_notional is not None or _cap_units is not None:
                             _pos_here = _position_for(symbol, strat, positions)
