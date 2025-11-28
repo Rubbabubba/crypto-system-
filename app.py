@@ -2257,6 +2257,36 @@ def scheduler_run(payload: Dict[str, Any] = Body(default=None)):
             if flatten_mode:
                 desired = "flat"
 
+                        # Profit-lock: if unrealized PnL >= take_profit_pct, force an exit to flat
+            if unrealized_pct is not None:
+                _tp_cfg = (profit_lock_cfg or {})
+                _tp = _tp_cfg.get("take_profit_pct")
+                try:
+                    _tp = float(_tp) if _tp is not None else None
+                except Exception:
+                    _tp = None
+
+                # Mode B: close position when unrealized >= +1.5%
+                if _tp is not None and unrealized_pct >= _tp and abs(current_qty) > 1e-10:
+                    # We set desired to "flat" so the position-handling logic
+                    # below will close the existing long/short without flipping.
+                    desired = "flat"
+
+            # Stop-loss: if unrealized PnL <= stop_loss_pct, force an exit to flat
+            if unrealized_pct is not None:
+                _sl_cfg = (loss_zone_cfg or {})
+                # Prefer explicit stop_loss_pct; fall back to no_rebuy_below_pct if needed
+                _sl = _sl_cfg.get("stop_loss_pct", _sl_cfg.get("no_rebuy_below_pct"))
+                try:
+                    _sl = float(_sl) if _sl is not None else None
+                except Exception:
+                    _sl = None
+
+                # Mode B: close position when unrealized <= -3.0%
+                if _sl is not None and unrealized_pct <= _sl and abs(current_qty) > 1e-10:
+                    # Again, "flat" tells the later logic to close-only, no flip.
+                    desired = "flat"
+            
             # Profit-lock: if unrealized PnL >= take_profit_pct, force an exit
             if unrealized_pct is not None:
                 _tp_cfg = (profit_lock_cfg or {})
