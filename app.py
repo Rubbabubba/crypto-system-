@@ -2250,14 +2250,15 @@ def scheduler_run(payload: Dict[str, Any] = Body(default=None)):
                     px = 0.0
                 return abs(qty) * px if px > 0 else 0.0
 
-            # Start from raw action, then apply flatten + profit-lock overrides
+                        # Start from raw action, then apply flatten + PnL/ATR-based overrides
             desired = r.action
 
             # Daily flatten mode: force flat regardless of raw signal
             if flatten_mode:
+                log.info("[sched] daily_flatten active -> flatten %s for %s", sym, strat)
                 desired = "flat"
 
-                        # Profit-lock: if unrealized PnL >= take_profit_pct, force an exit to flat
+            # Profit-lock (Mode B): if unrealized PnL >= take_profit_pct, force an exit (close only, no flip)
             if unrealized_pct is not None:
                 _tp_cfg = (profit_lock_cfg or {})
                 _tp = _tp_cfg.get("take_profit_pct")
@@ -2266,40 +2267,79 @@ def scheduler_run(payload: Dict[str, Any] = Body(default=None)):
                 except Exception:
                     _tp = None
 
-                # Mode B: close position when unrealized >= +1.5%
-                if _tp is not None and unrealized_pct >= _tp and abs(current_qty) > 1e-10:
-                    # We set desired to "flat" so the position-handling logic
-                    # below will close the existing long/short without flipping.
+                if _tp is not None and unrealized_pct >= _tp:
                     desired = "flat"
+                    log.info("[sched] profit_lock_flatten: strat=%s sym=%s upnl=%.2f tp=%.2f",
+                             strat, sym, unrealized_pct, _tp)
+                    telemetry.append({
+                        "strategy": strat,
+                        "symbol": sym,
+                        "raw_action": r.action,
+                        "reason": r.reason,
+                        "unrealized_pct": unrealized_pct,
+                        "take_profit_pct": _tp,
+                        "exit_reason": "profit_lock_flatten"
+                    })
 
-            # Stop-loss: if unrealized PnL <= stop_loss_pct, force an exit to flat
+            # Stop-loss (Mode B): if unrealized PnL <= stop_loss_pct (or no_rebuy_below_pct), force an exit
             if unrealized_pct is not None:
                 _sl_cfg = (loss_zone_cfg or {})
-                # Prefer explicit stop_loss_pct; fall back to no_rebuy_below_pct if needed
                 _sl = _sl_cfg.get("stop_loss_pct", _sl_cfg.get("no_rebuy_below_pct"))
                 try:
                     _sl = float(_sl) if _sl is not None else None
                 except Exception:
                     _sl = None
 
-                # Mode B: close position when unrealized <= -3.0%
-                if _sl is not None and unrealized_pct <= _sl and abs(current_qty) > 1e-10:
-                    # Again, "flat" tells the later logic to close-only, no flip.
+                if _sl is not None and unrealized_pct <= _sl:
                     desired = "flat"
-            
-            # Profit-lock: if unrealized PnL >= take_profit_pct, force an exit
-            if unrealized_pct is not None:
-                _tp_cfg = (profit_lock_cfg or {})
-                _tp = _tp_cfg.get("take_profit_pct")
-                try:
-                    _tp = float(_tp) if _tp is not None else None
-                except Exception:
-                    _tp = None
-                if _tp is not None and unrealized_pct >= _tp:
-                    if current_qty > 0:
-                        desired = "sell"
-                    elif current_qty < 0:
-                        desired = "buy"
+                    log.info("[sched] stop_loss_flatten: strat=%s sym=%s upnl=%.2f sl=%.2f",
+                             strat, sym, unrealized_pct, _sl)
+                    telemetry.append({
+                        "strategy": strat,
+                        "symbol": sym,
+                        "raw_action": r.action,
+                        "reason": r.reason,
+                        "unrealized_pct": unrealized_pct,
+                        "stop_loss_pct": _sl,
+                        "exit_reason": "stop_loss_flatten"
+                    })
+
+            # ATR reversal: if ATR% drops back below configured floor for this symbol's tier, flatten any open position
+            try:
+                atr_val = float(getattr(r, "atr_pct", 0.0) or 0.0)
+                atr_cfg = (_risk_cfg.get("atr_floor_pct") or {})
+                tiers_cfg = (_risk_cfg.get("tiers") or {})
+
+                sym_norm = sym.replace("/", "").replace("-", "")
+                tier_name = None
+                for tname, symbols_list in (tiers_cfg or {}).items():
+                    if sym_norm in symbols_list:
+                        tier_name = tname
+                        break
+
+                atr_floor = None
+                if tier_name is not None:
+                    atr_floor = atr_cfg.get(tier_name)
+
+                if atr_floor is not None and atr_val < float(atr_floor) and abs(current_qty) > 1e-10:
+                    # Volatility has collapsed below floor → exit (but don't flip)
+                    if desired != "flat":
+                        desired = "flat"
+                        log.info("[sched] atr_reversal_flatten: strat=%s sym=%s atr_pct=%.4f floor=%.4f",
+                                 strat, sym, atr_val, float(atr_floor))
+                        telemetry.append({
+                            "strategy": strat,
+                            "symbol": sym,
+                            "raw_action": r.action,
+                            "reason": r.reason,
+                            "unrealized_pct": unrealized_pct,
+                            "atr_pct": atr_val,
+                            "atr_floor": float(atr_floor),
+                            "exit_reason": "atr_reversal_flatten"
+                        })
+            except Exception:
+                # ATR failure shouldn't block trading
+                pass
 
             # Case 0: Already flat
             if abs(current_qty) < 1e-10:
