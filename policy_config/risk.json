@@ -66,11 +66,12 @@
       "default": null
     }
   },
-  "profit_lock": {
-    "take_profit_pct": 2.0
+    "profit_lock": {
+    "take_profit_pct": 1.5     // Mode B: close at +1.5% unrealized
   },
   "loss_zone": {
-    "no_rebuy_below_pct": -3.0
+    "no_rebuy_below_pct": -3.0, // already used to block new buys
+    "stop_loss_pct": -3.0       // NEW: close at -3.0% unrealized
   },
   "time_multipliers": {
     "day_night": {
