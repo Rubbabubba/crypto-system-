@@ -1824,7 +1824,7 @@ def debug_global_policy():
     - timezone + computed current local time
     """
     try:
-        from guard import load_risk_config
+        from policy.guard import guard_allows, note_trade_event
         _risk_cfg = load_risk_config()
 
         daily_flat = (_risk_cfg.get("daily_flatten") or {})
