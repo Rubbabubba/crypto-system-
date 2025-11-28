@@ -163,6 +163,25 @@ logging.basicConfig(
 log = logging.getLogger("crypto-system-api")
 
 # --------------------------------------------------------------------------------------
+# Risk config loader (policy_config/risk.json)
+# --------------------------------------------------------------------------------------
+def load_risk_config() -> dict:
+    """
+    Load structured risk config from policy_config/risk.json.
+    Returns {} on any error so callers can safely default.
+    """
+    try:
+        cfg_dir = os.getenv("POLICY_CFG_DIR", "policy_config")
+        path = Path(cfg_dir) / "risk.json"
+        if not path.exists():
+            return {}
+        with path.open("r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception as e:
+        log.warning("load_risk_config failed: %s", e)
+        return {}
+
+# --------------------------------------------------------------------------------------
 # Data Directory (avoid unwritable /mnt/data on some hosts)
 # --------------------------------------------------------------------------------------
 
@@ -1824,7 +1843,7 @@ def debug_global_policy():
     - timezone + computed current local time
     """
     try:
-        from policy.guard import guard_allows, note_trade_event
+        # Load risk config directly from policy_config/risk.json
         _risk_cfg = load_risk_config()
 
         daily_flat = (_risk_cfg.get("daily_flatten") or {})
