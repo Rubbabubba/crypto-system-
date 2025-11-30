@@ -1936,12 +1936,15 @@ def scheduler_run(payload: Dict[str, Any] = Body(default=None)):
     actions: List[Dict[str, Any]] = []
     telemetry: List[Dict[str, Any]] = []
 
+    # small helpers for super-safe config access
+    def _cfg_get(d: Any, key: str, default: Any = None) -> Any:
+        return d.get(key, default) if isinstance(d, dict) else default
+
+    def _cfg_dict(x: Any) -> Dict[str, Any]:
+        return x if isinstance(x, dict) else {}
+
     try:
         payload = payload or {}
-
-        def _cfg_dict(x) -> Dict[str, Any]:
-            """Return x if it is a dict, else {}. Makes risk.json sections robust."""
-            return x if isinstance(x, dict) else {}
 
         # --- imports that can fail cleanly ----------------------------------
         try:
@@ -1997,7 +2000,6 @@ def scheduler_run(payload: Dict[str, Any] = Body(default=None)):
         except Exception:
             _risk_cfg = {}
 
-        # 🔧 HARDEN: force risk config to be a dict, otherwise ignore it
         if not isinstance(_risk_cfg, dict):
             log.warning(
                 "load_risk_config returned non-dict (%r); treating as empty config",
@@ -2005,18 +2007,18 @@ def scheduler_run(payload: Dict[str, Any] = Body(default=None)):
             )
             _risk_cfg = {}
 
-        daily_flat_cfg   = _cfg_dict(_risk_cfg.get("daily_flatten"))
-        risk_caps_cfg    = _cfg_dict(_risk_cfg.get("risk_caps"))
-        profit_lock_cfg  = _cfg_dict(_risk_cfg.get("profit_lock"))
-        loss_zone_cfg    = _cfg_dict(_risk_cfg.get("loss_zone"))
-        time_mult_cfg    = _cfg_dict(_risk_cfg.get("time_multipliers"))
-        atr_floor_cfg    = _cfg_dict(_risk_cfg.get("atr_floor_pct"))
-        tiers_cfg        = _cfg_dict(_risk_cfg.get("tiers"))
+        daily_flat_cfg  = _cfg_dict(_cfg_get(_risk_cfg, "daily_flatten", {}))
+        risk_caps_cfg   = _cfg_dict(_cfg_get(_risk_cfg, "risk_caps", {}))
+        profit_lock_cfg = _cfg_dict(_cfg_get(_risk_cfg, "profit_lock", {}))
+        loss_zone_cfg   = _cfg_dict(_cfg_get(_risk_cfg, "loss_zone", {}))
+        time_mult_cfg   = _cfg_dict(_cfg_get(_risk_cfg, "time_multipliers", {}))
+        atr_floor_cfg   = _cfg_dict(_cfg_get(_risk_cfg, "atr_floor_pct", {}))
+        tiers_cfg       = _cfg_dict(_cfg_get(_risk_cfg, "tiers", {}))
 
         # Day vs night time multiplier for risk caps
         time_mult = 1.0
         try:
-            day_night_cfg = _cfg_dict(time_mult_cfg.get("day_night"))
+            day_night_cfg = _cfg_dict(_cfg_get(time_mult_cfg, "day_night", {}))
             if day_night_cfg:
                 try:
                     from zoneinfo import ZoneInfo as _ZInfo
@@ -2190,8 +2192,8 @@ def scheduler_run(payload: Dict[str, Any] = Body(default=None)):
 
                     # Loss-zone no-rebuy
                     if unrealized_pct is not None:
-                        _lz_cfg = loss_zone_cfg
-                        _lz = _lz_cfg.get("no_rebuy_below_pct")
+                        _lz_cfg = _cfg_dict(loss_zone_cfg)
+                        _lz = _cfg_get(_lz_cfg, "no_rebuy_below_pct", None)
                         try:
                             _lz = float(_lz) if _lz is not None else None
                         except Exception:
@@ -2221,9 +2223,13 @@ def scheduler_run(payload: Dict[str, Any] = Body(default=None)):
                     def _send(symbol: str, side: str, notional_value: float, intent: str) -> None:
                         try:
                             if intent.startswith("open"):
-                                _rcfg = risk_caps_cfg
-                                _max_notional_map = _cfg_dict(_rcfg.get("max_notional_per_symbol"))
-                                _max_units_map = _cfg_dict(_rcfg.get("max_units_per_symbol"))
+                                _rcfg = _cfg_dict(risk_caps_cfg)
+                                _max_notional_map = _cfg_dict(
+                                    _cfg_get(_rcfg, "max_notional_per_symbol", {})
+                                )
+                                _max_units_map = _cfg_dict(
+                                    _cfg_get(_rcfg, "max_units_per_symbol", {})
+                                )
                                 _sym_key = symbol.upper()
                                 _sym_norm = "".join(ch for ch in _sym_key if ch.isalnum())
                                 _cap_notional = _max_notional_map.get(
@@ -2338,8 +2344,8 @@ def scheduler_run(payload: Dict[str, Any] = Body(default=None)):
 
                     # Profit-lock
                     if unrealized_pct is not None:
-                        _tp_cfg = profit_lock_cfg
-                        _tp = _tp_cfg.get("take_profit_pct")
+                        _tp_cfg = _cfg_dict(profit_lock_cfg)
+                        _tp = _cfg_get(_tp_cfg, "take_profit_pct", None)
                         try:
                             _tp = float(_tp) if _tp is not None else None
                         except Exception:
@@ -2368,8 +2374,8 @@ def scheduler_run(payload: Dict[str, Any] = Body(default=None)):
 
                     # Stop-loss
                     if unrealized_pct is not None:
-                        _sl_cfg = loss_zone_cfg
-                        _sl = _sl_cfg.get("stop_loss_pct", _sl_cfg.get("no_rebuy_below_pct"))
+                        _sl_cfg = _cfg_dict(loss_zone_cfg)
+                        _sl = _cfg_get(_sl_cfg, "stop_loss_pct", _cfg_get(_sl_cfg, "no_rebuy_below_pct"))
                         try:
                             _sl = float(_sl) if _sl is not None else None
                         except Exception:
@@ -2402,14 +2408,19 @@ def scheduler_run(payload: Dict[str, Any] = Body(default=None)):
 
                         sym_norm = sym.replace("/", "").replace("-", "")
                         tier_name = None
-                        for tname, symbols_list in tiers_cfg.items():
-                            if sym_norm in symbols_list:
+                        for tname, symbols_list in _cfg_dict(tiers_cfg).items():
+                            # symbols_list can be list OR string; normalize to list
+                            if isinstance(symbols_list, str):
+                                symbols_iter = [symbols_list]
+                            else:
+                                symbols_iter = list(symbols_list) if symbols_list is not None else []
+                            if sym_norm in symbols_iter:
                                 tier_name = tname
                                 break
 
                         atr_floor = None
                         if tier_name is not None:
-                            atr_floor = atr_floor_cfg.get(tier_name)
+                            atr_floor = _cfg_get(atr_floor_cfg, tier_name, None)
 
                         if atr_floor is not None and atr_val < float(atr_floor) and abs(current_qty) > 1e-10:
                             if desired != "flat":
