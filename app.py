@@ -1938,6 +1938,28 @@ def scan_all(tf: str = "5Min", symbols: str = "BTC/USD,ETH/USD", strats: str = "
             out["results"][mod] = [{"error": str(e)}]
     return out
 
+def _last_price_safe(symbol: str) -> float:
+    """
+    Best-effort last price lookup that works whether we're using Kraken directly
+    or only have br_router available. Returns 0.0 on any failure.
+    """
+    try:
+        # Prefer direct broker_kraken if available
+        import broker_kraken as _bk  # type: ignore[import]
+    except Exception:
+        try:
+            # Fallback: br_router.last_price
+            import br_router as _bk  # type: ignore[import]
+        except Exception:
+            return 0.0
+
+    try:
+        if hasattr(_bk, "last_price"):
+            px = _bk.last_price(symbol)
+            return float(px or 0.0)
+    except Exception:
+        return 0.0
+    return 0.0
 
 @app.post("/scheduler/run")
 def scheduler_run(payload: Dict[str, Any] = Body(default=None)):
@@ -2124,11 +2146,8 @@ def scheduler_run(payload: Dict[str, Any] = Body(default=None)):
 
             # Approximate unrealized PnL % for this position using last price
             unrealized_pct = None
-            if pos is not None and pos.avg_price and abs(pos.qty) > 1e-10:
-                try:
-                    _px = float(broker_kraken.last_price(sym) or 0.0)
-                except Exception:
-                    _px = 0.0
+                        if pos is not None and pos.avg_price and abs(pos.qty) > 1e-10:
+                _px = _last_price_safe(sym)
                 try:
                     _avg = float(pos.avg_price or 0.0)
                 except Exception:
@@ -2263,10 +2282,7 @@ def scheduler_run(payload: Dict[str, Any] = Body(default=None)):
 
             # Helper: compute notional from qty using live price
             def _notional_for_qty(symbol: str, qty: float) -> float:
-                try:
-                    px = float(broker_kraken.last_price(symbol) or 0.0)
-                except Exception:
-                    px = 0.0
+                px = _last_price_safe(symbol)
                 return abs(qty) * px if px > 0 else 0.0
 
                         # Start from raw action, then apply flatten + PnL/ATR-based overrides
