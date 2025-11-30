@@ -2117,18 +2117,28 @@ def scheduler_run(payload: Dict[str, Any] = Body(default=None)):
             fee_pct = taker_fee_bps / 10000.0
             guard_ok = True
             guard_reason = None
-            if r.action not in ("buy","sell"):
-                guard_ok = False; guard_reason = r.reason or "flat"
+            if r.action not in ("buy", "sell"):
+                guard_ok = False
+                guard_reason = r.reason or "flat"
             elif r.notional < max(min_notional, 0.0):
-                guard_ok = False; guard_reason = f"notional_below_min:{r.notional:.2f}"
+                guard_ok = False
+                guard_reason = f"notional_below_min:{r.notional:.2f}"
             elif edge_pct < (fee_multiple * fee_pct * 100.0):
-                guard_ok = False; guard_reason = f"edge_vs_fee_low:{edge_pct:.3f}pct"
+                guard_ok = False
+                guard_reason = f"edge_vs_fee_low:{edge_pct:.3f}pct"
 
             telemetry.append({
-                "strategy": strat, "symbol": r.symbol, "raw_action": r.action, "reason": r.reason,
-                "score": r.score, "atr": r.atr, "atr_pct": r.atr_pct,
-                "qty": r.qty, "notional": r.notional,
-                "guard_ok": guard_ok, "guard_reason": guard_reason
+                "strategy": strat,
+                "symbol": r.symbol,
+                "raw_action": r.action,
+                "reason": r.reason,
+                "score": r.score,
+                "atr": r.atr,
+                "atr_pct": r.atr_pct,
+                "qty": r.qty,
+                "notional": r.notional,
+                "guard_ok": guard_ok,
+                "guard_reason": guard_reason,
             })
 
             # --- Position-aware execution -----------------------------------
@@ -2146,7 +2156,7 @@ def scheduler_run(payload: Dict[str, Any] = Body(default=None)):
 
             # Approximate unrealized PnL % for this position using last price
             unrealized_pct = None
-                        if pos is not None and pos.avg_price and abs(pos.qty) > 1e-10:
+            if pos is not None and pos.avg_price and abs(pos.qty) > 1e-10:
                 _px = _last_price_safe(sym)
                 try:
                     _avg = float(pos.avg_price or 0.0)
@@ -2169,9 +2179,9 @@ def scheduler_run(payload: Dict[str, Any] = Body(default=None)):
                 except Exception:
                     _lz = None
                 if (
-                    _lz is not None and
-                    unrealized_pct <= _lz and
-                    current_qty > 0
+                    _lz is not None
+                    and unrealized_pct <= _lz
+                    and current_qty > 0
                     and r.action == "buy"
                 ):
                     guard_ok = False
@@ -2196,21 +2206,30 @@ def scheduler_run(payload: Dict[str, Any] = Body(default=None)):
                         _max_units_map = (_rcfg.get("max_units_per_symbol") or {})
                         _sym_key = symbol.upper()
                         _sym_norm = "".join(ch for ch in _sym_key if ch.isalnum())
-                        _cap_notional = _max_notional_map.get(_sym_key, _max_notional_map.get(_sym_norm, _max_notional_map.get("default")))
+                        _cap_notional = _max_notional_map.get(
+                            _sym_key,
+                            _max_notional_map.get(
+                                _sym_norm, _max_notional_map.get("default")
+                            ),
+                        )
                         # Apply day/night multiplier to the notional cap
                         if _cap_notional is not None:
                             try:
-                                _cap_notional = float(_cap_notional) * float(time_mult or 1.0)
+                                _cap_notional = float(_cap_notional) * float(
+                                    time_mult or 1.0
+                                )
                             except Exception:
                                 _cap_notional = float(_cap_notional)
-                        _cap_units = _max_units_map.get(_sym_key, _max_units_map.get(_sym_norm, _max_units_map.get("default")))
+                        _cap_units = _max_units_map.get(
+                            _sym_key,
+                            _max_units_map.get(
+                                _sym_norm, _max_units_map.get("default")
+                            ),
+                        )
                         if _cap_notional is not None or _cap_units is not None:
                             _pos_here = _position_for(symbol, strat, positions)
                             _qty_here = float(_pos_here.qty) if _pos_here is not None else 0.0
-                            try:
-                                _px_here = float(broker_kraken.last_price(symbol) or 0.0)
-                            except Exception:
-                                _px_here = 0.0
+                            _px_here = _last_price_safe(symbol)
                             _cur_notional = abs(_qty_here) * _px_here
                             # Notional cap
                             if _cap_notional is not None and _px_here > 0.0:
@@ -2223,7 +2242,7 @@ def scheduler_run(payload: Dict[str, Any] = Body(default=None)):
                                         "notional": 0.0,
                                         "intent": intent,
                                         "status": "blocked_cap",
-                                        "reason": f"cap_notional:{_cur_notional:.2f}>={_cap_notional}"
+                                        "reason": f"cap_notional:{_cur_notional:.2f}>={_cap_notional}",
                                     })
                                     return
                                 if notional_value > _max_additional:
@@ -2240,7 +2259,7 @@ def scheduler_run(payload: Dict[str, Any] = Body(default=None)):
                                         "notional": 0.0,
                                         "intent": intent,
                                         "status": "blocked_cap",
-                                        "reason": f"cap_units:{abs(_qty_here):.6f}>={_max_units_total}"
+                                        "reason": f"cap_units:{abs(_qty_here):.6f}>={_max_units_total}",
                                     })
                                     return
                                 _max_notional_units = _max_units_add * _px_here
@@ -2285,7 +2304,7 @@ def scheduler_run(payload: Dict[str, Any] = Body(default=None)):
                 px = _last_price_safe(symbol)
                 return abs(qty) * px if px > 0 else 0.0
 
-                        # Start from raw action, then apply flatten + PnL/ATR-based overrides
+            # Start from raw action, then apply flatten + PnL/ATR-based overrides
             desired = r.action
 
             # Daily flatten mode: force flat regardless of raw signal
@@ -2304,8 +2323,13 @@ def scheduler_run(payload: Dict[str, Any] = Body(default=None)):
 
                 if _tp is not None and unrealized_pct >= _tp:
                     desired = "flat"
-                    log.info("[sched] profit_lock_flatten: strat=%s sym=%s upnl=%.2f tp=%.2f",
-                             strat, sym, unrealized_pct, _tp)
+                    log.info(
+                        "[sched] profit_lock_flatten: strat=%s sym=%s upnl=%.2f tp=%.2f",
+                        strat,
+                        sym,
+                        unrealized_pct,
+                        _tp,
+                    )
                     telemetry.append({
                         "strategy": strat,
                         "symbol": sym,
@@ -2313,7 +2337,7 @@ def scheduler_run(payload: Dict[str, Any] = Body(default=None)):
                         "reason": r.reason,
                         "unrealized_pct": unrealized_pct,
                         "take_profit_pct": _tp,
-                        "exit_reason": "profit_lock_flatten"
+                        "exit_reason": "profit_lock_flatten",
                     })
 
             # Stop-loss (Mode B): if unrealized PnL <= stop_loss_pct (or no_rebuy_below_pct), force an exit
@@ -2327,8 +2351,13 @@ def scheduler_run(payload: Dict[str, Any] = Body(default=None)):
 
                 if _sl is not None and unrealized_pct <= _sl:
                     desired = "flat"
-                    log.info("[sched] stop_loss_flatten: strat=%s sym=%s upnl=%.2f sl=%.2f",
-                             strat, sym, unrealized_pct, _sl)
+                    log.info(
+                        "[sched] stop_loss_flatten: strat=%s sym=%s upnl=%.2f sl=%.2f",
+                        strat,
+                        sym,
+                        unrealized_pct,
+                        _sl,
+                    )
                     telemetry.append({
                         "strategy": strat,
                         "symbol": sym,
@@ -2336,7 +2365,7 @@ def scheduler_run(payload: Dict[str, Any] = Body(default=None)):
                         "reason": r.reason,
                         "unrealized_pct": unrealized_pct,
                         "stop_loss_pct": _sl,
-                        "exit_reason": "stop_loss_flatten"
+                        "exit_reason": "stop_loss_flatten",
                     })
 
             # ATR reversal: if ATR% drops back below configured floor for this symbol's tier, flatten any open position
@@ -2360,8 +2389,13 @@ def scheduler_run(payload: Dict[str, Any] = Body(default=None)):
                     # Volatility has collapsed below floor → exit (but don't flip)
                     if desired != "flat":
                         desired = "flat"
-                        log.info("[sched] atr_reversal_flatten: strat=%s sym=%s atr_pct=%.4f floor=%.4f",
-                                 strat, sym, atr_val, float(atr_floor))
+                        log.info(
+                            "[sched] atr_reversal_flatten: strat=%s sym=%s atr_pct=%.4f floor=%.4f",
+                            strat,
+                            sym,
+                            atr_val,
+                            float(atr_floor),
+                        )
                         telemetry.append({
                             "strategy": strat,
                             "symbol": sym,
@@ -2370,7 +2404,7 @@ def scheduler_run(payload: Dict[str, Any] = Body(default=None)):
                             "unrealized_pct": unrealized_pct,
                             "atr_pct": atr_val,
                             "atr_floor": float(atr_floor),
-                            "exit_reason": "atr_reversal_flatten"
+                            "exit_reason": "atr_reversal_flatten",
                         })
             except Exception:
                 # ATR failure shouldn't block trading
@@ -2379,10 +2413,10 @@ def scheduler_run(payload: Dict[str, Any] = Body(default=None)):
             # Case 0: Already flat
             if abs(current_qty) < 1e-10:
                 if desired in ("buy", "sell"):
-                    target_notional = float(r.notional if r.notional and r.notional > 0 else notional)
+                    target_notional = float(
+                        r.notional if r.notional and r.notional > 0 else notional
+                    )
                     _send(sym, desired, target_notional, intent=f"open_{desired}")
-                    # We don't update `positions` here (we rely on journal + next run),
-                    # but we could approximate if needed.
                 # desired == "flat" and already flat: do nothing
                 continue
 
@@ -2402,7 +2436,9 @@ def scheduler_run(payload: Dict[str, Any] = Body(default=None)):
                 elif desired == "sell":
                     # Flip: close long then open short of target size
                     _send(sym, "sell", close_notional, intent="flip_close_long")
-                    target_notional = float(r.notional if r.notional and r.notional > 0 else notional)
+                    target_notional = float(
+                        r.notional if r.notional and r.notional > 0 else notional
+                    )
                     _send(sym, "sell", target_notional, intent="flip_open_short")
                     continue
 
@@ -2421,10 +2457,11 @@ def scheduler_run(payload: Dict[str, Any] = Body(default=None)):
                 elif desired == "buy":
                     # Flip: close short then open long
                     _send(sym, "buy", close_notional, intent="flip_close_short")
-                    target_notional = float(r.notional if r.notional and r.notional > 0 else notional)
+                    target_notional = float(
+                        r.notional if r.notional and r.notional > 0 else notional
+                    )
                     _send(sym, "buy", target_notional, intent="flip_open_long")
                     continue
-
 
     return {"ok": True, "message": msg, "actions": actions, "telemetry": telemetry}
 
