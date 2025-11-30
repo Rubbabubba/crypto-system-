@@ -1995,17 +1995,24 @@ def scheduler_run(payload: Dict[str, Any] = Body(default=None)):
         positions = _load_open_positions_from_trades(use_strategy_col=True)
 
         # --- risk config ----------------------------------------------------
+        # Load global risk policy config
         try:
             _risk_cfg = load_risk_config()
         except Exception:
             _risk_cfg = {}
 
+        # Extra safety: normalize to dict in case something weird slips through
         if not isinstance(_risk_cfg, dict):
-            log.warning(
-                "load_risk_config returned non-dict (%r); treating as empty config",
-                type(_risk_cfg),
-            )
-            _risk_cfg = {}
+            try:
+                import json as _json
+                if isinstance(_risk_cfg, str):
+                    _risk_cfg = _json.loads(_risk_cfg)
+                    if not isinstance(_risk_cfg, dict):
+                        _risk_cfg = {}
+                else:
+                    _risk_cfg = {}
+            except Exception:
+                _risk_cfg = {}
 
         daily_flat_cfg  = _cfg_dict(_cfg_get(_risk_cfg, "daily_flatten", {}))
         risk_caps_cfg   = _cfg_dict(_cfg_get(_risk_cfg, "risk_caps", {}))
