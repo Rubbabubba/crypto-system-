@@ -2124,23 +2124,44 @@ def scheduler_run(payload: Dict[str, Any] = Body(default=None)):
         fee_multiple = float(os.getenv("EDGE_MULTIPLE_VS_FEE", "2.0") or 2.0)   # require edge >= 2x fee
         min_notional = float(os.getenv("MIN_ORDER_NOTIONAL_USD", "10") or 10.0) # skip under min
 
-        # Preload bars once
+        # Preload bars once (defensive)
         contexts: Dict[str, Any] = {}
         for sym in syms:
             try:
                 one = br.get_bars(sym, timeframe="1Min", limit=limit)
                 five = br.get_bars(sym, timeframe=tf, limit=limit)
 
-                def series(bars, key):
-                    return [row.get(key) for row in (bars or [])]
+                def safe_series(bars, key):
+                    vals = []
+                    if isinstance(bars, list):
+                        for row in bars:
+                            if isinstance(row, dict) and key in row:
+                                vals.append(row[key])
+                            else:
+                                # bad row, skip it
+                                continue
+                    return vals
 
                 contexts[sym] = {
-                    "one": {"close": series(one, "c"), "high": series(one, "h"), "low": series(one, "l")},
-                    "five": {"close": series(five, "c"), "high": series(five, "h"), "low": series(five, "l")},
+                    "one": {
+                        "close": safe_series(one, "c"),
+                        "high": safe_series(one, "h"),
+                        "low": safe_series(one, "l"),
+                    },
+                    "five": {
+                        "close": safe_series(five, "c"),
+                        "high": safe_series(five, "h"),
+                        "low": safe_series(five, "l"),
+                    },
                 }
             except Exception as e:
-                contexts[sym] = None
+                contexts[sym] = {
+                    "one": {"close": [], "high": [], "low": []},
+                    "five": {"close": [], "high": [], "low": []},
+                    "error": str(e),
+                }
                 log.warning("bars preload error for %s: %s", sym, e)
+
 
         # --- main loop over strategies / results --------------------------------------
         for strat in strats:
