@@ -1997,6 +1997,14 @@ def scheduler_run(payload: Dict[str, Any] = Body(default=None)):
         except Exception:
             _risk_cfg = {}
 
+        # 🔧 HARDEN: force risk config to be a dict, otherwise ignore it
+        if not isinstance(_risk_cfg, dict):
+            log.warning(
+                "load_risk_config returned non-dict (%r); treating as empty config",
+                type(_risk_cfg),
+            )
+            _risk_cfg = {}
+
         daily_flat_cfg   = _cfg_dict(_risk_cfg.get("daily_flatten"))
         risk_caps_cfg    = _cfg_dict(_risk_cfg.get("risk_caps"))
         profit_lock_cfg  = _cfg_dict(_risk_cfg.get("profit_lock"))
@@ -2128,289 +2136,223 @@ def scheduler_run(payload: Dict[str, Any] = Body(default=None)):
                 continue
 
             for r in res:
-                edge_pct = float(r.atr_pct or 0.0) * 100.0
-                fee_pct = taker_fee_bps / 10000.0
-                guard_ok = True
-                guard_reason = None
-                if r.action not in ("buy", "sell"):
-                    guard_ok = False
-                    guard_reason = r.reason or "flat"
-                elif r.notional < max(min_notional, 0.0):
-                    guard_ok = False
-                    guard_reason = f"notional_below_min:{r.notional:.2f}"
-                elif edge_pct < (fee_multiple * fee_pct * 100.0):
-                    guard_ok = False
-                    guard_reason = f"edge_vs_fee_low:{edge_pct:.3f}pct"
-
-                telemetry.append(
-                    {
-                        "strategy": strat,
-                        "symbol": r.symbol,
-                        "raw_action": r.action,
-                        "reason": r.reason,
-                        "score": r.score,
-                        "atr": r.atr,
-                        "atr_pct": r.atr_pct,
-                        "qty": r.qty,
-                        "notional": r.notional,
-                        "guard_ok": guard_ok,
-                        "guard_reason": guard_reason,
-                    }
-                )
-
-                if not guard_ok:
-                    continue
-
-                sym = r.symbol
-                pos = _position_for(sym, strat, positions)
-                current_qty = float(pos.qty) if pos is not None else 0.0
-
-                # Unrealized PnL %
-                unrealized_pct = None
-                if pos is not None and pos.avg_price and abs(pos.qty) > 1e-10:
-                    _px = _last_price_safe(sym)
-                    try:
-                        _avg = float(pos.avg_price or 0.0)
-                    except Exception:
-                        _avg = 0.0
-                    if _px > 0.0 and _avg > 0.0:
-                        if pos.qty > 0:
-                            unrealized_pct = (_px - _avg) / _avg * 100.0
-                        else:
-                            unrealized_pct = (_avg - _px) / _avg * 100.0
-
-                # Loss-zone no-rebuy
-                if unrealized_pct is not None:
-                    _lz_cfg = loss_zone_cfg
-                    _lz = _lz_cfg.get("no_rebuy_below_pct")
-                    try:
-                        _lz = float(_lz) if _lz is not None else None
-                    except Exception:
-                        _lz = None
-                    if (
-                        _lz is not None
-                        and unrealized_pct <= _lz
-                        and current_qty > 0
-                        and r.action == "buy"
-                    ):
+                try:
+                    edge_pct = float(r.atr_pct or 0.0) * 100.0
+                    fee_pct = taker_fee_bps / 10000.0
+                    guard_ok = True
+                    guard_reason = None
+                    if r.action not in ("buy", "sell"):
                         guard_ok = False
-                        guard_reason = f"loss_zone_block:{unrealized_pct:.2f}pct"
-                        telemetry.append(
-                            {
-                                "strategy": strat,
-                                "symbol": sym,
-                                "raw_action": r.action,
-                                "reason": r.reason,
-                                "loss_zone": True,
-                                "unrealized_pct": unrealized_pct,
-                                "loss_zone_threshold": _lz,
-                            }
-                        )
+                        guard_reason = r.reason or "flat"
+                    elif r.notional < max(min_notional, 0.0):
+                        guard_ok = False
+                        guard_reason = f"notional_below_min:{r.notional:.2f}"
+                    elif edge_pct < (fee_multiple * fee_pct * 100.0):
+                        guard_ok = False
+                        guard_reason = f"edge_vs_fee_low:{edge_pct:.3f}pct"
+
+                    telemetry.append(
+                        {
+                            "strategy": strat,
+                            "symbol": r.symbol,
+                            "raw_action": r.action,
+                            "reason": r.reason,
+                            "score": r.score,
+                            "atr": r.atr,
+                            "atr_pct": r.atr_pct,
+                            "qty": r.qty,
+                            "notional": r.notional,
+                            "guard_ok": guard_ok,
+                            "guard_reason": guard_reason,
+                        }
+                    )
+
+                    if not guard_ok:
                         continue
 
-                # Helper to send an order
-                def _send(symbol: str, side: str, notional_value: float, intent: str) -> None:
-                    try:
-                        if intent.startswith("open"):
-                            _rcfg = risk_caps_cfg
-                            _max_notional_map = _cfg_dict(_rcfg.get("max_notional_per_symbol"))
-                            _max_units_map = _cfg_dict(_rcfg.get("max_units_per_symbol"))
-                            _sym_key = symbol.upper()
-                            _sym_norm = "".join(ch for ch in _sym_key if ch.isalnum())
-                            _cap_notional = _max_notional_map.get(
-                                _sym_key,
-                                _max_notional_map.get(
-                                    _sym_norm, _max_notional_map.get("default")
-                                ),
-                            )
-                            if _cap_notional is not None:
-                                try:
-                                    _cap_notional = float(_cap_notional) * float(
-                                        time_mult or 1.0
-                                    )
-                                except Exception:
-                                    _cap_notional = float(_cap_notional)
-                            _cap_units = _max_units_map.get(
-                                _sym_key,
-                                _max_units_map.get(
-                                    _sym_norm, _max_units_map.get("default")
-                                ),
-                            )
-                            if _cap_notional is not None or _cap_units is not None:
-                                _pos_here = _position_for(symbol, strat, positions)
-                                _qty_here = float(_pos_here.qty) if _pos_here is not None else 0.0
-                                _px_here = _last_price_safe(symbol)
-                                _cur_notional = abs(_qty_here) * _px_here
-                                if _cap_notional is not None and _px_here > 0.0:
-                                    _max_additional = float(_cap_notional) - float(
-                                        _cur_notional
-                                    )
-                                    if _max_additional <= 0:
-                                        actions.append(
-                                            {
-                                                "symbol": symbol,
-                                                "side": side,
-                                                "strategy": strat,
-                                                "notional": 0.0,
-                                                "intent": intent,
-                                                "status": "blocked_cap",
-                                                "reason": f"cap_notional:{_cur_notional:.2f}>={_cap_notional}",
-                                            }
-                                        )
-                                        return
-                                    if notional_value > _max_additional:
-                                        notional_value = _max_additional
-                                if _cap_units is not None and _px_here > 0.0:
-                                    _max_units_total = float(_cap_units)
-                                    _max_units_add = _max_units_total - abs(_qty_here)
-                                    if _max_units_add <= 0:
-                                        actions.append(
-                                            {
-                                                "symbol": symbol,
-                                                "side": side,
-                                                "strategy": strat,
-                                                "notional": 0.0,
-                                                "intent": intent,
-                                                "status": "blocked_cap",
-                                                "reason": f"cap_units:{abs(_qty_here):.6f}>={_max_units_total}",
-                                            }
-                                        )
-                                        return
-                                    _max_notional_units = _max_units_add * _px_here
-                                    if notional_value > _max_notional_units:
-                                        notional_value = _max_notional_units
-                        if notional_value <= 0:
-                            actions.append(
+                    sym = r.symbol
+                    pos = _position_for(sym, strat, positions)
+                    current_qty = float(pos.qty) if pos is not None else 0.0
+
+                    # Unrealized PnL %
+                    unrealized_pct = None
+                    if pos is not None and pos.avg_price and abs(pos.qty) > 1e-10:
+                        _px = _last_price_safe(sym)
+                        try:
+                            _avg = float(pos.avg_price or 0.0)
+                        except Exception:
+                            _avg = 0.0
+                        if _px > 0.0 and _avg > 0.0:
+                            if pos.qty > 0:
+                                unrealized_pct = (_px - _avg) / _avg * 100.0
+                            else:
+                                unrealized_pct = (_avg - _px) / _avg * 100.0
+
+                    # Loss-zone no-rebuy
+                    if unrealized_pct is not None:
+                        _lz_cfg = loss_zone_cfg
+                        _lz = _lz_cfg.get("no_rebuy_below_pct")
+                        try:
+                            _lz = float(_lz) if _lz is not None else None
+                        except Exception:
+                            _lz = None
+                        if (
+                            _lz is not None
+                            and unrealized_pct <= _lz
+                            and current_qty > 0
+                            and r.action == "buy"
+                        ):
+                            guard_ok = False
+                            guard_reason = f"loss_zone_block:{unrealized_pct:.2f}pct"
+                            telemetry.append(
                                 {
-                                    "symbol": symbol,
-                                    "side": side,
                                     "strategy": strat,
-                                    "notional": 0.0,
-                                    "intent": intent,
-                                    "status": "blocked_cap",
-                                    "reason": "notional_after_caps<=0",
+                                    "symbol": sym,
+                                    "raw_action": r.action,
+                                    "reason": r.reason,
+                                    "loss_zone": True,
+                                    "unrealized_pct": unrealized_pct,
+                                    "loss_zone_threshold": _lz,
                                 }
                             )
-                            return
-                    except Exception:
-                        # Fail-open on caps errors
-                        pass
+                            continue
 
-                    act = {
-                        "symbol": symbol,
-                        "side": side,
-                        "strategy": strat,
-                        "notional": float(notional_value),
-                        "intent": intent,
-                    }
-                    if dry:
-                        act["status"] = "dry_ok"
-                    else:
+                    # Helper to send an order
+                    def _send(symbol: str, side: str, notional_value: float, intent: str) -> None:
                         try:
-                            resp = br.market_notional(symbol, side, notional_value, strategy=strat)
-                            act["status"] = "live_ok"
-                            act["broker"] = resp
-                        except Exception as e:
-                            act["status"] = "live_err"
-                            act["error"] = str(e)
-                    actions.append(act)
+                            if intent.startswith("open"):
+                                _rcfg = risk_caps_cfg
+                                _max_notional_map = _cfg_dict(_rcfg.get("max_notional_per_symbol"))
+                                _max_units_map = _cfg_dict(_rcfg.get("max_units_per_symbol"))
+                                _sym_key = symbol.upper()
+                                _sym_norm = "".join(ch for ch in _sym_key if ch.isalnum())
+                                _cap_notional = _max_notional_map.get(
+                                    _sym_key,
+                                    _max_notional_map.get(
+                                        _sym_norm, _max_notional_map.get("default")
+                                    ),
+                                )
+                                if _cap_notional is not None:
+                                    try:
+                                        _cap_notional = float(_cap_notional) * float(
+                                            time_mult or 1.0
+                                        )
+                                    except Exception:
+                                        _cap_notional = float(_cap_notional)
+                                _cap_units = _max_units_map.get(
+                                    _sym_key,
+                                    _max_units_map.get(
+                                        _sym_norm, _max_units_map.get("default")
+                                    ),
+                                )
+                                if _cap_notional is not None or _cap_units is not None:
+                                    _pos_here = _position_for(symbol, strat, positions)
+                                    _qty_here = float(_pos_here.qty) if _pos_here is not None else 0.0
+                                    _px_here = _last_price_safe(symbol)
+                                    _cur_notional = abs(_qty_here) * _px_here
+                                    if _cap_notional is not None and _px_here > 0.0:
+                                        _max_additional = float(_cap_notional) - float(
+                                            _cur_notional
+                                        )
+                                        if _max_additional <= 0:
+                                            actions.append(
+                                                {
+                                                    "symbol": symbol,
+                                                    "side": side,
+                                                    "strategy": strat,
+                                                    "notional": 0.0,
+                                                    "intent": intent,
+                                                    "status": "blocked_cap",
+                                                    "reason": f"cap_notional:{_cur_notional:.2f}>={_cap_notional}",
+                                                }
+                                            )
+                                            return
+                                        if notional_value > _max_additional:
+                                            notional_value = _max_additional
+                                    if _cap_units is not None and _px_here > 0.0:
+                                        _max_units_total = float(_cap_units)
+                                        _max_units_add = _max_units_total - abs(_qty_here)
+                                        if _max_units_add <= 0:
+                                            actions.append(
+                                                {
+                                                    "symbol": symbol,
+                                                    "side": side,
+                                                    "strategy": strat,
+                                                    "notional": 0.0,
+                                                    "intent": intent,
+                                                    "status": "blocked_cap",
+                                                    "reason": f"cap_units:{abs(_qty_here):.6f}>={_max_units_total}",
+                                                }
+                                            )
+                                            return
+                                        _max_notional_units = _max_units_add * _px_here
+                                        if notional_value > _max_notional_units:
+                                            notional_value = _max_notional_units
+                            if notional_value <= 0:
+                                actions.append(
+                                    {
+                                        "symbol": symbol,
+                                        "side": side,
+                                        "strategy": strat,
+                                        "notional": 0.0,
+                                        "intent": intent,
+                                        "status": "blocked_cap",
+                                        "reason": "notional_after_caps<=0",
+                                    }
+                                )
+                                return
+                        except Exception:
+                            # Fail-open on caps errors
+                            pass
 
-                # Notional from qty
-                def _notional_for_qty(symbol: str, qty: float) -> float:
-                    px = _last_price_safe(symbol)
-                    return abs(qty) * px if px > 0 else 0.0
+                        act = {
+                            "symbol": symbol,
+                            "side": side,
+                            "strategy": strat,
+                            "notional": float(notional_value),
+                            "intent": intent,
+                        }
+                        if dry:
+                            act["status"] = "dry_ok"
+                        else:
+                            try:
+                                resp = br.market_notional(symbol, side, notional_value, strategy=strat)
+                                act["status"] = "live_ok"
+                                act["broker"] = resp
+                            except Exception as e:
+                                act["status"] = "live_err"
+                                act["error"] = str(e)
+                        actions.append(act)
 
-                # Start from raw action, then apply flatten + PnL/ATR-based overrides
-                desired = r.action
+                    # Notional from qty
+                    def _notional_for_qty(symbol: str, qty: float) -> float:
+                        px = _last_price_safe(symbol)
+                        return abs(qty) * px if px > 0 else 0.0
 
-                if flatten_mode:
-                    log.info("[sched] daily_flatten active -> flatten %s for %s", sym, strat)
-                    desired = "flat"
+                    # Start from raw action, then apply flatten + PnL/ATR-based overrides
+                    desired = r.action
 
-                # Profit-lock
-                if unrealized_pct is not None:
-                    _tp_cfg = profit_lock_cfg
-                    _tp = _tp_cfg.get("take_profit_pct")
-                    try:
-                        _tp = float(_tp) if _tp is not None else None
-                    except Exception:
-                        _tp = None
-
-                    if _tp is not None and unrealized_pct >= _tp:
+                    if flatten_mode:
+                        log.info("[sched] daily_flatten active -> flatten %s for %s", sym, strat)
                         desired = "flat"
-                        log.info(
-                            "[sched] profit_lock_flatten: strat=%s sym=%s upnl=%.2f tp=%.2f",
-                            strat,
-                            sym,
-                            unrealized_pct,
-                            _tp,
-                        )
-                        telemetry.append(
-                            {
-                                "strategy": strat,
-                                "symbol": sym,
-                                "raw_action": r.action,
-                                "reason": r.reason,
-                                "unrealized_pct": unrealized_pct,
-                                "take_profit_pct": _tp,
-                                "exit_reason": "profit_lock_flatten",
-                            }
-                        )
 
-                # Stop-loss
-                if unrealized_pct is not None:
-                    _sl_cfg = loss_zone_cfg
-                    _sl = _sl_cfg.get("stop_loss_pct", _sl_cfg.get("no_rebuy_below_pct"))
-                    try:
-                        _sl = float(_sl) if _sl is not None else None
-                    except Exception:
-                        _sl = None
+                    # Profit-lock
+                    if unrealized_pct is not None:
+                        _tp_cfg = profit_lock_cfg
+                        _tp = _tp_cfg.get("take_profit_pct")
+                        try:
+                            _tp = float(_tp) if _tp is not None else None
+                        except Exception:
+                            _tp = None
 
-                    if _sl is not None and unrealized_pct <= _sl:
-                        desired = "flat"
-                        log.info(
-                            "[sched] stop_loss_flatten: strat=%s sym=%s upnl=%.2f sl=%.2f",
-                            strat,
-                            sym,
-                            unrealized_pct,
-                            _sl,
-                        )
-                        telemetry.append(
-                            {
-                                "strategy": strat,
-                                "symbol": sym,
-                                "raw_action": r.action,
-                                "reason": r.reason,
-                                "unrealized_pct": unrealized_pct,
-                                "stop_loss_pct": _sl,
-                                "exit_reason": "stop_loss_flatten",
-                            }
-                        )
-
-                # ATR reversal
-                try:
-                    atr_val = float(getattr(r, "atr_pct", 0.0) or 0.0)
-
-                    sym_norm = sym.replace("/", "").replace("-", "")
-                    tier_name = None
-                    for tname, symbols_list in tiers_cfg.items():
-                        if sym_norm in symbols_list:
-                            tier_name = tname
-                            break
-
-                    atr_floor = None
-                    if tier_name is not None:
-                        atr_floor = atr_floor_cfg.get(tier_name)
-
-                    if atr_floor is not None and atr_val < float(atr_floor) and abs(current_qty) > 1e-10:
-                        if desired != "flat":
+                        if _tp is not None and unrealized_pct >= _tp:
                             desired = "flat"
                             log.info(
-                                "[sched] atr_reversal_flatten: strat=%s sym=%s atr_pct=%.4f floor=%.4f",
+                                "[sched] profit_lock_flatten: strat=%s sym=%s upnl=%.2f tp=%.2f",
                                 strat,
                                 sym,
-                                atr_val,
-                                float(atr_floor),
+                                unrealized_pct,
+                                _tp,
                             )
                             telemetry.append(
                                 {
@@ -2419,60 +2361,138 @@ def scheduler_run(payload: Dict[str, Any] = Body(default=None)):
                                     "raw_action": r.action,
                                     "reason": r.reason,
                                     "unrealized_pct": unrealized_pct,
-                                    "atr_pct": atr_val,
-                                    "atr_floor": float(atr_floor),
-                                    "exit_reason": "atr_reversal_flatten",
+                                    "take_profit_pct": _tp,
+                                    "exit_reason": "profit_lock_flatten",
                                 }
                             )
-                except Exception:
-                    pass
 
-                # Case 0: Already flat
-                if abs(current_qty) < 1e-10:
-                    if desired in ("buy", "sell"):
-                        target_notional = float(
-                            r.notional if r.notional and r.notional > 0 else notional
-                        )
-                        _send(sym, desired, target_notional, intent=f"open_{desired}")
+                    # Stop-loss
+                    if unrealized_pct is not None:
+                        _sl_cfg = loss_zone_cfg
+                        _sl = _sl_cfg.get("stop_loss_pct", _sl_cfg.get("no_rebuy_below_pct"))
+                        try:
+                            _sl = float(_sl) if _sl is not None else None
+                        except Exception:
+                            _sl = None
+
+                        if _sl is not None and unrealized_pct <= _sl:
+                            desired = "flat"
+                            log.info(
+                                "[sched] stop_loss_flatten: strat=%s sym=%s upnl=%.2f sl=%.2f",
+                                strat,
+                                sym,
+                                unrealized_pct,
+                                _sl,
+                            )
+                            telemetry.append(
+                                {
+                                    "strategy": strat,
+                                    "symbol": sym,
+                                    "raw_action": r.action,
+                                    "reason": r.reason,
+                                    "unrealized_pct": unrealized_pct,
+                                    "stop_loss_pct": _sl,
+                                    "exit_reason": "stop_loss_flatten",
+                                }
+                            )
+
+                    # ATR reversal
+                    try:
+                        atr_val = float(getattr(r, "atr_pct", 0.0) or 0.0)
+
+                        sym_norm = sym.replace("/", "").replace("-", "")
+                        tier_name = None
+                        for tname, symbols_list in tiers_cfg.items():
+                            if sym_norm in symbols_list:
+                                tier_name = tname
+                                break
+
+                        atr_floor = None
+                        if tier_name is not None:
+                            atr_floor = atr_floor_cfg.get(tier_name)
+
+                        if atr_floor is not None and atr_val < float(atr_floor) and abs(current_qty) > 1e-10:
+                            if desired != "flat":
+                                desired = "flat"
+                                log.info(
+                                    "[sched] atr_reversal_flatten: strat=%s sym=%s atr_pct=%.4f floor=%.4f",
+                                    strat,
+                                    sym,
+                                    atr_val,
+                                    float(atr_floor),
+                                )
+                                telemetry.append(
+                                    {
+                                        "strategy": strat,
+                                        "symbol": sym,
+                                        "raw_action": r.action,
+                                        "reason": r.reason,
+                                        "unrealized_pct": unrealized_pct,
+                                        "atr_pct": atr_val,
+                                        "atr_floor": float(atr_floor),
+                                        "exit_reason": "atr_reversal_flatten",
+                                    }
+                                )
+                    except Exception:
+                        pass
+
+                    # Case 0: Already flat
+                    if abs(current_qty) < 1e-10:
+                        if desired in ("buy", "sell"):
+                            target_notional = float(
+                                r.notional if r.notional and r.notional > 0 else notional
+                            )
+                            _send(sym, desired, target_notional, intent=f"open_{desired}")
+                        continue
+
+                    # Case 1: Currently long
+                    if current_qty > 0:
+                        if desired == "buy":
+                            continue
+                        close_notional = _notional_for_qty(sym, current_qty)
+                        if close_notional <= 0:
+                            continue
+
+                        if desired == "flat":
+                            _send(sym, "sell", close_notional, intent="close_long")
+                            continue
+                        elif desired == "sell":
+                            _send(sym, "sell", close_notional, intent="flip_close_long")
+                            target_notional = float(
+                                r.notional if r.notional and r.notional > 0 else notional
+                            )
+                            _send(sym, "sell", target_notional, intent="flip_open_short")
+                            continue
+
+                    # Case 2: Currently short
+                    if current_qty < 0:
+                        if desired == "sell":
+                            continue
+                        close_notional = _notional_for_qty(sym, current_qty)
+                        if close_notional <= 0:
+                            continue
+
+                        if desired == "flat":
+                            _send(sym, "buy", close_notional, intent="close_short")
+                            continue
+                        elif desired == "buy":
+                            _send(sym, "buy", close_notional, intent="flip_close_short")
+                            target_notional = float(
+                                r.notional if r.notional and r.notional > 0 else notional
+                            )
+                            _send(sym, "buy", target_notional, intent="flip_open_long")
+                            continue
+
+                except Exception as inner_e:
+                    # Belt-and-suspenders: don't let a single symbol/strategy blow up the whole run
+                    log.exception("scheduler_run per-row error: %s", inner_e)
+                    telemetry.append({
+                        "strategy": strat,
+                        "symbol": getattr(r, "symbol", None),
+                        "error": str(inner_e),
+                        "stage": "row_dispatch",
+                    })
                     continue
-
-                # Case 1: Currently long
-                if current_qty > 0:
-                    if desired == "buy":
-                        continue
-                    close_notional = _notional_for_qty(sym, current_qty)
-                    if close_notional <= 0:
-                        continue
-
-                    if desired == "flat":
-                        _send(sym, "sell", close_notional, intent="close_long")
-                        continue
-                    elif desired == "sell":
-                        _send(sym, "sell", close_notional, intent="flip_close_long")
-                        target_notional = float(
-                            r.notional if r.notional and r.notional > 0 else notional
-                        )
-                        _send(sym, "sell", target_notional, intent="flip_open_short")
-                        continue
-
-                # Case 2: Currently short
-                if current_qty < 0:
-                    if desired == "sell":
-                        continue
-                    close_notional = _notional_for_qty(sym, current_qty)
-                    if close_notional <= 0:
-                        continue
-
-                    if desired == "flat":
-                        _send(sym, "buy", close_notional, intent="close_short")
-                        continue
-                    elif desired == "buy":
-                        _send(sym, "buy", close_notional, intent="flip_close_short")
-                        target_notional = float(
-                            r.notional if r.notional and r.notional > 0 else notional
-                        )
-                        _send(sym, "buy", target_notional, intent="flip_open_long")
-                        continue
 
         return {"ok": True, "message": msg, "actions": actions, "telemetry": telemetry}
 
