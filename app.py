@@ -1761,7 +1761,7 @@ def debug_global_policy():
         return {"ok": False, "error": str(e)}
         
 # --------------------------------------------------------------------------------------
-# Scheduler status + controls
+# Scheduler globals
 # --------------------------------------------------------------------------------------
 
 _SCHED_ENABLED = bool(int(os.getenv("SCHED_ON", os.getenv("SCHED_ENABLED", "1") or "1")))
@@ -1771,6 +1771,10 @@ _SCHED_LAST: Dict[str, Any] = {}
 _SCHED_LAST_LOCK = threading.Lock()
 _SCHED_THREAD: Optional[threading.Thread] = None
 
+
+# --------------------------------------------------------------------------------------
+# Scheduler status + controls
+# --------------------------------------------------------------------------------------
 
 @app.get("/scheduler/status")
 def scheduler_status():
@@ -1826,7 +1830,6 @@ def scheduler_last():
 # Background scheduler loop
 # --------------------------------------------------------------------------------------
 
-
 def _scheduler_loop():
     """Background loop honoring _SCHED_ENABLED and _SCHED_SLEEP.
     Builds payload from env so Render env toggles work without redeploy.
@@ -1851,7 +1854,6 @@ def _scheduler_loop():
                 except Exception as e:
                     log.warning("could not set _SCHED_LAST (loop): %s", e)
 
-                # call the same function our route uses
                 _ = scheduler_run(payload)
                 tick += 1
                 _SCHED_TICKS = tick
@@ -1864,7 +1866,6 @@ def _scheduler_loop():
 # --------------------------------------------------------------------------------------
 # Startup hook (ensure DB + scheduler thread)
 # --------------------------------------------------------------------------------------
-
 
 def _ensure_strategy_column():
     conn = sqlite3.connect(DB_PATH)
@@ -1900,7 +1901,6 @@ def _startup():
 # Price helper used by scheduler
 # --------------------------------------------------------------------------------------
 
-
 def _last_price_safe(symbol: str) -> float:
     """
     Best-effort last price lookup that works whether we're using Kraken directly
@@ -1927,7 +1927,6 @@ def _last_price_safe(symbol: str) -> float:
 # Scheduler run (manual + background)
 # --------------------------------------------------------------------------------------
 
-
 @app.post("/scheduler/run")
 def scheduler_run(payload: Dict[str, Any] = Body(default=None)):
     """
@@ -1939,6 +1938,12 @@ def scheduler_run(payload: Dict[str, Any] = Body(default=None)):
 
     try:
         payload = payload or {}
+
+        def _cfg_dict(x) -> Dict[str, Any]:
+            """Return x if it is a dict, else {}. Makes risk.json sections robust."""
+            return x if isinstance(x, dict) else {}
+
+        # --- imports that can fail cleanly ----------------------------------
         try:
             import br_router as br
         except Exception as e:
@@ -1952,7 +1957,7 @@ def scheduler_run(payload: Dict[str, Any] = Body(default=None)):
             log.warning(msg)
             return {"ok": False, "message": msg, "actions": actions, "telemetry": telemetry}
 
-        # Resolve inputs
+        # --- resolve inputs -------------------------------------------------
         def _resolve_dry(_p):
             _env = str(os.getenv("SCHED_DRY", "1")).lower() in ("1", "true", "yes")
             try:
@@ -1984,24 +1989,26 @@ def scheduler_run(payload: Dict[str, Any] = Body(default=None)):
         log.info(msg)
 
         # Load open positions keyed by (symbol, strategy).
-        # Manual / unlabeled trades (strategy NULL / 'misc') are *ignored* by the scheduler.
         positions = _load_open_positions_from_trades(use_strategy_col=True)
 
-        # Load global risk policy config
+        # --- risk config ----------------------------------------------------
         try:
             _risk_cfg = load_risk_config()
         except Exception:
             _risk_cfg = {}
 
-        daily_flat_cfg = (_risk_cfg.get("daily_flatten") or {})
-        risk_caps_cfg = (_risk_cfg.get("risk_caps") or {})
-        profit_lock_cfg = (_risk_cfg.get("profit_lock") or {})
-        loss_zone_cfg = (_risk_cfg.get("loss_zone") or {})
+        daily_flat_cfg   = _cfg_dict(_risk_cfg.get("daily_flatten"))
+        risk_caps_cfg    = _cfg_dict(_risk_cfg.get("risk_caps"))
+        profit_lock_cfg  = _cfg_dict(_risk_cfg.get("profit_lock"))
+        loss_zone_cfg    = _cfg_dict(_risk_cfg.get("loss_zone"))
+        time_mult_cfg    = _cfg_dict(_risk_cfg.get("time_multipliers"))
+        atr_floor_cfg    = _cfg_dict(_risk_cfg.get("atr_floor_pct"))
+        tiers_cfg        = _cfg_dict(_risk_cfg.get("tiers"))
 
         # Day vs night time multiplier for risk caps
         time_mult = 1.0
         try:
-            day_night_cfg = (_risk_cfg.get("time_multipliers") or {}).get("day_night") or {}
+            day_night_cfg = _cfg_dict(time_mult_cfg.get("day_night"))
             if day_night_cfg:
                 try:
                     from zoneinfo import ZoneInfo as _ZInfo
@@ -2068,7 +2075,7 @@ def scheduler_run(payload: Dict[str, Any] = Body(default=None)):
         fee_multiple = float(os.getenv("EDGE_MULTIPLE_VS_FEE", "2.0") or 2.0)
         min_notional = float(os.getenv("MIN_ORDER_NOTIONAL_USD", "10") or 10.0)
 
-        # Preload bars once (defensive)
+        # --- preload bars once (defensive) ----------------------------------
         contexts: Dict[str, Any] = {}
 
         def _safe_series(bars, key: str):
@@ -2077,7 +2084,6 @@ def scheduler_run(payload: Dict[str, Any] = Body(default=None)):
                 for row in bars:
                     if isinstance(row, dict) and key in row:
                         vals.append(row[key])
-                    # silently skip bad rows (strings, None, etc.)
             return vals
 
         for sym in syms:
@@ -2104,7 +2110,7 @@ def scheduler_run(payload: Dict[str, Any] = Body(default=None)):
                 }
                 log.warning("bars preload error for %s: %s", sym, e)
 
-        # Main strategy loop
+        # --- main strategy loop ---------------------------------------------
         for strat in strats:
             book = StrategyBook(topk=topk, min_score=min_score, atr_stop_mult=atr_stop_mult)
             req = ScanRequest(
@@ -2175,7 +2181,7 @@ def scheduler_run(payload: Dict[str, Any] = Body(default=None)):
 
                 # Loss-zone no-rebuy
                 if unrealized_pct is not None:
-                    _lz_cfg = (loss_zone_cfg or {})
+                    _lz_cfg = loss_zone_cfg
                     _lz = _lz_cfg.get("no_rebuy_below_pct")
                     try:
                         _lz = float(_lz) if _lz is not None else None
@@ -2206,9 +2212,9 @@ def scheduler_run(payload: Dict[str, Any] = Body(default=None)):
                 def _send(symbol: str, side: str, notional_value: float, intent: str) -> None:
                     try:
                         if intent.startswith("open"):
-                            _rcfg = (risk_caps_cfg or {})
-                            _max_notional_map = (_rcfg.get("max_notional_per_symbol") or {})
-                            _max_units_map = (_rcfg.get("max_units_per_symbol") or {})
+                            _rcfg = risk_caps_cfg
+                            _max_notional_map = _cfg_dict(_rcfg.get("max_notional_per_symbol"))
+                            _max_units_map = _cfg_dict(_rcfg.get("max_units_per_symbol"))
                             _sym_key = symbol.upper()
                             _sym_norm = "".join(ch for ch in _sym_key if ch.isalnum())
                             _cap_notional = _max_notional_map.get(
@@ -2323,7 +2329,7 @@ def scheduler_run(payload: Dict[str, Any] = Body(default=None)):
 
                 # Profit-lock
                 if unrealized_pct is not None:
-                    _tp_cfg = (profit_lock_cfg or {})
+                    _tp_cfg = profit_lock_cfg
                     _tp = _tp_cfg.get("take_profit_pct")
                     try:
                         _tp = float(_tp) if _tp is not None else None
@@ -2353,7 +2359,7 @@ def scheduler_run(payload: Dict[str, Any] = Body(default=None)):
 
                 # Stop-loss
                 if unrealized_pct is not None:
-                    _sl_cfg = (loss_zone_cfg or {})
+                    _sl_cfg = loss_zone_cfg
                     _sl = _sl_cfg.get("stop_loss_pct", _sl_cfg.get("no_rebuy_below_pct"))
                     try:
                         _sl = float(_sl) if _sl is not None else None
@@ -2384,19 +2390,17 @@ def scheduler_run(payload: Dict[str, Any] = Body(default=None)):
                 # ATR reversal
                 try:
                     atr_val = float(getattr(r, "atr_pct", 0.0) or 0.0)
-                    atr_cfg = (_risk_cfg.get("atr_floor_pct") or {})
-                    tiers_cfg = (_risk_cfg.get("tiers") or {})
 
                     sym_norm = sym.replace("/", "").replace("-", "")
                     tier_name = None
-                    for tname, symbols_list in (tiers_cfg or {}).items():
+                    for tname, symbols_list in tiers_cfg.items():
                         if sym_norm in symbols_list:
                             tier_name = tname
                             break
 
                     atr_floor = None
                     if tier_name is not None:
-                        atr_floor = atr_cfg.get(tier_name)
+                        atr_floor = atr_floor_cfg.get(tier_name)
 
                     if atr_floor is not None and atr_val < float(atr_floor) and abs(current_qty) > 1e-10:
                         if desired != "flat":
