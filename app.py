@@ -1381,130 +1381,6 @@ def kpis():
         }
     }
 
-
-_SCHED_ENABLED = bool(int(os.getenv("SCHED_ON", os.getenv("SCHED_ENABLED","1") or "1")))
-@app.get("/scheduler/status")
-def scheduler_status():
-    symbols = os.getenv("SYMBOLS", os.getenv("DEFAULT_SYMBOLS", "BTC/USD,ETH/USD")).strip()
-    strats = os.getenv("SCHED_STRATS", "c1,c2,c3,c4,c5,c6").strip()
-    timeframe = os.getenv("SCHED_TIMEFRAME", os.getenv("DEFAULT_TIMEFRAME", "5Min")).strip()
-    limit = int(os.getenv("SCHED_LIMIT", os.getenv("DEFAULT_LIMIT", "300") or 300))
-    notional = float(os.getenv("SCHED_NOTIONAL", os.getenv("DEFAULT_NOTIONAL", "25") or 25))
-    guard_enabled = bool(int(os.getenv("TRADING_ENABLED", "1") or 1))
-    window = os.getenv("TRADING_WINDOW", os.getenv("WINDOW", "live")).strip()
-    return {
-        "ok": True,
-        "enabled": _SCHED_ENABLED,
-        "interval_secs": int(os.getenv("SCHED_SLEEP", "30") or 30),
-        "symbols": symbols,
-        "strats": strats,
-        "timeframe": timeframe,
-        "limit": limit,
-        "notional": notional,
-        "guard_enabled": guard_enabled,
-        "window": window,
-        "ticks": _SCHED_TICKS,
-    }
-
-
-@app.post("/scheduler/start")
-def scheduler_start():
-    global _SCHED_ENABLED
-    _SCHED_ENABLED = True
-    return {"ok": True, "enabled": True}
-
-@app.post("/scheduler/stop")
-def scheduler_stop():
-    global _SCHED_ENABLED
-    _SCHED_ENABLED = False
-    return {"ok": True, "enabled": False}
-
-# ---- Scheduler (stub) ----------------------------------------------------------------
-
-
-@app.get("/scheduler/last")
-def scheduler_last():
-    """
-    Returns the parameters of the most recent scheduler run (manual or background).
-    """
-    global _SCHED_LAST
-    if not _SCHED_LAST:
-        raise HTTPException(status_code=404, detail="No last scheduler payload yet")
-    with _SCHED_LAST_LOCK:
-        return dict(_SCHED_LAST)
-
-# --------------------------------------------------------------------------------------
-# Background scheduler loop
-# --------------------------------------------------------------------------------------
-def _scheduler_loop():
-    """Background loop honoring _SCHED_ENABLED and _SCHED_SLEEP.
-    Builds payload from env so Render env toggles work without redeploy.
-    """
-    global _SCHED_ENABLED
-    tick = 0
-    global _SCHED_TICKS
-    while True:
-        try:
-            if _SCHED_ENABLED:
-                # Build payload from env on each pass
-                payload = {
-                    "tf": os.getenv("SCHED_TIMEFRAME", os.getenv("DEFAULT_TIMEFRAME","5Min") or "5Min"),
-                    "strats": os.getenv("SCHED_STRATS", "c1,c2,c3,c4,c5,c6"),
-                    "symbols": os.getenv("SYMBOLS","BTC/USD,ETH/USD"),
-                    "limit": int(os.getenv("SCHED_LIMIT", os.getenv("DEFAULT_LIMIT","300") or "300")),
-                    "notional": float(os.getenv("SCHED_NOTIONAL", os.getenv("DEFAULT_NOTIONAL","25") or "25")),
-                    "dry_run": str(os.getenv("SCHED_DRY","0")).lower() in ("1","true","yes"),
-                }
-                try:
-                    with _SCHED_LAST_LOCK:
-                        _SCHED_LAST = dict(payload) | {"ts": datetime.datetime.utcnow().isoformat() + "Z"}
-                except Exception as e:
-                    log.warning("could not set _SCHED_LAST (loop): %s", e)
-
-                # call the same function our route uses
-                _ = scheduler_run(payload)
-                tick += 1
-                _SCHED_TICKS = tick
-                log.info("scheduler tick #%s ok", tick)
-        except Exception as e:
-            log.exception("scheduler loop error: %s", e)
-        # sleep regardless to prevent tight loop if disabled
-        time.sleep(_SCHED_SLEEP)
-# --------------------------------------------------------------------------------------
-# Startup log
-# --------------------------------------------------------------------------------------
-
-
-def _ensure_strategy_column():
-    conn = sqlite3.connect(DB_PATH)
-    try:
-        cur = conn.cursor()
-        # Check if column exists
-        cur.execute("PRAGMA table_info(trades)")
-        cols = [r[1] for r in cur.fetchall()]
-        if "strategy" not in cols:
-            cur.execute("ALTER TABLE trades ADD COLUMN strategy TEXT")
-            conn.commit()
-        cur.execute("CREATE INDEX IF NOT EXISTS idx_trades_strategy ON trades(strategy)")
-        conn.commit()
-    finally:
-        conn.close()
-
-@app.on_event("startup")
-def _startup():
-    log.info(f"Starting crypto-system-api v{APP_VERSION} on 0.0.0.0:{os.getenv('PORT','10000')}")
-    # ensure DB created
-    _ = _db()
-    _ensure_strategy_column()
-    log.info(f"Data dir: {DATA_DIR} | DB: {DB_PATH}")
-    global _SCHED_THREAD
-    if _SCHED_ENABLED and _SCHED_THREAD is None:
-        _SCHED_THREAD = threading.Thread(target=_scheduler_loop, daemon=True, name="scheduler")
-        _SCHED_THREAD.start()
-        log.info("Scheduler thread started: sleep=%s enabled=%s", _SCHED_SLEEP, _SCHED_ENABLED)
-    else:
-        log.info("Scheduler thread not started: enabled=%s existing=%s", _SCHED_ENABLED, bool(_SCHED_THREAD))
-
 # --------------------------------------------------------------------------------------
 # Entrypoint (for local runs; Render uses 'python app.py')
 # --------------------------------------------------------------------------------------
@@ -1938,6 +1814,147 @@ def scan_all(tf: str = "5Min", symbols: str = "BTC/USD,ETH/USD", strats: str = "
             out["results"][mod] = [{"error": str(e)}]
     return out
 
+# --------------------------------------------------------------------------------------
+# Scheduler globals
+# --------------------------------------------------------------------------------------
+_SCHED_ENABLED = bool(int(os.getenv("SCHED_ON", os.getenv("SCHED_ENABLED", "1") or "1")))
+_SCHED_SLEEP = int(os.getenv("SCHED_SLEEP", "30") or 30)
+_SCHED_TICKS = 0
+_SCHED_THREAD: threading.Thread | None = None
+_SCHED_LAST: Dict[str, Any] = {}
+_SCHED_LAST_LOCK = threading.Lock()
+
+# --------------------------------------------------------------------------------------
+# Scheduler status / control routes
+# --------------------------------------------------------------------------------------
+@app.get("/scheduler/status")
+def scheduler_status():
+    symbols = os.getenv("SYMBOLS", os.getenv("DEFAULT_SYMBOLS", "BTC/USD,ETH/USD")).strip()
+    strats = os.getenv("SCHED_STRATS", "c1,c2,c3,c4,c5,c6").strip()
+    timeframe = os.getenv("SCHED_TIMEFRAME", os.getenv("DEFAULT_TIMEFRAME", "5Min")).strip()
+    limit = int(os.getenv("SCHED_LIMIT", os.getenv("DEFAULT_LIMIT", "300") or 300))
+    notional = float(os.getenv("SCHED_NOTIONAL", os.getenv("DEFAULT_NOTIONAL", "25") or 25))
+    guard_enabled = bool(int(os.getenv("TRADING_ENABLED", "1") or 1))
+    window = os.getenv("TRADING_WINDOW", os.getenv("WINDOW", "live")).strip()
+    return {
+        "ok": True,
+        "enabled": _SCHED_ENABLED,
+        "interval_secs": _SCHED_SLEEP,
+        "symbols": symbols,
+        "strats": strats,
+        "timeframe": timeframe,
+        "limit": limit,
+        "notional": notional,
+        "guard_enabled": guard_enabled,
+        "window": window,
+        "ticks": _SCHED_TICKS,
+    }
+
+
+@app.post("/scheduler/start")
+def scheduler_start():
+    global _SCHED_ENABLED
+    _SCHED_ENABLED = True
+    return {"ok": True, "enabled": True}
+
+
+@app.post("/scheduler/stop")
+def scheduler_stop():
+    global _SCHED_ENABLED
+    _SCHED_ENABLED = False
+    return {"ok": True, "enabled": False}
+
+
+@app.get("/scheduler/last")
+def scheduler_last():
+    """
+    Returns the parameters of the most recent scheduler run (manual or background).
+    """
+    global _SCHED_LAST
+    if not _SCHED_LAST:
+        raise HTTPException(status_code=404, detail="No last scheduler payload yet")
+    with _SCHED_LAST_LOCK:
+        return dict(_SCHED_LAST)
+
+# --------------------------------------------------------------------------------------
+# Background scheduler loop
+# --------------------------------------------------------------------------------------
+def _scheduler_loop():
+    """
+    Background loop honoring _SCHED_ENABLED and _SCHED_SLEEP.
+    Builds payload from env so Render env toggles work without redeploy.
+    """
+    global _SCHED_ENABLED, _SCHED_TICKS
+    tick = 0
+    while True:
+        try:
+            if _SCHED_ENABLED:
+                # Build payload from env on each pass
+                payload = {
+                    "tf": os.getenv("SCHED_TIMEFRAME", os.getenv("DEFAULT_TIMEFRAME", "5Min") or "5Min"),
+                    "strats": os.getenv("SCHED_STRATS", "c1,c2,c3,c4,c5,c6"),
+                    "symbols": os.getenv("SYMBOLS", "BTC/USD,ETH/USD"),
+                    "limit": int(os.getenv("SCHED_LIMIT", os.getenv("DEFAULT_LIMIT", "300") or "300")),
+                    "notional": float(os.getenv("SCHED_NOTIONAL", os.getenv("DEFAULT_NOTIONAL", "25") or "25")),
+                    "dry_run": str(os.getenv("SCHED_DRY", "0")).lower() in ("1", "true", "yes"),
+                }
+                try:
+                    with _SCHED_LAST_LOCK:
+                        _SCHED_LAST.clear()
+                        _SCHED_LAST.update(
+                            dict(payload) | {"ts": datetime.datetime.utcnow().isoformat() + "Z"}
+                        )
+                except Exception as e:
+                    log.warning("could not set _SCHED_LAST (loop): %s", e)
+
+                # call the same function our route uses
+                _ = scheduler_run(payload)
+                tick += 1
+                _SCHED_TICKS = tick
+                log.info("scheduler tick #%s ok", tick)
+        except Exception as e:
+            log.exception("scheduler loop error: %s", e)
+
+        # sleep regardless to prevent tight loop if disabled
+        time.sleep(_SCHED_SLEEP)
+
+# --------------------------------------------------------------------------------------
+# Startup log (+ DB migration)
+# --------------------------------------------------------------------------------------
+def _ensure_strategy_column():
+    conn = sqlite3.connect(DB_PATH)
+    try:
+        cur = conn.cursor()
+        # Check if column exists
+        cur.execute("PRAGMA table_info(trades)")
+        cols = [r[1] for r in cur.fetchall()]
+        if "strategy" not in cols:
+            cur.execute("ALTER TABLE trades ADD COLUMN strategy TEXT")
+            conn.commit()
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_trades_strategy ON trades(strategy)")
+        conn.commit()
+    finally:
+        conn.close()
+
+
+@app.on_event("startup")
+def _startup():
+    log.info(f"Starting crypto-system-api v{APP_VERSION} on 0.0.0.0:{os.getenv('PORT','10000')}")
+    # ensure DB created
+    _ = _db()
+    _ensure_strategy_column()
+    log.info(f"Data dir: {DATA_DIR} | DB: {DB_PATH}")
+    global _SCHED_THREAD
+    if _SCHED_ENABLED and _SCHED_THREAD is None:
+        _SCHED_THREAD = threading.Thread(target=_scheduler_loop, daemon=True, name="scheduler")
+        _SCHED_THREAD.start()
+        log.info("Scheduler thread started: sleep=%s enabled=%s", _SCHED_SLEEP, _SCHED_ENABLED)
+    else:
+        log.info("Scheduler thread not started: enabled=%s existing=%s", _SCHED_ENABLED, bool(_SCHED_THREAD))
+
+# --------------------------------------------------------------------------------------
+# Helper: safe last price (works with broker_kraken OR br_router)
+# --------------------------------------------------------------------------------------
 def _last_price_safe(symbol: str) -> float:
     """
     Best-effort last price lookup that works whether we're using Kraken directly
@@ -1961,509 +1978,549 @@ def _last_price_safe(symbol: str) -> float:
         return 0.0
     return 0.0
 
+# --------------------------------------------------------------------------------------
+# Main scheduler: single pass
+# --------------------------------------------------------------------------------------
 @app.post("/scheduler/run")
 def scheduler_run(payload: Dict[str, Any] = Body(default=None)):
     """
     Real scheduler: fetch bars once, run StrategyBook on requested strats/symbols,
     and (optionally) place market orders via br_router.market_notional.
     """
-    payload = payload or {}
-    try:
-        import br_router as br
-    except Exception as e:
-        msg = f"import br_router failed: {e}"
-        log.warning(msg)
-        return {"ok": False, "message": msg, "actions": []}
-    try:
-        from book import StrategyBook, ScanRequest
-    except Exception as e:
-        msg = f"import book failed: {e}"
-        log.warning(msg)
-        return {"ok": False, "message": msg, "actions": []}
+    actions: list[dict] = []
+    telemetry: list[dict] = []
 
-    # Resolve inputs
-    def _resolve_dry(_p):
-        _env = str(os.getenv("SCHED_DRY", "1")).lower() in ("1","true","yes")
+    try:
+        # Import broker router + book
         try:
-            if _p is None: return _env
-            if isinstance(_p, dict):
-                v = _p.get("dry_run", None)
-            else:
-                v = None
-            return _env if v is None else bool(v)
+            import br_router as br
+        except Exception as e:
+            msg = f"import br_router failed: {e}"
+            log.warning(msg)
+            return {"ok": False, "message": msg, "actions": [], "telemetry": []}
+
+        try:
+            from book import StrategyBook, ScanRequest
+        except Exception as e:
+            msg = f"import book failed: {e}"
+            log.warning(msg)
+            return {"ok": False, "message": msg, "actions": [], "telemetry": []}
+
+        # Resolve inputs
+        def _resolve_dry(_p: Any) -> bool:
+            _env = str(os.getenv("SCHED_DRY", "1")).lower() in ("1", "true", "yes")
+            try:
+                if _p is None:
+                    return _env
+                if isinstance(_p, dict):
+                    v = _p.get("dry_run", None)
+                else:
+                    v = None
+                return _env if v is None else bool(v)
+            except Exception:
+                return _env
+
+        payload = payload or {}
+        dry = _resolve_dry(payload)
+        tf = str(payload.get("tf", os.getenv("SCHED_TIMEFRAME", "5Min")))
+        strats = [
+            s.strip().lower()
+            for s in str(payload.get("strats", os.getenv("SCHED_STRATS", "c1,c2,c3"))).split(",")
+            if s.strip()
+        ]
+        symbols_csv = str(payload.get("symbols", os.getenv("SYMBOLS", "BTC/USD,ETH/USD")))
+        syms = [s.strip().upper() for s in symbols_csv.split(",") if s.strip()]
+        limit = int(payload.get("limit", int(os.getenv("SCHED_LIMIT", "300") or 300)))
+        notional = float(payload.get("notional", float(os.getenv("SCHED_NOTIONAL", "25") or 25)))
+        msg = (
+            f"Scheduler pass: strats={','.join(strats)} tf={tf} "
+            f"limit={limit} notional={notional} dry={dry} symbols={symbols_csv}"
+        )
+        log.info(msg)
+
+        # Load open positions keyed by (symbol, strategy).
+        # Manual / unlabeled trades (strategy NULL / 'misc') are *ignored* by the scheduler.
+        positions = _load_open_positions_from_trades(use_strategy_col=True)
+
+        # Load global risk policy config
+        try:
+            _risk_cfg = load_risk_config()
         except Exception:
-            return _env
+            _risk_cfg = {}
 
-    dry = _resolve_dry(payload)
-    tf = str(payload.get("tf", os.getenv("SCHED_TIMEFRAME", "5Min")))
-    strats = [s.strip().lower() for s in str(payload.get("strats", os.getenv("SCHED_STRATS","c1,c2,c3"))).split(",") if s.strip()]
-    symbols_csv = str(payload.get("symbols", os.getenv("SYMBOLS","BTC/USD,ETH/USD")))
-    syms = [s.strip().upper() for s in symbols_csv.split(",") if s.strip()]
-    limit = int(payload.get("limit", int(os.getenv("SCHED_LIMIT", "300") or 300)))
-    notional = float(payload.get("notional", float(os.getenv("SCHED_NOTIONAL", "25") or 25)))
-    msg = f"Scheduler pass: strats={','.join(strats)} tf={tf} limit={limit} notional={notional} dry={dry} symbols={symbols_csv}"
-    log.info(msg)
-    # Load open positions keyed by (symbol, strategy).
-    # Manual / unlabeled trades (strategy NULL / 'misc') are *ignored* by the scheduler.
-    positions = _load_open_positions_from_trades(use_strategy_col=True)
+        daily_flat_cfg = (_risk_cfg.get("daily_flatten") or {})
+        risk_caps_cfg = (_risk_cfg.get("risk_caps") or {})
+        profit_lock_cfg = (_risk_cfg.get("profit_lock") or {})
+        loss_zone_cfg = (_risk_cfg.get("loss_zone") or {})
 
-    # Load global risk policy config
-    try:
-        _risk_cfg = load_risk_config()
-    except Exception:
-        _risk_cfg = {}
-
-    daily_flat_cfg = (_risk_cfg.get("daily_flatten") or {})
-    risk_caps_cfg = (_risk_cfg.get("risk_caps") or {})
-    profit_lock_cfg = (_risk_cfg.get("profit_lock") or {})
-    loss_zone_cfg = (_risk_cfg.get("loss_zone") or {})
-    # Day vs night time multiplier for risk caps (from risk.json -> time_multipliers.day_night)
-    time_mult = 1.0
-    try:
-        day_night_cfg = (_risk_cfg.get("time_multipliers") or {}).get("day_night") or {}
-        if day_night_cfg:
-            try:
-                from zoneinfo import ZoneInfo as _ZInfo
-                _tz_mult = os.getenv("TZ", "UTC")
-                _now_local_mult = dt.datetime.now(_ZInfo(_tz_mult))
-            except Exception:
-                _now_local_mult = dt.datetime.utcnow()
-
-            day_start = int(day_night_cfg.get("day_start_hour_local", 6))
-            night_start = int(day_night_cfg.get("night_start_hour_local", 19))
-            day_multiplier = float(day_night_cfg.get("day_multiplier", 1.0))
-            night_multiplier = float(day_night_cfg.get("night_multiplier", 1.0))
-            hour = _now_local_mult.hour
-
-            # Assume simple split: [day_start, night_start) = day, else = night
-            if day_start <= hour < night_start:
-                time_mult = day_multiplier
-            else:
-                time_mult = night_multiplier
-    except Exception:
+        # Day vs night time multiplier for risk caps (from risk.json -> time_multipliers.day_night)
         time_mult = 1.0
+        try:
+            day_night_cfg = (_risk_cfg.get("time_multipliers") or {}).get("day_night") or {}
+            if day_night_cfg:
+                try:
+                    from zoneinfo import ZoneInfo as _ZInfo
+                    _tz_mult = os.getenv("TZ", "UTC")
+                    _now_local_mult = dt.datetime.now(_ZInfo(_tz_mult))
+                except Exception:
+                    _now_local_mult = dt.datetime.utcnow()
 
+                day_start = int(day_night_cfg.get("day_start_hour_local", 6))
+                night_start = int(day_night_cfg.get("night_start_hour_local", 19))
+                day_multiplier = float(day_night_cfg.get("day_multiplier", 1.0))
+                night_multiplier = float(day_night_cfg.get("night_multiplier", 1.0))
+                hour = _now_local_mult.hour
 
-    # Determine whether we are in daily flatten window (local time from TZ env)
-    flatten_mode = False
-    try:
-        if daily_flat_cfg.get("enabled"):
-            try:
-                from zoneinfo import ZoneInfo as _ZInfo  # py3.9+
-                _tz = os.getenv("TZ", "UTC")
-                _now_local = dt.datetime.now(_ZInfo(_tz))
-            except Exception:
-                _now_local = dt.datetime.utcnow()
-            _fh = int(daily_flat_cfg.get("flatten_hour_local", 23))
-            _fm = int(daily_flat_cfg.get("flatten_minute_local", 0))
-            if (_now_local.hour, _now_local.minute) >= (_fh, _fm):
-                flatten_mode = True
-    except Exception:
+                # Assume simple split: [day_start, night_start) = day, else = night
+                if day_start <= hour < night_start:
+                    time_mult = day_multiplier
+                else:
+                    time_mult = night_multiplier
+        except Exception:
+            time_mult = 1.0
+
+        # Determine whether we are in daily flatten window (local time from TZ env)
         flatten_mode = False
-
-    # Record last-run
-
-    try:
-        with _SCHED_LAST_LOCK:
-            _SCHED_LAST.clear()
-            _SCHED_LAST.update({
-                "tf": tf, "strats": ",".join(strats), "symbols": symbols_csv,
-                "limit": limit, "notional": notional, "dry_run": dry,
-                "ts": dt.datetime.utcnow().isoformat() + "Z",
-            })
-    except Exception as e:
-        log.warning("could not set _SCHED_LAST: %s", e)
-
-    # Env-tunable book params
-    topk = int(os.getenv("BOOK_TOPK", "2") or 2)
-    min_score = float(os.getenv("BOOK_MIN_SCORE", "0.07") or 0.07)
-    atr_stop_mult = float(os.getenv("ATR_STOP_MULT", "1.0") or 1.0)
-
-    # Fee/edge guard envs
-    taker_fee_bps = float(os.getenv("KRAKEN_TAKER_FEE_BPS", "26") or 26.0)  # 0.26% typical
-    fee_multiple = float(os.getenv("EDGE_MULTIPLE_VS_FEE", "2.0") or 2.0)   # require edge >= 2x fee
-    min_notional = float(os.getenv("MIN_ORDER_NOTIONAL_USD", "10") or 10.0) # skip under min
-
-    # Preload bars once
-    contexts = {}
-    for sym in syms:
         try:
-            one = br.get_bars(sym, timeframe="1Min", limit=limit)
-            five = br.get_bars(sym, timeframe=tf, limit=limit)
-            def series(bars, key):
-                return [row.get(key) for row in (bars or [])]
-            contexts[sym] = {
-                "one":  {"close": series(one,"c"), "high": series(one,"h"), "low": series(one,"l")},
-                "five": {"close": series(five,"c"), "high": series(five,"h"), "low": series(five,"l")},
-            }
-        except Exception as e:
-            contexts[sym] = None
-            log.warning("bars preload error for %s: %s", sym, e)
+            if daily_flat_cfg.get("enabled"):
+                try:
+                    from zoneinfo import ZoneInfo as _ZInfo  # py3.9+
+                    _tz = os.getenv("TZ", "UTC")
+                    _now_local = dt.datetime.now(_ZInfo(_tz))
+                except Exception:
+                    _now_local = dt.datetime.utcnow()
+                _fh = int(daily_flat_cfg.get("flatten_hour_local", 23))
+                _fm = int(daily_flat_cfg.get("flatten_minute_local", 0))
+                if (_now_local.hour, _now_local.minute) >= (_fh, _fm):
+                    flatten_mode = True
+        except Exception:
+            flatten_mode = False
 
-    actions = []
-    telemetry = []
-
-    for strat in strats:
-        book = StrategyBook(topk=topk, min_score=min_score, atr_stop_mult=atr_stop_mult)
-        req = ScanRequest(strat=strat, timeframe=tf, limit=limit, topk=topk, min_score=min_score, notional=notional)
+        # Record last-run
         try:
-            res = book.scan(req, contexts)
+            with _SCHED_LAST_LOCK:
+                _SCHED_LAST.clear()
+                _SCHED_LAST.update(
+                    {
+                        "tf": tf,
+                        "strats": ",".join(strats),
+                        "symbols": symbols_csv,
+                        "limit": limit,
+                        "notional": notional,
+                        "dry_run": dry,
+                        "ts": dt.datetime.utcnow().isoformat() + "Z",
+                    }
+                )
         except Exception as e:
-            telemetry.append({"strategy": strat, "error": str(e)})
-            continue
+            log.warning("could not set _SCHED_LAST: %s", e)
 
-        for r in res:
-            edge_pct = float(r.atr_pct or 0.0) * 100.0  # rank pct 0..1 → 0..100 proxy
-            fee_pct = taker_fee_bps / 10000.0
-            guard_ok = True
-            guard_reason = None
-            if r.action not in ("buy", "sell"):
-                guard_ok = False
-                guard_reason = r.reason or "flat"
-            elif r.notional < max(min_notional, 0.0):
-                guard_ok = False
-                guard_reason = f"notional_below_min:{r.notional:.2f}"
-            elif edge_pct < (fee_multiple * fee_pct * 100.0):
-                guard_ok = False
-                guard_reason = f"edge_vs_fee_low:{edge_pct:.3f}pct"
+        # Env-tunable book params
+        topk = int(os.getenv("BOOK_TOPK", "2") or 2)
+        min_score = float(os.getenv("BOOK_MIN_SCORE", "0.07") or 0.07)
+        atr_stop_mult = float(os.getenv("ATR_STOP_MULT", "1.0") or 1.0)
 
-            telemetry.append({
-                "strategy": strat,
-                "symbol": r.symbol,
-                "raw_action": r.action,
-                "reason": r.reason,
-                "score": r.score,
-                "atr": r.atr,
-                "atr_pct": r.atr_pct,
-                "qty": r.qty,
-                "notional": r.notional,
-                "guard_ok": guard_ok,
-                "guard_reason": guard_reason,
-            })
+        # Fee/edge guard envs
+        taker_fee_bps = float(os.getenv("KRAKEN_TAKER_FEE_BPS", "26") or 26.0)  # 0.26% typical
+        fee_multiple = float(os.getenv("EDGE_MULTIPLE_VS_FEE", "2.0") or 2.0)   # require edge >= 2x fee
+        min_notional = float(os.getenv("MIN_ORDER_NOTIONAL_USD", "10") or 10.0) # skip under min
 
-            # --- Position-aware execution -----------------------------------
-            # We interpret:
-            #   buy  -> want to be long
-            #   sell -> want to be short
-            #   flat -> want to be flat (close any open position)
-            if not guard_ok:
+        # Preload bars once
+        contexts: Dict[str, Any] = {}
+        for sym in syms:
+            try:
+                one = br.get_bars(sym, timeframe="1Min", limit=limit)
+                five = br.get_bars(sym, timeframe=tf, limit=limit)
+
+                def series(bars, key):
+                    return [row.get(key) for row in (bars or [])]
+
+                contexts[sym] = {
+                    "one": {"close": series(one, "c"), "high": series(one, "h"), "low": series(one, "l")},
+                    "five": {"close": series(five, "c"), "high": series(five, "h"), "low": series(five, "l")},
+                }
+            except Exception as e:
+                contexts[sym] = None
+                log.warning("bars preload error for %s: %s", sym, e)
+
+        # --- main loop over strategies / results --------------------------------------
+        for strat in strats:
+            book = StrategyBook(topk=topk, min_score=min_score, atr_stop_mult=atr_stop_mult)
+            req = ScanRequest(
+                strat=strat,
+                timeframe=tf,
+                limit=limit,
+                topk=topk,
+                min_score=min_score,
+                notional=notional,
+            )
+            try:
+                res = book.scan(req, contexts)
+            except Exception as e:
+                telemetry.append({"strategy": strat, "error": str(e)})
                 continue
 
-            sym = r.symbol
-            # Lookup current position snapshot (by symbol, strategy or 'misc')
-            pos = _position_for(sym, strat, positions)
-            current_qty = float(pos.qty) if pos is not None else 0.0
-
-            # Approximate unrealized PnL % for this position using last price
-            unrealized_pct = None
-            if pos is not None and pos.avg_price and abs(pos.qty) > 1e-10:
-                _px = _last_price_safe(sym)
-                try:
-                    _avg = float(pos.avg_price or 0.0)
-                except Exception:
-                    _avg = 0.0
-                if _px > 0.0 and _avg > 0.0:
-                    if pos.qty > 0:
-                        # long: positive when price > avg
-                        unrealized_pct = (_px - _avg) / _avg * 100.0
-                    else:
-                        # short: positive when price < avg
-                        unrealized_pct = (_avg - _px) / _avg * 100.0
-
-            # Apply no-rebuy-in-loss-zone: if deeply underwater, block new buys/adds
-            if unrealized_pct is not None:
-                _lz_cfg = (loss_zone_cfg or {})
-                _lz = _lz_cfg.get("no_rebuy_below_pct")
-                try:
-                    _lz = float(_lz) if _lz is not None else None
-                except Exception:
-                    _lz = None
-                if (
-                    _lz is not None
-                    and unrealized_pct <= _lz
-                    and current_qty > 0
-                    and r.action == "buy"
-                ):
+            for r in res:
+                edge_pct = float(r.atr_pct or 0.0) * 100.0  # rank pct 0..1 → 0..100 proxy
+                fee_pct = taker_fee_bps / 10000.0
+                guard_ok = True
+                guard_reason = None
+                if r.action not in ("buy", "sell"):
                     guard_ok = False
-                    guard_reason = f"loss_zone_block:{unrealized_pct:.2f}pct"
-                    telemetry.append({
+                    guard_reason = r.reason or "flat"
+                elif r.notional < max(min_notional, 0.0):
+                    guard_ok = False
+                    guard_reason = f"notional_below_min:{r.notional:.2f}"
+                elif edge_pct < (fee_multiple * fee_pct * 100.0):
+                    guard_ok = False
+                    guard_reason = f"edge_vs_fee_low:{edge_pct:.3f}pct"
+
+                telemetry.append(
+                    {
                         "strategy": strat,
                         "symbol": r.symbol,
                         "raw_action": r.action,
                         "reason": r.reason,
-                        "loss_zone": True,
-                        "unrealized_pct": unrealized_pct,
-                        "loss_zone_threshold": _lz,
-                    })
+                        "score": r.score,
+                        "atr": r.atr,
+                        "atr_pct": r.atr_pct,
+                        "qty": r.qty,
+                        "notional": r.notional,
+                        "guard_ok": guard_ok,
+                        "guard_reason": guard_reason,
+                    }
+                )
 
-            # Helper to send an order
-            def _send(symbol: str, side: str, notional_value: float, intent: str) -> None:
-                # Apply per-symbol risk caps only for opening/adding exposure
-                try:
-                    if intent.startswith("open"):
-                        _rcfg = (risk_caps_cfg or {})
-                        _max_notional_map = (_rcfg.get("max_notional_per_symbol") or {})
-                        _max_units_map = (_rcfg.get("max_units_per_symbol") or {})
-                        _sym_key = symbol.upper()
-                        _sym_norm = "".join(ch for ch in _sym_key if ch.isalnum())
-                        _cap_notional = _max_notional_map.get(
-                            _sym_key,
-                            _max_notional_map.get(
-                                _sym_norm, _max_notional_map.get("default")
-                            ),
-                        )
-                        # Apply day/night multiplier to the notional cap
-                        if _cap_notional is not None:
-                            try:
-                                _cap_notional = float(_cap_notional) * float(
-                                    time_mult or 1.0
-                                )
-                            except Exception:
-                                _cap_notional = float(_cap_notional)
-                        _cap_units = _max_units_map.get(
-                            _sym_key,
-                            _max_units_map.get(
-                                _sym_norm, _max_units_map.get("default")
-                            ),
-                        )
-                        if _cap_notional is not None or _cap_units is not None:
-                            _pos_here = _position_for(symbol, strat, positions)
-                            _qty_here = float(_pos_here.qty) if _pos_here is not None else 0.0
-                            _px_here = _last_price_safe(symbol)
-                            _cur_notional = abs(_qty_here) * _px_here
-                            # Notional cap
-                            if _cap_notional is not None and _px_here > 0.0:
-                                _max_additional = float(_cap_notional) - float(_cur_notional)
-                                if _max_additional <= 0:
-                                    actions.append({
-                                        "symbol": symbol,
-                                        "side": side,
-                                        "strategy": strat,
-                                        "notional": 0.0,
-                                        "intent": intent,
-                                        "status": "blocked_cap",
-                                        "reason": f"cap_notional:{_cur_notional:.2f}>={_cap_notional}",
-                                    })
-                                    return
-                                if notional_value > _max_additional:
-                                    notional_value = _max_additional
-                            # Units cap
-                            if _cap_units is not None and _px_here > 0.0:
-                                _max_units_total = float(_cap_units)
-                                _max_units_add = _max_units_total - abs(_qty_here)
-                                if _max_units_add <= 0:
-                                    actions.append({
-                                        "symbol": symbol,
-                                        "side": side,
-                                        "strategy": strat,
-                                        "notional": 0.0,
-                                        "intent": intent,
-                                        "status": "blocked_cap",
-                                        "reason": f"cap_units:{abs(_qty_here):.6f}>={_max_units_total}",
-                                    })
-                                    return
-                                _max_notional_units = _max_units_add * _px_here
-                                if notional_value > _max_notional_units:
-                                    notional_value = _max_notional_units
-                        if notional_value <= 0:
-                            actions.append({
-                                "symbol": symbol,
-                                "side": side,
-                                "strategy": strat,
-                                "notional": 0.0,
-                                "intent": intent,
-                                "status": "blocked_cap",
-                                "reason": "notional_after_caps<=0",
-                            })
-                            return
-                except Exception:
-                    # Fail-open on caps errors (do not silently block trades)
-                    pass
+                # --- Position-aware execution -----------------------------------
+                if not guard_ok:
+                    continue
 
-                act = {
-                    "symbol": symbol,
-                    "side": side,
-                    "strategy": strat,
-                    "notional": float(notional_value),
-                    "intent": intent,  # open_long, open_short, close_long, close_short, flip_long_to_short, etc.
-                }
-                if dry:
-                    act["status"] = "dry_ok"
-                else:
+                sym = r.symbol
+                pos = _position_for(sym, strat, positions)
+                current_qty = float(pos.qty) if pos is not None else 0.0
+
+                # Unrealized PnL %
+                unrealized_pct = None
+                if pos is not None and pos.avg_price and abs(pos.qty) > 1e-10:
+                    _px = _last_price_safe(sym)
                     try:
-                        resp = br.market_notional(symbol, side, notional_value, strategy=strat)
-                        act["status"] = "live_ok"
-                        act["broker"] = resp
-                    except Exception as e:
-                        act["status"] = "live_err"
-                        act["error"] = str(e)
-                actions.append(act)
+                        _avg = float(pos.avg_price or 0.0)
+                    except Exception:
+                        _avg = 0.0
+                    if _px > 0.0 and _avg > 0.0:
+                        if pos.qty > 0:
+                            unrealized_pct = (_px - _avg) / _avg * 100.0
+                        else:
+                            unrealized_pct = (_avg - _px) / _avg * 100.0
 
-            # Helper: compute notional from qty using live price
-            def _notional_for_qty(symbol: str, qty: float) -> float:
-                px = _last_price_safe(symbol)
-                return abs(qty) * px if px > 0 else 0.0
+                # Loss zone no-rebuy guard
+                if unrealized_pct is not None:
+                    _lz_cfg = (loss_zone_cfg or {})
+                    _lz = _lz_cfg.get("no_rebuy_below_pct")
+                    try:
+                        _lz = float(_lz) if _lz is not None else None
+                    except Exception:
+                        _lz = None
+                    if (
+                        _lz is not None
+                        and unrealized_pct <= _lz
+                        and current_qty > 0
+                        and r.action == "buy"
+                    ):
+                        guard_ok = False
+                        guard_reason = f"loss_zone_block:{unrealized_pct:.2f}pct"
+                        telemetry.append(
+                            {
+                                "strategy": strat,
+                                "symbol": r.symbol,
+                                "raw_action": r.action,
+                                "reason": r.reason,
+                                "loss_zone": True,
+                                "unrealized_pct": unrealized_pct,
+                                "loss_zone_threshold": _lz,
+                            }
+                        )
 
-            # Start from raw action, then apply flatten + PnL/ATR-based overrides
-            desired = r.action
+                # Helper to send an order (with per-symbol caps)
+                def _send(symbol: str, side: str, notional_value: float, intent: str) -> None:
+                    nonlocal actions
+                    try:
+                        if intent.startswith("open"):
+                            _rcfg = (risk_caps_cfg or {})
+                            _max_notional_map = (_rcfg.get("max_notional_per_symbol") or {})
+                            _max_units_map = (_rcfg.get("max_units_per_symbol") or {})
+                            _sym_key = symbol.upper()
+                            _sym_norm = "".join(ch for ch in _sym_key if ch.isalnum())
+                            _cap_notional = _max_notional_map.get(
+                                _sym_key,
+                                _max_notional_map.get(_sym_norm, _max_notional_map.get("default")),
+                            )
+                            if _cap_notional is not None:
+                                try:
+                                    _cap_notional = float(_cap_notional) * float(time_mult or 1.0)
+                                except Exception:
+                                    _cap_notional = float(_cap_notional)
+                            _cap_units = _max_units_map.get(
+                                _sym_key,
+                                _max_units_map.get(_sym_norm, _max_units_map.get("default")),
+                            )
+                            if _cap_notional is not None or _cap_units is not None:
+                                _pos_here = _position_for(symbol, strat, positions)
+                                _qty_here = float(_pos_here.qty) if _pos_here is not None else 0.0
+                                _px_here = _last_price_safe(symbol)
+                                _cur_notional = abs(_qty_here) * _px_here
+                                # Notional cap
+                                if _cap_notional is not None and _px_here > 0.0:
+                                    _max_additional = float(_cap_notional) - float(_cur_notional)
+                                    if _max_additional <= 0:
+                                        actions.append(
+                                            {
+                                                "symbol": symbol,
+                                                "side": side,
+                                                "strategy": strat,
+                                                "notional": 0.0,
+                                                "intent": intent,
+                                                "status": "blocked_cap",
+                                                "reason": f"cap_notional:{_cur_notional:.2f}>={_cap_notional}",
+                                            }
+                                        )
+                                        return
+                                    if notional_value > _max_additional:
+                                        notional_value = _max_additional
+                                # Units cap
+                                if _cap_units is not None and _px_here > 0.0:
+                                    _max_units_total = float(_cap_units)
+                                    _max_units_add = _max_units_total - abs(_qty_here)
+                                    if _max_units_add <= 0:
+                                        actions.append(
+                                            {
+                                                "symbol": symbol,
+                                                "side": side,
+                                                "strategy": strat,
+                                                "notional": 0.0,
+                                                "intent": intent,
+                                                "status": "blocked_cap",
+                                                "reason": f"cap_units:{abs(_qty_here):.6f}>={_max_units_total}",
+                                            }
+                                        )
+                                        return
+                                    _max_notional_units = _max_units_add * _px_here
+                                    if notional_value > _max_notional_units:
+                                        notional_value = _max_notional_units
+                        if notional_value <= 0:
+                            actions.append(
+                                {
+                                    "symbol": symbol,
+                                    "side": side,
+                                    "strategy": strat,
+                                    "notional": 0.0,
+                                    "intent": intent,
+                                    "status": "blocked_cap",
+                                    "reason": "notional_after_caps<=0",
+                                }
+                            )
+                            return
+                    except Exception:
+                        # Fail-open on caps errors (do not silently block trades)
+                        pass
 
-            # Daily flatten mode: force flat regardless of raw signal
-            if flatten_mode:
-                log.info("[sched] daily_flatten active -> flatten %s for %s", sym, strat)
-                desired = "flat"
-
-            # Profit-lock (Mode B): if unrealized PnL >= take_profit_pct, force an exit (close only, no flip)
-            if unrealized_pct is not None:
-                _tp_cfg = (profit_lock_cfg or {})
-                _tp = _tp_cfg.get("take_profit_pct")
-                try:
-                    _tp = float(_tp) if _tp is not None else None
-                except Exception:
-                    _tp = None
-
-                if _tp is not None and unrealized_pct >= _tp:
-                    desired = "flat"
-                    log.info(
-                        "[sched] profit_lock_flatten: strat=%s sym=%s upnl=%.2f tp=%.2f",
-                        strat,
-                        sym,
-                        unrealized_pct,
-                        _tp,
-                    )
-                    telemetry.append({
+                    act = {
+                        "symbol": symbol,
+                        "side": side,
                         "strategy": strat,
-                        "symbol": sym,
-                        "raw_action": r.action,
-                        "reason": r.reason,
-                        "unrealized_pct": unrealized_pct,
-                        "take_profit_pct": _tp,
-                        "exit_reason": "profit_lock_flatten",
-                    })
+                        "notional": float(notional_value),
+                        "intent": intent,
+                    }
+                    if dry:
+                        act["status"] = "dry_ok"
+                    else:
+                        try:
+                            resp = br.market_notional(symbol, side, notional_value, strategy=strat)
+                            act["status"] = "live_ok"
+                            act["broker"] = resp
+                        except Exception as e:
+                            act["status"] = "live_err"
+                            act["error"] = str(e)
+                    actions.append(act)
 
-            # Stop-loss (Mode B): if unrealized PnL <= stop_loss_pct (or no_rebuy_below_pct), force an exit
-            if unrealized_pct is not None:
-                _sl_cfg = (loss_zone_cfg or {})
-                _sl = _sl_cfg.get("stop_loss_pct", _sl_cfg.get("no_rebuy_below_pct"))
-                try:
-                    _sl = float(_sl) if _sl is not None else None
-                except Exception:
-                    _sl = None
+                # Helper: compute notional from qty using live price
+                def _notional_for_qty(symbol: str, qty: float) -> float:
+                    px = _last_price_safe(symbol)
+                    return abs(qty) * px if px > 0 else 0.0
 
-                if _sl is not None and unrealized_pct <= _sl:
+                # Start from raw action, then apply flatten + PnL/ATR-based overrides
+                desired = r.action
+
+                # Daily flatten mode
+                if flatten_mode:
+                    log.info("[sched] daily_flatten active -> flatten %s for %s", sym, strat)
                     desired = "flat"
-                    log.info(
-                        "[sched] stop_loss_flatten: strat=%s sym=%s upnl=%.2f sl=%.2f",
-                        strat,
-                        sym,
-                        unrealized_pct,
-                        _sl,
-                    )
-                    telemetry.append({
-                        "strategy": strat,
-                        "symbol": sym,
-                        "raw_action": r.action,
-                        "reason": r.reason,
-                        "unrealized_pct": unrealized_pct,
-                        "stop_loss_pct": _sl,
-                        "exit_reason": "stop_loss_flatten",
-                    })
 
-            # ATR reversal: if ATR% drops back below configured floor for this symbol's tier, flatten any open position
-            try:
-                atr_val = float(getattr(r, "atr_pct", 0.0) or 0.0)
-                atr_cfg = (_risk_cfg.get("atr_floor_pct") or {})
-                tiers_cfg = (_risk_cfg.get("tiers") or {})
+                # Profit-lock
+                if unrealized_pct is not None:
+                    _tp_cfg = (profit_lock_cfg or {})
+                    _tp = _tp_cfg.get("take_profit_pct")
+                    try:
+                        _tp = float(_tp) if _tp is not None else None
+                    except Exception:
+                        _tp = None
 
-                sym_norm = sym.replace("/", "").replace("-", "")
-                tier_name = None
-                for tname, symbols_list in (tiers_cfg or {}).items():
-                    if sym_norm in symbols_list:
-                        tier_name = tname
-                        break
-
-                atr_floor = None
-                if tier_name is not None:
-                    atr_floor = atr_cfg.get(tier_name)
-
-                if atr_floor is not None and atr_val < float(atr_floor) and abs(current_qty) > 1e-10:
-                    # Volatility has collapsed below floor → exit (but don't flip)
-                    if desired != "flat":
+                    if _tp is not None and unrealized_pct >= _tp:
                         desired = "flat"
                         log.info(
-                            "[sched] atr_reversal_flatten: strat=%s sym=%s atr_pct=%.4f floor=%.4f",
+                            "[sched] profit_lock_flatten: strat=%s sym=%s upnl=%.2f tp=%.2f",
                             strat,
                             sym,
-                            atr_val,
-                            float(atr_floor),
+                            unrealized_pct,
+                            _tp,
                         )
-                        telemetry.append({
-                            "strategy": strat,
-                            "symbol": sym,
-                            "raw_action": r.action,
-                            "reason": r.reason,
-                            "unrealized_pct": unrealized_pct,
-                            "atr_pct": atr_val,
-                            "atr_floor": float(atr_floor),
-                            "exit_reason": "atr_reversal_flatten",
-                        })
-            except Exception:
-                # ATR failure shouldn't block trading
-                pass
+                        telemetry.append(
+                            {
+                                "strategy": strat,
+                                "symbol": sym,
+                                "raw_action": r.action,
+                                "reason": r.reason,
+                                "unrealized_pct": unrealized_pct,
+                                "take_profit_pct": _tp,
+                                "exit_reason": "profit_lock_flatten",
+                            }
+                        )
 
-            # Case 0: Already flat
-            if abs(current_qty) < 1e-10:
-                if desired in ("buy", "sell"):
-                    target_notional = float(
-                        r.notional if r.notional and r.notional > 0 else notional
-                    )
-                    _send(sym, desired, target_notional, intent=f"open_{desired}")
-                # desired == "flat" and already flat: do nothing
-                continue
+                # Stop-loss / loss-zone flatten
+                if unrealized_pct is not None:
+                    _sl_cfg = (loss_zone_cfg or {})
+                    _sl = _sl_cfg.get("stop_loss_pct", _sl_cfg.get("no_rebuy_below_pct"))
+                    try:
+                        _sl = float(_sl) if _sl is not None else None
+                    except Exception:
+                        _sl = None
 
-            # Case 1: Currently long
-            if current_qty > 0:
-                if desired == "buy":
-                    # Already long; for now, we do NOT pyramid.
-                    continue
-                # Need to close the long size
-                close_notional = _notional_for_qty(sym, current_qty)
-                if close_notional <= 0:
+                    if _sl is not None and unrealized_pct <= _sl:
+                        desired = "flat"
+                        log.info(
+                            "[sched] stop_loss_flatten: strat=%s sym=%s upnl=%.2f sl=%.2f",
+                            strat,
+                            sym,
+                            unrealized_pct,
+                            _sl,
+                        )
+                        telemetry.append(
+                            {
+                                "strategy": strat,
+                                "symbol": sym,
+                                "raw_action": r.action,
+                                "reason": r.reason,
+                                "unrealized_pct": unrealized_pct,
+                                "stop_loss_pct": _sl,
+                                "exit_reason": "stop_loss_flatten",
+                            }
+                        )
+
+                # ATR reversal flatten
+                try:
+                    atr_val = float(getattr(r, "atr_pct", 0.0) or 0.0)
+                    atr_cfg = (_risk_cfg.get("atr_floor_pct") or {})
+                    tiers_cfg = (_risk_cfg.get("tiers") or {})
+
+                    sym_norm = sym.replace("/", "").replace("-", "")
+                    tier_name = None
+                    for tname, symbols_list in (tiers_cfg or {}).items():
+                        if sym_norm in symbols_list:
+                            tier_name = tname
+                            break
+
+                    atr_floor = None
+                    if tier_name is not None:
+                        atr_floor = atr_cfg.get(tier_name)
+
+                    if atr_floor is not None and atr_val < float(atr_floor) and abs(current_qty) > 1e-10:
+                        if desired != "flat":
+                            desired = "flat"
+                            log.info(
+                                "[sched] atr_reversal_flatten: strat=%s sym=%s atr_pct=%.4f floor=%.4f",
+                                strat,
+                                sym,
+                                atr_val,
+                                float(atr_floor),
+                            )
+                            telemetry.append(
+                                {
+                                    "strategy": strat,
+                                    "symbol": sym,
+                                    "raw_action": r.action,
+                                    "reason": r.reason,
+                                    "unrealized_pct": unrealized_pct,
+                                    "atr_pct": atr_val,
+                                    "atr_floor": float(atr_floor),
+                                    "exit_reason": "atr_reversal_flatten",
+                                }
+                            )
+                except Exception:
+                    # ATR failure shouldn't block trading
+                    pass
+
+                # Case 0: Already flat
+                if abs(current_qty) < 1e-10:
+                    if desired in ("buy", "sell"):
+                        target_notional = float(
+                            r.notional if r.notional and r.notional > 0 else notional
+                        )
+                        _send(sym, desired, target_notional, intent=f"open_{desired}")
                     continue
 
-                if desired == "flat":
-                    _send(sym, "sell", close_notional, intent="close_long")
-                    continue
-                elif desired == "sell":
-                    # Flip: close long then open short of target size
-                    _send(sym, "sell", close_notional, intent="flip_close_long")
-                    target_notional = float(
-                        r.notional if r.notional and r.notional > 0 else notional
-                    )
-                    _send(sym, "sell", target_notional, intent="flip_open_short")
-                    continue
+                # Case 1: Currently long
+                if current_qty > 0:
+                    if desired == "buy":
+                        # Already long; no pyramiding for now
+                        continue
+                    close_notional = _notional_for_qty(sym, current_qty)
+                    if close_notional <= 0:
+                        continue
 
-            # Case 2: Currently short
-            if current_qty < 0:
-                if desired == "sell":
-                    # Already short; no pyramiding for now.
-                    continue
-                close_notional = _notional_for_qty(sym, current_qty)
-                if close_notional <= 0:
-                    continue
+                    if desired == "flat":
+                        _send(sym, "sell", close_notional, intent="close_long")
+                        continue
+                    elif desired == "sell":
+                        # Flip: close long then open short
+                        _send(sym, "sell", close_notional, intent="flip_close_long")
+                        target_notional = float(
+                            r.notional if r.notional and r.notional > 0 else notional
+                        )
+                        _send(sym, "sell", target_notional, intent="flip_open_short")
+                        continue
 
-                if desired == "flat":
-                    _send(sym, "buy", close_notional, intent="close_short")
-                    continue
-                elif desired == "buy":
-                    # Flip: close short then open long
-                    _send(sym, "buy", close_notional, intent="flip_close_short")
-                    target_notional = float(
-                        r.notional if r.notional and r.notional > 0 else notional
-                    )
-                    _send(sym, "buy", target_notional, intent="flip_open_long")
-                    continue
+                # Case 2: Currently short
+                if current_qty < 0:
+                    if desired == "sell":
+                        # Already short; no pyramiding for now.
+                        continue
+                    close_notional = _notional_for_qty(sym, current_qty)
+                    if close_notional <= 0:
+                        continue
 
-    return {"ok": True, "message": msg, "actions": actions, "telemetry": telemetry}
+                    if desired == "flat":
+                        _send(sym, "buy", close_notional, intent="close_short")
+                        continue
+                    elif desired == "buy":
+                        # Flip: close short then open long
+                        _send(sym, "buy", close_notional, intent="flip_close_short")
+                        target_notional = float(
+                            r.notional if r.notional and r.notional > 0 else notional
+                        )
+                        _send(sym, "buy", target_notional, intent="flip_open_long")
+                        continue
+
+        return {"ok": True, "message": msg, "actions": actions, "telemetry": telemetry}
+
+    except Exception as e:
+        # Catch-all so FastAPI doesn't throw a generic 500 with no detail
+        log.exception("scheduler_run unexpected error: %s", e)
+        return {
+            "ok": False,
+            "message": "scheduler_run_failed",
+            "error": str(e),
+            "actions": actions,
+            "telemetry": telemetry,
+        }
 
 # ==== BEGIN PATCH v1.0.0: P&L aggregation endpoints =============================================
 from typing import Optional, Any, List, Dict, Tuple
