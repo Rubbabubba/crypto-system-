@@ -187,17 +187,58 @@ def filter_allowed_now(strategies: Iterable[str], symbols: Iterable[str], now: O
 
 # ---------- Risk config loader ----------
 
+from functools import lru_cache
+
+@lru_cache(maxsize=1)
 def load_risk_config(cfg_dir: Optional[str] = None) -> dict:
     """
-    Load risk.json from the policy_config directory.
-    Returns an empty dict on error.
+    Load risk.json from a config directory.
+
+    Priority:
+      1) RISK_CONFIG_JSON env (inline JSON string)
+      2) RISK_CONFIG_PATH env (full path to a JSON file)
+      3) POLICY_CFG_DIR env (directory containing risk.json)
+      4) Default: <repo_root>/policy_config/risk.json
+
+    Always returns a dict ({} on any error).
     """
+    # 1) Inline JSON override
+    raw_inline = os.getenv("RISK_CONFIG_JSON")
+    if raw_inline:
+        try:
+            cfg = json.loads(raw_inline)
+            if isinstance(cfg, dict):
+                return cfg
+        except Exception:
+            # fall through to file-based options
+            pass
+
+    # 2) Full path override
+    path_env = os.getenv("RISK_CONFIG_PATH")
+    if path_env:
+        rpath = Path(path_env)
+    else:
+        # 3) Directory override via arg / env
+        if cfg_dir is not None:
+            base = Path(cfg_dir)
+        else:
+            dir_env = os.getenv("POLICY_CFG_DIR")
+            if dir_env:
+                base = Path(dir_env)
+            else:
+                # 4) Default: repo_root/policy_config/risk.json
+                # __file__ = <repo_root>/policy/guard.py
+                # parent        -> policy/
+                # parent.parent -> repo_root/
+                base = Path(__file__).resolve().parent.parent / "policy_config"
+        rpath = base / "risk.json"
+
     try:
-        cfg = Path(cfg_dir or os.getenv("POLICY_CFG_DIR", str(Path(__file__).parent / "policy_config")))
-        rpath = cfg / "risk.json"
         if not rpath.exists():
             return {}
         data = _read_json(rpath)
-        return data or {}
+        if isinstance(data, dict):
+            return data
+        return {}
     except Exception:
         return {}
