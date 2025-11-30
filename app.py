@@ -1981,9 +1981,9 @@ def scheduler_run(payload: Dict[str, Any] = Body(default=None)):
     notional = float(payload.get("notional", float(os.getenv("SCHED_NOTIONAL", "25") or 25)))
     msg = f"Scheduler pass: strats={','.join(strats)} tf={tf} limit={limit} notional={notional} dry={dry} symbols={symbols_csv}"
     log.info(msg)
-    # Load current open positions from trades table (symbol x strategy).
-    # We default to not using the 'strategy' column, since your attribution is symbol-based.
-    positions = _load_open_positions_from_trades(use_strategy_col=False)
+    # Load open positions keyed by (symbol, strategy).
+    # Manual / unlabeled trades (strategy NULL / 'misc') are *ignored* by the scheduler.
+    positions = _load_open_positions_from_trades(use_strategy_col=True)
 
     # Load global risk policy config
     try:
@@ -2587,14 +2587,19 @@ def _load_open_positions_from_trades(use_strategy_col: bool = False) -> Dict[Tup
     finally:
         con.close()
 
+def _position_for(positions, symbol, strategy):
+    """
+    Look up an open position for (symbol, strategy).
 
-def _position_for(symbol: str, strategy: str, positions: Dict[Tuple[str, str], Position]) -> Position | None:
-    key = (symbol, strategy)
-    if key in positions:
-        return positions[key]
-    # Fallback if strategy col not used: look for (symbol, 'misc')
-    key2 = (symbol, "misc")
-    return positions.get(key2)
+    We intentionally do NOT fall back to 'misc' anymore.
+    'misc' is reserved for manual / legacy trades that the bot
+    didn't create itself, and the scheduler should treat those
+    as external / opaque positions.
+    """
+    if not positions:
+        return None
+    key = (symbol, strategy or "misc")
+    return positions.get(key)
 
 @app.get("/pnl/by_strategy")
 def pnl_by_strategy(start: Optional[str] = None, end: Optional[str] = None,

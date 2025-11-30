@@ -2,13 +2,13 @@
 # -*- coding: utf-8 -*-
 """
 broker_kraken.py — Kraken adapter
-Build: v2.0.0 (2025-10-12, America/Chicago)
+Build: v2.1.0 (2025-10-12, America/Chicago)
 
 Public API used by app/strategies:
 - get_bars(symbol: str, timeframe: str = "5Min", limit: int = 300) -> List[{t,o,h,l,c,v}]
 - last_price(symbol: str) -> float
 - last_trade_map(symbols: list[str]) -> dict[UI_SYMBOL, {"price": float}]
-- market_notional(symbol: str, side: "buy"|"sell", notional: float) -> dict
+- market_notional(symbol: str, side: "buy"|"sell", notional: float, price: float|None = None, strategy: str|None = None, **kwargs) -> dict
 - orders() -> Any
 - positions() -> list[dict]
 - trades_history(count: int = 20) -> dict  # recent fills
@@ -16,7 +16,7 @@ Public API used by app/strategies:
 
 from __future__ import annotations
 
-__version__ = "2.0.0"
+__version__ = "2.1.0"
 
 import os
 import re
@@ -29,6 +29,7 @@ import threading
 import json
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+
 
 def _load_strategy_to_userref() -> Dict[str, int]:
     """Load mapping from strategy name -> Kraken userref (int).
@@ -373,11 +374,21 @@ def _ensure_price(symbol: str) -> float:
         raise RuntimeError(f"no price available for {symbol}")
     return p
 
-def market_notional(symbol: str, side: str, notional: float, strategy: Optional[str] = None) -> Dict[str, Any]:
+def market_notional(
+    symbol: str,
+    side: str,
+    notional: float,
+    price: Optional[float] = None,
+    strategy: Optional[str] = None,
+    **kwargs: Any,
+) -> Dict[str, Any]:
     """
     Market order by USD notional:
-      volume(base) = notional(quote USD) / last_price
-    Returns: { pair, side, notional, volume, txid, descr, result }
+      volume(base) = notional(quote USD) / price
+
+    Accepts an optional `price` (so callers like br_router can reuse a
+    resolved price) and an optional `strategy` (used to derive a stable
+    Kraken userref for correlation / journaling).
     """
     side = side.lower().strip()
     if side not in ("buy", "sell"):
@@ -385,7 +396,13 @@ def market_notional(symbol: str, side: str, notional: float, strategy: Optional[
 
     ui = symbol.upper()
     pair = to_kraken(ui)
-    px = _ensure_price(ui)
+
+    # Use caller-supplied price if valid; otherwise fall back to last_price.
+    if isinstance(price, (int, float)) and math.isfinite(float(price)) and float(price) > 0:
+        px = float(price)
+    else:
+        px = _ensure_price(ui)
+
     volume = _round_qty(float(notional) / px)
     if volume <= 0:
         raise ValueError("computed volume <= 0")
@@ -395,7 +412,11 @@ def market_notional(symbol: str, side: str, notional: float, strategy: Optional[
         "type": "buy" if side == "buy" else "sell",
         "ordertype": "market",
         "volume": f"{volume:.8f}",
-        "userref": str(_userref_for_strategy(strategy) if strategy is not None else _userref(ui, side, float(notional))),
+        "userref": str(
+            _userref_for_strategy(strategy)
+            if strategy is not None
+            else _userref(ui, side, float(notional))
+        ),
     }
     res = _priv("AddOrder", payload)
 
