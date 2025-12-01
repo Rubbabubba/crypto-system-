@@ -1024,8 +1024,6 @@ def journal_counts():
     conn.close()
     return {"ok": True, "total": total, "labeled": labeled, "unlabeled": unlabeled, "per_strategy": per_strategy}
 
-
-
 @app.get("/price/{base}/{quote}")
 def price_endpoint(base: str, quote: str):
     data = price_ticker(base, quote)
@@ -1060,7 +1058,6 @@ def debug_kraken():
     else:
         out["private"] = {"ok": False, "error": "no_creds_in_env"}
     return out
-
 
 @app.get("/debug/db")
 def debug_db():
@@ -2753,19 +2750,69 @@ def _load_open_positions_from_trades(use_strategy_col: bool = False) -> Dict[Tup
     finally:
         con.close()
 
-def _position_for(positions, symbol, strategy):
-    """
-    Look up an open position for (symbol, strategy).
-
-    We intentionally do NOT fall back to 'misc' anymore.
-    'misc' is reserved for manual / legacy trades that the bot
-    didn't create itself, and the scheduler should treat those
-    as external / opaque positions.
-    """
-    if not positions:
-        return None
-    key = (symbol, strategy or "misc")
+def _position_for(sym, strat, positions):
+    positions = _normalize_positions(positions)
+    key = f"{sym}|{strat}"
     return positions.get(key)
+    
+import json
+
+def _normalize_positions(positions):
+    """
+    Ensure positions is a dict mapping 'SYMBOL|STRAT' -> position dict.
+    Accepts dict, JSON string, list, or None and normalizes.
+    """
+    if isinstance(positions, dict):
+        return positions
+
+    if positions is None:
+        return {}
+
+    # If it's JSON text
+    if isinstance(positions, str):
+        positions = positions.strip()
+        if not positions:
+            return {}
+        try:
+            loaded = json.loads(positions)
+        except Exception:
+            return {}  # bad JSON; treat as no positions
+
+        # If the JSON is already a mapping
+        if isinstance(loaded, dict):
+            return loaded
+
+        # If it's a list of position objects, build a mapping
+        if isinstance(loaded, list):
+            mapping = {}
+            for p in loaded:
+                try:
+                    sym = p.get("symbol")
+                    strat = p.get("strategy") or p.get("strategy_id")
+                    if sym and strat:
+                        key = f"{sym}|{strat}"
+                        mapping[key] = p
+                except Exception:
+                    continue
+            return mapping
+
+        return {}
+
+    # If it’s some other weird type, just fail-safe
+    if isinstance(positions, list):
+        mapping = {}
+        for p in positions:
+            try:
+                sym = p.get("symbol")
+                strat = p.get("strategy") or p.get("strategy_id")
+                if sym and strat:
+                    key = f"{sym}|{strat}"
+                    mapping[key] = p
+            except Exception:
+                continue
+        return mapping
+
+    return {}
 
 @app.get("/pnl/by_strategy")
 def pnl_by_strategy(start: Optional[str] = None, end: Optional[str] = None,
