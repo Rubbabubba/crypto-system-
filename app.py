@@ -2933,7 +2933,7 @@ def scheduler_run_v2(payload: Dict[str, Any] = Body(default=None)):
                 symbol=intent.symbol,
                 side=side,
                 notional=final_notional,
-                strategy	intent.strategy,
+                strategy=intent.strategy,
             )
             action_record["status"] = "sent"
             action_record["response"] = resp
