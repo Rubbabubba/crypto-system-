@@ -1759,6 +1759,65 @@ def debug_global_policy():
         }
     except Exception as e:
         return {"ok": False, "error": str(e)}
+    
+
+@app.get("/debug/positions")
+def debug_positions():
+    """
+    Show current open positions as seen by the system, including:
+
+    - qty / avg_price from trades table
+    - last_price (via _last_price_safe)
+    - unrealized_pct (via RiskEngine.compute_unrealized_pct)
+    - per-symbol caps from risk.json (max_notional / max_units)
+
+    This is the single source of truth for exposures + unrealized P&L.
+    """
+    positions = _load_open_positions_from_trades(use_strategy_col=True)
+    risk_cfg = load_risk_config() or {}
+    risk_engine = RiskEngine(risk_cfg)
+
+    out = []
+
+    for (symbol, strategy), pm_pos in positions.items():
+        snap = PositionSnapshot(
+            symbol=symbol,
+            strategy=strategy,
+            qty=float(getattr(pm_pos, "qty", 0.0) or 0.0),
+            avg_price=getattr(pm_pos, "avg_price", None),
+            unrealized_pct=None,
+        )
+
+        last_px = _last_price_safe(symbol)
+        try:
+            unrealized_pct = risk_engine.compute_unrealized_pct(
+                snap,
+                last_price_fn=_last_price_safe,
+            )
+        except Exception:
+            unrealized_pct = None
+
+        snap.unrealized_pct = unrealized_pct
+
+        # symbol caps (already time-of-day adjusted)
+        max_notional, max_units = risk_engine.symbol_caps(symbol)
+
+        out.append(
+            {
+                "symbol": symbol,
+                "strategy": strategy,
+                "qty": snap.qty,
+                "avg_price": snap.avg_price,
+                "last_price": last_px,
+                "unrealized_pct": unrealized_pct,
+                "max_notional_cap": max_notional,
+                "max_units_cap": max_units,
+            }
+        )
+
+    return {
+        "positions": out,
+    }
         
 # --------------------------------------------------------------------------------------
 # Scheduler globals
@@ -2772,13 +2831,24 @@ def scheduler_run_v2(payload: Dict[str, Any] = Body(default=None)):
     for intent in final_intents:
         key = (intent.symbol, intent.strategy)
         pm_pos = positions.get(key)
+
         snap = PositionSnapshot(
-            symbol=intent.symbol,
+            symbol=intent.symbol,   
             strategy=intent.strategy,
             qty=float(getattr(pm_pos, "qty", 0.0) or 0.0),
             avg_price=getattr(pm_pos, "avg_price", None),
-            unrealized_pct=None,  # already populated inside scheduler_core when needed
+            unrealized_pct=None,
         )
+
+        # Fill unrealized_pct here so loss-zone + any extra logic
+        # see the exact same P&L % that scheduler_core used.
+        try:
+            snap.unrealized_pct = risk_engine.compute_unrealized_pct(
+                snap,
+                last_price_fn=_last_price_safe,
+            )
+        except Exception:
+            snap.unrealized_pct = None
 
         guard_allowed = True
         guard_reason = "ok"
