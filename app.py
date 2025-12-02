@@ -77,6 +77,9 @@ from symbol_map import KRAKEN_PAIR_MAP, to_kraken
 from position_engine import PositionEngine, Fill
 import broker_kraken
 from position_manager import load_net_positions, Position
+from scheduler_core import SchedulerConfig, run_scheduler_once
+from risk_engine import RiskEngine
+from strategy_api import PositionSnapshot
 
 
 # Routes:
@@ -1844,21 +1847,34 @@ def _scheduler_loop():
                     "notional": float(os.getenv("SCHED_NOTIONAL", os.getenv("DEFAULT_NOTIONAL", "25") or "25")),
                     "dry_run": str(os.getenv("SCHED_DRY", "0")).lower() in ("1", "true", "yes"),
                 }
+
+                # v2 payload: map dry_run -> dry
+                payload_v2 = {
+                    "tf": payload["tf"],
+                    "strats": payload["strats"],
+                    "symbols": payload["symbols"],
+                    "limit": payload["limit"],
+                    "notional": payload["notional"],
+                    "dry": payload["dry_run"],
+                }
+
                 try:
+                    # Keep /debug/scheduler status intact
                     with _SCHED_LAST_LOCK:
                         _SCHED_LAST.clear()
                         _SCHED_LAST.update(payload | {"ts": dt.datetime.utcnow().isoformat() + "Z"})
                 except Exception as e:
                     log.warning("could not set _SCHED_LAST (loop): %s", e)
 
-                _ = scheduler_run(payload)
+                # >>> new brain <<<
+                _ = scheduler_run_v2(payload_v2)
+
                 tick += 1
                 _SCHED_TICKS = tick
-                log.info("scheduler tick #%s ok", tick)
+                log.info("scheduler v2 tick #%s ok", tick)
         except Exception as e:
             log.exception("scheduler loop error: %s", e)
         time.sleep(_SCHED_SLEEP)
-
 
 # --------------------------------------------------------------------------------------
 # Startup hook (ensure DB + scheduler thread)
@@ -2520,6 +2536,569 @@ def scheduler_run(payload: Dict[str, Any] = Body(default=None)):
             "actions": actions,
             "telemetry": telemetry,
         }
+        
+# --------------------------------------------------------------------------------------
+# Scheduler v2: uses scheduler_core + risk_engine + br_router
+# --------------------------------------------------------------------------------------
+
+from fastapi import Body  # already imported near top, just here for context
+from typing import Dict, Any, List
+
+from strategy_api import PositionSnapshot
+from scheduler_core import SchedulerConfig, SchedulerResult, run_scheduler_once
+from risk_engine import RiskEngine
+
+
+@app.post("/scheduler/v2/run")
+def scheduler_run_v2(payload: Dict[str, Any] = Body(default=None)):
+    """
+    Scheduler v2:
+
+    - Uses scheduler_core + RiskEngine to produce explicit OrderIntents
+      (entries + exits + per-strategy + global exits).
+    - Applies per-symbol caps + loss-zone no-rebuy for ENTRY/SCALE intents.
+    - Routes surviving intents through br_router.market_notional when dry=False.
+
+    This does NOT remove the legacy /scheduler/run endpoint. Use this side-by-side
+    for testing until you're happy to flip over.
+    """
+    actions: List[Dict[str, Any]] = []
+    telemetry: List[Dict[str, Any]] = []
+
+    payload = payload or {}
+
+    # ------------------------------------------------------------------
+    # Helper: env bool
+    # ------------------------------------------------------------------
+    def _env_bool(key: str, default: bool) -> bool:
+        v = os.getenv(key)
+        if v is None:
+            return default
+        return str(v).lower() in ("1", "true", "yes", "on")
+
+    # Dry-run flag: payload.dry overrides SCHED_DRY (default True)
+    dry = payload.get("dry", None)
+    if dry is None:
+        dry = _env_bool("SCHED_DRY", True)
+    dry = bool(dry)
+
+    # ------------------------------------------------------------------
+    # Resolve basic scheduler config from payload + env
+    # ------------------------------------------------------------------
+    tf = str(payload.get("tf", os.getenv("SCHED_TIMEFRAME", "5Min")))
+    strats_csv = str(payload.get("strats", os.getenv("SCHED_STRATS", "c1,c2,c3,c4,c5,c6")))
+    strats = [s.strip().lower() for s in strats_csv.split(",") if s.strip()]
+
+    symbols_csv = str(payload.get("symbols", os.getenv("SYMBOLS", "BTC/USD,ETH/USD")))
+    syms = [s.strip().upper() for s in symbols_csv.split(",") if s.strip()]
+
+    limit = int(payload.get("limit", int(os.getenv("SCHED_LIMIT", "300") or 300)))
+    notional = float(payload.get("notional", float(os.getenv("SCHED_NOTIONAL", "25") or 25.0)))
+
+    log.info(
+        "Scheduler v2: strats=%s tf=%s limit=%s notional=%s dry=%s symbols=%s",
+        ",".join(strats),
+        tf,
+        limit,
+        notional,
+        dry,
+        symbols_csv,
+    )
+
+    # ------------------------------------------------------------------
+    # Imports that can fail without killing the API entirely
+    # ------------------------------------------------------------------
+    try:
+        import br_router as br  # type: ignore[import]
+    except Exception as e:
+        log.error("scheduler_v2: failed to import br_router: %s", e)
+        if not dry:
+            return {"ok": False, "error": f"failed to import br_router: {e}"}
+        br = None  # dry mode can still show intents
+
+    try:
+        from policy.guard import guard_allows  # type: ignore[import]
+    except Exception:
+        guard_allows = None  # optional; strategies already use guard internally
+
+    # ------------------------------------------------------------------
+    # Load positions & risk config
+    # ------------------------------------------------------------------
+    positions = _load_open_positions_from_trades(use_strategy_col=True)
+    risk_cfg = load_risk_config() or {}
+    risk_engine = RiskEngine(risk_cfg)
+
+    # ------------------------------------------------------------------
+    # Preload bar contexts once (similar to legacy scheduler_run)
+    # ------------------------------------------------------------------
+    contexts: Dict[str, Any] = {}
+
+    def _safe_series(bars, key: str):
+        vals = []
+        if isinstance(bars, list):
+            for row in bars:
+                if isinstance(row, dict) and key in row:
+                    vals.append(row[key])
+        return vals
+
+    for sym in syms:
+        try:
+            # For now, hard-code 1m + tf (e.g. 5Min) like your existing path
+            one = br.get_bars(sym, timeframe="1Min", limit=limit) if br is not None else []
+            five = br.get_bars(sym, timeframe=tf, limit=limit) if br is not None else []
+
+            if not one or not five:
+                contexts[sym] = None
+                telemetry.append(
+                    {
+                        "symbol": sym,
+                        "stage": "preload_bars",
+                        "ok": False,
+                        "reason": "no_bars",
+                    }
+                )
+                continue
+
+            contexts[sym] = {
+                "one": {
+                    "open": _safe_series(one, "open"),
+                    "high": _safe_series(one, "high"),
+                    "low": _safe_series(one, "low"),
+                    "close": _safe_series(one, "close"),
+                    "volume": _safe_series(one, "volume"),
+                    "ts": _safe_series(one, "ts"),
+                },
+                "five": {
+                    "open": _safe_series(five, "open"),
+                    "high": _safe_series(five, "high"),
+                    "low": _safe_series(five, "low"),
+                    "close": _safe_series(five, "close"),
+                    "volume": _safe_series(five, "volume"),
+                    "ts": _safe_series(five, "ts"),
+                },
+            }
+        except Exception as e:
+            contexts[sym] = None
+            telemetry.append(
+                {
+                    "symbol": sym,
+                    "stage": "preload_bars",
+                    "ok": False,
+                    "error": f"{e.__class__.__name__}: {e}",
+                }
+            )
+
+    # ------------------------------------------------------------------
+    # Run scheduler_core (strategies + per-strat + global exits)
+    # ------------------------------------------------------------------
+    now = dt.datetime.utcnow()
+    cfg = SchedulerConfig(
+        now=now,
+        timeframe=tf,
+        limit=limit,
+        symbols=syms,
+        strats=strats,
+        notional=notional,
+        positions=positions,
+        contexts=contexts,
+        risk_cfg=risk_cfg,
+    )
+
+    result: SchedulerResult = run_scheduler_once(cfg, last_price_fn=_last_price_safe)
+
+    telemetry.extend(result.telemetry)
+
+    # ------------------------------------------------------------------
+    # Deduplicate intents: exits take precedence over entries on same (sym,strat)
+    # ------------------------------------------------------------------
+    exit_kinds = {"exit", "take_profit", "stop_loss"}
+    entry_kinds = {"entry", "scale"}
+
+    # Priority for exits: stop_loss > take_profit > exit
+    def _exit_priority(kind: str) -> int:
+        if kind == "stop_loss":
+            return 3
+        if kind == "take_profit":
+            return 2
+        return 1  # generic exit
+
+    best_exit: Dict[tuple, Any] = {}
+    entries: List[Any] = []
+
+    for intent in result.intents:
+        key = (intent.symbol, intent.strategy)
+
+        if intent.kind in exit_kinds:
+            prev = best_exit.get(key)
+            if prev is None or _exit_priority(intent.kind) > _exit_priority(prev.kind):
+                best_exit[key] = intent
+        elif intent.kind in entry_kinds:
+            entries.append(intent)
+        else:
+            # unknown kind: just pass through as a generic action
+            entries.append(intent)
+
+    # Keep entries only if there is *no* exit for that (symbol,strategy)
+    final_intents: List[Any] = list(best_exit.values())
+    for intent in entries:
+        key = (intent.symbol, intent.strategy)
+        if key in best_exit:
+            telemetry.append(
+                {
+                    "symbol": intent.symbol,
+                    "strategy": intent.strategy,
+                    "kind": intent.kind,
+                    "side": intent.side,
+                    "reason": "dropped_entry_due_to_exit_same_pass",
+                    "source": "scheduler_v2",
+                }
+            )
+            continue
+        final_intents.append(intent)
+
+    # ------------------------------------------------------------------
+    # Apply guard + per-symbol caps + loss-zone no-rebuy; then route
+    # ------------------------------------------------------------------
+    for intent in final_intents:
+        key = (intent.symbol, intent.strategy)
+        pm_pos = positions.get(key)
+        snap = PositionSnapshot(
+            symbol=intent.symbol,
+            strategy=intent.strategy,
+            qty=float(getattr(pm_pos, "qty", 0.0) or 0.0),
+            avg_price=getattr(pm_pos, "avg_price", None),
+            unrealized_pct=None,  # already used by scheduler_core where needed
+        )
+
+        # Guard (optional; strategies already call guard_allows internally)
+        guard_allowed = True
+        guard_reason = "ok"
+        if guard_allows is not None and intent.kind in entry_kinds:
+            try:
+                guard_allowed, guard_reason = guard_allows(intent.strategy, intent.symbol, now=now)
+            except Exception as e:
+                guard_allowed = False
+                guard_reason = f"guard_exception:{e}"
+
+        if not guard_allowed:
+            telemetry.append(
+                {
+                    "symbol": intent.symbol,
+                    "strategy": intent.strategy,
+                    "kind": intent.kind,
+                    "side": intent.side,
+                    "reason": guard_reason,
+                    "source": "guard_allows",
+                }
+            )
+            continue
+
+        # Decide final notional to send
+        final_notional: float = 0.0
+        side = intent.side
+
+        if intent.kind in entry_kinds:
+            if intent.notional is None or intent.notional <= 0:
+                telemetry.append(
+                    {
+                        "symbol": intent.symbol,
+                        "strategy": intent.strategy,
+                        "kind": intent.kind,
+                        "side": intent.side,
+                        "reason": "entry_without_notional",
+                        "source": "scheduler_v2",
+                    }
+                )
+                continue
+
+            # Enforce per-symbol caps
+            allowed_cap, adjusted_notional, cap_reason = risk_engine.enforce_symbol_cap(
+                symbol=intent.symbol,
+                strat=intent.strategy,
+                pos=snap,
+                notional_value=float(intent.notional),
+                last_price_fn=_last_price_safe,
+                now=now,
+            )
+            if not allowed_cap or adjusted_notional <= 0.0:
+                telemetry.append(
+                    {
+                        "symbol": intent.symbol,
+                        "strategy": intent.strategy,
+                        "kind": intent.kind,
+                        "side": intent.side,
+                        "reason": cap_reason or "blocked_by_symbol_cap",
+                        "source": "risk_engine.enforce_symbol_cap",
+                    }
+                )
+                continue
+
+            final_notional = float(adjusted_notional)
+
+            # Loss-zone no-rebuy below threshold
+            # (use unrealized_pct from scheduler_core if present on snap)
+            # NOTE: scheduler_core currently doesn't override snap.unrealized_pct
+            # in this path, but we leave this here for future wiring.
+            if risk_engine.is_loss_zone_norebuy_block(
+                unrealized_pct=snap.unrealized_pct,
+                is_entry_side=True,
+            ):
+                telemetry.append(
+                    {
+                        "symbol": intent.symbol,
+                        "strategy": intent.strategy,
+                        "kind": intent.kind,
+                        "side": intent.side,
+                        "reason": "loss_zone_no_rebuy_below",
+                        "source": "risk_engine.is_loss_zone_norebuy_block",
+                    }
+                )
+                continue
+
+        else:
+            # EXIT / TAKE_PROFIT / STOP_LOSS: compute notional from position if missing
+            qty_here = float(getattr(pm_pos, "qty", 0.0) or 0.0)
+            if abs(qty_here) < 1e-10:
+                telemetry.append(
+                    {
+                        "symbol": intent.symbol,
+                        "strategy": intent.strategy,
+                        "kind": intent.kind,
+                        "side": intent.side,
+                        "reason": "no_position_to_exit",
+                        "source": "scheduler_v2",
+                    }
+                )
+                continue
+
+            px = _last_price_safe(intent.symbol)
+            if px <= 0.0:
+                telemetry.append(
+                    {
+                        "symbol": intent.symbol,
+                        "strategy": intent.strategy,
+                        "kind": intent.kind,
+                        "side": intent.side,
+                        "reason": "no_price_for_exit",
+                        "source": "scheduler_v2",
+                    }
+                )
+                continue
+
+            if intent.notional is not None and intent.notional > 0:
+                final_notional = float(intent.notional)
+            else:
+                final_notional = abs(qty_here) * px  # flatten full position
+
+        # If we reached here, we have a valid final_notional
+        if final_notional <= 0:
+            telemetry.append(
+                {
+                    "symbol": intent.symbol,
+                    "strategy": intent.strategy,
+                    "kind": intent.kind,
+                    "side": intent.side,
+                    "reason": "non_positive_final_notional",
+                    "source": "scheduler_v2",
+                }
+            )
+            continue
+
+        action_record: Dict[str, Any] = {
+            "symbol": intent.symbol,
+            "strategy": intent.strategy,
+            "side": side,
+            "kind": intent.kind,
+            "notional": final_notional,
+            "reason": intent.reason,
+            "dry": bool(dry),
+        }
+
+        if dry or br is None:
+            action_record["status"] = "skipped_dry_run"
+            actions.append(action_record)
+            continue
+
+        # ------------------------------------------------------------------
+        # Send to broker via br_router.market_notional
+        # ------------------------------------------------------------------
+        try:
+            resp = br.market_notional(
+                symbol=intent.symbol,
+                side=side,
+                notional=final_notional,
+                strategy=intent.strategy,
+            )
+            action_record["status"] = "sent"
+            action_record["response"] = resp
+        except Exception as e:
+            action_record["status"] = "error"
+            action_record["error"] = f"{e.__class__.__name__}: {e}"
+
+        actions.append(action_record)
+
+    return {
+        "ok": True,
+        "dry": bool(dry),
+        "actions": actions,
+        "telemetry": telemetry,
+    }
+
+
+# ---- New core debug endpoint) ------------------------------------------------------------        
+        
+@app.post("/scheduler/core_debug")
+def scheduler_core_debug(payload: Dict[str, Any] = Body(default=None)):
+    """
+    Runs the new scheduler_core once and returns the raw OrderIntents,
+    WITHOUT sending any orders to the broker. Safe for inspection.
+    """
+    # Reuse the same config parsing you already do in scheduler_run:
+    # - resolve timeframe, symbols, strats, limit, notional, dry from
+    #   env + payload
+    # - load positions via _load_open_positions_from_trades(use_strategy_col=True)
+    # - load risk_cfg via load_risk_config()
+    # - preload contexts dict exactly like scheduler_run does
+
+    # Pseudocode sketch (you’ll adapt from your existing scheduler_run):
+    now = dt.datetime.utcnow()
+    positions = _load_open_positions_from_trades(use_strategy_col=True)
+    risk_cfg = load_risk_config() or {}
+    contexts = { ... }  # the same structure you currently pass to StrategyBook
+
+    cfg = SchedulerConfig(
+        now=now,
+        timeframe=tf,
+        limit=limit,
+        symbols=symbols,
+        strats=strats,
+        notional=notional,
+        positions=positions,
+        contexts=contexts,
+        risk_cfg=risk_cfg,
+    )
+
+    result = run_scheduler_once(cfg)
+
+    # Convert OrderIntents to plain dicts for JSON
+    intents_as_dicts = [
+        {
+            "strategy": i.strategy,
+            "symbol": i.symbol,
+            "side": i.side,
+            "kind": i.kind,
+            "notional": i.notional,
+            "reason": i.reason,
+            "meta": i.meta,
+        }
+        for i in result.intents
+    ]
+
+    return {
+        "intents": intents_as_dicts,
+        "telemetry": result.telemetry,
+    }
+    
+@app.post("/scheduler/core_debug_risk")
+def scheduler_core_debug_risk(payload: Dict[str, Any] = Body(default=None)):
+    """
+    Debug-only: run scheduler_core + RiskEngine, but DO NOT send orders.
+
+    This lets us see per-strategy OrderIntents and which ones risk caps
+    or global exits would flatten or block.
+    """
+    payload = payload or {}
+
+    # 1) Reuse existing helpers in scheduler_run to resolve tf, strats, symbols, etc.
+    tf = str(payload.get("tf", os.getenv("SCHED_TIMEFRAME", "5Min")))
+    strats_csv = str(payload.get("strats", os.getenv("SCHED_STRATS", "c1")))
+    strats = [s.strip().lower() for s in strats_csv.split(",") if s.strip()]
+    notional = float(payload.get("notional", os.getenv("SCHED_NOTIONAL", "40")) or 40.0)
+    limit = int(payload.get("limit", os.getenv("SCHED_LIMIT", "300")) or 300)
+
+    # Same symbols logic you already use in scheduler_run
+    symbols_csv = payload.get("symbols", os.getenv("SYMBOLS", "BTC/USD,ETH/USD"))
+    if isinstance(symbols_csv, str):
+        symbols = [s.strip().upper() for s in symbols_csv.split(",") if s.strip()]
+    else:
+        symbols = [str(s).strip().upper() for s in symbols_csv or []]
+
+    # 2) Load positions & risk_cfg exactly as scheduler_run does
+    positions = _load_open_positions_from_trades(use_strategy_col=True)
+    risk_cfg = load_risk_config() or {}
+
+    # 3) Build contexts exactly like scheduler_run (reuse your existing code)
+    contexts = _preload_contexts(tf=tf, symbols=symbols, limit=limit)
+    # ^ if you don't have _preload_contexts yet, this is the same bar-loading
+    #   logic that's currently inside scheduler_run before StrategyBook.scan.
+
+    now = dt.datetime.utcnow()
+    cfg = SchedulerConfig(
+        now=now,
+        timeframe=tf,
+        limit=limit,
+        symbols=symbols,
+        strats=strats,
+        notional=notional,
+        positions=positions,
+        contexts=contexts,
+        risk_cfg=risk_cfg,
+    )
+
+    # 4) Run pure strategy logic
+    sched_result = run_scheduler_once(cfg)
+
+    # 5) Apply RiskEngine to see what would be flattened/blocked
+    re_engine = RiskEngine(risk_cfg)
+    intents_after_risk: List[Dict[str, Any]] = []
+    for intent in sched_result.intents:
+        key = (intent.symbol, intent.strategy)
+        pm_pos = positions.get(key)
+        snap = PositionSnapshot(
+            symbol=intent.symbol,
+            strategy=intent.strategy,
+            qty=float(getattr(pm_pos, "qty", 0.0) or 0.0),
+            avg_price=getattr(pm_pos, "avg_price", None),
+            unrealized_pct=None,  # optional: compute via RiskEngine later
+        )
+
+        # example: check symbol caps for ENTRY / SCALE
+        cap_reason = None
+        allowed = True
+        adjusted_notional = intent.notional
+        if intent.kind in ("entry", "scale") and intent.notional is not None:
+            def _last_price(sym: str) -> float:
+                return float(_last_price_safe(sym) or 0.0)
+
+            allowed, adjusted_notional, cap_reason = re_engine.enforce_symbol_cap(
+                symbol=intent.symbol,
+                strat=intent.strategy,
+                pos=snap,
+                notional_value=float(intent.notional),
+                last_price_fn=_last_price,
+                now=now,
+            )
+
+        intents_after_risk.append(
+            {
+                "strategy": intent.strategy,
+                "symbol": intent.symbol,
+                "side": intent.side,
+                "kind": intent.kind,
+                "original_notional": intent.notional,
+                "adjusted_notional": adjusted_notional,
+                "cap_allowed": allowed,
+                "cap_reason": cap_reason,
+                "reason": intent.reason,
+                "meta": intent.meta,
+            }
+        )
+
+    return {
+        "intents": intents_after_risk,
+        "telemetry": sched_result.telemetry,
+        "risk_raw": risk_cfg,
+    }
 
 # ---- Scan all (no orders) ------------------------------------------------------------
 @app.get("/scan/all")

@@ -1,75 +1,194 @@
 from __future__ import annotations
+
 import logging
+import os
+from typing import Optional
+
+from book import ScanResult
+from strategy_api import OrderIntent, PositionSnapshot, RiskContext
+
 logger = logging.getLogger(__name__)
-
-try:
-    from policy.guard import guard_allows, note_trade_event
-except Exception as e:
-    logger.debug("[policy] guard import skipped: %s", e)
-    def guard_allows(*args, **kwargs): return (True, "ok")
-    def note_trade_event(*args, **kwargs): pass
-
-import pandas as pd
-import broker_kraken as br
-from book import StrategyBook, ScanRequest
 
 STRAT_ID = "c5"
 
-def _df(rows):
-    if not rows:
-        return None
-    df = pd.DataFrame(rows)
-    return df.rename(columns={"t":"time","o":"open","h":"high","l":"low","c":"close","v":"volume"})
 
-def _norm_tf(tf: str) -> str:
-    s = str(tf or "").strip().replace("Minute","Min")
-    if s.lower().endswith("min"):
-        try:
-            n = int(s[:-3])
-            return f"{n}m"
-        except Exception:
-            pass
-    table = {"1min":"1m","1m":"1m","5min":"5m","5m":"5m","15min":"15m","15m":"15m","30min":"30m","30m":"30m","1h":"1h","4h":"4h","1d":"1d"}
-    return table.get(s.lower(), s.lower())
+def _is_flat(pos: Optional[PositionSnapshot]) -> bool:
+    return (pos is None) or (abs(pos.qty) < 1e-10)
 
-def _ctx_for(sym: str, tf: str, limit: int):
+
+def _is_long(pos: Optional[PositionSnapshot]) -> bool:
+    return (pos is not None) and (pos.qty > 1e-10)
+
+
+def _is_short(pos: Optional[PositionSnapshot]) -> bool:
+    return (pos is not None) and (pos.qty < -1e-10)
+
+
+def _env_float(key: str, default: float) -> float:
     try:
-        tf_norm = _norm_tf(tf) or "5m"
-        one = br.get_bars(sym, timeframe="1m", limit=max(300, limit*5))
-        five = br.get_bars(sym, timeframe=tf_norm,      limit=limit)
-        d1 = _df(one); d5 = _df(five)
-        if d1 is None or d5 is None:
+        v = os.getenv(key)
+        return float(v) if v is not None else default
+    except Exception:
+        return default
+
+
+def _normalize_unrealized_pct(pct: Optional[float]) -> Optional[float]:
+    if pct is None:
+        return None
+    if abs(pct) > 1.0:
+        return pct / 100.0
+    return pct
+
+
+class C5Strategy:
+    """
+    C5 — Alt momentum.
+
+    Entry:
+      - Uses sig_c5_alt_mom via StrategyBook (we just see ScanResult).
+
+    Exit:
+      - LONG: exit when signal != "buy".
+      - SHORT: exit when signal != "sell".
+      - Similar to c3 but intended for shorter holding periods.
+
+    TP / SL:
+      - Tighter thresholds:
+        * C5_TAKE_PROFIT_PCT default 1.5  (≈ +1.5%)
+        * C5_STOP_LOSS_PCT   default -2.0 (≈ -2%)
+    """
+
+    STRAT_ID = STRAT_ID
+
+    def entry_signal(
+        self,
+        scan: ScanResult,
+        position: PositionSnapshot,
+        risk: Optional[RiskContext] = None,
+    ) -> Optional[OrderIntent]:
+        if not _is_flat(position):
             return None
-        return {"one": d1.to_dict(orient="list"), "five": d5.to_dict(orient="list")}
-    except Exception as e:
-        logger.warning("[%s] failed to build context for %s: %s", STRAT_ID, sym, e)
-        return None
+        if not getattr(scan, "selected", False):
+            return None
+        if scan.action not in ("buy", "sell"):
+            return None
+        if float(getattr(scan, "notional", 0.0) or 0.0) <= 0.0:
+            return None
 
-def scan(req: dict, ctx: dict):
-    try:
-        tf      = str(req.get("timeframe") or ctx.get("timeframe") or "5Min")
-        limit   = int(req.get("limit") or ctx.get("limit") or 300)
-        syms    = [s.upper() for s in (req.get("symbols") or ctx.get("symbols") or [])]
-        notional= float(req.get("notional") or ctx.get("notional") or 25.0)
+        notional = float(scan.notional or 0.0)
 
-        book = StrategyBook(topk=2, min_score=0.10, risk_target_usd=notional, atr_stop_mult=1.0)
-        sreq = ScanRequest(strat=STRAT_ID, timeframe=_norm_tf(tf), limit=limit, topk=2, min_score=0.10, notional=notional)
+        return OrderIntent(
+            strategy=self.STRAT_ID,
+            symbol=scan.symbol,
+            side=scan.action,
+            kind="entry",
+            notional=notional,
+            reason=scan.reason or "c5_entry_alt_mom",
+            meta={
+                "score": float(getattr(scan, "score", 0.0) or 0.0),
+                "atr_pct": float(getattr(scan, "atr_pct", 0.0) or 0.0),
+            },
+        )
 
-        contexts = { sym: _ctx_for(sym, tf, limit) for sym in syms }
+    def exit_signal(
+        self,
+        scan: ScanResult,
+        position: PositionSnapshot,
+        risk: Optional[RiskContext] = None,
+    ) -> Optional[OrderIntent]:
+        if _is_flat(position):
+            return None
+        if scan.symbol != position.symbol:
+            return None
 
-        results = book.scan(sreq, contexts) or []
-        intents = []
-        for r in results:
-            if not getattr(r, "selected", False) or getattr(r, "action", None) not in ("buy","sell") or float(getattr(r, "notional", 0) or 0) <= 0:
-                continue
-            expected_move_pct = float(getattr(r, "atr_pct", 0.0) or 0.0)
-            ok, reason = guard_allows(strategy=STRAT_ID, symbol=r.symbol,
-                                      expected_move_pct=expected_move_pct, atr_pct=float(getattr(r, "atr_pct", 0.0) or 0.0))
-            if not ok:
-                logger.info("[guard] %s blocked %s: %s", STRAT_ID, r.symbol, reason)
-                continue
-            intents.append({"symbol": r.symbol, "side": ("buy" if r.action == "buy" else "sell"), "notional": min(notional, float(r.notional or notional))})
-        return intents
-    except Exception as e:
-        logger.exception("[%s] scan() error: %s", STRAT_ID, e)
-        return []
+        if _is_long(position) and scan.action != "buy":
+            side = "sell"
+        elif _is_short(position) and scan.action != "sell":
+            side = "buy"
+        else:
+            return None
+
+        return OrderIntent(
+            strategy=self.STRAT_ID,
+            symbol=scan.symbol,
+            side=side,
+            kind="exit",
+            notional=None,
+            reason="c5_exit_momentum_fade_or_reverse",
+            meta={"raw_action": scan.action},
+        )
+
+    def profit_take_rule(
+        self,
+        position: PositionSnapshot,
+        risk: Optional[RiskContext] = None,
+    ) -> Optional[OrderIntent]:
+        if _is_flat(position):
+            return None
+        upnl = _normalize_unrealized_pct(position.unrealized_pct)
+        if upnl is None:
+            return None
+
+        tp_pct = _env_float("C5_TAKE_PROFIT_PCT", 1.5) / 100.0
+        if upnl < tp_pct:
+            return None
+
+        if _is_long(position):
+            side = "sell"
+        elif _is_short(position):
+            side = "buy"
+        else:
+            return None
+
+        return OrderIntent(
+            strategy=self.STRAT_ID,
+            symbol=position.symbol,
+            side=side,
+            kind="take_profit",
+            notional=None,
+            reason=f"c5_take_profit_{tp_pct*100:.2f}pct",
+            meta={"unrealized_pct": upnl},
+        )
+
+    def stop_loss_rule(
+        self,
+        position: PositionSnapshot,
+        risk: Optional[RiskContext] = None,
+    ) -> Optional[OrderIntent]:
+        if _is_flat(position):
+            return None
+        upnl = _normalize_unrealized_pct(position.unrealized_pct)
+        if upnl is None:
+            return None
+
+        sl_pct = _env_float("C5_STOP_LOSS_PCT", -2.0) / 100.0
+        if upnl > sl_pct:
+            return None
+
+        if _is_long(position):
+            side = "sell"
+        elif _is_short(position):
+            side = "buy"
+        else:
+            return None
+
+        return OrderIntent(
+            strategy=self.STRAT_ID,
+            symbol=position.symbol,
+            side=side,
+            kind="stop_loss",
+            notional=None,
+            reason=f"c5_stop_loss_{sl_pct*100:.2f}pct",
+            meta={"unrealized_pct": upnl},
+        )
+
+    def should_scale(
+        self,
+        scan: ScanResult,
+        position: PositionSnapshot,
+        risk: Optional[RiskContext] = None,
+    ) -> bool:
+        return False
+
+
+c5 = C5Strategy()
