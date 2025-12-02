@@ -12,8 +12,8 @@ import sqlite3
 class Position:
     symbol: str
     strategy: str
-    qty: float      # net signed quantity (>0 long, <0 short)
-    avg_price: float | None = None  # optional; we mainly need qty
+    qty: float
+    avg_price: Optional[float] = None
 
 
 @dataclass
@@ -29,89 +29,103 @@ class OrderIntent:
 
 
 def load_net_positions(
-    conn: sqlite3.Connection,
+    con,
     table: str = "trades",
     use_strategy_col: bool = False,
 ) -> Dict[Tuple[str, str], Position]:
     """
-    Build net positions by (symbol, strategy) or just (symbol, 'misc') if strategy col not used.
+    Build net positions from the trades table.
 
-    Assumes table has columns:
-      - symbol (text)
-      - side   ('buy' / 'sell')
-      - volume (real)
-      - price  (real)
-      - strategy (optional)
+    - Long-only spot model.
+    - avg_price is a simple volume-weighted average of all *net* buys
+      remaining after sells.
+
+    We ignore 'cost' and compute everything from price * volume.
     """
-    # Detect columns dynamically
-    cols = [r[1] for r in conn.execute(f"PRAGMA table_info({table})")]
-    has_strategy = "strategy" in cols and use_strategy_col
+    cur = con.cursor()
 
-    if not all(c in cols for c in ("symbol", "side", "volume", "price")):
-        return {}
+    # We need at least: symbol, side, price, volume, ts
+    cols = ["symbol", "side", "price", "volume", "ts"]
+    if use_strategy_col:
+        cols.append("strategy")
 
-    if has_strategy:
-        sql = (
-            f"SELECT symbol, COALESCE(NULLIF(TRIM(strategy),''),'misc'), "
-            f"side, volume, price FROM {table} ORDER BY ts"
-        )
-    else:
-        sql = f"SELECT symbol, 'misc' as strategy, side, volume, price FROM {table} ORDER BY ts"
+    col_sql = ", ".join(cols)
+    cur.execute(
+        f"""
+        SELECT {col_sql}
+        FROM {table}
+        ORDER BY ts ASC
+        """
+    )
 
-    positions: Dict[Tuple[str, str], Position] = {}
-    cur = conn.execute(sql)
-    for symbol, strategy, side, volume, price in cur.fetchall():
-        if not symbol or not side:
-            continue
-        try:
-            qty = float(volume or 0.0)
-            px = float(price or 0.0)
-        except Exception:
-            continue
+    state: Dict[Tuple[str, str], Dict[str, float]] = {}
 
-        side = side.lower().strip()
-        signed = qty if side == "buy" else -qty
+    for row in cur.fetchall():
+        # unpack based on whether we have strategy or not
+        if use_strategy_col:
+            symbol, side, price, volume, ts, strategy = row
+            strategy = strategy or "misc"
+        else:
+            symbol, side, price, volume, ts = row
+            strategy = "misc"
 
         key = (symbol, strategy)
-        pos = positions.get(key)
-        if pos is None:
-            positions[key] = Position(
-                symbol=symbol,
-                strategy=strategy,
-                qty=signed,
-                avg_price=px if signed != 0 else None,
-            )
+        price = float(price or 0.0)
+        volume = float(volume or 0.0)
+
+        # skip zero volume
+        if abs(volume) < 1e-12:
             continue
 
-        # Update existing position
-        new_qty = pos.qty + signed
+        s = state.get(key) or {"qty": 0.0, "avg_price": 0.0}
+        qty = s["qty"]
+        avg_price = s["avg_price"]
 
-        # Update avg price only if position stays on same side
-        if pos.qty == 0 or (pos.qty > 0 and new_qty > 0) or (pos.qty < 0 and new_qty < 0):
-            # size-weighted average price
-            try:
-                total_notional_old = abs(pos.qty) * (pos.avg_price or 0.0)
-                total_notional_new = abs(signed) * px
-                if abs(new_qty) > 0:
-                    avg_px = (total_notional_old + total_notional_new) / abs(new_qty)
-                else:
-                    avg_px = None
-            except Exception:
-                avg_px = pos.avg_price
+        if side == "buy":
+            # add to long
+            new_qty = qty + volume
+            if new_qty <= 0:
+                # fully flipped or flat => reset avg_price
+                qty = new_qty
+                avg_price = 0.0
+            else:
+                new_cost = qty * avg_price + volume * price
+                qty = new_qty
+                avg_price = new_cost / qty
+        elif side == "sell":
+            # reduce long
+            new_qty = qty - volume
+            if new_qty <= 1e-10:
+                # position closed (or tiny dust) -> treat as flat
+                qty = 0.0
+                avg_price = 0.0
+            else:
+                # closing part of a long position:
+                # keep the same avg_price for remaining qty
+                qty = new_qty
         else:
-            # We crossed through flat (partial or full close); for simplicity: keep old avg_price
-            avg_px = pos.avg_price
+            # unknown side; ignore
+            continue
 
-        pos.qty = new_qty
-        pos.avg_price = avg_px
+        s["qty"] = qty
+        s["avg_price"] = avg_price
+        state[key] = s
 
-    # Filter out positions that are effectively flat
-    out: Dict[Tuple[str, str], Position] = {}
-    for key, pos in positions.items():
-        if abs(pos.qty) > 1e-10:
-            out[key] = pos
-    return out
+    # Build Position objects for non-zero qty (with dust cut off)
+    positions: Dict[Tuple[str, str], Position] = {}
+    for (symbol, strategy), s in state.items():
+        qty = s["qty"]
+        avg_price = s["avg_price"]
+        if abs(qty) <= 1e-8:
+            continue  # ignore dust
+        positions[(symbol, strategy)] = Position(
+            symbol=symbol,
+            strategy=strategy,
+            qty=qty,
+            avg_price=avg_price if avg_price > 0 else None,
+        )
 
+    return positions
 
 # ---------------------------------------------------------------------------
 # Unified Position Manager
