@@ -3399,11 +3399,23 @@ def _pnl__agg(group_fields: List[str], start: Optional[str], end: Optional[str],
 def _load_open_positions_from_trades(use_strategy_col: bool = False) -> Dict[Tuple[str, str], Position]:
     """
     Load net positions from the trades/journal table, using the same DB the PnL uses.
+    For positions, we treat the 'trades' table as the single source of truth
+    whenever it exists, because that's where TradesHistory imports write.
+
     Returns a dict keyed by (symbol, strategy).
     """
     con = _db()
     try:
-        table = _pnl__detect_table(con)
+        table = "trades"
+        try:
+            cur = con.execute("SELECT name FROM sqlite_master WHERE type='table'")
+            names = {r[0] for r in cur.fetchall()}
+            if "trades" not in names:
+                # Fall back to the generic detector if no 'trades' table
+                table = _pnl__detect_table(con)
+        except Exception:
+            table = _pnl__detect_table(con)
+
         return load_net_positions(con, table=table, use_strategy_col=use_strategy_col)
     finally:
         con.close()
