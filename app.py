@@ -1220,6 +1220,156 @@ def debug_kraken_trades2(since_hours: int = 200000, mode: str = "cursor", max_pa
 
     return out
 
+def _compute_realized_pnl(
+    con,
+    symbol: Optional[str] = None,
+    strategy: Optional[str] = None,
+    since_ts: Optional[int] = None,
+    until_ts: Optional[int] = None,
+) -> Dict[str, Any]:
+    """
+    Compute a very simple realized PnL summary from the trades table.
+
+    Assumes 'trades' has:
+      - symbol (TEXT)
+      - strategy (TEXT, may be NULL)
+      - side ('buy'/'sell')
+      - price (REAL)
+      - volume (REAL)
+      - fee (REAL)
+      - ts (INTEGER, unix seconds)
+
+    This uses a naive running-average method for entries and exits
+    (not strict FIFO) but is consistent and easy to reason about.
+    """
+    cur = con.cursor()
+    clauses = []
+    params: List[Any] = []
+
+    if symbol:
+        clauses.append("symbol = ?")
+        params.append(symbol)
+    if strategy:
+        clauses.append("strategy = ?")
+        params.append(strategy)
+    if since_ts is not None:
+        clauses.append("ts >= ?")
+        params.append(since_ts)
+    if until_ts is not None:
+        clauses.append("ts <= ?")
+        params.append(until_ts)
+
+    where_sql = ""
+    if clauses:
+        where_sql = "WHERE " + " AND ".join(clauses)
+
+    cur.execute(
+        f"""
+        SELECT symbol, strategy, side, price, volume, fee, ts
+        FROM trades
+        {where_sql}
+        ORDER BY ts ASC
+        """,
+        tuple(params),
+    )
+
+    # simple running-average model per (symbol,strategy)
+    state: Dict[Tuple[str, str], Dict[str, float]] = {}
+    realized_total = 0.0
+    fees_total = 0.0
+    trade_count = 0
+
+    for sym, strat, side, price, vol, fee, ts in cur.fetchall():
+        strat = strat or "misc"
+        key = (sym, strat)
+        price = float(price or 0.0)
+        vol = float(vol or 0.0)
+        fee = float(fee or 0.0)
+
+        s = state.get(key) or {"qty": 0.0, "avg_price": 0.0}
+        qty = s["qty"]
+        avg_price = s["avg_price"]
+
+        if side == "buy":
+            # if currently short, this reduces/flip the short
+            if qty <= 0:
+                # realized pnl if you're closing short
+                closed_qty = min(-qty, vol) if qty < 0 else 0.0
+                if closed_qty > 0:
+                    # short: entry at avg_price, exit at price
+                    pnl = (avg_price - price) * closed_qty
+                    realized_total += pnl
+                # update net position
+                new_qty = qty + vol
+                if new_qty > 0:
+                    # now net long; compute new avg_price for long portion
+                    # combine residual short pnl implicitly via running sum
+                    new_cost = price * max(new_qty - max(-qty, 0.0), 0.0)
+                    avg_price = new_cost / new_qty if new_qty != 0 else avg_price
+                qty = new_qty
+            else:
+                # add to long
+                new_qty = qty + vol
+                new_cost = qty * avg_price + vol * price
+                avg_price = new_cost / new_qty if new_qty != 0 else avg_price
+                qty = new_qty
+
+        elif side == "sell":
+            if qty >= 0:
+                # closing/flip long
+                closed_qty = min(qty, vol) if qty > 0 else 0.0
+                if closed_qty > 0:
+                    pnl = (price - avg_price) * closed_qty
+                    realized_total += pnl
+                new_qty = qty - vol
+                if new_qty < 0:
+                    # now net short; avg_price for short is entry price
+                    avg_price = price
+                qty = new_qty
+            else:
+                # add to short
+                new_qty = qty - vol
+                new_cost = (-qty) * avg_price + vol * price
+                avg_price = new_cost / (-new_qty) if new_qty != 0 else avg_price
+                qty = new_qty
+
+        fees_total += fee
+        trade_count += 1
+
+        s["qty"] = qty
+        s["avg_price"] = avg_price
+        state[key] = s
+
+    net_realized = realized_total - fees_total
+
+    return {
+        "realized_gross": realized_total,
+        "fees": fees_total,
+        "realized_net": net_realized,
+        "trade_count": trade_count,
+    }
+
+@app.get("/pnl/realized_summary")
+def pnl_realized_summary(
+    symbol: Optional[str] = Query(None),
+    strategy: Optional[str] = Query(None),
+    since_ts: Optional[int] = Query(None),
+    until_ts: Optional[int] = Query(None),
+):
+    con = _db()
+    try:
+        summary = _compute_realized_pnl(
+            con,
+            symbol=symbol,
+            strategy=strategy,
+            since_ts=since_ts,
+            until_ts=until_ts,
+        )
+    finally:
+        con.close()
+    return summary
+
+
 @app.get("/pnl/summary")
 def pnl_summary():
     # Fresh recompute from DB; include 'misc' only if unlabeled rows exist
@@ -1939,6 +2089,230 @@ def scheduler_last():
         raise HTTPException(status_code=404, detail="No last scheduler payload yet")
     with _SCHED_LAST_LOCK:
         return dict(_SCHED_LAST)
+
+@app.post("/scheduler/core_debug")
+def scheduler_core_debug(payload: Dict[str, Any] = Body(default=None)):
+    """
+    Run scheduler_core.run_scheduler_once with the current config,
+    but DO NOT route anything to the broker.
+
+    Returns:
+      - config (resolved from payload + env)
+      - positions
+      - raw intents from scheduler_core (before caps/guard/loss-zone)
+      - scheduler_core telemetry
+    """
+    payload = payload or {}
+
+    def _env_bool(key: str, default: bool) -> bool:
+        v = os.getenv(key)
+        if v is None:
+            return default
+        return str(v).lower() in ("1", "true", "yes", "on")
+
+    tf = str(payload.get("tf", os.getenv("SCHED_TIMEFRAME", "5Min")))
+    strats_csv = str(payload.get("strats", os.getenv("SCHED_STRATS", "c1,c2,c3,c4,c5,c6")))
+    strats = [s.strip().lower() for s in strats_csv.split(",") if s.strip()]
+
+    symbols_csv = str(payload.get("symbols", os.getenv("SYMBOLS", "BTC/USD,ETH/USD")))
+    syms = [s.strip().upper() for s in symbols_csv.split(",") if s.strip()]
+
+    limit = int(payload.get("limit", int(os.getenv("SCHED_LIMIT", "300") or 300)))
+    notional = float(payload.get("notional", float(os.getenv("SCHED_NOTIONAL", "25") or 25.0)))
+
+    config_snapshot = {
+        "tf": tf,
+        "strats_raw": strats_csv,
+        "strats": strats,
+        "symbols_raw": symbols_csv,
+        "symbols": syms,
+        "limit": limit,
+        "notional": notional,
+    }
+
+    # positions + risk_cfg
+    positions = _load_open_positions_from_trades(use_strategy_col=True)
+    risk_cfg = load_risk_config() or {}
+    risk_engine = RiskEngine(risk_cfg)
+
+    # preload bars (same as v2)
+    try:
+        import br_router as br  # type: ignore[import]
+    except Exception as e:
+        return {
+            "ok": False,
+            "error": f"failed to import br_router: {e}",
+            "config": config_snapshot,
+        }
+
+    contexts: Dict[str, Any] = {}
+    telemetry: List[Dict[str, Any]] = []
+
+    def _safe_series(bars, key: str):
+        vals = []
+        if isinstance(bars, list):
+            for row in bars:
+                if isinstance(row, dict) and key in row:
+                    vals.append(row[key])
+        return vals
+
+    for sym in syms:
+        try:
+            one = br.get_bars(sym, timeframe="1Min", limit=limit)
+            multi = br.get_bars(sym, timeframe=tf, limit=limit)
+
+            if not one or not multi:
+                contexts[sym] = None
+                telemetry.append(
+                    {
+                        "symbol": sym,
+                        "stage": "preload_bars",
+                        "ok": False,
+                        "reason": "no_bars",
+                    }
+                )
+                continue
+
+            contexts[sym] = {
+                "one": {
+                    "open": _safe_series(one, "open"),
+                    "high": _safe_series(one, "high"),
+                    "low": _safe_series(one, "low"),
+                    "close": _safe_series(one, "close"),
+                    "volume": _safe_series(one, "volume"),
+                    "ts": _safe_series(one, "ts"),
+                },
+                "five": {
+                    "open": _safe_series(multi, "open"),
+                    "high": _safe_series(multi, "high"),
+                    "low": _safe_series(multi, "low"),
+                    "close": _safe_series(multi, "close"),
+                    "volume": _safe_series(multi, "volume"),
+                    "ts": _safe_series(multi, "ts"),
+                },
+            }
+        except Exception as e:
+            contexts[sym] = None
+            telemetry.append(
+                {
+                    "symbol": sym,
+                    "stage": "preload_bars",
+                    "ok": False,
+                    "error": f"{e.__class__.__name__}: {e}",
+                }
+            )
+
+    now = dt.datetime.utcnow()
+    cfg = SchedulerConfig(
+        now=now,
+        timeframe=tf,
+        limit=limit,
+        symbols=syms,
+        strats=strats,
+        notional=notional,
+        positions=positions,
+        contexts=contexts,
+        risk_cfg=risk_cfg,
+    )
+
+    result: SchedulerResult = run_scheduler_once(cfg, last_price_fn=_last_price_safe)
+
+    telemetry.extend(result.telemetry)
+
+    intents_out = []
+    for it in result.intents:
+        intents_out.append(
+            {
+                "strategy": it.strategy,
+                "symbol": it.symbol,
+                "kind": it.kind,
+                "side": it.side,
+                "notional": it.notional,
+                "reason": it.reason,
+                "meta": it.meta,
+            }
+        )
+
+    pos_out = []
+    for (sym, strat), pm_pos in positions.items():
+        pos_out.append(
+            {
+                "symbol": sym,
+                "strategy": strat,
+                "qty": float(getattr(pm_pos, "qty", 0.0) or 0.0),
+                "avg_price": getattr(pm_pos, "avg_price", None),
+            }
+        )
+
+    return {
+        "ok": True,
+        "config": config_snapshot,
+        "positions": pos_out,
+        "intents": intents_out,
+        "telemetry": telemetry,
+    }
+
+@app.get("/scheduler/risk_debug")
+def scheduler_risk_debug(
+    symbol: Optional[str] = Query(None),
+    strategy: Optional[str] = Query(None),
+):
+    """
+    For each open position (optionally filtered by symbol/strategy),
+    show:
+
+    - unrealized_pct
+    - symbol caps
+    - global exit decision (if any)
+    """
+    positions = _load_open_positions_from_trades(use_strategy_col=True)
+    risk_cfg = load_risk_config() or {}
+    risk_engine = RiskEngine(risk_cfg)
+
+    now = dt.datetime.utcnow()
+
+    out = []
+    for (sym, strat), pm_pos in positions.items():
+        if symbol and sym != symbol:
+            continue
+        if strategy and strat != strategy:
+            continue
+
+        snap = PositionSnapshot(
+            symbol=sym,
+            strategy=strat,
+            qty=float(getattr(pm_pos, "qty", 0.0) or 0.0),
+            avg_price=getattr(pm_pos, "avg_price", None),
+            unrealized_pct=None,
+        )
+        try:
+            upnl = risk_engine.compute_unrealized_pct(snap, last_price_fn=_last_price_safe)
+        except Exception:
+            upnl = None
+
+        snap.unrealized_pct = upnl
+        max_notional, max_units = risk_engine.symbol_caps(sym)
+        reason = risk_engine.apply_global_exit_rules(
+            pos=snap,
+            unrealized_pct=upnl,
+            atr_pct=None,
+            now=now,
+        )
+
+        out.append(
+            {
+                "symbol": sym,
+                "strategy": strat,
+                "qty": snap.qty,
+                "avg_price": snap.avg_price,
+                "unrealized_pct": upnl,
+                "max_notional_cap": max_notional,
+                "max_units_cap": max_units,
+                "global_exit_reason": reason,
+            }
+        )
+
+    return {"positions": out}
 
 
 # --------------------------------------------------------------------------------------
