@@ -1818,6 +1818,62 @@ def debug_positions():
     return {
         "positions": out,
     }
+
+@app.get("/debug/trades_sample")
+def debug_trades_sample(
+    symbol: str = Query(None, description="Optional symbol filter, e.g. ADA/USD"),
+    limit: int = Query(10, ge=1, le=200, description="Max rows to return"),
+):
+    """
+    Show a small sample of rows from the trades table so we can inspect
+    price / volume / cost / fee and spot scaling issues.
+    """
+    con = _db()
+    try:
+        cur = con.cursor()
+        if symbol:
+            cur.execute(
+                """
+                SELECT txid, ts, pair, symbol, side, price, volume, cost, fee
+                FROM trades
+                WHERE symbol = ?
+                ORDER BY ts DESC
+                LIMIT ?
+                """,
+                (symbol, limit),
+            )
+        else:
+            cur.execute(
+                """
+                SELECT txid, ts, pair, symbol, side, price, volume, cost, fee
+                FROM trades
+                ORDER BY ts DESC
+                LIMIT ?
+                """,
+                (limit,),
+            )
+        rows = cur.fetchall()
+    finally:
+        con.close()
+
+    out = []
+    for r in rows:
+        txid, ts, pair, sym, side, price, volume, cost, fee = r
+        out.append(
+            {
+                "txid": txid,
+                "ts": ts,
+                "pair": pair,
+                "symbol": sym,
+                "side": side,
+                "price": float(price) if price is not None else None,
+                "volume": float(volume) if volume is not None else None,
+                "cost": float(cost) if cost is not None else None,
+                "fee": float(fee) if fee is not None else None,
+            }
+        )
+
+    return {"rows": out}
         
 # --------------------------------------------------------------------------------------
 # Scheduler globals
