@@ -2595,6 +2595,18 @@ def scheduler_run_v2(payload: Dict[str, Any] = Body(default=None)):
     limit = int(payload.get("limit", int(os.getenv("SCHED_LIMIT", "300") or 300)))
     notional = float(payload.get("notional", float(os.getenv("SCHED_NOTIONAL", "25") or 25.0)))
 
+    config_snapshot = {
+        "tf": tf,
+        "strats_raw": strats_csv,
+        "strats": strats,
+        "symbols_raw": symbols_csv,
+        "symbols": syms,
+        "limit": limit,
+        "notional": notional,
+        "dry": bool(dry),
+    }
+
+
     log.info(
         "Scheduler v2: strats=%s tf=%s limit=%s notional=%s dry=%s symbols=%s",
         ",".join(strats),
@@ -2937,9 +2949,10 @@ def scheduler_run_v2(payload: Dict[str, Any] = Body(default=None)):
 
         actions.append(action_record)
 
-    return {
+        return {
         "ok": True,
         "dry": bool(dry),
+        "config": config_snapshot,
         "actions": actions,
         "telemetry": telemetry,
     }
