@@ -2606,7 +2606,6 @@ def scheduler_run_v2(payload: Dict[str, Any] = Body(default=None)):
         "dry": bool(dry),
     }
 
-
     log.info(
         "Scheduler v2: strats=%s tf=%s limit=%s notional=%s dry=%s symbols=%s",
         ",".join(strats),
@@ -2625,7 +2624,7 @@ def scheduler_run_v2(payload: Dict[str, Any] = Body(default=None)):
     except Exception as e:
         log.error("scheduler_v2: failed to import br_router: %s", e)
         if not dry:
-            return {"ok": False, "error": f"failed to import br_router: {e}"}
+            return {"ok": False, "error": f"failed to import br_router: {e}", "config": config_snapshot}
         br = None  # dry mode can still show intents
 
     try:
@@ -2657,9 +2656,9 @@ def scheduler_run_v2(payload: Dict[str, Any] = Body(default=None)):
         try:
             # For now, hard-code 1m + tf (e.g. 5Min) like your existing path
             one = br.get_bars(sym, timeframe="1Min", limit=limit) if br is not None else []
-            five = br.get_bars(sym, timeframe=tf, limit=limit) if br is not None else []
+            multi = br.get_bars(sym, timeframe=tf, limit=limit) if br is not None else []
 
-            if not one or not five:
+            if not one or not multi:
                 contexts[sym] = None
                 telemetry.append(
                     {
@@ -2680,13 +2679,13 @@ def scheduler_run_v2(payload: Dict[str, Any] = Body(default=None)):
                     "volume": _safe_series(one, "volume"),
                     "ts": _safe_series(one, "ts"),
                 },
-                "five": {
-                    "open": _safe_series(five, "open"),
-                    "high": _safe_series(five, "high"),
-                    "low": _safe_series(five, "low"),
-                    "close": _safe_series(five, "close"),
-                    "volume": _safe_series(five, "volume"),
-                    "ts": _safe_series(five, "ts"),
+                "five": {  # we keep the key name 'five' even if tf != 5Min
+                    "open": _safe_series(multi, "open"),
+                    "high": _safe_series(multi, "high"),
+                    "low": _safe_series(multi, "low"),
+                    "close": _safe_series(multi, "close"),
+                    "volume": _safe_series(multi, "volume"),
+                    "ts": _safe_series(multi, "ts"),
                 },
             }
         except Exception as e:
@@ -2717,7 +2716,6 @@ def scheduler_run_v2(payload: Dict[str, Any] = Body(default=None)):
     )
 
     result: SchedulerResult = run_scheduler_once(cfg, last_price_fn=_last_price_safe)
-
     telemetry.extend(result.telemetry)
 
     # ------------------------------------------------------------------
@@ -2779,10 +2777,9 @@ def scheduler_run_v2(payload: Dict[str, Any] = Body(default=None)):
             strategy=intent.strategy,
             qty=float(getattr(pm_pos, "qty", 0.0) or 0.0),
             avg_price=getattr(pm_pos, "avg_price", None),
-            unrealized_pct=None,  # already used by scheduler_core where needed
+            unrealized_pct=None,  # already populated inside scheduler_core when needed
         )
 
-        # Guard (optional; strategies already call guard_allows internally)
         guard_allowed = True
         guard_reason = "ok"
         if guard_allows is not None and intent.kind in entry_kinds:
@@ -2809,6 +2806,7 @@ def scheduler_run_v2(payload: Dict[str, Any] = Body(default=None)):
         final_notional: float = 0.0
         side = intent.side
 
+        # ----- ENTRY / SCALE: enforce caps & loss-zone --------------------------------
         if intent.kind in entry_kinds:
             if intent.notional is None or intent.notional <= 0:
                 telemetry.append(
@@ -2823,7 +2821,6 @@ def scheduler_run_v2(payload: Dict[str, Any] = Body(default=None)):
                 )
                 continue
 
-            # Enforce per-symbol caps
             allowed_cap, adjusted_notional, cap_reason = risk_engine.enforce_symbol_cap(
                 symbol=intent.symbol,
                 strat=intent.strategy,
@@ -2847,10 +2844,7 @@ def scheduler_run_v2(payload: Dict[str, Any] = Body(default=None)):
 
             final_notional = float(adjusted_notional)
 
-            # Loss-zone no-rebuy below threshold
-            # (use unrealized_pct from scheduler_core if present on snap)
-            # NOTE: scheduler_core currently doesn't override snap.unrealized_pct
-            # in this path, but we leave this here for future wiring.
+            # Loss-zone no-rebuy below threshold (if we have unrealized_pct wired)
             if risk_engine.is_loss_zone_norebuy_block(
                 unrealized_pct=snap.unrealized_pct,
                 is_entry_side=True,
@@ -2867,8 +2861,8 @@ def scheduler_run_v2(payload: Dict[str, Any] = Body(default=None)):
                 )
                 continue
 
+        # ----- EXIT / TP / SL: compute notional from position if missing -------------
         else:
-            # EXIT / TAKE_PROFIT / STOP_LOSS: compute notional from position if missing
             qty_here = float(getattr(pm_pos, "qty", 0.0) or 0.0)
             if abs(qty_here) < 1e-10:
                 telemetry.append(
@@ -2939,7 +2933,7 @@ def scheduler_run_v2(payload: Dict[str, Any] = Body(default=None)):
                 symbol=intent.symbol,
                 side=side,
                 notional=final_notional,
-                strategy=intent.strategy,
+                strategy	intent.strategy,
             )
             action_record["status"] = "sent"
             action_record["response"] = resp
@@ -2949,14 +2943,16 @@ def scheduler_run_v2(payload: Dict[str, Any] = Body(default=None)):
 
         actions.append(action_record)
 
-        return {
+    # ------------------------------------------------------------------
+    # FINAL RETURN — avoid null/None responses
+    # ------------------------------------------------------------------
+    return {
         "ok": True,
         "dry": bool(dry),
         "config": config_snapshot,
         "actions": actions,
         "telemetry": telemetry,
     }
-
 
 # ---- New core debug endpoint) ------------------------------------------------------------        
         
