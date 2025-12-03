@@ -3072,6 +3072,11 @@ def scheduler_run_v2(payload: Dict[str, Any] = Body(default=None)):
     dry = bool(dry)
 
     # ------------------------------------------------------------------
+    # Minimum order notional (USD) to avoid dust orders
+    # ------------------------------------------------------------------
+    MIN_NOTIONAL_USD = float(os.getenv("MIN_ORDER_NOTIONAL_USD", "5.0") or 5.0)
+
+    # ------------------------------------------------------------------
     # Resolve basic scheduler config from payload + env
     # ------------------------------------------------------------------
     tf = str(payload.get("tf", os.getenv("SCHED_TIMEFRAME", "5Min")))
@@ -3405,6 +3410,20 @@ def scheduler_run_v2(payload: Dict[str, Any] = Body(default=None)):
                     "kind": intent.kind,
                     "side": intent.side,
                     "reason": "non_positive_final_notional",
+                    "source": "scheduler_v2",
+                }
+            )
+            continue
+
+                # Ignore dust for entries + TP/SL; still allow generic exits (e.g. daily_flatten)
+        if final_notional < MIN_NOTIONAL_USD and intent.kind in {"entry", "scale", "take_profit", "stop_loss"}:
+            telemetry.append(
+                {
+                    "symbol": intent.symbol,
+                    "strategy": intent.strategy,
+                    "kind": intent.kind,
+                    "side": intent.side,
+                    "reason": f"below_min_notional:{final_notional:.4f}<{MIN_NOTIONAL_USD}",
                     "source": "scheduler_v2",
                 }
             )
