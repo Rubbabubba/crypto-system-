@@ -161,6 +161,11 @@ def guard_allows(strategy: str, symbol: str, now: Optional[datetime] = None) -> 
         if "*" not in allowed_syms and sym not in allowed_syms:
             return False, "not_in_strategy_whitelist"
 
+    # Avoid list from risk.json (hard block)
+    avoid_set = _load_avoid_set()
+    if sym in avoid_set:
+        return False, "in_avoid_pairs"
+
     # Windows
     win = policy.windows.get(s)
     if win:
@@ -188,6 +193,34 @@ def filter_allowed_now(strategies: Iterable[str], symbols: Iterable[str], now: O
 # ---------- Risk config loader ----------
 
 from functools import lru_cache
+
+@lru_cache(maxsize=1)
+def _load_avoid_set() -> Set[str]:
+    """
+    Load the normalized avoid list (e.g. avoid_pairs) from risk.json.
+    Returned symbols are normalized the same way as _norm_symbol.
+    """
+    cfg = load_risk_config()
+    avoid: Set[str] = set()
+
+    # Handle either "avoid_pairs" (preferred) or legacy "avoid" structures
+    raw = cfg.get("avoid_pairs") or cfg.get("avoid") or []
+    # raw might be a list, set, tuple, or dict
+    if isinstance(raw, dict):
+        # Support either {"symbols": [...]} or {"pairs": [...]} etc.
+        if "symbols" in raw and isinstance(raw["symbols"], (list, tuple, set)):
+            raw = raw["symbols"]
+        elif "pairs" in raw and isinstance(raw["pairs"], (list, tuple, set)):
+            raw = raw["pairs"]
+        else:
+            raw = list(raw.values())
+
+    if isinstance(raw, (list, tuple, set)):
+        for s in raw:
+            if isinstance(s, str):
+                avoid.add(_norm_symbol(s))
+
+    return avoid
 
 @lru_cache(maxsize=1)
 def load_risk_config(cfg_dir: Optional[str] = None) -> dict:
