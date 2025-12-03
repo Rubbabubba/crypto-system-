@@ -1105,6 +1105,37 @@ def debug_db():
         info["error"] = str(e)
     return info
 
+@app.post("/debug/strategy_scan")
+def debug_strategy_scan(payload: Dict[str, Any] = Body(default=None)):
+    payload = payload or {}
+    strat = str(payload.get("strategy") or "").strip()
+    symbol = str(payload.get("symbol") or "").strip().upper()
+
+    # Reuse the same tf/limit/notional logic as scheduler_run_v2
+    tf = payload.get("tf") or os.getenv("TF", "5Min")
+    limit = int(payload.get("limit", int(os.getenv("SCHED_LIMIT", "300") or 300)))
+    notional = float(payload.get("notional", float(os.getenv("SCHED_NOTIONAL", "25") or 25)))
+
+    # Build positions, contexts, risk_cfg exactly like scheduler_run_v2
+    # (you can literally copy that part of the code)
+    positions = _load_open_positions_from_trades(use_strategy_col=True)
+    risk_cfg = load_risk_config() or {}
+    contexts, telemetry = _preload_contexts(tf=tf, symbols=[symbol], limit=limit)
+
+    cfg = SchedulerConfig(
+        now=dt.datetime.utcnow(),
+        timeframe=tf,
+        limit=limit,
+        symbols=[symbol],
+        strats=[strat],
+        notional=notional,
+        positions=positions,
+        contexts=contexts,
+        risk_cfg=risk_cfg,
+    )
+
+    info = debug_scan_for(cfg, strat=strat, symbol=symbol)
+    return {"ok": True, "debug": info}
 
 @app.get("/debug/kraken/trades")
 def debug_kraken_trades(since_hours: int = 720, limit: int = 50000):

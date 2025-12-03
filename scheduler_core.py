@@ -93,6 +93,68 @@ def _strategy_instance_for(strat_id: str):
 def _risk_context_from_engine(engine: RiskEngine) -> RiskContext:
     return engine.risk_context()
 
+def debug_scan_for(cfg: SchedulerConfig, strat: str, symbol: str) -> Dict[str, Any]:
+    """
+    Explain why STRAT did or did not want to trade SYMBOL on this pass.
+    """
+    book = StrategyBook()
+    sreq = ScanRequest(
+        strat=strat,
+        timeframe=cfg.timeframe,
+        limit=cfg.limit,
+        topk=book.topk,
+        min_score=book.min_score,
+        notional=cfg.notional,
+    )
+
+    scan_results: List[ScanResult] = book.scan(sreq, cfg.contexts) or []
+
+    # Find the ScanResult for this symbol
+    scan = next((r for r in scan_results if isinstance(r, ScanResult) and r.symbol == symbol), None)
+
+    # Current position snapshot (if any)
+    pos_map = _make_position_snapshot_map(cfg.positions)
+    pos = pos_map.get((symbol, strat))
+
+    out: Dict[str, Any] = {
+        "strategy": strat,
+        "symbol": symbol,
+        "position": {
+            "qty": float(getattr(pos, "qty", 0.0) or 0.0),
+            "avg_price": float(getattr(pos, "avg_price", 0.0) or 0.0) if pos else None,
+        },
+    }
+
+    if scan is None:
+        out["scan"] = {"reason": "no_scan_result"}
+        return out
+
+    # Raw scan fields
+    out["scan"] = {
+        "action": scan.action,
+        "reason": scan.reason,
+        "score": float(scan.score),
+        "atr_pct": float(scan.atr_pct),
+        "notional": float(scan.notional),
+        "selected": bool(scan.selected),
+    }
+
+    # Entry gating logic (mirror of your entry_signal)
+    is_flat = (pos is None) or (abs(getattr(pos, "qty", 0.0) or 0.0) < 1e-10)
+    out["entry_gate"] = {
+        "is_flat": is_flat,
+        "scan_selected": bool(scan.selected),
+        "scan_action": scan.action,
+        "scan_notional_positive": scan.notional > 0,
+        "would_emit_entry": (
+            is_flat
+            and scan.selected
+            and scan.action in ("buy", "sell")
+            and scan.notional > 0
+        ),
+    }
+
+    return out
 
 # ----------------------------------------------------------------------
 # Main entry point
