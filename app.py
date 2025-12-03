@@ -69,17 +69,22 @@ import os
 import sqlite3
 import sys
 import time
+import threading
+import broker_kraken
+import requests
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
-import threading
-import time
 from symbol_map import KRAKEN_PAIR_MAP, to_kraken
 from position_engine import PositionEngine, Fill
-import broker_kraken
 from position_manager import load_net_positions, Position
-from scheduler_core import SchedulerConfig, run_scheduler_once
 from risk_engine import RiskEngine
 from strategy_api import PositionSnapshot
+from typing import Dict, Any, List
+from strategy_api import PositionSnapshot
+from scheduler_core import SchedulerConfig, SchedulerResult, StrategyBook, ScanRequest, ScanResult,run_scheduler_once
+from risk_engine import RiskEngine
+from fastapi import Body, FastAPI, HTTPException, Query
+
 
 
 # Routes:
@@ -127,10 +132,6 @@ from strategy_api import PositionSnapshot
 #   - /scheduler/run
 #
 #   - /scan/all
-
-
-import requests
-from fastapi import Body, FastAPI, HTTPException, Query
 
 # --- logging baseline for Render stdout ---
 import logging, sys, os as _os
@@ -1107,21 +1108,99 @@ def debug_db():
 
 @app.post("/debug/strategy_scan")
 def debug_strategy_scan(payload: Dict[str, Any] = Body(default=None)):
+    """
+    Explain why a given strategy did or did not want to trade a symbol
+    on the most recent bar.
+
+    Returns:
+      - position snapshot (qty, avg_price)
+      - raw scan fields (action, reason, score, atr_pct, notional, selected)
+      - entry gating flags (is_flat, scan_selected, etc.)
+    """
     payload = payload or {}
-    strat = str(payload.get("strategy") or "").strip()
+
+    strat = str(payload.get("strategy") or "").strip().lower()
     symbol = str(payload.get("symbol") or "").strip().upper()
 
-    # Reuse the same tf/limit/notional logic as scheduler_run_v2
-    tf = payload.get("tf") or os.getenv("TF", "5Min")
-    limit = int(payload.get("limit", int(os.getenv("SCHED_LIMIT", "300") or 300)))
-    notional = float(payload.get("notional", float(os.getenv("SCHED_NOTIONAL", "25") or 25)))
+    if not strat or not symbol:
+        return {
+            "ok": False,
+            "error": "Both 'strategy' and 'symbol' are required, e.g. c3 / ADA/USD",
+        }
 
-    # Build positions, contexts, risk_cfg exactly like scheduler_run_v2
-    # (you can literally copy that part of the code)
+    tf = str(payload.get("tf") or os.getenv("TF", "5Min"))
+    limit = int(payload.get("limit", int(os.getenv("SCHED_LIMIT", "300") or 300)))
+    notional = float(payload.get("notional", float(os.getenv("SCHED_NOTIONAL", "25") or 25.0)))
+
+    # Load positions + risk config
     positions = _load_open_positions_from_trades(use_strategy_col=True)
     risk_cfg = load_risk_config() or {}
-    contexts, telemetry = _preload_contexts(tf=tf, symbols=[symbol], limit=limit)
 
+    # Preload bars exactly like /scheduler/core_debug does
+    try:
+        import br_router as br  # type: ignore[import]
+    except Exception as e:
+        return {
+            "ok": False,
+            "error": f"failed to import br_router: {e}",
+        }
+
+    def _safe_series(bars, key: str):
+        vals = []
+        if isinstance(bars, list):
+            for row in bars:
+                if isinstance(row, dict) and key in row:
+                    vals.append(row[key])
+        return vals
+
+    contexts: Dict[str, Any] = {}
+    telemetry: List[Dict[str, Any]] = []
+
+    try:
+        one = br.get_bars(symbol, timeframe="1Min", limit=limit)
+        multi = br.get_bars(symbol, timeframe=tf, limit=limit)
+
+        if not one or not multi:
+            contexts[symbol] = None
+            telemetry.append(
+                {
+                    "symbol": symbol,
+                    "stage": "preload_bars",
+                    "ok": False,
+                    "reason": "no_bars",
+                }
+            )
+        else:
+            contexts[symbol] = {
+                "one": {
+                    "open": _safe_series(one, "open"),
+                    "high": _safe_series(one, "high"),
+                    "low": _safe_series(one, "low"),
+                    "close": _safe_series(one, "close"),
+                    "volume": _safe_series(one, "volume"),
+                    "ts": _safe_series(one, "ts"),
+                },
+                "five": {
+                    "open": _safe_series(multi, "open"),
+                    "high": _safe_series(multi, "high"),
+                    "low": _safe_series(multi, "low"),
+                    "close": _safe_series(multi, "close"),
+                    "volume": _safe_series(multi, "volume"),
+                    "ts": _safe_series(multi, "ts"),
+                },
+            }
+    except Exception as e:
+        contexts[symbol] = None
+        telemetry.append(
+            {
+                "symbol": symbol,
+                "stage": "preload_bars",
+                "ok": False,
+                "error": f"{e.__class__.__name__}: {e}",
+            }
+        )
+
+    # Build a minimal SchedulerConfig (we only care about this one symbol/strat)
     cfg = SchedulerConfig(
         now=dt.datetime.utcnow(),
         timeframe=tf,
@@ -1134,8 +1213,88 @@ def debug_strategy_scan(payload: Dict[str, Any] = Body(default=None)):
         risk_cfg=risk_cfg,
     )
 
-    info = debug_scan_for(cfg, strat=strat, symbol=symbol)
-    return {"ok": True, "debug": info}
+    # Run the book's scan for this strategy
+    book = StrategyBook()
+    sreq = ScanRequest(
+        strat=strat,
+        timeframe=tf,
+        limit=limit,
+        topk=book.topk,
+        min_score=book.min_score,
+        notional=notional,
+    )
+
+    scans: List[ScanResult] = book.scan(sreq, cfg.contexts) or []
+
+    # Get the scan result for this symbol (if any)
+    scan = None
+    for r in scans:
+        if isinstance(r, ScanResult) and getattr(r, "symbol", None) == symbol:
+            scan = r
+            break
+
+    # Position snapshot for this strategy/symbol
+    pos_obj = positions.get((symbol, strat))
+    qty = float(getattr(pos_obj, "qty", 0.0) or 0.0) if pos_obj is not None else 0.0
+    avg_price = getattr(pos_obj, "avg_price", None) if pos_obj is not None else None
+
+    out: Dict[str, Any] = {
+        "ok": True,
+        "strategy": strat,
+        "symbol": symbol,
+        "tf": tf,
+        "limit": limit,
+        "notional": notional,
+        "position": {
+            "qty": qty,
+            "avg_price": avg_price,
+        },
+        "telemetry": telemetry,
+    }
+
+    if scan is None:
+        out["scan"] = {"reason": "no_scan_result"}
+        out["entry_gate"] = {
+            "is_flat": abs(qty) < 1e-10,
+            "scan_selected": None,
+            "scan_action": None,
+            "scan_notional_positive": None,
+            "would_emit_entry": False,
+        }
+        return out
+
+    # Raw scan fields
+    out["scan"] = {
+        "action": scan.action,
+        "reason": scan.reason,
+        "score": float(getattr(scan, "score", 0.0) or 0.0),
+        "atr_pct": float(getattr(scan, "atr_pct", 0.0) or 0.0),
+        "notional": float(getattr(scan, "notional", 0.0) or 0.0),
+        "selected": bool(getattr(scan, "selected", False)),
+    }
+
+    # Entry gating logic (mirrors entry_signal checks, but simplified)
+    is_flat = abs(qty) < 1e-10
+    scan_selected = bool(getattr(scan, "selected", False))
+    scan_action = getattr(scan, "action", None)
+    scan_notional_positive = float(getattr(scan, "notional", 0.0) or 0.0) > 0.0
+
+    would_emit_entry = (
+        is_flat
+        and scan_selected
+        and scan_action in ("buy", "sell")
+        and scan_notional_positive
+    )
+
+    out["entry_gate"] = {
+        "is_flat": is_flat,
+        "scan_selected": scan_selected,
+        "scan_action": scan_action,
+        "scan_notional_positive": scan_notional_positive,
+        "would_emit_entry": would_emit_entry,
+    }
+
+    return out
 
 @app.get("/debug/kraken/trades")
 def debug_kraken_trades(since_hours: int = 720, limit: int = 50000):
@@ -3060,14 +3219,6 @@ def scheduler_run(payload: Dict[str, Any] = Body(default=None)):
 # --------------------------------------------------------------------------------------
 # Scheduler v2: uses scheduler_core + risk_engine + br_router
 # --------------------------------------------------------------------------------------
-
-from fastapi import Body  # already imported near top, just here for context
-from typing import Dict, Any, List
-
-from strategy_api import PositionSnapshot
-from scheduler_core import SchedulerConfig, SchedulerResult, run_scheduler_once
-from risk_engine import RiskEngine
-
 
 @app.post("/scheduler/v2/run")
 def scheduler_run_v2(payload: Dict[str, Any] = Body(default=None)):
