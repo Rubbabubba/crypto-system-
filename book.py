@@ -13,6 +13,10 @@ DEFAULT_BOOK_MIN_SCORE = float(os.getenv("BOOK_MIN_SCORE", "0.10"))
 DEFAULT_ATR_STOP_MULT = float(os.getenv("ATR_STOP_MULT", "1.5"))
 DEFAULT_MTF_CONFIRM = (str(os.getenv("MTF_CONFIRM", "true")).lower() in ("1","true","yes","on"))
 
+# NEW: minimum bar counts (global defaults; can be overridden via env)
+DEFAULT_MIN_BARS_1M = int(float(os.getenv("BOOK_MIN_BARS_1M", "50")))
+DEFAULT_MIN_BARS_5M = int(float(os.getenv("BOOK_MIN_BARS_5M", "50")))
+
 # ====== utilities ======
 def _roll_mean(a, n): return pd.Series(a).rolling(n).mean().to_numpy()
 def _roll_std(a, n):  return pd.Series(a).rolling(n).std(ddof=0).to_numpy()
@@ -258,15 +262,27 @@ def size_from_atr(price: float, atr_pct: float, target_risk_usd: float = 10.0, a
     return float(max(0.0, qty)), float(max(0.0, notional))
 
 class StrategyBook:
-    def __init__(self, topk: int = DEFAULT_BOOK_TOPK, min_score: float = DEFAULT_BOOK_MIN_SCORE,
-                 risk_target_usd: float = 10.0, atr_stop_mult: float = DEFAULT_ATR_STOP_MULT,
-                 min_atr_pct_5m: Optional[float] = None, mtf_confirm_flag: Optional[bool] = None):
+    def __init__(
+        self,
+        topk: int = DEFAULT_BOOK_TOPK,
+        min_score: float = DEFAULT_BOOK_MIN_SCORE,
+        risk_target_usd: float = 10.0,
+        atr_stop_mult: float = DEFAULT_ATR_STOP_MULT,
+        min_atr_pct_5m: Optional[float] = None,
+        mtf_confirm_flag: Optional[bool] = None,
+        min_bars_1m: Optional[int] = None,
+        min_bars_5m: Optional[int] = None,
+    ):
         self.topk = int(topk)
         self.min_score = float(min_score)
         self.risk_target_usd = float(risk_target_usd)
         self.atr_stop_mult = float(atr_stop_mult)
         self.min_atr_pct_5m = float(min_atr_pct_5m) if min_atr_pct_5m is not None else None
         self.mtf_confirm_flag = bool(mtf_confirm_flag) if mtf_confirm_flag is not None else None
+
+        # NEW: minimum required bars for 1m & 5m contexts
+        self.min_bars_1m = int(min_bars_1m) if min_bars_1m is not None else DEFAULT_MIN_BARS_1M
+        self.min_bars_5m = int(min_bars_5m) if min_bars_5m is not None else DEFAULT_MIN_BARS_5M
 
     def _resolve_knobs_for_strat(self, strat: str):
         s = strat.strip().lower()
@@ -295,8 +311,22 @@ class StrategyBook:
             one = ctx["one"]; five = ctx["five"]
             close1, high1, low1 = one["close"], one["high"], one["low"]
             close5, high5, low5 = five["close"], five["high"], five["low"]
-            if len(close1) < 50 or len(close5) < 50:
-                results.append(ScanResult(sym, "flat", "insufficient_bars", 0.0, 0.0, 0.0, 0.0, 0.0, False))
+
+            # NEW: configurable minimum bar counts
+            if len(close1) < self.min_bars_1m or len(close5) < self.min_bars_5m:
+                results.append(
+                    ScanResult(
+                        sym,
+                        "flat",
+                        "insufficient_bars",
+                        0.0,
+                        0.0,
+                        0.0,
+                        0.0,
+                        0.0,
+                        False,
+                    )
+                )
                 continue
 
             reg1 = compute_regimes(close1, high1, low1)
