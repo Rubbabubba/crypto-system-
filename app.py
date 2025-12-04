@@ -1136,7 +1136,7 @@ def debug_strategy_scan(payload: Dict[str, Any] = Body(default=None)):
     positions = _load_open_positions_from_trades(use_strategy_col=True)
     risk_cfg = load_risk_config() or {}
 
-    # Preload bars exactly like /scheduler/core_debug does
+    # Preload bars using the same format as the main scheduler
     try:
         import br_router as br  # type: ignore[import]
     except Exception as e:
@@ -1158,9 +1158,9 @@ def debug_strategy_scan(payload: Dict[str, Any] = Body(default=None)):
 
     try:
         one = br.get_bars(symbol, timeframe="1Min", limit=limit)
-        multi = br.get_bars(symbol, timeframe=tf, limit=limit)
+        five = br.get_bars(symbol, timeframe=tf, limit=limit)
 
-        if not one or not multi:
+        if not one or not five:
             contexts[symbol] = None
             telemetry.append(
                 {
@@ -1171,22 +1171,18 @@ def debug_strategy_scan(payload: Dict[str, Any] = Body(default=None)):
                 }
             )
         else:
+            # IMPORTANT: match the real scheduler preload:
+            # broker returns keys like "c","h","l" (close, high, low)
             contexts[symbol] = {
                 "one": {
-                    "open": _safe_series(one, "open"),
-                    "high": _safe_series(one, "high"),
-                    "low": _safe_series(one, "low"),
-                    "close": _safe_series(one, "close"),
-                    "volume": _safe_series(one, "volume"),
-                    "ts": _safe_series(one, "ts"),
+                    "close": _safe_series(one, "c"),
+                    "high":  _safe_series(one, "h"),
+                    "low":   _safe_series(one, "l"),
                 },
                 "five": {
-                    "open": _safe_series(multi, "open"),
-                    "high": _safe_series(multi, "high"),
-                    "low": _safe_series(multi, "low"),
-                    "close": _safe_series(multi, "close"),
-                    "volume": _safe_series(multi, "volume"),
-                    "ts": _safe_series(multi, "ts"),
+                    "close": _safe_series(five, "c"),
+                    "high":  _safe_series(five, "h"),
+                    "low":   _safe_series(five, "l"),
                 },
             }
     except Exception as e:
