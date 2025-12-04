@@ -11,53 +11,58 @@ logger = logging.getLogger(__name__)
 
 STRAT_ID = "c6"
 
+# --- Env-configurable knobs for c6 -----------------------------------------
 
-def _is_flat(pos: Optional[PositionSnapshot]) -> bool:
-    return (pos is None) or (abs(pos.qty) < 1e-10)
+C6_ENABLE_SIGNAL_EXIT = (
+    str(os.getenv("C6_ENABLE_SIGNAL_EXIT", "true")).lower() in ("1", "true", "yes", "on")
+)
+
+_raw = os.getenv("C6_MIN_ENTRY_SCORE")
+C6_MIN_ENTRY_SCORE = float(_raw) if _raw not in (None, "") else None
+
+# Volatility band for entries
+_raw = os.getenv("C6_MIN_ATR_PCT")
+C6_MIN_ATR_PCT = float(_raw) if _raw not in (None, "") else 0.1  # default 0.1%
+
+_raw = os.getenv("C6_MAX_ATR_PCT")
+C6_MAX_ATR_PCT = float(_raw) if _raw not in (None, "") else 2.0  # default 2%
+
+# Panic exit threshold: if atr_pct exceeds this while long, be happy to exit
+_raw = os.getenv("C6_PANIC_ATR_PCT")
+C6_PANIC_ATR_PCT = float(_raw) if _raw not in (None, "") else 3.0
 
 
-def _is_long(pos: Optional[PositionSnapshot]) -> bool:
-    return (pos is not None) and (pos.qty > 1e-10)
+def _is_flat(position: Optional[PositionSnapshot]) -> bool:
+    if position is None:
+        return True
+    qty = getattr(position, "qty", 0.0) or 0.0
+    return abs(qty) < 1e-10
 
 
-def _is_short(pos: Optional[PositionSnapshot]) -> bool:
-    return (pos is not None) and (pos.qty < -1e-10)
-
-
-def _env_float(key: str, default: float) -> float:
-    try:
-        v = os.getenv(key)
-        return float(v) if v is not None else default
-    except Exception:
-        return default
-
-
-def _normalize_unrealized_pct(pct: Optional[float]) -> Optional[float]:
-    if pct is None:
-        return None
-    if abs(pct) > 1.0:
-        return pct / 100.0
-    return pct
+def _is_long(position: Optional[PositionSnapshot]) -> bool:
+    if position is None:
+        return False
+    qty = getattr(position, "qty", 0.0) or 0.0
+    return qty > 1e-10
 
 
 class C6Strategy:
     """
-    C6 — Relative-to-BTC momentum (volatility flavored).
+    Strategy c6 – volatility-aware long-only.
 
-    Entry:
-      - Follow sig_c6_rel_to_btc via StrategyBook (through ScanResult).
-
-    Exit:
-      - LONG: exit when signal != "buy".
-      - SHORT: exit when signal != "sell".
-
-    TP / SL:
-      - Moderately wide; we expect this to be used on higher-vol names:
-        * C6_TAKE_PROFIT_PCT default 3.0  (≈ +3%)
-        * C6_STOP_LOSS_PCT   default -3.5 (≈ -3.5%)
+    Semantics:
+      - Only enters when ATR% is within a configurable band (C6_MIN_ATR_PCT,
+        C6_MAX_ATR_PCT).
+      - When long, "sell" signals and/or ATR% above C6_PANIC_ATR_PCT can be
+        used as exits.
+      - Numeric TP/SL is delegated to global risk engine.
     """
 
-    STRAT_ID = STRAT_ID
+    STRAT_ID: str = STRAT_ID
+
+    # ------------------------------------------------------------------ #
+    # Entry logic
+    # ------------------------------------------------------------------ #
 
     def entry_signal(
         self,
@@ -67,27 +72,45 @@ class C6Strategy:
     ) -> Optional[OrderIntent]:
         if not _is_flat(position):
             return None
+
         if not getattr(scan, "selected", False):
             return None
-        if scan.action not in ("buy", "sell"):
-            return None
-        if float(getattr(scan, "notional", 0.0) or 0.0) <= 0.0:
+
+        if scan.action != "buy":
             return None
 
-        notional = float(scan.notional or 0.0)
+        notional = float(getattr(scan, "notional", 0.0) or 0.0)
+        if notional <= 0.0:
+            return None
+
+        score = float(getattr(scan, "score", 0.0) or 0.0)
+        if C6_MIN_ENTRY_SCORE is not None and score < C6_MIN_ENTRY_SCORE:
+            return None
+
+        atr_pct = float(getattr(scan, "atr_pct", 0.0) or 0.0)
+
+        # Require volatility inside a target band
+        if atr_pct < C6_MIN_ATR_PCT or atr_pct > C6_MAX_ATR_PCT:
+            return None
 
         return OrderIntent(
             strategy=self.STRAT_ID,
             symbol=scan.symbol,
-            side=scan.action,
+            side="buy",
             kind="entry",
             notional=notional,
-            reason=scan.reason or "c6_entry_rel_btc",
+            reason=f"c6_vol_band_long_entry:{scan.reason}",
             meta={
-                "score": float(getattr(scan, "score", 0.0) or 0.0),
-                "atr_pct": float(getattr(scan, "atr_pct", 0.0) or 0.0),
+                "scan_action": scan.action,
+                "scan_reason": scan.reason,
+                "scan_score": score,
+                "scan_atr_pct": atr_pct,
             },
         )
+
+    # ------------------------------------------------------------------ #
+    # Exit logic
+    # ------------------------------------------------------------------ #
 
     def exit_signal(
         self,
@@ -95,91 +118,67 @@ class C6Strategy:
         position: PositionSnapshot,
         risk: Optional[RiskContext] = None,
     ) -> Optional[OrderIntent]:
-        if _is_flat(position):
-            return None
-        if scan.symbol != position.symbol:
+        if not _is_long(position):
             return None
 
-        if _is_long(position) and scan.action != "buy":
-            side = "sell"
-        elif _is_short(position) and scan.action != "sell":
-            side = "buy"
-        else:
+        if not C6_ENABLE_SIGNAL_EXIT:
+            return None
+
+        atr_pct = float(getattr(scan, "atr_pct", 0.0) or 0.0)
+
+        # If volatility blows out above panic threshold, we are happy to exit
+        if atr_pct >= C6_PANIC_ATR_PCT:
+            return OrderIntent(
+                strategy=self.STRAT_ID,
+                symbol=scan.symbol,
+                side="sell",
+                kind="exit",
+                notional=None,
+                reason=f"c6_panic_vol_exit:atr_pct={atr_pct}",
+                meta={
+                    "scan_action": scan.action,
+                    "scan_reason": scan.reason,
+                    "scan_score": float(getattr(scan, "score", 0.0) or 0.0),
+                    "scan_atr_pct": atr_pct,
+                },
+            )
+
+        # Otherwise, use "sell" actions as normal exits
+        if scan.action != "sell":
             return None
 
         return OrderIntent(
             strategy=self.STRAT_ID,
             symbol=scan.symbol,
-            side=side,
+            side="sell",
             kind="exit",
             notional=None,
-            reason="c6_exit_rel_btc_fade_or_reverse",
-            meta={"raw_action": scan.action},
+            reason=f"c6_vol_band_long_exit:{scan.reason}",
+            meta={
+                "scan_action": scan.action,
+                "scan_reason": scan.reason,
+                "scan_score": float(getattr(scan, "score", 0.0) or 0.0),
+                "scan_atr_pct": atr_pct,
+            },
         )
+
+    # ------------------------------------------------------------------ #
+    # TP/SL hooks (delegating to global risk)
+    # ------------------------------------------------------------------ #
 
     def profit_take_rule(
         self,
         position: PositionSnapshot,
         risk: Optional[RiskContext] = None,
     ) -> Optional[OrderIntent]:
-        if _is_flat(position):
-            return None
-        upnl = _normalize_unrealized_pct(position.unrealized_pct)
-        if upnl is None:
-            return None
-
-        tp_pct = _env_float("C6_TAKE_PROFIT_PCT", 3.0) / 100.0
-        if upnl < tp_pct:
-            return None
-
-        if _is_long(position):
-            side = "sell"
-        elif _is_short(position):
-            side = "buy"
-        else:
-            return None
-
-        return OrderIntent(
-            strategy=self.STRAT_ID,
-            symbol=position.symbol,
-            side=side,
-            kind="take_profit",
-            notional=None,
-            reason=f"c6_take_profit_{tp_pct*100:.2f}pct",
-            meta={"unrealized_pct": upnl},
-        )
+        return None
 
     def stop_loss_rule(
         self,
         position: PositionSnapshot,
         risk: Optional[RiskContext] = None,
     ) -> Optional[OrderIntent]:
-        if _is_flat(position):
-            return None
-        upnl = _normalize_unrealized_pct(position.unrealized_pct)
-        if upnl is None:
-            return None
-
-        sl_pct = _env_float("C6_STOP_LOSS_PCT", -3.5) / 100.0
-        if upnl > sl_pct:
-            return None
-
-        if _is_long(position):
-            side = "sell"
-        elif _is_short(position):
-            side = "buy"
-        else:
-            return None
-
-        return OrderIntent(
-            strategy=self.STRAT_ID,
-            symbol=position.symbol,
-            side=side,
-            kind="stop_loss",
-            notional=None,
-            reason=f"c6_stop_loss_{sl_pct*100:.2f}pct",
-            meta={"unrealized_pct": upnl},
-        )
+        return None
 
     def should_scale(
         self,
@@ -187,7 +186,9 @@ class C6Strategy:
         position: PositionSnapshot,
         risk: Optional[RiskContext] = None,
     ) -> bool:
+        # No explicit scaling logic for c6 (volatility-sensitive).
         return False
 
 
+# Module-level singleton expected by scheduler_core.get_strategy("c6")
 c6 = C6Strategy()
