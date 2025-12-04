@@ -2,65 +2,66 @@ from __future__ import annotations
 
 import logging
 import os
-from typing import Any, Dict, List, Optional
+from typing import Optional
 
-from book import StrategyBook, ScanRequest, ScanResult
+from book import ScanResult
 from strategy_api import OrderIntent, PositionSnapshot, RiskContext
 
 logger = logging.getLogger(__name__)
 
 STRAT_ID = "c1"
 
+# --- Env-configurable knobs for c1 -----------------------------------------
 
-# ---------------------------------------------------------------------
-# Small helpers
-# ---------------------------------------------------------------------
+# Whether c1 should use signal-based exits (in addition to global risk engine)
+C1_ENABLE_SIGNAL_EXIT = (
+    str(os.getenv("C1_ENABLE_SIGNAL_EXIT", "true")).lower() in ("1", "true", "yes", "on")
+)
 
-def _is_flat(pos: Optional[PositionSnapshot]) -> bool:
-    return (pos is None) or (abs(pos.qty) < 1e-10)
+# Optional minimum score for c1 entries. If None, rely on the book's min_score.
+_raw = os.getenv("C1_MIN_ENTRY_SCORE")
+C1_MIN_ENTRY_SCORE = float(_raw) if _raw not in (None, "") else None
 
-
-def _is_long(pos: Optional[PositionSnapshot]) -> bool:
-    return (pos is not None) and (pos.qty > 1e-10)
-
-
-def _is_short(pos: Optional[PositionSnapshot]) -> bool:
-    return (pos is not None) and (pos.qty < -1e-10)
-
-
-def _env_float(key: str, default: float) -> float:
-    try:
-        v = os.getenv(key)
-        return float(v) if v is not None else default
-    except Exception:
-        return default
+# Optional minimum ATR% floor for c1 (ignore ultra-low volatility environments)
+_raw = os.getenv("C1_MIN_ATR_PCT")
+C1_MIN_ATR_PCT = float(_raw) if _raw not in (None, "") else None
 
 
-def _normalize_unrealized_pct(pct: Optional[float]) -> Optional[float]:
-    if pct is None:
-        return None
-    # Normalize if something like +2.5 instead of 0.025 comes in
-    if abs(pct) > 1.0:
-        return pct / 100.0
-    return pct
+def _is_flat(position: Optional[PositionSnapshot]) -> bool:
+    if position is None:
+        return True
+    qty = getattr(position, "qty", 0.0) or 0.0
+    return abs(qty) < 1e-10
 
 
-# ---------------------------------------------------------------------
-# Core C1 Strategy (RSI-based)
-# ---------------------------------------------------------------------
+def _is_long(position: Optional[PositionSnapshot]) -> bool:
+    if position is None:
+        return False
+    qty = getattr(position, "qty", 0.0) or 0.0
+    return qty > 1e-10
+
 
 class C1Strategy:
     """
-    C1 — Adaptive RSI strategy.
+    Strategy c1 – mean-reversion / RSI-style long-only scalper.
 
-    This class does NOT fetch bars or talk to the broker. It only:
-      - interprets ScanResult from StrategyBook
-      - decides entries, exits, take-profit, stop-loss, scaling
+    Semantics on spot:
+      - When FLAT:
+          * Only "buy" ScanResult.action may open a new long.
+          * "sell" actions are ignored as new entries (we do not short).
+      - When LONG:
+          * "sell" actions may trigger exits (if C1_ENABLE_SIGNAL_EXIT is true).
+      - Numeric TP/SL (exact percentages) are primarily handled by the global
+        risk engine (profit_lock, loss_zone, daily_flatten). This strategy
+        provides signal-shaped entries/exits, global config enforces the
+        numeric guardrails.
     """
 
-    STRAT_ID = STRAT_ID
+    STRAT_ID: str = STRAT_ID
 
-    # ---- Entry ------------------------------------------------------
+    # ------------------------------------------------------------------ #
+    # Entry logic
+    # ------------------------------------------------------------------ #
 
     def entry_signal(
         self,
@@ -69,38 +70,62 @@ class C1Strategy:
         risk: Optional[RiskContext] = None,
     ) -> Optional[OrderIntent]:
         """
-        Entry logic:
+        Entry logic for c1 (long-only).
 
-        - Only acts when FLAT.
-        - If ScanResult is selected and action in {buy, sell}, emit entry.
-        - Uses scan.notional as the intended order size.
+        Conditions:
+          - Must be flat.
+          - Scan must be 'selected' by the book (top-K & above min_score).
+          - Scan.action must be "buy".
+          - Notional must be > 0.
+          - Optional: C1_MIN_ENTRY_SCORE and C1_MIN_ATR_PCT thresholds.
         """
+        # Must be flat to open a new position
         if not _is_flat(position):
             return None
 
+        # Respect the StrategyBook's selection
         if not getattr(scan, "selected", False):
             return None
-        if scan.action not in ("buy", "sell"):
-            return None
-        if float(getattr(scan, "notional", 0.0) or 0.0) <= 0.0:
+
+        # Long-only: ignore "sell" for NEW entries
+        if scan.action != "buy":
             return None
 
-        notional = float(scan.notional or 0.0)
+        # Notional must be positive
+        notional = float(getattr(scan, "notional", 0.0) or 0.0)
+        if notional <= 0.0:
+            return None
 
-        return OrderIntent(
+        # Optional per-strategy min score
+        score = float(getattr(scan, "score", 0.0) or 0.0)
+        if C1_MIN_ENTRY_SCORE is not None and score < C1_MIN_ENTRY_SCORE:
+            return None
+
+        # Optional per-strategy ATR floor (e.g., require some volatility)
+        atr_pct = float(getattr(scan, "atr_pct", 0.0) or 0.0)
+        if C1_MIN_ATR_PCT is not None and atr_pct < C1_MIN_ATR_PCT:
+            return None
+
+        # Risk caps and loss-zone are applied later by the global engine
+        intent = OrderIntent(
             strategy=self.STRAT_ID,
             symbol=scan.symbol,
-            side=scan.action,           # "buy" or "sell"
+            side="buy",
             kind="entry",
             notional=notional,
-            reason=scan.reason or "c1_entry_signal",
+            reason=f"c1_long_entry:{scan.reason}",
             meta={
-                "score": float(getattr(scan, "score", 0.0) or 0.0),
-                "atr_pct": float(getattr(scan, "atr_pct", 0.0) or 0.0),
+                "scan_action": scan.action,
+                "scan_reason": scan.reason,
+                "scan_score": score,
+                "scan_atr_pct": atr_pct,
             },
         )
+        return intent
 
-    # ---- Exit on reverse signal -------------------------------------
+    # ------------------------------------------------------------------ #
+    # Exit logic
+    # ------------------------------------------------------------------ #
 
     def exit_signal(
         self,
@@ -109,40 +134,43 @@ class C1Strategy:
         risk: Optional[RiskContext] = None,
     ) -> Optional[OrderIntent]:
         """
-        Exit logic (RSI-based via opposite signal):
+        Exit logic for c1.
 
-        - If LONG and ScanResult says "sell" -> exit.
-        - If SHORT and ScanResult says "buy" -> exit.
-
-        We emit EXIT only (no flip). The higher-level scheduler
-        can decide whether to enter the opposite side after exit.
+        While LONG:
+          - Use "sell" actions as exits (e.g., RSI overbought / mean reversion
+            completed). This is layered on top of global profit_lock / loss_zone.
         """
-        if _is_flat(position):
-            return None
-        if scan.symbol != position.symbol:
-            return None
-
-        if _is_long(position) and scan.action == "sell":
-            side = "sell"
-        elif _is_short(position) and scan.action == "buy":
-            side = "buy"
-        else:
+        # No exit if we are not in a long
+        if not _is_long(position):
             return None
 
-        return OrderIntent(
+        # Allow disabling signal-based exits if desired
+        if not C1_ENABLE_SIGNAL_EXIT:
+            return None
+
+        # Only react to "sell" actions as exits
+        if scan.action != "sell":
+            return None
+
+        intent = OrderIntent(
             strategy=self.STRAT_ID,
             symbol=scan.symbol,
-            side=side,
+            side="sell",
             kind="exit",
-            notional=None,     # close full position
-            reason="c1_exit_on_reverse_signal",
+            notional=None,  # "flatten" semantics; router/risk can adjust
+            reason=f"c1_long_exit:{scan.reason}",
             meta={
-                "raw_action": scan.action,
-                "score": float(getattr(scan, "score", 0.0) or 0.0),
+                "scan_action": scan.action,
+                "scan_reason": scan.reason,
+                "scan_score": float(getattr(scan, "score", 0.0) or 0.0),
+                "scan_atr_pct": float(getattr(scan, "atr_pct", 0.0) or 0.0),
             },
         )
+        return intent
 
-    # ---- Per-strategy take-profit -----------------------------------
+    # ------------------------------------------------------------------ #
+    # Optional per-strategy TP/SL hooks (currently rely on global risk)
+    # ------------------------------------------------------------------ #
 
     def profit_take_rule(
         self,
@@ -150,44 +178,12 @@ class C1Strategy:
         risk: Optional[RiskContext] = None,
     ) -> Optional[OrderIntent]:
         """
-        Per-strategy take-profit for c1.
+        Per-strategy profit-take hook for c1.
 
-        Env-tunable:
-          C1_TAKE_PROFIT_PCT (default: 1.5, meaning +1.5%)
-
-        This is *in addition* to your global profit_lock from risk.json.
+        For now, this returns None so that the global profit_lock rules
+        in risk.json remain the single source of truth for numeric TP.
         """
-        if _is_flat(position):
-            return None
-
-        upnl = _normalize_unrealized_pct(position.unrealized_pct)
-        if upnl is None:
-            return None
-
-        tp_pct = _env_float("C1_TAKE_PROFIT_PCT", 1.5) / 100.0
-        if upnl < tp_pct:
-            return None
-
-        if _is_long(position):
-            side = "sell"
-        elif _is_short(position):
-            side = "buy"
-        else:
-            return None
-
-        return OrderIntent(
-            strategy=self.STRAT_ID,
-            symbol=position.symbol,
-            side=side,
-            kind="take_profit",
-            notional=None,  # close full position
-            reason=f"c1_take_profit_{tp_pct*100:.2f}pct",
-            meta={
-                "unrealized_pct": upnl,
-            },
-        )
-
-    # ---- Per-strategy stop-loss -------------------------------------
+        return None
 
     def stop_loss_rule(
         self,
@@ -195,45 +191,12 @@ class C1Strategy:
         risk: Optional[RiskContext] = None,
     ) -> Optional[OrderIntent]:
         """
-        Per-strategy stop-loss for c1.
+        Per-strategy stop-loss hook for c1.
 
-        Env-tunable:
-          C1_STOP_LOSS_PCT (default: -3.0, meaning -3%)
-
-        This is *in addition* to your global loss_zone from risk.json.
+        For now, this returns None so that the global loss_zone / stop-loss
+        rules remain the single source of truth for numeric SL.
         """
-        if _is_flat(position):
-            return None
-
-        upnl = _normalize_unrealized_pct(position.unrealized_pct)
-        if upnl is None:
-            return None
-
-        sl_pct = _env_float("C1_STOP_LOSS_PCT", -3.0) / 100.0
-        # Expect sl_pct to be negative (e.g. -0.03)
-        if upnl > sl_pct:
-            return None
-
-        if _is_long(position):
-            side = "sell"
-        elif _is_short(position):
-            side = "buy"
-        else:
-            return None
-
-        return OrderIntent(
-            strategy=self.STRAT_ID,
-            symbol=position.symbol,
-            side=side,
-            kind="stop_loss",
-            notional=None,
-            reason=f"c1_stop_loss_{sl_pct*100:.2f}pct",
-            meta={
-                "unrealized_pct": upnl,
-            },
-        )
-
-    # ---- Scaling -----------------------------------------------------
+        return None
 
     def should_scale(
         self,
@@ -242,75 +205,12 @@ class C1Strategy:
         risk: Optional[RiskContext] = None,
     ) -> bool:
         """
-        Decide whether to add to an existing winning position.
+        Decide whether to scale INTO an existing long position.
 
-        For now, we keep this conservative and return False.
-        We can wire this up later if you want c1 to pyramid on
-        especially strong RSI signals.
+        Currently disabled for c1; we rely on a single entry plus global risk.
         """
         return False
 
 
-# Singleton instance that scheduler_core can import
+# Module-level singleton expected by scheduler_core.get_strategy("c1")
 c1 = C1Strategy()
-
-
-# ---------------------------------------------------------------------
-# Optional legacy helper (if you used c1.scan in local tooling)
-# ---------------------------------------------------------------------
-
-def legacy_scan(req: Dict[str, Any], ctx: Dict[str, Any]) -> List[Dict[str, Any]]:
-    """
-    Legacy scan-style helper so any old scripts that call c1.scan-like
-    behavior can be pointed here if you want.
-
-    It runs StrategyBook directly and returns a simple list of dicts
-    similar to your old behavior, but without guard / risk.
-    """
-    try:
-        tf = str(req.get("timeframe") or ctx.get("timeframe") or "5Min")
-        limit = int(req.get("limit") or ctx.get("limit") or 300)
-        syms = [s.upper() for s in (req.get("symbols") or ctx.get("symbols") or [])]
-        notional = float(req.get("notional") or ctx.get("notional") or 25.0)
-
-        book = StrategyBook(
-            topk=2,
-            min_score=0.10,
-            risk_target_usd=notional,
-            atr_stop_mult=1.0,
-        )
-        sreq = ScanRequest(
-            strat=STRAT_ID,
-            timeframe=tf,
-            limit=limit,
-            topk=2,
-            min_score=0.10,
-            notional=notional,
-        )
-
-        # Expect contexts of shape {sym: {"one": {...}, "five": {...}}}
-        contexts = ctx.get("contexts") or {}
-        results: List[ScanResult] = book.scan(sreq, contexts) or []
-
-        intents: List[Dict[str, Any]] = []
-        for r in results:
-            if not getattr(r, "selected", False):
-                continue
-            if r.action not in ("buy", "sell"):
-                continue
-            if float(getattr(r, "notional", 0) or 0) <= 0:
-                continue
-            intents.append(
-                {
-                    "symbol": r.symbol,
-                    "side": r.action,
-                    "notional": min(notional, float(r.notional or notional)),
-                    "score": float(getattr(r, "score", 0.0) or 0.0),
-                    "atr_pct": float(getattr(r, "atr_pct", 0.0) or 0.0),
-                    "reason": r.reason or "",
-                }
-            )
-        return intents
-    except Exception as e:
-        logger.exception("[%s] legacy_scan() error: %s", STRAT_ID, e)
-        return []
