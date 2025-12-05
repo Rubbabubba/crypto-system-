@@ -225,35 +225,75 @@ def run_scheduler_once(
             if not isinstance(r, ScanResult):
                 continue
 
-            key = (r.symbol, strat)
-            pos = pos_map.get(key) or PositionSnapshot(symbol=r.symbol, strategy=strat)
+            sym = r.symbol
+            key = (sym, strat)
+            pos = pos_map.get(key) or PositionSnapshot(symbol=sym, strategy=strat)
+
+            qty = float(getattr(pos, "qty", 0.0) or 0.0)
+            is_flat = abs(qty) < 1e-10
+
+            # Precompute some scan fields for reuse
+            scan_selected = bool(getattr(r, "selected", False))
+            scan_notional = float(getattr(r, "notional", 0.0) or 0.0)
+            scan_action = getattr(r, "action", None)
+            scan_score = float(getattr(r, "score", 0.0) or 0.0)
+            scan_atr_pct = float(getattr(r, "atr_pct", 0.0) or 0.0)
 
             # ----- ENTRY (flat -> new position) -----------------------
-            if abs(pos.qty) < 1e-10:
+            if is_flat:
                 intent = strat_obj.entry_signal(r, pos, risk_ctx)
+
                 if intent:
                     all_intents.append(intent)
                     telemetry.append(
                         {
-                            "symbol": r.symbol,
+                            "symbol": sym,
                             "strategy": strat,
                             "kind": intent.kind,
                             "side": intent.side,
                             "reason": intent.reason,
-                            "score": float(getattr(r, "score", 0.0) or 0.0),
-                            "atr_pct": float(getattr(r, "atr_pct", 0.0) or 0.0),
+                            "score": scan_score,
+                            "atr_pct": scan_atr_pct,
                             "source": "entry_signal",
                         }
                     )
+                    # We don't need to consider exit logic when flat.
+                    continue
+
+                # No entry intent: if this looked like a valid candidate,
+                # record WHY the strategy skipped it.
+                if scan_selected and scan_notional > 0.0:
+                    reason = "strategy_rejected_entry"
+                    if scan_action == "sell":
+                        # This is the case we're especially interested in:
+                        # long-only strategy ignoring a SELL signal while flat.
+                        reason = "long_only_blocked_sell_entry"
+
+                    telemetry.append(
+                        {
+                            "symbol": sym,
+                            "strategy": strat,
+                            "kind": "entry_skip",
+                            "side": scan_action,
+                            "reason": reason,
+                            "source": "strategy_layer",
+                            "scan_score": scan_score,
+                            "scan_atr_pct": scan_atr_pct,
+                            "scan_notional": scan_notional,
+                        }
+                    )
+
+                # Still flat, no entry; nothing more to do for this scan.
                 continue
 
             # ----- EXIT on reverse signal (non-flat position) ---------
             exit_intent = strat_obj.exit_signal(r, pos, risk_ctx)
+
             if exit_intent:
                 all_intents.append(exit_intent)
                 telemetry.append(
                     {
-                        "symbol": r.symbol,
+                        "symbol": sym,
                         "strategy": strat,
                         "kind": exit_intent.kind,
                         "side": exit_intent.side,
@@ -261,6 +301,22 @@ def run_scheduler_once(
                         "source": "exit_signal",
                     }
                 )
+            else:
+                # Optional: log when we had a SELL signal while long but
+                # the strategy decided not to exit.
+                if scan_action == "sell":
+                    telemetry.append(
+                        {
+                            "symbol": sym,
+                            "strategy": strat,
+                            "kind": "exit_skip",
+                            "side": "sell",
+                            "reason": "strategy_rejected_exit",
+                            "source": "strategy_layer",
+                            "scan_score": scan_score,
+                            "scan_atr_pct": scan_atr_pct,
+                        }
+                    )
 
         # ----- Per-position TP / SL rules (once per position) --------
         for (sym, s_id), snap in pos_map.items():
