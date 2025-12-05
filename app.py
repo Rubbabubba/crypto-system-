@@ -3144,12 +3144,37 @@ def scheduler_run(payload: Dict[str, Any] = Body(default=None)):
 
                     # Case 0: Already flat
                     if abs(current_qty) < 1e-10:
-                        if desired in ("buy", "sell"):
+                        # Long-only guard: do NOT open a fresh short when flat.
+                        # Instead, log telemetry so we can see that we skipped it.
+                        if desired == "sell":
+                            telemetry.append(
+                                {
+                                    "symbol": sym,
+                                    "strategy": strat,
+                                    "kind": "entry_skip",
+                                    "side": "sell",
+                                    "reason": "long_only_blocked_sell_entry",
+                                    "source": "scheduler_v2",
+                                    "scan_score": float(getattr(r, "score", 0.0) or 0.0),
+                                    "scan_atr_pct": float(getattr(r, "atr_pct", 0.0) or 0.0),
+                                    "scan_notional": float(
+                                        getattr(r, "notional", 0.0) or 0.0
+                                    ),
+                                }
+                            )
+                            # Do not send any order in this case
+                            continue
+
+                        # Normal long-only entry: open a BUY when flat
+                        if desired == "buy":
                             target_notional = float(
                                 r.notional if r.notional and r.notional > 0 else notional
                             )
-                            _send(sym, desired, target_notional, intent=f"open_{desired}")
+                            _send(sym, "buy", target_notional, intent="open_buy")
+
+                        # In all other cases while flat, do nothing.
                         continue
+
 
                     # Case 1: Currently long
                     if current_qty > 0:
