@@ -17,17 +17,19 @@ C6_ENABLE_SIGNAL_EXIT = (
     str(os.getenv("C6_ENABLE_SIGNAL_EXIT", "true")).lower() in ("1", "true", "yes", "on")
 )
 
+C6_ALLOW_SHORTS = (
+    str(os.getenv("C6_ALLOW_SHORTS", "true")).lower() in ("1", "true", "yes", "on")
+)
+
 _raw = os.getenv("C6_MIN_ENTRY_SCORE")
 C6_MIN_ENTRY_SCORE = float(_raw) if _raw not in (None, "") else None
 
-# Volatility band for entries
 _raw = os.getenv("C6_MIN_ATR_PCT")
-C6_MIN_ATR_PCT = float(_raw) if _raw not in (None, "") else 0.1  # default 0.1%
+C6_MIN_ATR_PCT = float(_raw) if _raw not in (None, "") else 0.1
 
 _raw = os.getenv("C6_MAX_ATR_PCT")
-C6_MAX_ATR_PCT = float(_raw) if _raw not in (None, "") else 2.0  # default 2%
+C6_MAX_ATR_PCT = float(_raw) if _raw not in (None, "") else 2.0
 
-# Panic exit threshold: if atr_pct exceeds this while long, be happy to exit
 _raw = os.getenv("C6_PANIC_ATR_PCT")
 C6_PANIC_ATR_PCT = float(_raw) if _raw not in (None, "") else 3.0
 
@@ -46,23 +48,29 @@ def _is_long(position: Optional[PositionSnapshot]) -> bool:
     return qty > 1e-10
 
 
+def _is_short(position: Optional[PositionSnapshot]) -> bool:
+    if position is None:
+        return False
+    qty = getattr(position, "qty", 0.0) or 0.0
+    return qty < -1e-10
+
+
 class C6Strategy:
     """
-    Strategy c6 – volatility-aware long-only.
+    Strategy c6 – volatility-aware, now two-sided.
 
-    Semantics:
-      - Only enters when ATR% is within a configurable band (C6_MIN_ATR_PCT,
-        C6_MAX_ATR_PCT).
-      - When long, "sell" signals and/or ATR% above C6_PANIC_ATR_PCT can be
-        used as exits.
-      - Numeric TP/SL is delegated to global risk engine.
+    - Only enters when ATR% is within [C6_MIN_ATR_PCT, C6_MAX_ATR_PCT].
+    - While flat:
+        * "buy" -> long entry
+        * "sell" -> short entry (if C6_ALLOW_SHORTS)
+    - While in a position:
+        * Panic exit if atr_pct >= C6_PANIC_ATR_PCT (any direction)
+        * Otherwise:
+            - LONG: exit on "sell"
+            - SHORT: exit on "buy"
     """
 
     STRAT_ID: str = STRAT_ID
-
-    # ------------------------------------------------------------------ #
-    # Entry logic
-    # ------------------------------------------------------------------ #
 
     def entry_signal(
         self,
@@ -76,8 +84,16 @@ class C6Strategy:
         if not getattr(scan, "selected", False):
             return None
 
-        if scan.action != "buy":
+        action = getattr(scan, "action", None)
+        if action not in ("buy", "sell"):
             return None
+
+        if action == "buy":
+            side = "buy"
+        else:
+            if not C6_ALLOW_SHORTS:
+                return None
+            side = "sell"
 
         notional = float(getattr(scan, "notional", 0.0) or 0.0)
         if notional <= 0.0:
@@ -88,29 +104,23 @@ class C6Strategy:
             return None
 
         atr_pct = float(getattr(scan, "atr_pct", 0.0) or 0.0)
-
-        # Require volatility inside a target band
         if atr_pct < C6_MIN_ATR_PCT or atr_pct > C6_MAX_ATR_PCT:
             return None
 
         return OrderIntent(
             strategy=self.STRAT_ID,
             symbol=scan.symbol,
-            side="buy",
+            side=side,
             kind="entry",
             notional=notional,
-            reason=f"c6_vol_band_long_entry:{scan.reason}",
+            reason=f"c6_vol_band_entry:{action}:{scan.reason}",
             meta={
-                "scan_action": scan.action,
+                "scan_action": action,
                 "scan_reason": scan.reason,
                 "scan_score": score,
                 "scan_atr_pct": atr_pct,
             },
         )
-
-    # ------------------------------------------------------------------ #
-    # Exit logic
-    # ------------------------------------------------------------------ #
 
     def exit_signal(
         self,
@@ -118,53 +128,56 @@ class C6Strategy:
         position: PositionSnapshot,
         risk: Optional[RiskContext] = None,
     ) -> Optional[OrderIntent]:
-        if not _is_long(position):
-            return None
-
         if not C6_ENABLE_SIGNAL_EXIT:
             return None
 
         atr_pct = float(getattr(scan, "atr_pct", 0.0) or 0.0)
+        action = getattr(scan, "action", None)
 
-        # If volatility blows out above panic threshold, we are happy to exit
-        if atr_pct >= C6_PANIC_ATR_PCT:
+        # Panic exit on extreme volatility regardless of direction
+        if ( _is_long(position) or _is_short(position) ) and atr_pct >= C6_PANIC_ATR_PCT:
+            side = "sell" if _is_long(position) else "buy"
             return OrderIntent(
                 strategy=self.STRAT_ID,
                 symbol=scan.symbol,
-                side="sell",
+                side=side,
                 kind="exit",
                 notional=None,
                 reason=f"c6_panic_vol_exit:atr_pct={atr_pct}",
                 meta={
-                    "scan_action": scan.action,
+                    "scan_action": action,
                     "scan_reason": scan.reason,
                     "scan_score": float(getattr(scan, "score", 0.0) or 0.0),
                     "scan_atr_pct": atr_pct,
                 },
             )
 
-        # Otherwise, use "sell" actions as normal exits
-        if scan.action != "sell":
+        # Directional exits
+        if _is_long(position):
+            if action != "sell":
+                return None
+            side = "sell"
+        elif _is_short(position):
+            if action != "buy":
+                return None
+            side = "buy"
+        else:
             return None
 
         return OrderIntent(
             strategy=self.STRAT_ID,
             symbol=scan.symbol,
-            side="sell",
+            side=side,
             kind="exit",
             notional=None,
-            reason=f"c6_vol_band_long_exit:{scan.reason}",
+            reason=f"c6_vol_band_exit:{action}:{scan.reason}",
             meta={
-                "scan_action": scan.action,
+                "scan_action": action,
                 "scan_reason": scan.reason,
                 "scan_score": float(getattr(scan, "score", 0.0) or 0.0),
                 "scan_atr_pct": atr_pct,
             },
         )
-
-    # ------------------------------------------------------------------ #
-    # TP/SL hooks (delegating to global risk)
-    # ------------------------------------------------------------------ #
 
     def profit_take_rule(
         self,
@@ -186,9 +199,7 @@ class C6Strategy:
         position: PositionSnapshot,
         risk: Optional[RiskContext] = None,
     ) -> bool:
-        # No explicit scaling logic for c6 (volatility-sensitive).
         return False
 
 
-# Module-level singleton expected by scheduler_core.get_strategy("c6")
 c6 = C6Strategy()
