@@ -918,30 +918,40 @@
       // keys: "YYYY-MM" -> [{day, realized}]
     };
 
-    async function getDailyForMonth(year, monthIndex) {
-      const key = year + "-" + pad2(monthIndex+1);
-      if (DailyCache[key]) return DailyCache[key];
+   // ===== Daily P&L helper using /pnl2/daily =====
+	async function getDailyForMonth(year, monthIndex) {
+	  // monthIndex is 0-based (0 = Jan) in JS; API will use 1-based.
+	  const key = year + "-" + pad2(monthIndex + 1);
+	  if (DailyCache[key]) return DailyCache[key];
 
-      const days = daysInMonth(year, monthIndex);
-      const out = [];
-      for (let day = 1; day <= days; day++) {
-        const dStart = new Date(year, monthIndex, day, 0,0,0);
-        const dEnd   = new Date(year, monthIndex, day, 23,59,59);
-        const qs = "?start=" + encodeURIComponent(toIsoNoMs(dStart)) +
-                   "&end=" + encodeURIComponent(toIsoNoMs(dEnd));
-        try {
-          const res = await fetchJSON("/pnl2/summary" + qs);
-          const realized = res && res.total && typeof res.total.realized === "number"
-            ? res.total.realized
-            : 0;
-          out.push({ day, realized });
-        } catch (e) {
-          out.push({ day, realized: 0 });
-        }
-      }
-      DailyCache[key] = out;
-      return out;
-    }
+	  const month = monthIndex + 1;
+
+	  try {
+		const res = await fetchJSON(`/pnl2/daily?year=${year}&month=${month}`);
+		const rows = (res && (res.rows || res.daily)) || [];
+
+		// Normalize into [{ day, realized }]
+		const normalized = rows
+		  .map(r => ({
+			day: Number(r.day),
+			realized: Number(r.realized || 0),
+		  }))
+		  .filter(r => !Number.isNaN(r.day))
+		  .sort((a, b) => a.day - b.day);
+
+		DailyCache[key] = normalized;
+		return normalized;
+	  } catch (e) {
+		log("getDailyForMonth failed, falling back to zeros", String(e));
+		const days = daysInMonth(year, monthIndex);
+		const out = [];
+		for (let day = 1; day <= days; day++) {
+		  out.push({ day, realized: 0 });
+		}
+		DailyCache[key] = out;
+		return out;
+	  }
+	}
 
     // ===== Top bar: config & KPIs =====
     async function initConfig() {
@@ -1085,43 +1095,53 @@
 
     // ===== Performance card (this month vs last month) =====
     async function updatePerformanceCard() {
-      const now = new Date();
-      const thisYear = now.getFullYear();
-      const thisMonthIdx = now.getMonth();
+	  const now = new Date();
+	  const thisYear = now.getFullYear();
+	  const thisMonthIdx = now.getMonth();
 
-      const prevFirst = firstOfPreviousMonth(now);
-      const prevYear = prevFirst.getFullYear();
-      const prevMonthIdx = prevFirst.getMonth();
+	  const prevFirst = firstOfPreviousMonth(now);
+	  const prevYear = prevFirst.getFullYear();
+	  const prevMonthIdx = prevFirst.getMonth();
 
-      const thisMonthData = await getDailyForMonth(thisYear, thisMonthIdx);
-      const lastMonthData = await getDailyForMonth(prevYear, prevMonthIdx);
+	  // Pull both months in parallel
+	  const [thisMonthData, lastMonthData] = await Promise.all([
+		getDailyForMonth(thisYear, thisMonthIdx),
+		getDailyForMonth(prevYear, prevMonthIdx),
+	  ]);
 
-      const sum = arr => arr.reduce((acc, d) => acc + (d.realized || 0), 0);
+	  const sum = arr => arr.reduce((acc, d) => acc + (d.realized || 0), 0);
 
-      const thisSum = sum(thisMonthData);
-      const lastSum = sum(lastMonthData);
-      const delta = thisSum - lastSum;
+	  const thisSum = sum(thisMonthData);
+	  const lastSum = sum(lastMonthData);
+	  const delta = thisSum - lastSum;
 
-      $id("perf_this_month_value").textContent = money(thisSum);
-      $id("perf_last_month_value").textContent = money(lastSum);
-      $id("perf_delta_value").textContent = money(delta);
-      $id("perf_range_label").textContent = "MTD vs last month";
+	  $id("perf_this_month_value").textContent = money(thisSum);
+	  $id("perf_last_month_value").textContent = money(lastSum);
+	  $id("perf_delta_value").textContent = money(delta);
+	  $id("perf_range_label").textContent = "MTD vs last month";
 
-      const maxAbs = Math.max(Math.abs(thisSum), Math.abs(lastSum), 1);
-      const thisPct = Math.abs(thisSum) / maxAbs * 100;
-      const lastPct = Math.abs(lastSum) / maxAbs * 100;
+	  const maxAbs = Math.max(Math.abs(thisSum), Math.abs(lastSum), 1);
+	  const thisPct = Math.abs(thisSum) / maxAbs * 100;
+	  const lastPct = Math.abs(lastSum) / maxAbs * 100;
 
-      const barThis = $id("perf_bar_this");
-      const barLast = $id("perf_bar_last");
-      barThis.style.width = thisPct.toFixed(1) + "%";
-      barLast.style.width = lastPct.toFixed(1) + "%";
-      barThis.classList.toggle("neg", thisSum < 0);
-      barLast.classList.toggle("neg", lastSum < 0);
-      $id("perf_bar_this_val").textContent = money(thisSum);
-      $id("perf_bar_last_val").textContent = money(lastSum);
+	  const barThis = $id("perf_bar_this");
+	  const barLast = $id("perf_bar_last");
+	  barThis.style.width = thisPct.toFixed(1) + "%";
+	  barLast.style.width = lastPct.toFixed(1) + "%";
+	  barThis.classList.toggle("neg", thisSum < 0);
+	  barLast.classList.toggle("neg", lastSum < 0);
+	  $id("perf_bar_this_val").textContent = money(thisSum);
+	  $id("perf_bar_last_val").textContent = money(lastSum);
 
-      $id("perf_extra_summary").textContent = "";
-    }
+	  // Optional: simple text summary (you can customize this)
+	  const totalDays = thisMonthData.length;
+	  const greenDays = thisMonthData.filter(d => d.realized > 0).length;
+	  const redDays = thisMonthData.filter(d => d.realized < 0).length;
+	  const flatDays = totalDays - greenDays - redDays;
+
+	  $id("perf_extra_summary").textContent =
+		`This month: ${greenDays} green · ${redDays} red · ${flatDays} flat days.`;
+	}
 
     // ===== Calendar card =====
     let CalendarState = {

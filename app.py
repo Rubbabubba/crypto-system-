@@ -4200,7 +4200,34 @@ def pnl2_by_strategy(start: Optional[str] = None, end: Optional[str] = None):
         }
     except Exception as e:
         return {"ok": False, "error": f"/pnl2/by_strategy failed: {e.__class__.__name__}: {e}"}
+        
+@app.get("/pnl2/daily")
+def pnl2_daily(year: int, month: int):
+    """
+    Return daily realized P&L for a given month.
+    year: 2025, month: 12 (1-based)
+    """
+    try:
+        from datetime import datetime, timedelta
 
+        days_in_month = (datetime(year + (month // 12), ((month % 12) + 1), 1) -
+                         timedelta(days=1)).day
+        engine = PositionEngine()
+        rows = []
+
+        for day in range(1, days_in_month + 1):
+            start = datetime(year, month, day, 0, 0, 0)
+            end   = datetime(year, month, day, 23, 59, 59)
+            fills = _pnl__load_fills(start.isoformat(), end.isoformat())
+            engine_day = PositionEngine()
+            engine_day.process_fills(fills)
+            snap = engine_day.snapshot()
+            realized = snap["total"]["realized"]
+            rows.append({"day": day, "realized": realized})
+
+        return {"ok": True, "year": year, "month": month, "rows": rows}
+    except Exception as e:
+        return {"ok": False, "error": f"/pnl2/daily failed: {e.__class__.__name__}: {e}"}
 
 @app.get("/pnl2/by_symbol")
 def pnl2_by_symbol(start: Optional[str] = None, end: Optional[str] = None):
