@@ -64,8 +64,8 @@ def _strategy_instance_for(strat_id: str):
     """
     Map strat_id -> strategy instance.
 
-    c1–c6 are implemented as classes with a module-level singleton
-    named c1, c2, ..., c6 in their respective modules.
+    c1–c7 are implemented as classes with a module-level singleton
+    named c1, c2, ..., c7 in their respective modules.
     """
     s = strat_id.strip().lower()
 
@@ -87,6 +87,9 @@ def _strategy_instance_for(strat_id: str):
     if s == "c6":
         import c6 as m
         return m.c6
+    if s == "c7":
+        import c7 as m
+        return m.c7    
 
     return None
 
