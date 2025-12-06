@@ -346,6 +346,10 @@ class StrategyBook:
                 action, score, reason = sig_c5_alt_mom(close1, reg1, min_atr_pct=min_atr_5m)
             elif s == "c6":
                 action, score, reason = sig_c6_rel_to_btc(close1, reg1, ref_btc, min_atr_pct=min_atr_5m)
+            elif s == "c7":
+                # c7 piggybacks on the same trend signal engine as c2.
+                # c7.py interprets SELL signals as short entries.
+                action, score, reason = sig_c2_trend(close1, reg1, min_atr_pct=min_atr_5m)
             else:
                 action, score, reason = "flat", 0.0, "unknown_strategy"
 
@@ -378,3 +382,4 @@ class StrategyBook:
                 r.notional = 0.0
             out.append(r)
         return out
+
