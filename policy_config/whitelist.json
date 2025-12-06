@@ -1,26 +1,9 @@
 {
-  "c1": [
-    "SOL/USD",
-    "AVAX/USD"
-  ],
-  "c2": [
-    "BTC/USD",
-    "ETH/USD"
-  ],
-  "c3": [
-    "ADA/USD",
-    "XRP/USD"
-  ],
-  "c4": [
-    "LTC/USD",
-    "BCH/USD"
-  ],
-  "c5": [
-    "LINK/USD",
-    "DOT/USD"
-  ],
-  "c6": [
-    "NEAR/USD",
-    "SUI/USD"
-  ]
+  "c1": ["SOL/USD","AVAX/USD"],
+  "c2": ["BTC/USD","ETH/USD"],
+  "c3": ["ADA/USD","XRP/USD"],
+  "c4": ["LTC/USD","BCH/USD"],
+  "c5": ["LINK/USD","DOT/USD"],
+  "c6": ["NEAR/USD","SUI/USD"],
+  "c7": ["BTC/USD","ETH/USD"]
 }
