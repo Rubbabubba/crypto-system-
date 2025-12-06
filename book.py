@@ -286,11 +286,23 @@ class StrategyBook:
 
     def _resolve_knobs_for_strat(self, strat: str):
         s = strat.strip().lower()
+
+        # Base: strategy-aware overrides via env, with global defaults
         topk          = _cfg_int("BOOK_TOPK", s, DEFAULT_BOOK_TOPK)
         min_score     = _cfg_float("BOOK_MIN_SCORE", s, DEFAULT_BOOK_MIN_SCORE)
         atr_stop_mult = _cfg_float("ATR_STOP_MULT", s, DEFAULT_ATR_STOP_MULT)
         min_atr_5m    = _cfg_float("VOL_MIN_ATR_PCT_5M", s, DEFAULT_MIN_ATR_PCT)
         mtf_ok        = _cfg_bool("MTF_CONFIRM", s, DEFAULT_MTF_CONFIRM)
+
+        # c7-specific default tweaks:
+        # If you have NOT explicitly set BOOK_MIN_SCORE_C7 / BOOK_TOPK_C7
+        # in the environment, relax the score cutoff a bit and allow up to 2 picks.
+        if s == "c7":
+            if "BOOK_MIN_SCORE_C7" not in os.environ:
+                min_score = 0.05  # more permissive for bear-ride entries
+            if "BOOK_TOPK_C7" not in os.environ:
+                topk = 2          # allow up to 2 c7 symbols per scan
+
         return topk, min_score, atr_stop_mult, min_atr_5m, mtf_ok
 
     def scan(self, req: ScanRequest, contexts: Dict[str, Optional[Dict[str, Any]]]) -> List[ScanResult]:
