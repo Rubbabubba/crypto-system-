@@ -1,9 +1,11 @@
 {
-  "c1": { "hours": [], "dows": ["Mon","Tue","Wed","Thu","Fri","Sat","Sun"] },
-  "c2": { "hours": [], "dows": ["Mon","Tue","Wed","Thu","Fri","Sat","Sun"] },
-  "c3": { "hours": [], "dows": ["Mon","Tue","Wed","Thu","Fri","Sat","Sun"] },
-  "c4": { "hours": [], "dows": ["Mon","Tue","Wed","Thu","Fri","Sat","Sun"] },
-  "c5": { "hours": [], "dows": ["Mon","Tue","Wed","Thu","Fri","Sat","Sun"] },
-  "c6": { "hours": [], "dows": ["Mon","Tue","Wed","Thu","Fri","Sat","Sun"] },
-  "c7": { "hours": [], "dows": ["Mon","Tue","Wed","Thu","Fri","Sat","Sun"] }
+  "windows": {
+    "c1": { "hours": [], "dows": ["Mon","Tue","Wed","Thu","Fri","Sat","Sun"] },
+    "c2": { "hours": [], "dows": ["Mon","Tue","Wed","Thu","Fri","Sat","Sun"] },
+    "c3": { "hours": [], "dows": ["Mon","Tue","Wed","Thu","Fri","Sat","Sun"] },
+    "c4": { "hours": [], "dows": ["Mon","Tue","Wed","Thu","Fri","Sat","Sun"] },
+    "c5": { "hours": [], "dows": ["Mon","Tue","Wed","Thu","Fri","Sat","Sun"] },
+    "c6": { "hours": [], "dows": ["Mon","Tue","Wed","Thu","Fri","Sat","Sun"] },
+    "c7": { "hours": [], "dows": ["Mon","Tue","Wed","Thu","Fri","Sat","Sun"] }
+  }
 }
