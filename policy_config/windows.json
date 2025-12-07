@@ -1,9 +1,9 @@
 {
-  "c1": { "days": ["Mon","Tue","Wed","Thu","Fri","Sat","Sun"], "hours": [0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23] },
-  "c2": { "days": ["Mon","Tue","Wed","Thu","Fri","Sat","Sun"], "hours": [0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23] },
-  "c3": { "days": ["Mon","Tue","Wed","Thu","Fri","Sat","Sun"], "hours": [0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23] },
-  "c4": { "days": ["Mon","Tue","Wed","Thu","Fri","Sat","Sun"], "hours": [0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23] },
-  "c5": { "days": ["Mon","Tue","Wed","Thu","Fri","Sat","Sun"], "hours": [0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23] },
-  "c6": { "days": ["Mon","Tue","Wed","Thu","Fri","Sat","Sun"], "hours": [0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23] },
-  "c7": { "days": ["Mon","Tue","Wed","Thu","Fri","Sat","Sun"], "hours": [0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23] }
+  "c1": { "hours": [], "dows": ["Mon","Tue","Wed","Thu","Fri","Sat","Sun"] },
+  "c2": { "hours": [], "dows": ["Mon","Tue","Wed","Thu","Fri","Sat","Sun"] },
+  "c3": { "hours": [], "dows": ["Mon","Tue","Wed","Thu","Fri","Sat","Sun"] },
+  "c4": { "hours": [], "dows": ["Mon","Tue","Wed","Thu","Fri","Sat","Sun"] },
+  "c5": { "hours": [], "dows": ["Mon","Tue","Wed","Thu","Fri","Sat","Sun"] },
+  "c6": { "hours": [], "dows": ["Mon","Tue","Wed","Thu","Fri","Sat","Sun"] },
+  "c7": { "hours": [], "dows": ["Mon","Tue","Wed","Thu","Fri","Sat","Sun"] }
 }
