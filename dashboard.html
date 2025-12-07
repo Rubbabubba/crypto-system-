@@ -723,7 +723,8 @@
           <div class="card-header">
             <h2>Recent Trades</h2>
             <div class="subtext">
-              <span class="pill" id="trades_count_pill">Last 20 fills</span>
+              <span class="pill" id="trades_count_pill">Last 10 fills</span>
+			  <a class="link-open" href="/fills" target="_blank">view more</a>
             </div>
           </div>
           <table class="mini-table" id="table_trades">
@@ -918,19 +919,18 @@
       // keys: "YYYY-MM" -> [{day, realized}]
     };
 
-   // ===== Daily P&L helper using /pnl2/daily =====
+	// ===== Daily P&L helper using /pnl2/daily =====
 	async function getDailyForMonth(year, monthIndex) {
-	  // monthIndex is 0-based (0 = Jan) in JS; API will use 1-based.
+	  // monthIndex is 0-based (0 = Jan)
 	  const key = year + "-" + pad2(monthIndex + 1);
 	  if (DailyCache[key]) return DailyCache[key];
 
-	  const month = monthIndex + 1;
+	  const month = monthIndex + 1; // API is 1-based (1 = Jan)
 
 	  try {
 		const res = await fetchJSON(`/pnl2/daily?year=${year}&month=${month}`);
 		const rows = (res && (res.rows || res.daily)) || [];
 
-		// Normalize into [{ day, realized }]
 		const normalized = rows
 		  .map(r => ({
 			day: Number(r.day),
@@ -986,23 +986,32 @@
         if (todayRealized < 0) $id("kpi_today_value").classList.add("kpi-bad");
         $id("kpi_today_sub").textContent = "Realized today";
 
-        // MTD
-        const mtdStart = firstOfMonth(now);
-        const mtdRes = await fetchJSON(
-          "/pnl2/summary?start=" + encodeURIComponent(toIsoNoMs(mtdStart)) +
-          "&end=" + encodeURIComponent(toIsoNoMs(endOfDay(now)))
-        );
-        const mtdTotal = mtdRes.total || {};
-        const mtdRealized = mtdTotal.realized || 0;
-        $id("kpi_mtd_value").textContent = money(mtdRealized);
-        $id("kpi_mtd_value").classList.remove("kpi-good","kpi-bad");
-        if (mtdRealized > 0) $id("kpi_mtd_value").classList.add("kpi-good");
-        if (mtdRealized < 0) $id("kpi_mtd_value").classList.add("kpi-bad");
-        $id("kpi_mtd_sub").textContent = "Realized P&L since " + mtdStart.toISOString().slice(0,10);
+        // MTD (use /pnl2/daily so it matches performance/calendar exactly)
+		const mtdStart = firstOfMonth(now);
+		const mtdEnd = endOfDay(now);
 
-        // Equity from MTD snapshot
-        $id("kpi_equity_value").textContent = money(mtdTotal.equity || 0);
-        $id("kpi_equity_sub").textContent = "Equity from pnl2 snapshot";
+		// equity snapshot still from /pnl2/summary
+		const mtdRes = await fetchJSON(
+		  "/pnl2/summary?start=" + encodeURIComponent(toIsoNoMs(mtdStart)) +
+		  "&end=" + encodeURIComponent(toIsoNoMs(mtdEnd))
+		);
+		const mtdTotal = mtdRes.total || {};
+		const equitySnap = mtdTotal.equity || 0;
+
+		// realized MTD from daily
+		const dailyThisMonth = await getDailyForMonth(now.getFullYear(), now.getMonth());
+		const mtdRealized = dailyThisMonth.reduce((acc, d) => acc + (d.realized || 0), 0);
+
+		$id("kpi_mtd_value").textContent = money(mtdRealized);
+		$id("kpi_mtd_value").classList.remove("kpi-good","kpi-bad");
+		if (mtdRealized > 0) $id("kpi_mtd_value").classList.add("kpi-good");
+		if (mtdRealized < 0) $id("kpi_mtd_value").classList.add("kpi-bad");
+		$id("kpi_mtd_sub").textContent = "Realized P&L since " + mtdStart.toISOString().slice(0,10);
+
+		// Equity from snapshot
+		$id("kpi_equity_value").textContent = money(equitySnap);
+		$id("kpi_equity_sub").textContent = "Equity from pnl2 snapshot";
+
 
       } catch (e) {
         log("updateTopKpis failed", String(e));
@@ -1094,7 +1103,7 @@
     }
 
     // ===== Performance card (this month vs last month) =====
-    async function updatePerformanceCard() {
+	async function updatePerformanceCard() {
 	  const now = new Date();
 	  const thisYear = now.getFullYear();
 	  const thisMonthIdx = now.getMonth();
@@ -1103,7 +1112,7 @@
 	  const prevYear = prevFirst.getFullYear();
 	  const prevMonthIdx = prevFirst.getMonth();
 
-	  // Pull both months in parallel
+	  // Load both months in parallel
 	  const [thisMonthData, lastMonthData] = await Promise.all([
 		getDailyForMonth(thisYear, thisMonthIdx),
 		getDailyForMonth(prevYear, prevMonthIdx),
@@ -1133,7 +1142,7 @@
 	  $id("perf_bar_this_val").textContent = money(thisSum);
 	  $id("perf_bar_last_val").textContent = money(lastSum);
 
-	  // Optional: simple text summary (you can customize this)
+	  // Simple summary line
 	  const totalDays = thisMonthData.length;
 	  const greenDays = thisMonthData.filter(d => d.realized > 0).length;
 	  const redDays = thisMonthData.filter(d => d.realized < 0).length;
@@ -1142,6 +1151,7 @@
 	  $id("perf_extra_summary").textContent =
 		`This month: ${greenDays} green · ${redDays} red · ${flatDays} flat days.`;
 	}
+
 
     // ===== Calendar card =====
     let CalendarState = {
@@ -1299,7 +1309,7 @@
     // ===== Recent trades =====
     async function updateRecentTrades() {
       try {
-        const res = await fetchJSON("/fills?limit=20&offset=0");
+        const res = await fetchJSON("/fills?limit=10&offset=0");
         const rows = (res && res.rows) || [];
         const tbody = $id("table_trades").querySelector("tbody");
         tbody.innerHTML = "";

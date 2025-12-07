@@ -4207,27 +4207,44 @@ def pnl2_daily(year: int, month: int):
     Return daily realized P&L for a given month.
     year: 2025, month: 12 (1-based)
     """
-    try:
-        from datetime import datetime, timedelta
+    from datetime import datetime, timedelta
 
-        days_in_month = (datetime(year + (month // 12), ((month % 12) + 1), 1) -
-                         timedelta(days=1)).day
-        engine = PositionEngine()
+    try:
+        # Days in month: go to the first of next month and step back a day
+        if month == 12:
+            next_month = datetime(year + 1, 1, 1)
+        else:
+            next_month = datetime(year, month + 1, 1)
+        days_in_month = (next_month - timedelta(days=1)).day
+
         rows = []
 
         for day in range(1, days_in_month + 1):
-            start = datetime(year, month, day, 0, 0, 0)
-            end   = datetime(year, month, day, 23, 59, 59)
-            fills = _pnl__load_fills(start.isoformat(), end.isoformat())
+            start_dt = datetime(year, month, day, 0, 0, 0)
+            end_dt   = datetime(year, month, day, 23, 59, 59)
+
+            # IMPORTANT: use same format as rest of PnL code ("YYYY-MM-DD HH:MM:SS")
+            start = start_dt.strftime("%Y-%m-%d %H:%M:%S")
+            end   = end_dt.strftime("%Y-%m-%d %H:%M:%S")
+
+            fills = _pnl__load_fills(start, end)
             engine_day = PositionEngine()
             engine_day.process_fills(fills)
             snap = engine_day.snapshot()
             realized = snap["total"]["realized"]
+
             rows.append({"day": day, "realized": realized})
 
         return {"ok": True, "year": year, "month": month, "rows": rows}
+
     except Exception as e:
-        return {"ok": False, "error": f"/pnl2/daily failed: {e.__class__.__name__}: {e}"}
+        return {
+            "ok": False,
+            "error": f"/pnl2/daily failed: {e.__class__.__name__}: {e}",
+            "year": year,
+            "month": month,
+            "rows": [],
+        }
 
 @app.get("/pnl2/by_symbol")
 def pnl2_by_symbol(start: Optional[str] = None, end: Optional[str] = None):
