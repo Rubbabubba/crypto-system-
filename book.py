@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from typing import Dict, Any, List, Optional, Tuple
 import numpy as np
 import pandas as pd
+from utils_volatility import atr as _atr_series, atr_pct as _atr_pct_series
 
 # ---- Defaults (kept consistent with your current behavior) ----
 DEFAULT_MIN_ATR_PCT = float(os.getenv('MIN_ATR_PCT', '0.08'))  # default 8% for 5m
@@ -26,12 +27,6 @@ def _zscore(x, n):
     m = s.rolling(n).mean()
     sd = s.rolling(n).std(ddof=0).replace(0, np.nan)
     return ((s - m) / sd).to_numpy()
-
-def _atr(high, low, close, n=14):
-    h, l, c = map(pd.Series, (high, low, close))
-    pc = c.shift(1)
-    tr = pd.concat([(h-l).abs(), (h-pc).abs(), (l-pc).abs()], axis=1).max(axis=1)
-    return tr.rolling(n).mean().to_numpy()
 
 def _rsi(values, n=14):
     s = pd.Series(values)
@@ -120,18 +115,41 @@ class Regimes:
     sma_slow: float
 
 def compute_regimes(close, high, low) -> Regimes:
+    """Compute trend and volatility regimes for the latest bar.
+
+    - trend_z: z-score of (SMA20 - SMA60) over a 60-bar window.
+    - atr:     14-period ATR (EMA) in price units.
+    - atr_pct: 14-period ATR as a *percent* of price (1.0 == 1% move).
+
+    All inputs are expected to be 1D sequences ordered oldest -> newest.
+    """
     sma_f = _roll_mean(close, 20)
     sma_s = _roll_mean(close, 60)
     trend_z = _zscore(sma_f - sma_s, 60)
-    atr = _atr(high, low, close, 14)
-    # Percentile of ATR over 200 bars, used as a "volatility percentile"
-    atr_pct = pd.Series(atr).rolling(200).rank(pct=True).to_numpy()
+
+    # Use the shared volatility helpers so ATR semantics stay consistent
+    # across the entire system (book, strategies, advisor, etc.).
+    df = pd.DataFrame(
+        {
+            "high": np.asarray(high, dtype="float64"),
+            "low": np.asarray(low, dtype="float64"),
+            "close": np.asarray(close, dtype="float64"),
+        }
+    )
+    atr_series = _atr_series(df, period=14, method="ema").to_numpy()
+    atr_pct_series = _atr_pct_series(df, period=14, method="ema").to_numpy()
+
     i = len(close) - 1
-    def last(x): return float(x[i]) if len(x) else float("nan")
+
+    def last(x):
+        if len(x) == 0:
+            return float("nan")
+        return float(x[i])
+
     return Regimes(
         trend_z=last(trend_z),
-        atr=last(atr),
-        atr_pct=last(atr_pct),
+        atr=last(atr_series),
+        atr_pct=last(atr_pct_series),
         sma_fast=last(sma_f),
         sma_slow=last(sma_s),
     )
@@ -224,14 +242,32 @@ def mtf_confirm(action: str, reg5: Regimes) -> bool:
     if action == "sell": return reg5.sma_fast < reg5.sma_slow
     return True
 
-def size_from_atr(price: float, atr_pct: float, target_risk_usd: float = 10.0, atr_mult: float = 1.0, max_notional: float = 30000.0):
-    """Position sizing using ATR%% as a risk proxy.
+def size_from_atr(
+    price: float,
+    atr_pct: float,
+    target_risk_usd: float = 10.0,
+    atr_mult: float = 1.0,
+    max_notional: float = 30000.0,
+):
+    """Position sizing using ATR% as a risk proxy.
+
+    Parameters
+    ----------
+    price : float
+        Latest trade/close price.
+    atr_pct : float
+        ATR as a *percent* of price, where 1.0 means 1%.
+        This matches utils_volatility.atr_pct and the C?_*ATR_PCT env knobs.
+    target_risk_usd : float
+        Desired dollar risk per position.
+    atr_mult : float
+        Multiplier applied to ATR% when estimating risk per position.
+    max_notional : float
+        Hard cap on position notional in USD.
 
     We approximate percentage risk on the position as:
 
-        effective_risk_pct ~= atr_mult * atr_pct
-
-    where `atr_pct` is expressed as a decimal (e.g. 0.05 for 5%%).
+        effective_risk_pct ~= atr_mult * (atr_pct / 100.0)
 
     For a desired dollar risk `target_risk_usd`, we solve:
 
@@ -240,6 +276,7 @@ def size_from_atr(price: float, atr_pct: float, target_risk_usd: float = 10.0, a
 
     and clamp position notional to `max_notional` to avoid outsized trades.
     """
+
     # Basic sanity checks
     if (not np.isfinite(price)) or price <= 0:
         return 0.0, 0.0
@@ -248,8 +285,9 @@ def size_from_atr(price: float, atr_pct: float, target_risk_usd: float = 10.0, a
     if (not np.isfinite(target_risk_usd)) or target_risk_usd <= 0:
         return 0.0, 0.0
 
-    # Floor risk so that extremely tiny ATR%% cannot explode size.
-    effective_risk_pct = max(atr_mult * atr_pct, 1e-4)
+    # Convert ATR% to a decimal risk fraction and floor it so that extremely
+    # tiny ATR values cannot explode position size.
+    effective_risk_pct = max(atr_mult * (atr_pct / 100.0), 1e-4)
 
     # Target notional based on desired dollar risk.
     notional = target_risk_usd / effective_risk_pct
