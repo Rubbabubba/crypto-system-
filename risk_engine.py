@@ -102,6 +102,23 @@ class RiskEngine:
             risk_cfg = _load_risk_dict()
         self._cfg_raw = risk_cfg or {}
         self.config = self._parse_config(self._cfg_raw)
+        
+    def cash_buffer_usd(self) -> float:
+        """
+        Small helper for the global cash buffer, in USD.
+
+        Reads the optional `cash_buffer_usd` key from the raw
+        risk config (risk.json). Returns 0.0 if the key is
+        missing or not a valid number.
+        """
+        raw = self._cfg_raw or {}
+
+        value = raw.get("cash_buffer_usd", 0)
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return 0.0
+
 
     # ------------------------------------------------------------------
     # Parsing
