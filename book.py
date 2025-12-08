@@ -18,6 +18,13 @@ DEFAULT_MTF_CONFIRM = (str(os.getenv("MTF_CONFIRM", "true")).lower() in ("1","tr
 DEFAULT_MIN_BARS_1M = int(float(os.getenv("BOOK_MIN_BARS_1M", "50")))
 DEFAULT_MIN_BARS_5M = int(float(os.getenv("BOOK_MIN_BARS_5M", "50")))
 
+# NEW: optional per-strategy 5m dollar-volume filter.
+#  - BOOK_MIN_DOLLAR_VOL_5M: global default (USD per 5m bar, averaged)
+#  - {STRAT}_MIN_DOLLAR_VOL_5M: per-strategy override (e.g. C2_MIN_DOLLAR_VOL_5M)
+DEFAULT_MIN_DOLLAR_VOL_5M = float(os.getenv("BOOK_MIN_DOLLAR_VOL_5M", "0.0"))
+DEFAULT_VOL_LOOKBACK_5M = int(float(os.getenv("BOOK_VOL_LOOKBACK_5M", "20")))
+
+
 # ====== utilities ======
 def _roll_mean(a, n): return pd.Series(a).rolling(n).mean().to_numpy()
 def _roll_std(a, n):  return pd.Series(a).rolling(n).std(ddof=0).to_numpy()
@@ -331,6 +338,7 @@ class StrategyBook:
         atr_stop_mult = _cfg_float("ATR_STOP_MULT", s, DEFAULT_ATR_STOP_MULT)
         min_atr_5m    = _cfg_float("VOL_MIN_ATR_PCT_5M", s, DEFAULT_MIN_ATR_PCT)
         mtf_ok        = _cfg_bool("MTF_CONFIRM", s, DEFAULT_MTF_CONFIRM)
+        min_dollar_vol_5m = _cfg_float("MIN_DOLLAR_VOL_5M", s, DEFAULT_MIN_DOLLAR_VOL_5M)
 
         # c7-specific default tweaks:
         # If you have NOT explicitly set BOOK_MIN_SCORE_C7 / BOOK_TOPK_C7
@@ -344,10 +352,11 @@ class StrategyBook:
         return topk, min_score, atr_stop_mult, min_atr_5m, mtf_ok
 
     def scan(self, req: ScanRequest, contexts: Dict[str, Optional[Dict[str, Any]]]) -> List[ScanResult]:
-        topk, min_score, atr_stop_mult, min_atr_5m, mtf_ok = self._resolve_knobs_for_strat(req.strat)
+        topk, min_score, atr_stop_mult, min_atr_5m, mtf_ok, min_dollar_vol_5m = self._resolve_knobs_for_strat(req.strat)
         self.topk = topk
         self.min_score = min_score
         self.atr_stop_mult = atr_stop_mult
+        self.min_dollar_vol_5m = min_dollar_vol_5m
 
         results: List[ScanResult] = []
         ref_btc = None
@@ -381,6 +390,40 @@ class StrategyBook:
 
             reg1 = compute_regimes(close1, high1, low1)
             reg5 = compute_regimes(close5, high5, low5)
+            
+            # NEW: optional 5m dollar-volume filter (per-strategy).
+            # If min_dollar_vol_5m <= 0, this filter is effectively disabled.
+            if min_dollar_vol_5m > 0.0:
+                vol5 = five.get("volume") or []
+                avg_dollar_vol_5m = None
+                # Only attempt the filter if we have both volume and price.
+                if vol5 and close5:
+                    n = min(len(vol5), len(close5), DEFAULT_VOL_LOOKBACK_5M)
+                    if n > 0:
+                        v = np.asarray(vol5[-n:], dtype="float64")
+                        c5 = np.asarray(close5[-n:], dtype="float64")
+                        with np.errstate(invalid="ignore", divide="ignore"):
+                            dollar_vol = v * c5
+                        if dollar_vol.size:
+                            avg_dollar_vol_5m = float(np.nanmean(dollar_vol))
+                # If we successfully computed an average and it is below threshold, skip.
+                if (avg_dollar_vol_5m is not None
+                        and np.isfinite(avg_dollar_vol_5m)
+                        and avg_dollar_vol_5m < min_dollar_vol_5m):
+                    results.append(
+                        ScanResult(
+                            sym,
+                            "flat",
+                            "filt_dollar_vol_5m_too_low",
+                            0.0,
+                            float(reg1.atr if np.isfinite(reg1.atr) else 0.0),
+                            float(reg1.atr_pct if np.isfinite(reg1.atr_pct) else 0.0),
+                            0.0,
+                            0.0,
+                            False,
+                        )
+                    )
+                    continue
 
             action, score, reason = "flat", 0.0, "no_raw_signal"
             s = req.strat.strip().lower()

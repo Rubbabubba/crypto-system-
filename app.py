@@ -1178,11 +1178,13 @@ def debug_strategy_scan(payload: Dict[str, Any] = Body(default=None)):
                     "close": _safe_series(one, "c"),
                     "high":  _safe_series(one, "h"),
                     "low":   _safe_series(one, "l"),
+                    "volume": _safe_series(one, "v"),
                 },
                 "five": {
                     "close": _safe_series(five, "c"),
                     "high":  _safe_series(five, "h"),
                     "low":   _safe_series(five, "l"),
+                    "volume": _safe_series(five, "v"),
                 },
             }
     except Exception as e:
@@ -3959,8 +3961,8 @@ def scan_all(tf: str = "5Min", symbols: str = "BTC/USD,ETH/USD", strats: str = "
             def series(bars, key):
                 return [row.get(key) for row in (bars or [])]
             bars_cache[sym] = {
-                "one":  {"close": series(one,"c"), "high": series(one,"h"), "low": series(one,"l")},
-                "five": {"close": series(five,"c"), "high": series(five,"h"), "low": series(five,"l")},
+                "one":  {"close": series(one,"c"), "high": series(one,"h"), "low": series(one,"l"), "volume": series(one, "v")},
+                "five": {"close": series(five,"c"), "high": series(five,"h"), "low": series(five,"l"), "volume": series(five, "v")},
             }
         except Exception as e:
             bars_cache[sym] = {"error": str(e)}
