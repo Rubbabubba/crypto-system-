@@ -3341,7 +3341,7 @@ def scheduler_run_v2(payload: Dict[str, Any] = Body(default=None)):
     risk_engine = RiskEngine(risk_cfg)
 
     # ------------------------------------------------------------------
-    # Preload bar contexts once (similar to legacy scheduler_run)
+    # Preload bar contexts once (match /debug/strategy_scan + StrategyBook)
     # ------------------------------------------------------------------
     contexts: Dict[str, Any] = {}
 
@@ -3353,41 +3353,36 @@ def scheduler_run_v2(payload: Dict[str, Any] = Body(default=None)):
                     vals.append(row[key])
         return vals
 
-    try:
-        from book import br_router as br_bars  # type: ignore[import]
-    except Exception:
-        br_bars = None
-
     for sym in syms:
         try:
-            # 1m + tf multi-context
-            if br_bars is None:
-                raise RuntimeError("br_bars (book.br_router) not available")
+            # 1m + tf (e.g. 5Min) bars from the SAME br_router used in debug_strategy_scan
+            one = br.get_bars(sym, timeframe="1Min", limit=limit)
+            five = br.get_bars(sym, timeframe=tf,     limit=limit)
 
-            ctx = {}
-            # Base timeframe (e.g. 5Min) context
-            bars_multi = br_bars.get_bars(sym, tf=tf, limit=limit)
-            ctx["multi"] = {
-                "open": _safe_series(bars_multi, "open"),
-                "high": _safe_series(bars_multi, "high"),
-                "low": _safe_series(bars_multi, "low"),
-                "close": _safe_series(bars_multi, "close"),
-                "volume": _safe_series(bars_multi, "volume"),
-                "ts": _safe_series(bars_multi, "ts"),
-            }
-
-            # 1m context (for ATR, etc.)
-            bars_1m = br_bars.get_bars(sym, tf="1Min", limit=limit * 5)
-            ctx["1m"] = {
-                "open": _safe_series(bars_1m, "open"),
-                "high": _safe_series(bars_1m, "high"),
-                "low": _safe_series(bars_1m, "low"),
-                "close": _safe_series(bars_1m, "close"),
-                "volume": _safe_series(bars_1m, "volume"),
-                "ts": _safe_series(bars_1m, "ts"),
-            }
-
-            contexts[sym] = ctx
+            if not one or not five:
+                contexts[sym] = None
+                telemetry.append(
+                    {
+                        "symbol": sym,
+                        "stage": "preload_bars",
+                        "ok": False,
+                        "reason": "no_bars",
+                    }
+                )
+            else:
+                # IMPORTANT: match the exact structure StrategyBook.scan() expects
+                contexts[sym] = {
+                    "one": {
+                        "close": _safe_series(one, "c"),
+                        "high":  _safe_series(one, "h"),
+                        "low":   _safe_series(one, "l"),
+                    },
+                    "five": {
+                        "close": _safe_series(five, "c"),
+                        "high":  _safe_series(five, "h"),
+                        "low":   _safe_series(five, "l"),
+                    },
+                }
         except Exception as e:
             contexts[sym] = None
             telemetry.append(
@@ -3406,8 +3401,8 @@ def scheduler_run_v2(payload: Dict[str, Any] = Body(default=None)):
         ctx = contexts.get(symbol)
         if not ctx:
             return 0.0
-        multi = ctx.get("multi") or {}
-        closes = multi.get("close") or []
+        five = ctx.get("five") or {}
+        closes = five.get("close") or []
         if not closes:
             return 0.0
         try:
