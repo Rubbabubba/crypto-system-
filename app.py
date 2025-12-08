@@ -3257,7 +3257,9 @@ def scheduler_run_v2(payload: Dict[str, Any] = Body(default=None)):
     actions: List[Dict[str, Any]] = []
     telemetry: List[Dict[str, Any]] = []
 
-    payload = payload or {}
+    # small helpers for super-safe config access
+    def _cfg_get(d: Any, key: str, default: Any = None) -> Any:
+        return d.get(key, default) if isinstance(d, dict) else default
 
     # ------------------------------------------------------------------
     # Helper: env bool
@@ -3267,6 +3269,8 @@ def scheduler_run_v2(payload: Dict[str, Any] = Body(default=None)):
         if v is None:
             return default
         return str(v).lower() in ("1", "true", "yes", "on")
+
+    payload = payload or {}
 
     # Dry-run flag: payload.dry overrides SCHED_DRY (default True)
     dry = payload.get("dry", None)
@@ -3310,11 +3314,11 @@ def scheduler_run_v2(payload: Dict[str, Any] = Body(default=None)):
         limit,
         notional,
         dry,
-        symbols_csv,
+        ",".join(syms),
     )
 
     # ------------------------------------------------------------------
-    # Imports that can fail without killing the API entirely
+    # Load broker router + guard
     # ------------------------------------------------------------------
     try:
         import br_router as br  # type: ignore[import]
@@ -3349,42 +3353,41 @@ def scheduler_run_v2(payload: Dict[str, Any] = Body(default=None)):
                     vals.append(row[key])
         return vals
 
+    try:
+        from book import br_router as br_bars  # type: ignore[import]
+    except Exception:
+        br_bars = None
+
     for sym in syms:
         try:
-            # For now, hard-code 1m + tf (e.g. 5Min) like your existing path
-            one = br.get_bars(sym, timeframe="1Min", limit=limit) if br is not None else []
-            multi = br.get_bars(sym, timeframe=tf, limit=limit) if br is not None else []
+            # 1m + tf multi-context
+            if br_bars is None:
+                raise RuntimeError("br_bars (book.br_router) not available")
 
-            if not one or not multi:
-                contexts[sym] = None
-                telemetry.append(
-                    {
-                        "symbol": sym,
-                        "stage": "preload_bars",
-                        "ok": False,
-                        "reason": "no_bars",
-                    }
-                )
-                continue
-
-            contexts[sym] = {
-                "one": {
-                    "open": _safe_series(one, "open"),
-                    "high": _safe_series(one, "high"),
-                    "low": _safe_series(one, "low"),
-                    "close": _safe_series(one, "close"),
-                    "volume": _safe_series(one, "volume"),
-                    "ts": _safe_series(one, "ts"),
-                },
-                "five": {  # we keep the key name 'five' even if tf != 5Min
-                    "open": _safe_series(multi, "open"),
-                    "high": _safe_series(multi, "high"),
-                    "low": _safe_series(multi, "low"),
-                    "close": _safe_series(multi, "close"),
-                    "volume": _safe_series(multi, "volume"),
-                    "ts": _safe_series(multi, "ts"),
-                },
+            ctx = {}
+            # Base timeframe (e.g. 5Min) context
+            bars_multi = br_bars.get_bars(sym, tf=tf, limit=limit)
+            ctx["multi"] = {
+                "open": _safe_series(bars_multi, "open"),
+                "high": _safe_series(bars_multi, "high"),
+                "low": _safe_series(bars_multi, "low"),
+                "close": _safe_series(bars_multi, "close"),
+                "volume": _safe_series(bars_multi, "volume"),
+                "ts": _safe_series(bars_multi, "ts"),
             }
+
+            # 1m context (for ATR, etc.)
+            bars_1m = br_bars.get_bars(sym, tf="1Min", limit=limit * 5)
+            ctx["1m"] = {
+                "open": _safe_series(bars_1m, "open"),
+                "high": _safe_series(bars_1m, "high"),
+                "low": _safe_series(bars_1m, "low"),
+                "close": _safe_series(bars_1m, "close"),
+                "volume": _safe_series(bars_1m, "volume"),
+                "ts": _safe_series(bars_1m, "ts"),
+            }
+
+            contexts[sym] = ctx
         except Exception as e:
             contexts[sym] = None
             telemetry.append(
@@ -3397,7 +3400,23 @@ def scheduler_run_v2(payload: Dict[str, Any] = Body(default=None)):
             )
 
     # ------------------------------------------------------------------
-    # Run scheduler_core (strategies + per-strat + global exits)
+    # Last-price helper for risk calculation + exits
+    # ------------------------------------------------------------------
+    def _last_price_safe(symbol: str) -> float:
+        ctx = contexts.get(symbol)
+        if not ctx:
+            return 0.0
+        multi = ctx.get("multi") or {}
+        closes = multi.get("close") or []
+        if not closes:
+            return 0.0
+        try:
+            return float(closes[-1])
+        except Exception:
+            return 0.0
+
+    # ------------------------------------------------------------------
+    # Build SchedulerConfig and run scheduler_core once
     # ------------------------------------------------------------------
     now = dt.datetime.utcnow()
     cfg = SchedulerConfig(
@@ -3421,15 +3440,7 @@ def scheduler_run_v2(payload: Dict[str, Any] = Body(default=None)):
     exit_kinds = {"exit", "take_profit", "stop_loss"}
     entry_kinds = {"entry", "scale"}
 
-    # Priority for exits: stop_loss > take_profit > exit
-    def _exit_priority(kind: str) -> int:
-        if kind == "stop_loss":
-            return 3
-        if kind == "take_profit":
-            return 2
-        return 1  # generic exit
-
-    best_exit: Dict[tuple, Any] = {}
+    best_exit: Dict[Tuple[str, str], Any] = {}
     entries: List[Any] = []
 
     for intent in result.intents:
@@ -3445,8 +3456,15 @@ def scheduler_run_v2(payload: Dict[str, Any] = Body(default=None)):
             # unknown kind: just pass through as a generic action
             entries.append(intent)
 
-    # Keep entries only if there is *no* exit for that (symbol,strategy)
-    final_intents: List[Any] = list(best_exit.values())
+    # Combine exits + entries, making sure no entry is emitted on same pass
+    # when an exit exists for that (symbol,strategy).
+    final_intents: List[Any] = []
+
+    # First, add exits
+    for key, intent in best_exit.items():
+        final_intents.append(intent)
+
+    # Then, add entries only where no exit exists
     for intent in entries:
         key = (intent.symbol, intent.strategy)
         if key in best_exit:
@@ -3471,7 +3489,7 @@ def scheduler_run_v2(payload: Dict[str, Any] = Body(default=None)):
         pm_pos = positions.get(key)
 
         snap = PositionSnapshot(
-            symbol=intent.symbol,   
+            symbol=intent.symbol,
             strategy=intent.strategy,
             qty=float(getattr(pm_pos, "qty", 0.0) or 0.0),
             avg_price=getattr(pm_pos, "avg_price", None),
@@ -3514,7 +3532,7 @@ def scheduler_run_v2(payload: Dict[str, Any] = Body(default=None)):
         final_notional: float = 0.0
         side = intent.side
 
-        # ----- ENTRY / SCALE: enforce caps & loss-zone --------------------------------
+        # ----- ENTRY / SCALE: use intent.notional (after caps) --------------------
         if intent.kind in entry_kinds:
             if intent.notional is None or intent.notional <= 0:
                 telemetry.append(
@@ -3572,19 +3590,6 @@ def scheduler_run_v2(payload: Dict[str, Any] = Body(default=None)):
         # ----- EXIT / TP / SL: compute notional from position if missing -------------
         else:
             qty_here = float(getattr(pm_pos, "qty", 0.0) or 0.0)
-            if abs(qty_here) < 1e-10:
-                telemetry.append(
-                    {
-                        "symbol": intent.symbol,
-                        "strategy": intent.strategy,
-                        "kind": intent.kind,
-                        "side": intent.side,
-                        "reason": "no_position_to_exit",
-                        "source": "scheduler_v2",
-                    }
-                )
-                continue
-
             px = _last_price_safe(intent.symbol)
             if px <= 0.0:
                 telemetry.append(
@@ -3618,7 +3623,7 @@ def scheduler_run_v2(payload: Dict[str, Any] = Body(default=None)):
             )
             continue
 
-                # Ignore dust for entries + TP/SL; still allow generic exits (e.g. daily_flatten)
+        # Ignore dust for entries + TP/SL; still allow generic exits (e.g. daily_flatten)
         if final_notional < MIN_NOTIONAL_USD and intent.kind in {"entry", "scale", "take_profit", "stop_loss"}:
             telemetry.append(
                 {
@@ -3660,10 +3665,100 @@ def scheduler_run_v2(payload: Dict[str, Any] = Body(default=None)):
             action_record["status"] = "sent"
             action_record["response"] = resp
         except Exception as e:
+            log.error("scheduler_v2: broker error for %s %s: %s", intent.symbol, side, e)
             action_record["status"] = "error"
             action_record["error"] = f"{e.__class__.__name__}: {e}"
 
         actions.append(action_record)
+
+    # ------------------------------------------------------------------
+    # Build per-(strategy,symbol) universe summary for debugging
+    # ------------------------------------------------------------------
+    universe_map: Dict[Tuple[str, str], Dict[str, Any]] = {}
+
+    def _uni(symbol: str, strategy: str) -> Dict[str, Any]:
+        key = (symbol, strategy)
+        if key not in universe_map:
+            universe_map[key] = {
+                "symbol": symbol,
+                "strategy": strategy,
+                "has_context": bool(contexts.get(symbol)),
+                "had_scan": False,
+                "had_entry_intent": False,
+                "had_exit_intent": False,
+                "blocked_by_guard": False,
+                "blocked_by_cap": False,
+                "blocked_by_loss_zone": False,
+                "below_min_notional": False,
+                "actions_sent": 0,
+                "actions_dry": 0,
+                "reasons": [],
+            }
+        return universe_map[key]
+
+    # Prime universe with all (strat, symbol) pairs from config
+    for strat in strats:
+        for sym in syms:
+            _uni(sym, strat)
+
+    # Fold telemetry into universe_map
+    for row in telemetry:
+        sym = row.get("symbol")
+        strat = row.get("strategy")
+        if not sym or not strat:
+            continue
+        u = _uni(sym, strat)
+        kind = row.get("kind")
+        source = row.get("source") or ""
+        reason = row.get("reason")
+
+        if kind in {"entry", "scale", "entry_skip"}:
+            u["had_scan"] = True
+            if kind in {"entry", "scale"}:
+                u["had_entry_intent"] = True
+
+        if kind in {"exit", "take_profit", "stop_loss", "exit_skip"}:
+            u["had_scan"] = True
+            if kind in {"exit", "take_profit", "stop_loss"}:
+                u["had_exit_intent"] = True
+
+        if source == "guard_allows":
+            u["blocked_by_guard"] = True
+        if source == "risk_engine.enforce_symbol_cap":
+            u["blocked_by_cap"] = True
+        if source == "risk_engine.is_loss_zone_norebuy_block":
+            u["blocked_by_loss_zone"] = True
+        if isinstance(reason, str) and reason.startswith("below_min_notional:"):
+            u["below_min_notional"] = True
+
+        if reason:
+            tag = f"{source}:{reason}" if source else str(reason)
+            u["reasons"].append(tag)
+
+    # Fold actions into universe_map
+    for act in actions:
+        sym = act.get("symbol")
+        strat = act.get("strategy")
+        if not sym or not strat:
+            continue
+        u = _uni(sym, strat)
+        status = act.get("status")
+        if status == "sent":
+            u["actions_sent"] += 1
+        elif status == "skipped_dry_run":
+            u["actions_dry"] += 1
+
+    # Finalize universe list (dedupe reasons)
+    universe: List[Dict[str, Any]] = []
+    for (sym, strat), u in universe_map.items():
+        seen_reasons = set()
+        uniq_reasons: List[str] = []
+        for r in u.get("reasons", []):
+            if r not in seen_reasons:
+                uniq_reasons.append(r)
+                seen_reasons.add(r)
+        u["reasons"] = uniq_reasons
+        universe.append(u)
 
     # ------------------------------------------------------------------
     # FINAL RETURN — avoid null/None responses
@@ -3674,6 +3769,7 @@ def scheduler_run_v2(payload: Dict[str, Any] = Body(default=None)):
         "config": config_snapshot,
         "actions": actions,
         "telemetry": telemetry,
+        "universe": universe,
     }
 
 # ---- New core debug endpoint) ------------------------------------------------------------        
