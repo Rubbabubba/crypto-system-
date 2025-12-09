@@ -6,8 +6,12 @@ from collections import defaultdict, deque
 
 POLICY_DIR = Path(os.getenv("POLICY_CFG_DIR", "policy_config"))
 JOURNAL_PATH = Path(os.getenv("JOURNAL_PATH", "./journal_v2.jsonl"))
+TELEMETRY_PATH = Path(os.getenv("TELEMETRY_PATH", "./telemetry_v2.jsonl"))
 TZ = dt.timezone(dt.timedelta(hours=-5))
 _DOWS = ["Mon","Tue","Wed","Thu","Fri","Sat","Sun"]
+
+def _load_telemetry() -> List[dict]:
+    return _load_jsonl(TELEMETRY_PATH)
 
 def _load_jsonl(path: Path) -> List[dict]:
     rows=[]; 

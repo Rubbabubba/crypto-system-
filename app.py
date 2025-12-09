@@ -208,6 +208,34 @@ def _pick_data_dir() -> Path:
 DATA_DIR = _pick_data_dir()
 DB_PATH = DATA_DIR / "journal.db"
 
+# Telemetry JSONL log (one row per scheduler event)
+TELEMETRY_PATH = DATA_DIR / "telemetry_v2.jsonl"
+
+
+def _append_telemetry_rows(rows: List[Dict[str, Any]]) -> None:
+    """
+    Append scheduler_v2 telemetry rows to a JSONL file on disk.
+
+    Each row is a plain dict. We add a UTC timestamp if not already present.
+    """
+    if not rows:
+        return
+
+    import time
+    ts = time.time()
+
+    try:
+        TELEMETRY_PATH.parent.mkdir(parents=True, exist_ok=True)
+        with open(TELEMETRY_PATH, "a", encoding="utf-8") as fh:
+            for r in rows:
+                if "ts" not in r:
+                    r = dict(r)
+                    r["ts"] = ts
+                fh.write(json.dumps(r) + "\n")
+    except Exception as e:
+        # Telemetry logging must never break the scheduler
+        log.warning("failed to append telemetry rows: %s", e)
+
 # --------------------------------------------------------------------------------------
 # Scheduler globals
 # --------------------------------------------------------------------------------------
@@ -3758,8 +3786,17 @@ def scheduler_run_v2(payload: Dict[str, Any] = Body(default=None)):
         universe.append(u)
 
     # ------------------------------------------------------------------
-    # FINAL RETURN — avoid null/None responses
+    # FINAL RETURN — log telemetry, then respond
     # ------------------------------------------------------------------
+    try:
+        # Log telemetry for offline Advisor v2 analysis.
+        # We log regardless of dry/live, but the rows themselves include any
+        # dry/run flags you added at the source.
+        _append_telemetry_rows(telemetry)
+    except Exception as e:
+        # Never let telemetry logging break the API
+        log.warning("scheduler_v2: failed to log telemetry: %s", e)
+
     return {
         "ok": True,
         "dry": bool(dry),
@@ -3768,6 +3805,7 @@ def scheduler_run_v2(payload: Dict[str, Any] = Body(default=None)):
         "telemetry": telemetry,
         "universe": universe,
     }
+
 
 # ---- New core debug endpoint) ------------------------------------------------------------        
         
