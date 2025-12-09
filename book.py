@@ -1,8 +1,9 @@
 # strategies/book.py
-from __future__ import annotations
 import os
+import math
 from dataclasses import dataclass
-from typing import Dict, Any, List, Optional, Tuple
+from typing import Optional, Sequence
+
 import numpy as np
 import pandas as pd
 from utils_volatility import atr as _atr_series, atr_pct as _atr_pct_series
