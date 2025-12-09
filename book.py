@@ -24,6 +24,12 @@ DEFAULT_MIN_BARS_5M = int(float(os.getenv("BOOK_MIN_BARS_5M", "50")))
 DEFAULT_MIN_DOLLAR_VOL_5M = float(os.getenv("BOOK_MIN_DOLLAR_VOL_5M", "0.0"))
 DEFAULT_VOL_LOOKBACK_5M = int(float(os.getenv("BOOK_VOL_LOOKBACK_5M", "20")))
 
+# Optional per-strategy raw-signal quality thresholds.
+# These are disabled if left at 0.0 and can be tuned via env.
+C2_MIN_TREND_Z = float(os.getenv("C2_MIN_TREND_Z", "0.0"))        # min |trend_z| for c2/c7
+C3_MIN_MOM_SCORE = float(os.getenv("C3_MIN_MOM_SCORE", "0.0"))    # min momentum score for c3/c5
+C4_MIN_BREAK_ATR = float(os.getenv("C4_MIN_BREAK_ATR", "0.0"))    # min breakout distance (in ATRs) for c4
+
 
 # ====== utilities ======
 def _roll_mean(a, n): return pd.Series(a).rolling(n).mean().to_numpy()
@@ -200,52 +206,127 @@ def sig_c1_adaptive_rsi(close, regimes: Regimes,
 
 def sig_c2_trend(close, regimes: Regimes,
                  f=20, s=60, pullback=5, min_atr_pct=DEFAULT_MIN_ATR_PCT):
+    """Trend-following pullback entry.
+
+    - Requires ATR% >= min_atr_pct.
+    - Optional: requires |trend_z| >= C2_MIN_TREND_Z if that env is > 0.
+    """
     i = len(close) - 1
+
+    # Volatility floor
     if (regimes.atr_pct or 0.0) < min_atr_pct:
         return "flat", 0.0, "filt_vol_too_low"
+
     sma_f = _roll_mean(close, f)
     sma_s = _roll_mean(close, s)
     up = sma_f[i] > sma_s[i]
     dn = sma_f[i] < sma_s[i]
+
+    # Optional: require a minimum trend_z magnitude if configured.
+    z = regimes.trend_z if np.isfinite(regimes.trend_z) else 0.0
+    if C2_MIN_TREND_Z > 0.0 and abs(z) < C2_MIN_TREND_Z:
+        return "flat", 0.0, "filt_trend_z_too_weak"
+
     s_close = pd.Series(close)
     pb_up = s_close[i] < s_close.rolling(pullback).max().to_numpy()[i] if up else False
     pb_dn = s_close[i] > s_close.rolling(pullback).min().to_numpy()[i] if dn else False
+
     if up and pb_up:
-        return "buy", float(abs(regimes.trend_z)), "trend_up_pb"
+        score = float(abs(z))
+        if score <= 0.0:
+            score = 0.01
+        return "buy", score, "trend_up_pb"
+
     if dn and pb_dn:
-        return "sell", float(abs(regimes.trend_z)), "trend_down_pb"
+        score = float(abs(z))
+        if score <= 0.0:
+            score = 0.01
+        return "sell", score, "trend_down_pb"
+
     return "flat", 0.0, "no_raw_signal"
 
 def sig_c3_momentum(close, regimes: Regimes,
                     roc_len=12, rsi_slope_len=7, min_atr_pct=DEFAULT_MIN_ATR_PCT):
+    """Momentum signal combining ROC and smoothed RSI slope.
+
+    - Requires ATR% >= min_atr_pct.
+    - Optional: requires score >= C3_MIN_MOM_SCORE if that env is > 0.
+    """
     if (regimes.atr_pct or 0.0) < min_atr_pct:
         return "flat", 0.0, "filt_vol_too_low"
+
     roc = _roc(close, roc_len)
     rsi = _rsi(close, 14)
     i = len(close) - 1
     rsi_slope = pd.Series(rsi).diff().rolling(rsi_slope_len).mean().to_numpy()[i]
+
+    action, score, reason = "flat", 0.0, "no_raw_signal"
+
     if np.isfinite(roc[i]) and np.isfinite(rsi_slope):
         if roc[i] > 0 and rsi_slope > 0:
-            return "buy", float(roc[i] + 0.1 * rsi_slope), "mom_up"
-        if roc[i] < 0 and rsi_slope < 0:
-            return "sell", float(abs(roc[i]) + 0.1 * abs(rsi_slope)), "mom_down"
+            score = float(roc[i] + 0.1 * rsi_slope)
+            action = "buy"
+            reason = "mom_up"
+        elif roc[i] < 0 and rsi_slope < 0:
+            score = float(abs(roc[i]) + 0.1 * abs(rsi_slope))
+            action = "sell"
+            reason = "mom_down"
+
+    if action in ("buy", "sell"):
+        if C3_MIN_MOM_SCORE > 0.0 and score < C3_MIN_MOM_SCORE:
+            return "flat", 0.0, "filt_mom_score_too_low"
+        # Ensure non-zero positive score for ranking
+        if not np.isfinite(score) or score <= 0.0:
+            score = 0.01
+        return action, score, reason
+
     return "flat", 0.0, "no_raw_signal"
 
 def sig_c4_breakout(close, regimes: Regimes,
                     don_len=20, min_bandwidth=0.75, min_atr_pct=DEFAULT_MIN_ATR_PCT):
+    """Donchian-style breakout.
+
+    - Requires ATR% >= min_atr_pct.
+    - Requires range bandwidth (hi-lo)/ATR >= min_bandwidth.
+    - Optional: requires breakout distance >= C4_MIN_BREAK_ATR * ATR if that env is > 0.
+    """
     if (regimes.atr_pct or 0.0) < min_atr_pct:
         return "flat", 0.0, "filt_vol_too_low"
+
     s = pd.Series(close)
     hi = s.rolling(don_len).max().to_numpy()
     lo = s.rolling(don_len).min().to_numpy()
-    i  = len(close) - 1
-    bandwidth = (hi[i] - lo[i]) / (regimes.atr or np.nan)
-    if not np.isfinite(bandwidth) or bandwidth < min_bandwidth:
+    i = len(close) - 1
+
+    atr_val = regimes.atr if np.isfinite(regimes.atr) and regimes.atr > 0.0 else np.nan
+    bandwidth = (hi[i] - lo[i]) / (atr_val if np.isfinite(atr_val) else np.nan)
+
+    if (not np.isfinite(bandwidth)) or bandwidth < min_bandwidth:
         return "flat", 0.0, "range_narrow"
-    if close[i] > hi[i-1]:
-        return "buy", float(bandwidth), "breakout_high"
-    if close[i] < lo[i-1]:
-        return "sell", float(bandwidth), "breakout_low"
+
+    price = close[i]
+    score = float(bandwidth)
+
+    # Up-breakout
+    if price > hi[i - 1]:
+        if C4_MIN_BREAK_ATR > 0.0 and np.isfinite(atr_val):
+            break_atr = (price - hi[i - 1]) / atr_val
+            if break_atr < C4_MIN_BREAK_ATR:
+                return "flat", 0.0, "filt_breakout_too_shallow"
+        if score <= 0.0:
+            score = 0.01
+        return "buy", score, "breakout_high"
+
+    # Down-breakout
+    if price < lo[i - 1]:
+        if C4_MIN_BREAK_ATR > 0.0 and np.isfinite(atr_val):
+            break_atr = (lo[i - 1] - price) / atr_val
+            if break_atr < C4_MIN_BREAK_ATR:
+                return "flat", 0.0, "filt_breakout_too_shallow"
+        if score <= 0.0:
+            score = 0.01
+        return "sell", score, "breakout_low"
+
     return "flat", 0.0, "range_no_break"
 
 def sig_c5_alt_mom(close, regimes: Regimes, min_atr_pct=DEFAULT_MIN_ATR_PCT):
