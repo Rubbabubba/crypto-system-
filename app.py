@@ -3552,6 +3552,20 @@ def scheduler_run_v2(payload: Dict[str, Any] = Body(default=None)):
                 }
             )
             continue
+            
+        # NEW: advisory-only guard reasons (e.g. soft whitelist violations).
+        # In this case guard_allowed is True but guard_reason != "ok".
+        if guard_reason and guard_reason != "ok":
+            telemetry.append(
+                {
+                    "symbol": intent.symbol,
+                    "strategy": intent.strategy,
+                    "kind": intent.kind,
+                    "side": intent.side,
+                    "reason": f"guard_warn:{guard_reason}",
+                    "source": "guard_allows",
+                }
+            )
 
         # Decide final notional to send
         final_notional: float = 0.0
