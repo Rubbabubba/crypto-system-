@@ -2,11 +2,10 @@
 import os
 import math
 from dataclasses import dataclass
-from typing import Optional, Sequence, Dict, List
+from typing import Optional, Sequence, Dict, Any, List
 
 import numpy as np
 import pandas as pd
-
 
 # ---- Defaults (kept consistent with your current behavior) ----
 DEFAULT_MIN_ATR_PCT = float(os.getenv('MIN_ATR_PCT', '0.08'))  # default 8% for 5m
@@ -35,18 +34,6 @@ def _zscore(x, n):
     m = s.rolling(n).mean()
     sd = s.rolling(n).std(ddof=0).replace(0, np.nan)
     return ((s - m) / sd).to_numpy()
-
-def _rsi(values, n=14):
-    s = pd.Series(values)
-    d = s.diff()
-    up = d.clip(lower=0).rolling(n).mean()
-    dn = (-d.clip(upper=0)).rolling(n).mean()
-    rs = up / dn.replace(0, np.nan)
-    return (100 - (100 / (1 + rs))).to_numpy()
-
-def _roc(values, n=12):
-    v = pd.Series(values)
-    return (v / v.shift(n) - 1.0).to_numpy()
     
 def _atr(high, low, close, n: int = 14):
     """Simple ATR(n) in price units using a rolling mean of true range."""
@@ -62,6 +49,18 @@ def _atr(high, low, close, n: int = 14):
     ).max(axis=1)
     return tr.rolling(n).mean().to_numpy()
 
+def _rsi(values, n=14):
+    s = pd.Series(values)
+    d = s.diff()
+    up = d.clip(lower=0).rolling(n).mean()
+    dn = (-d.clip(upper=0)).rolling(n).mean()
+    rs = up / dn.replace(0, np.nan)
+    return (100 - (100 / (1 + rs))).to_numpy()
+
+def _roc(values, n=12):
+    v = pd.Series(values)
+    return (v / v.shift(n) - 1.0).to_numpy()
+    
 # ====== small config helpers (per-strategy override -> global -> default) ======
 def _cfg_bool(key: str, strat: Optional[str], default: bool) -> bool:
     if strat:
@@ -366,7 +365,6 @@ class StrategyBook:
                 topk = 2          # allow up to 2 c7 symbols per scan
 
         return topk, min_score, atr_stop_mult, min_atr_5m, mtf_ok, min_dollar_vol_5m
-
 
     def scan(self, req: ScanRequest, contexts: Dict[str, Optional[Dict[str, Any]]]) -> List[ScanResult]:
         topk, min_score, atr_stop_mult, min_atr_5m, mtf_ok, min_dollar_vol_5m = self._resolve_knobs_for_strat(req.strat)
