@@ -8,6 +8,12 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Set, Tuple
 
+# Controls whether the strategy whitelist is a hard gate or advisory-only.
+ENFORCE_STRAT_WHITELIST = str(
+    os.getenv("ENFORCE_STRAT_WHITELIST", "true")
+).lower() in ("1", "true", "yes", "on")
+
+
 # ---------- Helpers ----------
 
 def _norm_symbol(s: str) -> str:
@@ -147,31 +153,64 @@ def _in_window(now: datetime, win: dict) -> bool:
 
 def guard_allows(strategy: str, symbol: str, now: Optional[datetime] = None) -> Tuple[bool, str]:
     """
-    Return (allowed, reason). reason is 'ok' if allowed, otherwise a short block reason.
+    Core policy guard for entries.
+
+    Returns:
+        (allowed: bool, reason: str)
+
+    Semantics:
+        - Whitelist can be HARD (blocks) or SOFT (advisory only) depending on
+          ENFORCE_STRAT_WHITELIST.
+        - Avoid list and windows ALWAYS hard-block.
     """
     policy = load_policy()
     s = _norm_strategy(strategy)
     sym = _norm_symbol(symbol)
 
-    # Whitelist
+    whitelist_reason = "ok"
+
+    # --------------------
+    # Strategy whitelist
+    # --------------------
     if policy.whitelist:
         allowed_syms = policy.whitelist.get(s)
-        if allowed_syms is None:
-            return False, "not_in_strategy_whitelist"
-        if "*" not in allowed_syms and sym not in allowed_syms:
-            return False, "not_in_strategy_whitelist"
+        in_whitelist = False
 
-    # Avoid list from risk.json (hard block)
+        if allowed_syms is not None:
+            # '*' means "all symbols allowed" for that strategy
+            if "*" in allowed_syms or sym in allowed_syms:
+                in_whitelist = True
+
+        if not in_whitelist:
+            if ENFORCE_STRAT_WHITELIST:
+                # Hard mode: block entries for non-whitelisted pairs.
+                return False, "not_in_strategy_whitelist"
+            else:
+                # Soft/advisory mode: allow, but keep the reason so callers
+                # can log a warning via telemetry.
+                whitelist_reason = "not_in_strategy_whitelist"
+
+    # --------------------
+    # Hard blocks: avoid list
+    # --------------------
     avoid_set = _load_avoid_set()
     if sym in avoid_set:
         return False, "in_avoid_pairs"
 
-    # Windows
+    # --------------------
+    # Hard blocks: windows
+    # --------------------
     win = policy.windows.get(s)
     if win:
-        t = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
-        if not _in_window(t, win):
-            return False, f"outside_window hour={t.hour} dow={_dow_str(t)}"
+        if now is None:
+            now = datetime.now(timezone.utc)
+        if not _is_now_within_window(now, win):
+            return False, "outside_window"
+
+    # If we reached here, symbol is allowed. If there was a soft whitelist
+    # violation, surface that reason so callers can log it as a warning.
+    if whitelist_reason != "ok":
+        return True, whitelist_reason
 
     return True, "ok"
 
