@@ -2,11 +2,11 @@
 import os
 import math
 from dataclasses import dataclass
-from typing import Optional, Sequence
+from typing import Optional, Sequence, Dict, List
 
 import numpy as np
 import pandas as pd
-from utils_volatility import atr as _atr_series, atr_pct as _atr_pct_series
+
 
 # ---- Defaults (kept consistent with your current behavior) ----
 DEFAULT_MIN_ATR_PCT = float(os.getenv('MIN_ATR_PCT', '0.08'))  # default 8% for 5m
@@ -47,6 +47,20 @@ def _rsi(values, n=14):
 def _roc(values, n=12):
     v = pd.Series(values)
     return (v / v.shift(n) - 1.0).to_numpy()
+    
+def _atr(high, low, close, n: int = 14):
+    """Simple ATR(n) in price units using a rolling mean of true range."""
+    h, l, c = map(pd.Series, (high, low, close))
+    pc = c.shift(1)
+    tr = pd.concat(
+        [
+            (h - l).abs(),
+            (h - pc).abs(),
+            (l - pc).abs(),
+        ],
+        axis=1,
+    ).max(axis=1)
+    return tr.rolling(n).mean().to_numpy()
 
 # ====== small config helpers (per-strategy override -> global -> default) ======
 def _cfg_bool(key: str, strat: Optional[str], default: bool) -> bool:
@@ -126,8 +140,8 @@ def compute_regimes(close, high, low) -> Regimes:
     """Compute trend and volatility regimes for the latest bar.
 
     - trend_z: z-score of (SMA20 - SMA60) over a 60-bar window.
-    - atr:     14-period ATR (EMA) in price units.
-    - atr_pct: 14-period ATR as a *percent* of price (1.0 == 1% move).
+    - atr:     14-period ATR in price units.
+    - atr_pct: 14-period ATR as a *percent* of price (1.0 == 1%).
 
     All inputs are expected to be 1D sequences ordered oldest -> newest.
     """
@@ -135,19 +149,20 @@ def compute_regimes(close, high, low) -> Regimes:
     sma_s = _roll_mean(close, 60)
     trend_z = _zscore(sma_f - sma_s, 60)
 
-    # Use the shared volatility helpers so ATR semantics stay consistent
-    # across the entire system (book, strategies, advisor, etc.).
-    df = pd.DataFrame(
-        {
-            "high": np.asarray(high, dtype="float64"),
-            "low": np.asarray(low, dtype="float64"),
-            "close": np.asarray(close, dtype="float64"),
-        }
-    )
-    atr_series = _atr_series(df, period=14, method="ema").to_numpy()
-    atr_pct_series = _atr_pct_series(df, period=14, method="ema").to_numpy()
+    # ATR in price units, using the local helper.
+    atr_series = _atr(high, low, close, 14)
 
-    i = len(close) - 1
+    close_arr = np.asarray(close, dtype="float64")
+    atr_arr = np.asarray(atr_series, dtype="float64")
+
+    with np.errstate(invalid="ignore", divide="ignore"):
+        atr_pct_series = np.where(
+            np.isfinite(close_arr) & (close_arr > 0.0),
+            100.0 * atr_arr / close_arr,
+            np.nan,
+        )
+
+    i = len(close_arr) - 1
 
     def last(x):
         if len(x) == 0:
@@ -156,7 +171,7 @@ def compute_regimes(close, high, low) -> Regimes:
 
     return Regimes(
         trend_z=last(trend_z),
-        atr=last(atr_series),
+        atr=last(atr_arr),
         atr_pct=last(atr_pct_series),
         sma_fast=last(sma_f),
         sma_slow=last(sma_s),
@@ -350,7 +365,8 @@ class StrategyBook:
             if "BOOK_TOPK_C7" not in os.environ:
                 topk = 2          # allow up to 2 c7 symbols per scan
 
-        return topk, min_score, atr_stop_mult, min_atr_5m, mtf_ok
+        return topk, min_score, atr_stop_mult, min_atr_5m, mtf_ok, min_dollar_vol_5m
+
 
     def scan(self, req: ScanRequest, contexts: Dict[str, Optional[Dict[str, Any]]]) -> List[ScanResult]:
         topk, min_score, atr_stop_mult, min_atr_5m, mtf_ok, min_dollar_vol_5m = self._resolve_knobs_for_strat(req.strat)
