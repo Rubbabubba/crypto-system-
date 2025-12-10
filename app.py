@@ -1757,188 +1757,223 @@ if __name__ == "__main__":
     uvicorn.run("app:app", host="0.0.0.0", port=port, reload=False)
 
 @app.post("/journal/enrich")
-def journal_enrich(payload: Dict[str, Any] = Body(default=None)):
-    dry_run = bool(payload.get("dry_run", False))
-    batch_size = int(payload.get("batch_size", 40) or 40)
-    max_rows   = int(payload.get("max_rows", 5000) or 5000)
-    apply_rules = bool(payload.get("apply_rules", True))
-    log.info("enrich start: dry_run=%s batch=%s max_rows=%s apply_rules=%s", dry_run, batch_size, max_rows, apply_rules)
+def journal_enrich(
+    apply_rules: bool = Query(True),
+    batch_size: int = Query(200, ge=1, le=2000),
+    max_rows: int = Query(5000, ge=1, le=20000),
+    dry_run: bool = Query(False),
+):
+    """
+    Enrich unlabeled trades in the local journal using the Kraken `userref`
+    field and `policy_config/userref_map.json`.
 
-    conn = _db(); cur = conn.cursor()
-    try:
-        cur.execute("SELECT txid, ts, symbol, raw FROM trades WHERE strategy IS NULL OR TRIM(strategy)='' LIMIT ?", (max_rows,))
-        rows = cur.fetchall()
-    finally:
-        conn.close()
+    This is a simpler, more robust attribution pass that:
+    - reads unlabeled rows from the `trades` table;
+    - parses the raw Kraken trade JSON for `userref`;
+    - maps `userref -> strategy` via userref_map.json;
+    - writes the inferred strategy back to `trades.strategy`.
+
+    NOTE:
+    - We no longer rely on Kraken's QueryTrades / QueryOrdersInfo here.
+    - Only trades that were placed with a `userref` that appears in
+      userref_map.json will be labeled.
+    """
+
+    log.info(
+        "journal_enrich (v2): apply_rules=%s dry_run=%s batch_size=%s max_rows=%s",
+        apply_rules,
+        dry_run,
+        batch_size,
+        max_rows,
+    )
+
+    conn = _db()
+    cur = conn.cursor()
+
+    # ---------------------------------------------------------
+    # Step 1: Load unlabeled trades from the local journal
+    # ---------------------------------------------------------
+    rows: list[dict] = []
+    cur.execute(
+        "SELECT txid, ts, symbol, raw "
+        "FROM trades "
+        "WHERE strategy IS NULL OR TRIM(strategy) = '' "
+        "ORDER BY ts DESC "
+        "LIMIT ?",
+        (max_rows,),
+    )
+    for txid, ts, symbol, raw in cur.fetchall():
+        rows.append(
+            {
+                "txid": txid,
+                "ts": ts,
+                "symbol": symbol,
+                "raw": raw,
+            }
+        )
 
     scanned = len(rows)
     if scanned == 0:
-        return {"ok": True, "scanned": 0, "orders_checked": 0, "updated": 0,
-                "api_labeled": 0, "rules_labeled": 0, "ambiguous": 0, "missing_order": 0,
-                "apply_rules": apply_rules, "batch_size": batch_size, "max_rows": max_rows}
+        log.info("journal_enrich (v2): nothing to do, 0 unlabeled rows")
+        return JSONResponse(
+            {
+                "ok": True,
+                "scanned": 0,
+                "orders_checked": 0,
+                "updated": 0,
+                "api_labeled": 0,
+                "rules_labeled": 0,
+                "ambiguous": 0,
+                "missing_order": 0,
+                "apply_rules": apply_rules,
+                "batch_size": batch_size,
+                "max_rows": max_rows,
+            }
+        )
 
-    def _j(x):
-        try:
-            return json.loads(x) if isinstance(x, str) else (x or {})
-        except Exception:
-            return {}
+    # ---------------------------------------------------------
+    # Step 2: Load userref -> strategy mapping from policy_config
+    # ---------------------------------------------------------
+    from pathlib import Path
+    import json
 
-    trade_info = {}
-    trade_ids = []
-    for txid, ts, symbol, raw in rows:
-        txid = str(txid)
-        trade_ids.append(txid)
-        trade_info[txid] = {"ts": ts, "symbol": symbol, "raw": _j(raw)}
-    log.info("unlabeled scanned=%d trade_ids=%d", scanned, len(trade_ids))
+    cfg_dir = _os.getenv("POLICY_CONFIG_DIR", "policy_config")
+    userref_path = Path(cfg_dir) / "userref_map.json"
+    userref_to_strategy: dict[int, str] = {}
 
-    key, sec, *_ = _kraken_creds()
+    try:
+        if userref_path.exists():
+            with userref_path.open("r", encoding="utf-8") as f:
+                raw_map = json.load(f)
 
-    # Stage A: trades -> order ids
-    trade_meta = {}
-    order_to_trades = {}
-    if key and sec and trade_ids:
-        for i in range(0, len(trade_ids), batch_size):
-            chunk = trade_ids[i:i+batch_size]
-            try:
-                resp = kraken_private("QueryTrades", {"txid": ",".join(chunk)}, key, sec)
-                res = (resp.get("result") or {}) if isinstance(resp, dict) else {}
-                if isinstance(res, dict):
-                    trade_meta.update(res)
-            except Exception as e:
-                log.warning("QueryTrades failed for %d txids: %s", len(chunk), e)
-        for txid in trade_ids:
-            meta = trade_meta.get(txid, {})
-            otx = meta.get("ordertxid")
-            if isinstance(otx, list):
-                otx = otx[0] if otx else None
-            if otx:
-                order_to_trades.setdefault(str(otx), []).append(txid)
-    else:
-        log.warning("journal_enrich: Kraken creds missing or no trade_ids; skipping API enrichment")
+            if isinstance(raw_map, dict):
+                # Current repo shape is: { "101": "c1", "102": "c2", ..., "1": "manual", ... }
+                for k, v in raw_map.items():
+                    try:
+                        ref = int(k)
+                    except Exception:
+                        continue
+                    strat = str(v).strip()
+                    if strat:
+                        userref_to_strategy[ref] = strat
+        else:
+            log.warning(
+                "journal_enrich (v2): userref_map.json not found at %s; "
+                "no attribution will be possible from userref.",
+                userref_path,
+            )
+    except Exception as e:
+        log.exception("journal_enrich (v2): failed to load userref_map.json: %s", e)
 
-    all_order_ids = list(order_to_trades.keys())
-    log.info("order_to_trades size=%d (unique orders)", len(all_order_ids))
-
-    # Stage B: orders -> strategy
-    orders_meta = {}
-    if key and sec and all_order_ids:
-        for i in range(0, len(all_order_ids), batch_size):
-            chunk = all_order_ids[i:i+batch_size]
-            try:
-                resp = kraken_private("QueryOrdersInfo", {"txid": ",".join(chunk)}, key, sec)
-                res = (resp.get("result") or {}) if isinstance(resp, dict) else {}
-                if isinstance(res, dict):
-                    orders_meta.update(res)
-            except Exception as e:
-                log.warning("QueryOrdersInfo failed for %d orders: %s", len(chunk), e)
-    log.info("orders_meta fetched=%d", len(orders_meta))
-
-    import re as _re, datetime as _dt, pytz, json as _json
-    def infer_from_order(o):
-        if not isinstance(o, dict): return None
-        u = o.get("userref")
-        if isinstance(u, str) and _re.fullmatch(r"c[1-9]", u.lower()): return u.lower()
-        if isinstance(u, int) and 1 <= u <= 9: return f"c{u}"
-        d = o.get("descr") or {}
-        for val in d.values():
-            if not isinstance(val, str): continue
-            m = _re.search(r"\b(c[1-9])\b", val.lower())
-            if m: return m.group(1)
-            m = _re.search(r"strat\s*[:=]\s*(c[1-9])", val.lower())
-            if m: return m.group(1)
+    # ---------------------------------------------------------
+    # Step 3: Extract userref from raw JSON and propose updates
+    # ---------------------------------------------------------
+    def _extract_userref(obj):
+        """Recursively search a JSON-like object for a `userref` field."""
+        if isinstance(obj, dict):
+            if "userref" in obj:
+                try:
+                    return int(obj["userref"])
+                except Exception:
+                    pass
+            for val in obj.values():
+                ref = _extract_userref(val)
+                if ref is not None:
+                    return ref
+        elif isinstance(obj, (list, tuple)):
+            for val in obj:
+                ref = _extract_userref(val)
+                if ref is not None:
+                    return ref
         return None
 
-    # Load rules
-    whitelist = {}
-    windows = {}
-    try:
-        whitelist = json.load(open(DATA_DIR / "whitelist.json", "r", encoding="utf-8"))
-    except Exception:
-        try:
-            whitelist = json.load(open("whitelist.json", "r", encoding="utf-8"))
-        except Exception:
-            pass
-    try:
-        windows = json.load(open(DATA_DIR / "windows.json", "r", encoding="utf-8"))
-    except Exception:
-        try:
-            windows = json.load(open("windows.json", "r", encoding="utf-8"))
-        except Exception:
-            pass
+    updates: dict[tuple[str, float], str] = {}  # key: (txid, ts) -> strategy
+    rules_labeled = 0
 
-    tzname = os.getenv("TZ", "America/Chicago")
-    try:
-        tz = pytz.timezone(tzname)
-    except Exception:
-        import pytz as _p; tz = _p.UTC
+    if not userref_to_strategy:
+        log.warning(
+            "journal_enrich (v2): userref_to_strategy map is empty; "
+            "no rows will be labeled this pass."
+        )
+    else:
+        for row in rows:
+            txid = row["txid"]
+            ts = row["ts"]
+            raw = row.get("raw")
+            if not raw:
+                continue
 
-    def allowed_by_rules(strat, symbol, ts):
-        syms = whitelist.get(strat)
-        if syms and ("*" not in syms) and (symbol not in syms): return False
-        win = windows.get(strat) or {}
-        days = set([d[:3].title() for d in (win.get("days") or [])])
-        hours = set(win.get("hours") or [])
-        if not days and not hours: return True
-        try:
-            t = _dt.datetime.fromtimestamp(float(ts), tz)
-            if days and t.strftime("%a") not in days: return False
-            if hours and t.hour not in set(int(h) for h in hours): return False
-            return True
-        except Exception:
-            return False
-
-    to_update = {}
-    api_labeled = rules_labeled = ambiguous = missing_order = 0
-
-    for oid, txs in order_to_trades.items():
-        strat = infer_from_order(orders_meta.get(oid) or {})
-        if strat:
-            for tx in txs: to_update[tx] = strat
-            api_labeled += len(txs)
-        else:
-            missing_order += len(txs)
-
-    if apply_rules and (whitelist or windows):
-        all_strats = list(set(list(whitelist.keys()) + list(windows.keys())))
-        for txid, info in trade_info.items():
-            if txid in to_update: continue
-            sym, ts = info.get("symbol"), info.get("ts")
-            if not sym or ts is None: continue
-            cands = [s for s in all_strats if allowed_by_rules(s, sym, ts)]
-            if len(cands) == 1:
-                to_update[txid] = cands[0]; rules_labeled += 1
-            else:
-                ambiguous += 1
-
-    if dry_run:
-        sample = dict(list(to_update.items())[:10])
-        return {"ok": True, "dry_run": True, "scanned": scanned, "orders_checked": len(all_order_ids),
-                "to_update_count": len(to_update), "sample_updates": sample}
-
-    updated = 0
-    if to_update:
-        conn = _db(); cur = conn.cursor()
-        for txid, strat in to_update.items():
             try:
-                cur.execute("UPDATE trades SET strategy=? WHERE txid=?", (str(strat), str(txid)))
-                updated += cur.rowcount
-            except Exception as e:
-                log.warning("update failed txid=%s: %s", txid, e)
-        conn.commit(); conn.close()
+                blob = json.loads(raw)
+            except Exception:
+                # raw may be NULL or not JSON for legacy rows
+                continue
 
-    return {
-        "ok": True,
-        "scanned": scanned,
-        "orders_checked": len(all_order_ids),
-        "updated": updated,
-        "api_labeled": api_labeled,
-        "rules_labeled": rules_labeled,
-        "ambiguous": ambiguous,
-        "missing_order": missing_order,
-        "apply_rules": apply_rules,
-        "batch_size": batch_size,
-        "max_rows": max_rows,
-    }
+            ref = _extract_userref(blob)
+            if ref is None:
+                continue
+
+            strat = userref_to_strategy.get(ref)
+            if not strat:
+                continue
+
+            key = (txid, ts)
+            if key not in updates:
+                updates[key] = strat
+                rules_labeled += 1
+
+    # ---------------------------------------------------------
+    # Step 4: Apply updates (or report what would be done)
+    # ---------------------------------------------------------
+    updated = 0
+    orders_checked = 0
+    api_labeled = 0
+    ambiguous = 0
+    missing_order = 0
+
+    if not updates:
+        log.info("journal_enrich (v2): no strategies inferred from userref.")
+    elif dry_run:
+        log.info(
+            "journal_enrich (v2): DRY RUN, would update %d rows", len(updates)
+        )
+    else:
+        log.info(
+            "journal_enrich (v2): applying %d updates to trades.strategy",
+            len(updates),
+        )
+        try:
+            for (txid, ts), strat in updates.items():
+                cur.execute(
+                    "UPDATE trades "
+                    "SET strategy = ? "
+                    "WHERE txid = ? AND ts = ?",
+                    (strat, txid, ts),
+                )
+                updated += cur.rowcount
+            conn.commit()
+        except Exception:
+            log.exception("journal_enrich (v2): failed while updating trades")
+            conn.rollback()
+
+    # ---------------------------------------------------------
+    # Step 5: Return summary for the UI / CLI
+    # ---------------------------------------------------------
+    return JSONResponse(
+        {
+            "ok": True,
+            "scanned": scanned,
+            "orders_checked": orders_checked,
+            "updated": updated,
+            "api_labeled": api_labeled,
+            "rules_labeled": rules_labeled,
+            "ambiguous": ambiguous,
+            "missing_order": missing_order,
+            "apply_rules": apply_rules,
+            "batch_size": batch_size,
+            "max_rows": max_rows,
+        }
+    )
 
 @app.get("/debug/env")
 def debug_env():
