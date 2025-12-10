@@ -206,7 +206,64 @@ def _pick_data_dir() -> Path:
         return p
 
 DATA_DIR = _pick_data_dir()
+DATA_DIR.mkdir(parents=True, exist_ok=True)
 DB_PATH = DATA_DIR / "journal.db"
+
+# ----------------------------------------------------------------------
+# Journal v2: append-only JSONL log written directly from scheduler_v2
+# ----------------------------------------------------------------------
+JOURNAL_V2_PATH = DATA_DIR / "journal_v2.jsonl"
+JOURNAL_V2_MAX_BYTES = int(os.getenv("JOURNAL_V2_MAX_BYTES", str(5 * 1024 * 1024)))  # 5 MB default
+_JOURNAL_V2_LOCK = threading.Lock()
+
+
+def append_journal_v2(event: Dict[str, Any]) -> None:
+    """
+    Append a single JSON event to journal_v2.jsonl with very defensive
+    error handling. Rotates the file when it grows beyond JOURNAL_V2_MAX_BYTES.
+
+    This MUST NEVER raise; failures are silently ignored so the scheduler
+    and API continue to run even if disk is unhappy.
+    """
+    # Best-effort ensure data dir exists
+    try:
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        pass
+
+    path = JOURNAL_V2_PATH
+
+    # Size-based rotation
+    try:
+        if path.exists() and path.stat().st_size > JOURNAL_V2_MAX_BYTES:
+            ts = int(time.time())
+            rotated = path.with_name(f"{path.name}.{ts}")
+            try:
+                path.rename(rotated)
+            except Exception:
+                # If rename fails, just keep appending to current file
+                pass
+    except Exception:
+        # If stat/exists fails, ignore and try writing anyway
+        pass
+
+    # Serialize safely
+    try:
+        line = json.dumps(event, sort_keys=False, default=str)
+    except Exception:
+        # Never let bad event data kill the logger
+        return
+
+    # Append with a lock
+    try:
+        with _JOURNAL_V2_LOCK:
+            with path.open("a", encoding="utf-8") as f:
+                f.write(line)
+                f.write("\n")
+    except Exception:
+        # Swallow all I/O errors
+        return
+
 
 # Telemetry JSONL log (one row per scheduler event)
 TELEMETRY_PATH = DATA_DIR / "telemetry_v2.jsonl"
@@ -1055,6 +1112,123 @@ def journal_counts():
         per_strategy.append({"strategy": row[0], "count": row[1]})
     conn.close()
     return {"ok": True, "total": total, "labeled": labeled, "unlabeled": unlabeled, "per_strategy": per_strategy}
+    
+@app.get("/journal/v2/review")
+def journal_v2_review(
+    limit: int = Query(2000, ge=1, le=100000),
+) -> Dict[str, Any]:
+    """
+    Lightweight summary over the append-only journal_v2.jsonl file.
+
+    - Reads up to `limit` most recent events.
+    - Aggregates by strategy and (strategy, symbol).
+    - Ready for Advisor v2 to consume (we'll add P&L fields later).
+    """
+    path = JOURNAL_V2_PATH
+    if not path.exists():
+        return {
+            "ok": True,
+            "count": 0,
+            "per_strategy": [],
+            "per_pair": [],
+        }
+
+    rows: List[Dict[str, Any]] = []
+    try:
+        with path.open("r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    evt = json.loads(line)
+                except Exception:
+                    continue
+                rows.append(evt)
+    except Exception as e:
+        return {
+            "ok": False,
+            "error": f"failed_to_read_journal_v2: {e.__class__.__name__}: {e}",
+        }
+
+    # Keep only the last `limit` events
+    if len(rows) > limit:
+        rows = rows[-limit:]
+
+    per_strategy: Dict[str, Dict[str, Any]] = {}
+    per_pair: Dict[Tuple[str, str], Dict[str, Any]] = {}
+
+    for evt in rows:
+        strat = str(evt.get("strategy") or "unknown")
+        sym = str(evt.get("symbol") or "unknown")
+        status = str(evt.get("status") or "unknown")
+        side = str(evt.get("side") or "unknown")
+        kind = str(evt.get("kind") or "unknown")
+        dry = bool(evt.get("dry") or False)
+
+        # Placeholder for future P&L; currently zero until we enrich events
+        pnl = float(evt.get("pnl", 0.0) or 0.0)
+
+        # --- per strategy ---
+        s_rec = per_strategy.setdefault(
+            strat,
+            {
+                "strategy": strat,
+                "count": 0,
+                "sent": 0,
+                "error": 0,
+                "dry": 0,
+                "buy": 0,
+                "sell": 0,
+                "pnl_sum": 0.0,
+            },
+        )
+        s_rec["count"] += 1
+        if status == "sent":
+            s_rec["sent"] += 1
+        if status == "error":
+            s_rec["error"] += 1
+        if dry:
+            s_rec["dry"] += 1
+        if side == "buy":
+            s_rec["buy"] += 1
+        if side == "sell":
+            s_rec["sell"] += 1
+        s_rec["pnl_sum"] += pnl
+
+        # --- per (strategy, symbol) ---
+        key = (strat, sym)
+        p_rec = per_pair.setdefault(
+            key,
+            {
+                "strategy": strat,
+                "symbol": sym,
+                "count": 0,
+                "sent": 0,
+                "error": 0,
+                "buy": 0,
+                "sell": 0,
+                "pnl_sum": 0.0,
+            },
+        )
+        p_rec["count"] += 1
+        if status == "sent":
+            p_rec["sent"] += 1
+        if status == "error":
+            p_rec["error"] += 1
+        if side == "buy":
+            p_rec["buy"] += 1
+        if side == "sell":
+            p_rec["sell"] += 1
+        p_rec["pnl_sum"] += pnl
+
+    return {
+        "ok": True,
+        "count": len(rows),
+        "per_strategy": sorted(per_strategy.values(), key=lambda r: r["strategy"]),
+        "per_pair": sorted(per_pair.values(), key=lambda r: (r["strategy"], r["symbol"])),
+    }
+
 
 @app.get("/price/{base}/{quote}")
 def price_endpoint(base: str, quote: str):
@@ -3723,8 +3897,32 @@ def scheduler_run_v2(payload: Dict[str, Any] = Body(default=None)):
 
         if dry or br is None:
             action_record["status"] = "skipped_dry_run"
+
+            # Journal v2: record dry-run / no-broker actions
+            try:
+                append_journal_v2(
+                    {
+                        "ts": time.time(),
+                        "source": "scheduler_v2",
+                        "symbol": intent.symbol,
+                        "strategy": intent.strategy,
+                        "kind": intent.kind,
+                        "side": side,
+                        "notional": final_notional,
+                        "reason": intent.reason,
+                        "dry": bool(dry),
+                        "status": action_record.get("status"),
+                        "response": action_record.get("response"),
+                        "error": action_record.get("error"),
+                    }
+                )
+            except Exception:
+                # Never let logging break the scheduler
+                pass
+
             actions.append(action_record)
             continue
+
 
         # ------------------------------------------------------------------
         # Send to broker via br_router.market_notional
@@ -3743,7 +3941,30 @@ def scheduler_run_v2(payload: Dict[str, Any] = Body(default=None)):
             action_record["status"] = "error"
             action_record["error"] = f"{e.__class__.__name__}: {e}"
 
+        # Journal v2: record every executed (or failed) broker call
+        try:
+            append_journal_v2(
+                {
+                    "ts": time.time(),
+                    "source": "scheduler_v2",
+                    "symbol": intent.symbol,
+                    "strategy": intent.strategy,
+                    "kind": intent.kind,
+                    "side": side,
+                    "notional": final_notional,
+                    "reason": intent.reason,
+                    "dry": bool(dry),
+                    "status": action_record.get("status"),
+                    "response": action_record.get("response"),
+                    "error": action_record.get("error"),
+                }
+            )
+        except Exception:
+            # Guard rail: journaling must never crash the scheduler
+            pass
+
         actions.append(action_record)
+
 
     # ------------------------------------------------------------------
     # Build per-(strategy,symbol) universe summary for debugging
