@@ -5,7 +5,7 @@ import json
 import os
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Dict, Optional, Tuple
+from typing import Any, Callable, Dict, Optional, Tuple, List
 
 from strategy_api import PositionSnapshot, RiskContext, OrderIntent
 
@@ -58,6 +58,9 @@ class RiskConfig:
     daily_flatten: DailyFlattenConfig
     time_multiplier: TimeMultiplierConfig
     atr_floor: AtrFloorConfig
+    # NEW: optional list of strategies for which global exits (profit_lock/stop_loss/atr_floor)
+    # are allowed to fire. If None or empty, exits apply to all strategies.
+    exit_for_strategies: Optional[Tuple[str, ...]]
     raw: Dict[str, Any]
 
 
@@ -168,6 +171,20 @@ class RiskEngine:
             tiers=tiers_cfg,
         )
 
+        # NEW: optional per-strategy filter for global exits.
+        # Example in risk.json:
+        #   "exit_for_strategies": ["c2", "c3"]
+        efs_raw = _get(cfg, "exit_for_strategies", None)
+        exit_for_strategies: Optional[Tuple[str, ...]] = None
+        if isinstance(efs_raw, (list, tuple)):
+            normalized = [
+                str(s).strip().lower()
+                for s in efs_raw
+                if str(s).strip()
+            ]
+            if normalized:
+                exit_for_strategies = tuple(normalized)
+
         return RiskConfig(
             fee_rate_pct=fee_rate_pct,
             edge_multiple_vs_fee=edge_multiple_vs_fee,
@@ -177,6 +194,7 @@ class RiskEngine:
             daily_flatten=daily_flatten,
             time_multiplier=time_multiplier,
             atr_floor=atr_floor,
+            exit_for_strategies=exit_for_strategies,
             raw=cfg,
         )
 
@@ -246,7 +264,42 @@ class RiskEngine:
             return (px - avg) / avg * 100.0
         else:
             return (avg - px) / avg * 100.0
+            
+    def _exit_for_strategies(self, symbol: str) -> List[str]:
+        """
+        Return a sorted list of strategies that currently hold a non-flat
+        position in `symbol`. Used for tagging global exits (misc).
+        """
+        seen = set()
 
+        # This assumes you have an in-memory positions structure like:
+        # self.positions: Dict[str, PositionSnapshot] or
+        # self.positions: Dict[Tuple[str, str], PositionSnapshot]
+        #
+        # Adjust the loop slightly if your keys/fields differ.
+        for pos in self.positions.values():
+            try:
+                sym = getattr(pos, "symbol", None)
+                strat = getattr(pos, "strategy", None)
+                size = getattr(pos, "size", None) or getattr(pos, "qty", None)
+            except Exception:
+                continue
+
+            if sym != symbol:
+                continue
+
+            # Treat very tiny positions as flat
+            if size is None:
+                continue
+            if abs(float(size)) < 1e-8:
+                continue
+
+            if strat:
+                seen.add(str(strat))
+
+        return sorted(seen)
+            
+   
     # ------------------------------------------------------------------
     # Per-symbol caps
     # ------------------------------------------------------------------
@@ -348,9 +401,20 @@ class RiskEngine:
         if pos is None or abs(pos.qty) < 1e-10:
             return None
 
-        # 1) Daily flatten
+        # 1) Daily flatten still applies to EVERY position.
         if self.is_daily_flatten_active(now):
             return "daily_flatten"
+
+        # NEW: Optional per-strategy restriction for *other* global exits
+        # (profit_lock, stop_loss, atr_floor_flat).
+        # If exit_for_strategies is set and this position's strategy is not in the list,
+        # we skip global exits for this position.
+        allowed = self.config.exit_for_strategies
+        if allowed:
+            # Try both .strategy and .strat to be defensive.
+            pos_strat = getattr(pos, "strategy", None) or getattr(pos, "strat", None)
+            if not pos_strat or str(pos_strat).strip().lower() not in allowed:
+                return None
 
         if unrealized_pct is None:
             return None
@@ -374,6 +438,7 @@ class RiskEngine:
                     return f"atr_floor_flat:{atr_pct:.4f}<{float(floor):.4f}"
 
         return None
+
 
     def _tier_for_symbol(self, symbol: str) -> Optional[str]:
         upper, norm = self._norm_symbol_key(symbol)
