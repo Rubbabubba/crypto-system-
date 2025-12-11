@@ -174,7 +174,7 @@ class RiskEngine:
             tiers=tiers_cfg,
         )
 
-        # NEW: optional per-strategy filter for global exits.
+        # Optional per-strategy filter for global exits.
         # Example in risk.json:
         #   "exit_for_strategies": ["c2", "c3"]
         efs_raw = _get(cfg, "exit_for_strategies", None)
@@ -200,6 +200,7 @@ class RiskEngine:
             exit_for_strategies=exit_for_strategies,
             raw=cfg,
         )
+
         
     # ------------------------------------------------------------------
     # Helpers
@@ -397,53 +398,47 @@ class RiskEngine:
     ) -> Optional[str]:
         if pos is None or abs(pos.qty) < 1e-10:
             return None
-            
-        # Optional: restrict global exits to a subset of strategies.
-        # If config.exit_for_strategies is set, only those strategies
-        # are eligible for global exits; everything else is ignored here.
-        efs = self.config.exit_for_strategies
-        if efs is not None:
-            # PositionSnapshot is expected to carry the strategy name;
-            # fall back safely if not present.
-            strat = getattr(pos, "strategy", None)
-            strat_norm = str(strat).strip().lower() if strat is not None else ""
-            if strat_norm not in efs:
-                return None
-
 
         # 1) Daily flatten (always applies, regardless of strategy)
         if self.is_daily_flatten_active(now):
             return "daily_flatten"
 
-        # 1b) Optional per-strategy scoping of global exits
-        exit_for = self.config.exit_for_strategies or []
-        if exit_for:
-            pos_strat = (getattr(pos, "strategy", None) or "").strip().lower()
-            if pos_strat not in exit_for:
-                # Do not apply profit-lock / loss-zone / ATR floor to this position
+        # 2) Optional per-strategy scoping of the *rest* of the global exits
+        #
+        # If config.exit_for_strategies is:
+        #   - None or empty => apply to ALL strategies (current behavior)
+        #   - Non-empty list => only those strategies get profit-lock / stop-loss / ATR floor
+        efs = self.config.exit_for_strategies
+        if efs is not None:
+            strat = getattr(pos, "strategy", None)
+            strat_norm = str(strat).strip().lower() if strat is not None else ""
+            if strat_norm not in efs:
+                # Skip profit-lock / loss-zone / ATR floor for this position
                 return None
 
         if unrealized_pct is None:
             return None
 
-        # 2) Profit-lock
+        # 3) Profit-lock
         pl = self.config.profit_lock
         if pl.take_profit_pct is not None and unrealized_pct >= pl.take_profit_pct:
             return f"profit_lock:{unrealized_pct:.2f}>={pl.take_profit_pct:.2f}"
 
-        # 3) Stop-loss
+        # 4) Stop-loss
         lz = self.config.loss_zone
         if lz.stop_loss_pct is not None and unrealized_pct <= lz.stop_loss_pct:
             return f"stop_loss:{unrealized_pct:.2f}<={lz.stop_loss_pct:.2f}"
 
-        # 4) ATR floor flatten
+        # 5) ATR floor flatten
         af = self.config.atr_floor
-        tier = self._tier_for_symbol(pos.symbol.replace("/", ""))
-        floor_pct = getattr(af, tier, None) if tier in ("tier1", "tier2", "tier3") else None
+        # _tier_for_symbol already handles normalization, so we can pass the raw symbol
+        tier = self._tier_for_symbol(pos.symbol)
+        floor_pct = af.floors.get(tier) if tier is not None else None
         if floor_pct is not None and atr_pct is not None and atr_pct < floor_pct:
             return f"atr_floor:{atr_pct:.2f}<{floor_pct:.2f}"
 
         return None
+
 
 
     def _tier_for_symbol(self, symbol: str) -> Optional[str]:
