@@ -697,3 +697,7 @@ def summarize_v2(limit: int = 1000) -> Dict[str, Any]:
         'top_strategies': [{'strategy': k, 'count': v} for k,v in top_strats],
         'top_pairs': [{'pair': k, 'count': v} for k,v in top_pairs],
     }
+
+# Backwards-compatible alias (app.py imports advisor_summary)
+def advisor_summary(limit: int = 1000):
+    return summarize_v2(limit=limit)
