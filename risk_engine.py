@@ -58,11 +58,14 @@ class RiskConfig:
     daily_flatten: DailyFlattenConfig
     time_multiplier: TimeMultiplierConfig
     atr_floor: AtrFloorConfig
-    # NEW: optional list of strategies for which global exits (profit_lock/stop_loss/atr_floor)
-    # are allowed to fire. If None or empty, exits apply to all strategies.
-    exit_for_strategies: Optional[Tuple[str, ...]]
-    raw: Dict[str, Any]
 
+    # Optional list of strategies that global exit rules should apply to.
+    # If None, apply to ALL strategies (current behavior).
+    # If set, only these strategies get global exits.
+    exit_for_strategies: Optional[Tuple[str, ...]] = None
+
+    # Raw config for debugging / introspection
+    raw: Dict[str, Any] = None
 
 def _load_risk_dict() -> Dict[str, Any]:
     """
@@ -197,7 +200,7 @@ class RiskEngine:
             exit_for_strategies=exit_for_strategies,
             raw=cfg,
         )
-
+        
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
@@ -387,33 +390,37 @@ class RiskEngine:
 
     def apply_global_exit_rules(
         self,
-        pos: PositionSnapshot,
+        pos,
         unrealized_pct: Optional[float],
         atr_pct: Optional[float],
-        now: Optional[dt.datetime] = None,
+        now: datetime,
     ) -> Optional[str]:
-        """
-        Decide if global risk wants this position FLATTENED, and why.
-
-        Returns:
-            reason string if we should flatten, else None.
-        """
         if pos is None or abs(pos.qty) < 1e-10:
             return None
+            
+        # Optional: restrict global exits to a subset of strategies.
+        # If config.exit_for_strategies is set, only those strategies
+        # are eligible for global exits; everything else is ignored here.
+        efs = self.config.exit_for_strategies
+        if efs is not None:
+            # PositionSnapshot is expected to carry the strategy name;
+            # fall back safely if not present.
+            strat = getattr(pos, "strategy", None)
+            strat_norm = str(strat).strip().lower() if strat is not None else ""
+            if strat_norm not in efs:
+                return None
 
-        # 1) Daily flatten still applies to EVERY position.
+
+        # 1) Daily flatten (always applies, regardless of strategy)
         if self.is_daily_flatten_active(now):
             return "daily_flatten"
 
-        # NEW: Optional per-strategy restriction for *other* global exits
-        # (profit_lock, stop_loss, atr_floor_flat).
-        # If exit_for_strategies is set and this position's strategy is not in the list,
-        # we skip global exits for this position.
-        allowed = self.config.exit_for_strategies
-        if allowed:
-            # Try both .strategy and .strat to be defensive.
-            pos_strat = getattr(pos, "strategy", None) or getattr(pos, "strat", None)
-            if not pos_strat or str(pos_strat).strip().lower() not in allowed:
+        # 1b) Optional per-strategy scoping of global exits
+        exit_for = self.config.exit_for_strategies or []
+        if exit_for:
+            pos_strat = (getattr(pos, "strategy", None) or "").strip().lower()
+            if pos_strat not in exit_for:
+                # Do not apply profit-lock / loss-zone / ATR floor to this position
                 return None
 
         if unrealized_pct is None:
@@ -429,13 +436,12 @@ class RiskEngine:
         if lz.stop_loss_pct is not None and unrealized_pct <= lz.stop_loss_pct:
             return f"stop_loss:{unrealized_pct:.2f}<={lz.stop_loss_pct:.2f}"
 
-        # 4) ATR floor flatten (if ATR too small for this tier)
-        if atr_pct is not None:
-            tier_name = self._tier_for_symbol(pos.symbol)
-            if tier_name is not None:
-                floor = self.config.atr_floor.floors.get(tier_name)
-                if floor is not None and atr_pct < float(floor):
-                    return f"atr_floor_flat:{atr_pct:.4f}<{float(floor):.4f}"
+        # 4) ATR floor flatten
+        af = self.config.atr_floor
+        tier = self._tier_for_symbol(pos.symbol.replace("/", ""))
+        floor_pct = getattr(af, tier, None) if tier in ("tier1", "tier2", "tier3") else None
+        if floor_pct is not None and atr_pct is not None and atr_pct < floor_pct:
+            return f"atr_floor:{atr_pct:.2f}<{floor_pct:.2f}"
 
         return None
 
