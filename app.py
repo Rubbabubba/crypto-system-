@@ -1116,6 +1116,34 @@ def advisor_v2_summary(limit: int = Query(1000, ge=1, le=10000)):
             "detail": str(exc),
         }
 
+
+@app.get("/advisor/v2/report")
+def advisor_v2_report(
+    hours: int = Query(24, ge=1, le=24*30),
+    days: Optional[int] = Query(None, ge=1, le=365),
+    bucket_hours: int = Query(4, ge=1, le=12),
+    write_file: bool = Query(True),
+    markdown: bool = Query(False),
+):
+    """
+    Full Advisor v2 attribution report.
+
+    Reads (last N hours/days):
+      - journal.db (trades table)
+      - journal_v2.jsonl (broker actions)
+      - telemetry_v2.jsonl (guard/risk/skip reasons)
+
+    Returns JSON by default, or Markdown if markdown=true.
+    """
+    try:
+        from advisor_v2 import generate_report, to_markdown
+        rep = generate_report(hours=hours, days=days, bucket_hours=bucket_hours, write_file=write_file)
+        if markdown:
+            return {"ok": True, "markdown": to_markdown(rep)}
+        return rep
+    except Exception as exc:
+        return {"ok": False, "error": "advisor_v2_report_failed", "detail": str(exc)}
+
 @app.get("/journal/counts")
 def journal_counts():
     conn = _db()
