@@ -84,7 +84,7 @@ from strategy_api import PositionSnapshot
 from scheduler_core import SchedulerConfig, SchedulerResult, StrategyBook, ScanRequest, ScanResult,run_scheduler_once
 from risk_engine import RiskEngine
 from fastapi import Body, FastAPI, HTTPException, Query
-
+from advisor_v2 import advisor_summary
 
 
 # Routes:
@@ -1099,6 +1099,22 @@ def advisor_apply(payload: Dict[str, Any] = Body(default=None)):
     with open(DAILY_JSON, "w", encoding="utf-8") as fh:
         json.dump(data, fh, indent=2)
     return {"ok": True, "saved": True, **data}
+    
+@app.get("/advisor/v2/summary")
+def advisor_v2_summary(limit: int = Query(1000, ge=1, le=10000)):
+    """
+    High-level Advisor summary over recent journal_v2 entries.
+    This does NOT place orders; it's read-only analytics.
+    """
+    try:
+        payload = advisor_summary(limit=limit)
+        return payload
+    except Exception as exc:
+        return {
+            "ok": False,
+            "error": "advisor_v2_failed",
+            "detail": str(exc),
+        }
 
 @app.get("/journal/counts")
 def journal_counts():
