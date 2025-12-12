@@ -72,6 +72,7 @@ import time
 import threading
 import broker_kraken
 import requests
+import uuid
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 from symbol_map import KRAKEN_PAIR_MAP, to_kraken
@@ -287,10 +288,22 @@ def _load_attrib_from_journal_v2(max_lines: int = 250_000) -> Dict[str, Dict[str
             except Exception:
                 continue
 
-            # Common fields we expect in events
-            ordertxid = ev.get("ordertxid") or ev.get("order_txid") or ev.get("orderId")
+            # Common fields we expect in events (top-level OR inside response/result)
+            ordertxid = ev.get("ordertxid") or ev.get("order_txid") or ev.get("orderId") or ev.get("txid")
+            userref   = ev.get("userref")
+
+            resp = ev.get("response")
+            if (not ordertxid or userref is None) and isinstance(resp, dict):
+                # try inside response itself
+                otx2, ur2 = _extract_ordertxid_userref_from_resp(resp)
+                if not ordertxid and otx2:
+                    ordertxid = otx2
+                if userref is None and ur2 is not None:
+                    userref = ur2
+
             intent_id = ev.get("intent_id")
             strategy  = ev.get("strategy")
+
 
             if ordertxid and (intent_id or strategy):
                 rec = m.setdefault(str(ordertxid), {})
@@ -372,6 +385,65 @@ def _append_telemetry_rows(rows: List[Dict[str, Any]]) -> None:
     except Exception as e:
         # Telemetry logging must never break the scheduler
         log.warning("failed to append telemetry rows: %s", e)
+        
+def _extract_ordertxid_userref_from_resp(resp: Any) -> Tuple[Optional[str], Optional[int]]:
+    """
+    Best-effort: pull ordertxid + userref out of br_router.market_notional response.
+    Handles shapes like:
+      - {"ordertxid": "...", "userref": 123}
+      - {"txid": "..."} or {"txid": ["..."]}
+      - {"result": {"txid": ["..."]}}
+      - {"result": {"ordertxid": "..."}}
+    """
+    if resp is None:
+        return (None, None)
+
+    # Sometimes response is not a dict
+    if not isinstance(resp, dict):
+        return (None, None)
+
+    # candidates to search
+    cands = [resp]
+    if isinstance(resp.get("result"), dict):
+        cands.append(resp["result"])
+    if isinstance(resp.get("data"), dict):
+        cands.append(resp["data"])
+
+    ordertxid: Optional[str] = None
+    userref: Optional[int] = None
+
+    for d in cands:
+        if not isinstance(d, dict):
+            continue
+
+        # Kraken often returns "txid" as the order tx id in order placement calls
+        otx = d.get("ordertxid") or d.get("order_txid") or d.get("txid") or d.get("orderId")
+        if isinstance(otx, list) and otx:
+            otx = otx[0]
+        if otx and ordertxid is None:
+            ordertxid = str(otx)
+
+        ur = d.get("userref") or d.get("user_ref")
+        if ur is not None and userref is None:
+            try:
+                userref = int(ur)
+            except Exception:
+                userref = None
+
+    return (ordertxid, userref)
+
+
+def _intent_id(intent: Any) -> Optional[str]:
+    """Read the stable intent id you set in intent.meta."""
+    try:
+        meta = getattr(intent, "meta", None)
+        if isinstance(meta, dict):
+            v = meta.get("intent_id")
+            return str(v) if v else None
+    except Exception:
+        pass
+    return None
+
 
 # --------------------------------------------------------------------------------------
 # Scheduler globals
@@ -695,6 +767,72 @@ def _kraken_error_str(resp: Dict[str, Any]) -> Optional[str]:
     except Exception:
         pass
     return None
+    
+def _extract_ordertxid_and_userref(resp: Any) -> Tuple[Optional[str], Optional[int]]:
+    """
+    Best-effort extraction of ordertxid + userref from whatever the broker/execution layer returns.
+    Handles common shapes:
+      - {"ok": True, "txid": "..."} or {"txid": ["..."]}
+      - {"result": {"txid": ["..."]}}
+      - {"order_txid": "..."} / {"ordertxid": "..."}
+    """
+    try:
+        if resp is None:
+            return (None, None)
+
+        # Sometimes response is a string
+        if isinstance(resp, str):
+            return (None, None)
+
+        # Sometimes response is a list (rare)
+        if isinstance(resp, list):
+            # try first dict in list
+            for x in resp:
+                if isinstance(x, dict):
+                    otx, ur = _extract_ordertxid_and_userref(x)
+                    if otx or ur is not None:
+                        return (otx, ur)
+            return (None, None)
+
+        if not isinstance(resp, dict):
+            return (None, None)
+
+        # unwrap common nesting
+        candidate_dicts = [resp]
+        if isinstance(resp.get("result"), dict):
+            candidate_dicts.append(resp["result"])
+        if isinstance(resp.get("data"), dict):
+            candidate_dicts.append(resp["data"])
+
+        ordertxid: Optional[str] = None
+        userref: Optional[int] = None
+
+        for d in candidate_dicts:
+            # order txid keys
+            val = (
+                d.get("ordertxid")
+                or d.get("order_txid")
+                or d.get("orderTxid")
+                or d.get("txid")     # Kraken often returns txid for order placement
+            )
+            if isinstance(val, list) and val:
+                val = val[0]
+            if val and ordertxid is None:
+                ordertxid = str(val)
+
+            # userref keys
+            ur = d.get("userref") or d.get("user_ref")
+            if ur is not None and userref is None:
+                try:
+                    userref = int(ur)
+                except Exception:
+                    userref = None
+
+        return (ordertxid, userref)
+
+    except Exception:
+        return (None, None)
+
 
 # --------------------------------------------------------------------------------------
 # Routes
@@ -4012,6 +4150,14 @@ def scheduler_run_v2(payload: Dict[str, Any] = Body(default=None)):
             avg_price=getattr(pm_pos, "avg_price", None),
             unrealized_pct=None,
         )
+        
+            # Ensure every intent has a stable id for attribution
+        try:
+            if isinstance(getattr(intent, "meta", None), dict):
+                intent.meta.setdefault("intent_id", uuid.uuid4().hex)
+        except Exception:
+            pass
+
 
         # Fill unrealized_pct here so loss-zone + any extra logic
         # see the exact same P&L % that scheduler_core used.
@@ -4194,11 +4340,18 @@ def scheduler_run_v2(payload: Dict[str, Any] = Body(default=None)):
                         "notional": final_notional,
                         "reason": intent.reason,
                         "dry": bool(dry),
+
+                        # --- PATCH: attribution keys ---
+                        "intent_id": _intent_id(intent),
+                        "ordertxid": None,
+                        "userref": None,
+
                         "status": action_record.get("status"),
                         "response": action_record.get("response"),
                         "error": action_record.get("error"),
                     }
                 )
+
             except Exception:
                 # Never let logging break the scheduler
                 pass
@@ -4224,6 +4377,9 @@ def scheduler_run_v2(payload: Dict[str, Any] = Body(default=None)):
             action_record["status"] = "error"
             action_record["error"] = f"{e.__class__.__name__}: {e}"
 
+        # --- PATCH: pull ordertxid/userref out of response (if present) ---
+        otx, ur = _extract_ordertxid_userref_from_resp(action_record.get("response"))
+
         # Journal v2: record every executed (or failed) broker call
         try:
             append_journal_v2(
@@ -4237,6 +4393,12 @@ def scheduler_run_v2(payload: Dict[str, Any] = Body(default=None)):
                     "notional": final_notional,
                     "reason": intent.reason,
                     "dry": bool(dry),
+
+                    # --- PATCH: attribution keys ---
+                    "intent_id": _intent_id(intent),
+                    "ordertxid": otx,
+                    "userref": ur,
+
                     "status": action_record.get("status"),
                     "response": action_record.get("response"),
                     "error": action_record.get("error"),
