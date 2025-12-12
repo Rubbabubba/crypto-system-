@@ -3022,6 +3022,9 @@ def scheduler_core_debug(payload: Dict[str, Any] = Body(default=None)):
                     vals.append(row[key])
         return vals
 
+
+
+
     for sym in syms:
         try:
             one = br.get_bars(sym, timeframe="1Min", limit=limit)
@@ -4448,40 +4451,13 @@ def scheduler_run_v2(payload: Dict[str, Any] = Body(default=None)):
             if ur:
                 action_record["userref"] = ur
             
-            # Best-effort: extract broker order txid (Kraken AddOrder returns txid list)
-            ordertxid = None
-            try:
-                if isinstance(resp, dict):
-                    # direct forms
-                    ordertxid = resp.get("ordertxid") or resp.get("order_txid") or resp.get("orderId")
-                    # common Kraken form: {"result":{"txid":["..."]}}
-                    if not ordertxid:
-                        r = resp.get("result") if isinstance(resp.get("result"), dict) else None
-                        tx = (r.get("txid") if r else None)
-                        if isinstance(tx, list) and tx:
-                            ordertxid = tx[0]
-                        elif isinstance(tx, str):
-                            ordertxid = tx
-                    # sometimes top-level "txid"
-                    if not ordertxid:
-                        tx = resp.get("txid")
-                        if isinstance(tx, list) and tx:
-                            ordertxid = tx[0]
-                        elif isinstance(tx, str):
-                            ordertxid = tx
-                if ordertxid:
-                    action_record["ordertxid"] = str(ordertxid)
-            except Exception:
-                pass
-            
+                        
         except Exception as e:
             log.error("scheduler_v2: broker error for %s %s: %s", intent.symbol, side, e)
             action_record["status"] = "error"
             action_record["error"] = f"{e.__class__.__name__}: {e}"
 
-        # --- PATCH: pull ordertxid/userref out of response (if present) ---
-        otx, ur = _extract_ordertxid_userref_from_resp(action_record.get("response"))
-
+        
         # Journal v2: record every executed (or failed) broker call
         try:
             append_journal_v2({
@@ -4501,6 +4477,7 @@ def scheduler_run_v2(payload: Dict[str, Any] = Body(default=None)):
                 "response": action_record.get("response"),
                 "error": action_record.get("error"),
             })
+
                 
         except Exception:
             # Guard rail: journaling must never crash the scheduler
