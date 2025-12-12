@@ -80,7 +80,6 @@ from position_engine import PositionEngine, Fill
 from position_manager import load_net_positions, Position
 from risk_engine import RiskEngine
 from strategy_api import PositionSnapshot
-from typing import Dict, Any, List
 from strategy_api import PositionSnapshot
 from scheduler_core import SchedulerConfig, SchedulerResult, StrategyBook, ScanRequest, ScanResult,run_scheduler_once
 from risk_engine import RiskEngine
@@ -3952,6 +3951,61 @@ def scheduler_run_v2(payload: Dict[str, Any] = Body(default=None)):
         return str(v).lower() in ("1", "true", "yes", "on")
 
     payload = payload or {}
+    
+    # ---------------------------------------------------------------
+    # Helpers: intent_id + broker response extraction (attribution)
+    # ---------------------------------------------------------------
+    def _ensure_intent_id(intent_obj: Any) -> Optional[str]:
+        try:
+            meta = getattr(intent_obj, "meta", None)
+            if not isinstance(meta, dict):
+                meta = {}
+                try:
+                    setattr(intent_obj, "meta", meta)
+                except Exception:
+                    pass
+            iid = meta.get("intent_id")
+            if not iid:
+                iid = uuid.uuid4().hex
+                meta["intent_id"] = iid
+            return str(iid)
+        except Exception:
+            return None
+
+    def _extract_ordertxid_userref(resp: Any) -> Tuple[Optional[str], Optional[str]]:
+        """
+        Best-effort extraction for Kraken-style responses.
+        Returns (ordertxid, userref).
+        """
+        ordertxid = None
+        userref = None
+        try:
+            if isinstance(resp, dict):
+                # direct keys (if you already normalize somewhere)
+                ordertxid = resp.get("ordertxid") or resp.get("order_txid") or resp.get("orderId")
+                userref = resp.get("userref") or resp.get("user_ref")
+
+                # Kraken common: {"result":{"txid":["..."]}}
+                if not ordertxid:
+                    r = resp.get("result") if isinstance(resp.get("result"), dict) else None
+                    tx = (r.get("txid") if r else None)
+                    if isinstance(tx, list) and tx:
+                        ordertxid = tx[0]
+                    elif isinstance(tx, str):
+                        ordertxid = tx
+
+                # Sometimes: top-level "txid"
+                if not ordertxid:
+                    tx = resp.get("txid")
+                    if isinstance(tx, list) and tx:
+                        ordertxid = tx[0]
+                    elif isinstance(tx, str):
+                        ordertxid = tx
+        except Exception:
+            pass
+
+        return (str(ordertxid) if ordertxid else None, str(userref) if userref else None)
+
 
     # Dry-run flag: payload.dry overrides SCHED_DRY (default True)
     dry = payload.get("dry", None)
@@ -4162,24 +4216,8 @@ def scheduler_run_v2(payload: Dict[str, Any] = Body(default=None)):
     # ------------------------------------------------------------------
     for intent in final_intents:
         
-    # ------------------------------------------------------------------
-    # Ensure every intent has a stable id for attribution (intent_id)
-    # ------------------------------------------------------------------
-    intent_id: Optional[str] = None
-    try:
-        meta = getattr(intent, "meta", None)
-        if not isinstance(meta, dict):
-            meta = {}
-            try:
-                setattr(intent, "meta", meta)
-            except Exception:
-                pass
-        intent_id = meta.get("intent_id")
-        if not intent_id:
-            intent_id = uuid.uuid4().hex
-            meta["intent_id"] = intent_id
-    except Exception:
-        intent_id = None
+        # Ensure every intent has a stable id for attribution
+        intent_id = _ensure_intent_id(intent)
         
         key = (intent.symbol, intent.strategy)
         pm_pos = positions.get(key)
@@ -4192,14 +4230,7 @@ def scheduler_run_v2(payload: Dict[str, Any] = Body(default=None)):
             unrealized_pct=None,
         )
         
-            # Ensure every intent has a stable id for attribution
-        try:
-            if isinstance(getattr(intent, "meta", None), dict):
-                intent.meta.setdefault("intent_id", uuid.uuid4().hex)
-        except Exception:
-            pass
-
-
+            
         # Fill unrealized_pct here so loss-zone + any extra logic
         # see the exact same P&L % that scheduler_core used.
         try:
@@ -4371,29 +4402,24 @@ def scheduler_run_v2(payload: Dict[str, Any] = Body(default=None)):
 
             # Journal v2: record dry-run / no-broker actions
             try:
-                append_journal_v2(
-                    {
-                        "ts": time.time(),
-                        "source": "scheduler_v2",
-                        "intent_id": intent_id,
-                        "symbol": intent.symbol,
-                        "strategy": intent.strategy,
-                        "kind": intent.kind,
-                        "side": side,
-                        "notional": final_notional,
-                        "reason": intent.reason,
-                        "dry": bool(dry),
+                append_journal_v2({
+                    "ts": time.time(),
+                    "source": "scheduler_v2",
+                    "intent_id": intent_id,
+                    "ordertxid": None,
+                    "userref": None,
+                    "symbol": intent.symbol,
+                    "strategy": intent.strategy,
+                    "kind": intent.kind,
+                    "side": side,
+                    "notional": final_notional,
+                    "reason": intent.reason,
+                    "dry": bool(dry),
+                    "status": action_record.get("status"),
+                    "response": action_record.get("response"),
+                    "error": action_record.get("error"),
+                })
 
-                        # --- PATCH: attribution keys ---
-                        "intent_id": _intent_id(intent),
-                        "ordertxid": None,
-                        "userref": None,
-
-                        "status": action_record.get("status"),
-                        "response": action_record.get("response"),
-                        "error": action_record.get("error"),
-                    }
-                )
 
             except Exception:
                 # Never let logging break the scheduler
@@ -4415,6 +4441,12 @@ def scheduler_run_v2(payload: Dict[str, Any] = Body(default=None)):
             )
             action_record["status"] = "sent"
             action_record["response"] = resp
+            
+            otx, ur = _extract_ordertxid_userref(resp)
+            if otx:
+                action_record["ordertxid"] = otx
+            if ur:
+                action_record["userref"] = ur
             
             # Best-effort: extract broker order txid (Kraken AddOrder returns txid list)
             ordertxid = None
@@ -4452,30 +4484,24 @@ def scheduler_run_v2(payload: Dict[str, Any] = Body(default=None)):
 
         # Journal v2: record every executed (or failed) broker call
         try:
-            append_journal_v2(
-                {
-                    "ts": time.time(),
-                    "source": "scheduler_v2",
-                    "intent_id": intent_id,
-                    "ordertxid": action_record.get("ordertxid"),
-                    "symbol": intent.symbol,
-                    "strategy": intent.strategy,
-                    "kind": intent.kind,
-                    "side": side,
-                    "notional": final_notional,
-                    "reason": intent.reason,
-                    "dry": bool(dry),
-
-                    # --- PATCH: attribution keys ---
-                    "intent_id": _intent_id(intent),
-                    "ordertxid": otx,
-                    "userref": ur,
-
-                    "status": action_record.get("status"),
-                    "response": action_record.get("response"),
-                    "error": action_record.get("error"),
-                }
-            )
+            append_journal_v2({
+                "ts": time.time(),
+                "source": "scheduler_v2",
+                "intent_id": intent_id,
+                "ordertxid": action_record.get("ordertxid"),
+                "userref": action_record.get("userref"),
+                "symbol": intent.symbol,
+                "strategy": intent.strategy,
+                "kind": intent.kind,
+                "side": side,
+                "notional": final_notional,
+                "reason": intent.reason,
+                "dry": bool(dry),
+                "status": action_record.get("status"),
+                "response": action_record.get("response"),
+                "error": action_record.get("error"),
+            })
+                
         except Exception:
             # Guard rail: journaling must never crash the scheduler
             pass
