@@ -3273,25 +3273,19 @@ def _startup():
 # --------------------------------------------------------------------------------------
 
 def _last_price_safe(symbol: str) -> float:
-    """
-    Best-effort last price lookup that works whether we're using Kraken directly
-    or only have br_router available. Returns 0.0 on any failure.
-    """
+    sym_can = _canon_symbol(symbol)
+    ctx = contexts.get(sym_can)
+    if not ctx:
+        return 0.0
+    five = ctx.get("five") or {}
+    closes = five.get("close") or []
+    if not closes:
+        return 0.0
     try:
-        import broker_kraken as _bk  # type: ignore[import]
-    except Exception:
-        try:
-            import br_router as _bk  # type: ignore[import]
-        except Exception:
-            return 0.0
-
-    try:
-        if hasattr(_bk, "last_price"):
-            px = _bk.last_price(symbol)
-            return float(px or 0.0)
+        return float(closes[-1])
     except Exception:
         return 0.0
-    return 0.0
+
 
 
 # --------------------------------------------------------------------------------------
@@ -3974,6 +3968,23 @@ def scheduler_run_v2(payload: Dict[str, Any] = Body(default=None)):
             return str(iid)
         except Exception:
             return None
+            
+    def _canon_symbol(sym: str) -> str:
+        s = (sym or "").strip().upper()
+
+        # Common Kraken asset-code wrappers you’re seeing in fills:
+        # XLTCZ/USD -> LTC/USD
+        # XXRPZ/USD -> XRP/USD
+        # Keep USD, normalize base.
+        if "/" in s:
+            base, quote = s.split("/", 1)
+            # Strip leading X/Z wrappers often used by Kraken asset codes
+            base = base.lstrip("XZ")
+            quote = quote.lstrip("XZ")
+            return f"{base}/{quote}"
+
+        return s
+
 
     def _extract_ordertxid_userref(resp: Any) -> Tuple[Optional[str], Optional[str]]:
         """
@@ -4092,45 +4103,23 @@ def scheduler_run_v2(payload: Dict[str, Any] = Body(default=None)):
         return vals
 
     for sym in syms:
+        sym_can = _canon_symbol(sym)
         try:
-            # 1m + tf (e.g. 5Min) bars from the SAME br_router used in debug_strategy_scan
             one = br.get_bars(sym, timeframe="1Min", limit=limit)
             five = br.get_bars(sym, timeframe=tf,     limit=limit)
 
             if not one or not five:
-                contexts[sym] = None
-                telemetry.append(
-                    {
-                        "symbol": sym,
-                        "stage": "preload_bars",
-                        "ok": False,
-                        "reason": "no_bars",
-                    }
-                )
+                contexts[sym_can] = None
+                telemetry.append({"symbol": sym, "stage": "preload_bars", "ok": False, "reason": "no_bars"})
             else:
-                # IMPORTANT: match the exact structure StrategyBook.scan() expects
-                contexts[sym] = {
-                    "one": {
-                        "close": _safe_series(one, "c"),
-                        "high":  _safe_series(one, "h"),
-                        "low":   _safe_series(one, "l"),
-                    },
-                    "five": {
-                        "close": _safe_series(five, "c"),
-                        "high":  _safe_series(five, "h"),
-                        "low":   _safe_series(five, "l"),
-                    },
+                contexts[sym_can] = {
+                    "one":  {"close": _safe_series(one, "c"),  "high": _safe_series(one, "h"),  "low": _safe_series(one, "l")},
+                    "five": {"close": _safe_series(five, "c"), "high": _safe_series(five, "h"), "low": _safe_series(five, "l")},
                 }
         except Exception as e:
-            contexts[sym] = None
-            telemetry.append(
-                {
-                    "symbol": sym,
-                    "stage": "preload_bars",
-                    "ok": False,
-                    "error": f"{e.__class__.__name__}: {e}",
-                }
-            )
+            contexts[sym_can] = None
+            telemetry.append({"symbol": sym, "stage": "preload_bars", "ok": False, "error": f"{e.__class__.__name__}: {e}"})
+
 
     # ------------------------------------------------------------------
     # Last-price helper for risk calculation + exits
@@ -4221,6 +4210,13 @@ def scheduler_run_v2(payload: Dict[str, Any] = Body(default=None)):
         
         # Ensure every intent has a stable id for attribution
         intent_id = _ensure_intent_id(intent)
+        
+    # Force strategy label for global/system intents so they don't land in "misc"
+    try:
+        if not getattr(intent, "strategy", None):
+            intent.strategy = "global"
+    except Exception:
+        pass
         
         key = (intent.symbol, intent.strategy)
         pm_pos = positions.get(key)
