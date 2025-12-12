@@ -1006,6 +1006,37 @@ def get_fills(limit: int = 50, offset: int = 0):
         return {"ok": True, "rows": rows}
     finally:
         conn.close()
+        
+        
+@app.get("/attrib/debug")
+def attrib_debug(limit: int = 80):
+    path = JOURNAL_V2_PATH
+    if not path.exists():
+        return {"ok": False, "error": "journal_v2_missing", "path": str(path)}
+
+    out = []
+    with path.open("r", encoding="utf-8") as fh:
+        lines = fh.readlines()[-limit:]
+
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            ev = json.loads(line)
+        except Exception:
+            continue
+
+        out.append({
+            "t": ev.get("t") or ev.get("type"),
+            "ts": ev.get("ts") or ev.get("time"),
+            "ordertxid": ev.get("ordertxid") or ev.get("order_txid") or ev.get("orderId"),
+            "userref": ev.get("userref"),
+            "intent_id": ev.get("intent_id"),
+            "strategy": ev.get("strategy"),
+        })
+
+    return {"ok": True, "path": str(path), "rows": out}
 
 @app.post("/journal/backfill")
 def journal_backfill(payload: Dict[str, Any] = Body(default=None)):
