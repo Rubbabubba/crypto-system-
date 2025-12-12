@@ -551,12 +551,11 @@ def insert_trades(rows: List[Dict[str, Any]]) -> int:
     cur = conn.cursor()
 
     ins = """
-        INSERT OR IGNORE INTO trades
-        (txid, ts, pair, symbol, side, price, volume, cost, fee,
-         userref, ordertxid, intent_id, strategy, inserted_at, raw)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?,
-                ?, ?, ?, ?, ?, ?)
+    INSERT OR IGNORE INTO trades
+    (txid, ts, pair, symbol, side, price, volume, cost, fee, userref, ordertxid, intent_id, strategy, raw)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """
+
 
     count = 0
     now_ts = time.time()
@@ -565,7 +564,7 @@ def insert_trades(rows: List[Dict[str, Any]]) -> int:
         try:
             cur.execute(ins, (
                 r.get("txid"),
-                float(r.get("ts", 0) or 0),
+                float(r.get("ts", 0)),
                 r.get("pair"),
                 r.get("symbol"),
                 r.get("side"),
@@ -573,15 +572,13 @@ def insert_trades(rows: List[Dict[str, Any]]) -> int:
                 float(r.get("volume", 0) or 0),
                 float(r.get("cost", 0) or 0),
                 float(r.get("fee", 0) or 0),
-
-                (int(r.get("userref")) if r.get("userref") is not None else None),
-                r.get("ordertxid"),
-                r.get("intent_id"),
-                r.get("strategy"),
-                float(r.get("inserted_at", now_ts) or now_ts),
-
-                json.dumps(r.get("raw", r), separators=(",", ":"), default=str),
+                int(r.get("userref") or 0),
+                (r.get("ordertxid") or None),
+                (r.get("intent_id") or None),
+                (r.get("strategy") or None),
+                json.dumps(r.get("raw") if isinstance(r.get("raw"), dict) else r, separators=(",", ":")),
             ))
+
             count += cur.rowcount
         except Exception as e:
             log.warning(f"insert skip txid={r.get('txid')}: {e}")
@@ -909,6 +906,9 @@ def _pull_trades_from_kraken(since_hours: int, hard_limit: int) -> Tuple[int, in
                     "volume": float(t.get("vol") or 0),
                     "cost": float(t.get("cost") or 0),
                     "fee": float(t.get("fee") or 0),
+                    "ordertxid": str(t.get("ordertxid") or ""),
+                    "userref": int(t.get("userref") or 0),
+                    "intent_id": None,
                     "strategy": None,
                     "raw": t,
                 })
@@ -988,7 +988,7 @@ def get_fills(limit: int = 50, offset: int = 0):
         cur = conn.cursor()
         cur.execute(
             """
-            SELECT txid, ts, pair, symbol, side, price, volume, fee, cost, strategy
+            SELECT txid, ts, pair, symbol, side, price, volume, fee, cost, strategy, userref, ordertxid, intent_id
             FROM trades
             ORDER BY ts DESC
             LIMIT ? OFFSET ?
@@ -998,7 +998,7 @@ def get_fills(limit: int = 50, offset: int = 0):
         rows = [
             {
                 "txid": r[0], "ts": r[1], "pair": r[2], "symbol": r[3], "side": r[4],
-                "price": r[5], "volume": r[6], "fee": r[7], "cost": r[8], "strategy": r[9]
+                "price": r[5], "volume": r[6], "fee": r[7], "cost": r[8], "strategy": r[9],
                 "userref": r[10], "ordertxid": r[11], "intent_id": r[12]
             }
             for r in cur.fetchall()
