@@ -251,19 +251,32 @@ def _normalize_quote(q: str) -> str:
 
 def _kraken_key_to_ui_pair(k: str) -> Optional[str]:
     """
-    Convert Kraken key (e.g., 'XXBTZUSD' or 'XETHZUSD' or 'XBTUSD') to UI 'BTCUSD'/'ETHUSD'.
-    IMPORTANT: check 'Z'+fiat suffix BEFORE plain fiat to handle '...ZUSD' correctly.
+    Convert Kraken key (e.g., 'XXBTZUSD' or 'XETHZUSD' or 'XBTUSD')
+    to UI 'BTC/USD', 'ETH/USD', etc.
+
+    IMPORTANT: we normalize to the slash style the rest of the system uses.
     """
     K = k.upper()
     for q in _KNOWN_QUOTES:
+        # Handle ...ZUSD, ...ZEUR, etc. first
         if K.endswith("Z" + q):
             base = K[: -(len(q) + 1)]
-            return _normalize_base(base) + _normalize_quote("Z" + q)
+            return f"{_normalize_base(base)}/{_normalize_quote('Z' + q)}"
         if K.endswith(q):
             base = K[: -len(q)]
-            return _normalize_base(base) + _normalize_quote(q)
+            return f"{_normalize_base(base)}/{_normalize_quote(q)}"
     try:
-        return from_kraken(k).upper()
+        # Fall back to symbol_map.from_kraken, but make sure we return slash style
+        ui = from_kraken(k)
+        if isinstance(ui, str) and "/" in ui:
+            return ui.upper()
+        if isinstance(ui, str):
+            # If something like 'BTCUSD' came back, insert a slash before quote
+            for q in _KNOWN_QUOTES:
+                if ui.upper().endswith(q):
+                    b = ui[:-len(q)]
+                    return f"{b.upper()}/{q}"
+        return None
     except Exception:
         return None
 
@@ -581,6 +594,17 @@ def trade_details(ids):
                 row["descr"] = desc_blob or ""
             if "userref" in o and o["userref"] is not None:
                 row["userref"] = o["userref"]
+
+            # Propagate order userref down to each trade id for attribution
+            tr_list = o.get("trades") or []
+            if tr_list and "userref" in row and row.get("userref") is not None:
+                for _tid in tr_list:
+                    if not _tid:
+                        continue
+                    trow = out.get(_tid, {})
+                    if trow.get("userref") is None:
+                        trow["userref"] = row.get("userref")
+                    out[_tid] = trow
 
             # If the order lists trades, copy the latest trade's monetized fields
             tr_list = o.get("trades") or []

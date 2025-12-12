@@ -413,14 +413,38 @@ def _db() -> sqlite3.Connection:
             volume REAL,
             cost REAL,
             fee REAL,
+            userref INTEGER,
+            ordertxid TEXT,
+            intent_id TEXT,
             strategy TEXT,
+            inserted_at REAL,
             raw JSON
         )
     """)
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_trades_ts ON trades(ts)")
-    return conn
+    # Lightweight migrations for existing DBs (safe if columns already exist)
+    try:
+        cur = conn.cursor()
+        cur.execute("PRAGMA table_info(trades)")
+        cols = {r[1] for r in cur.fetchall()}
+        for col_sql in [
+            ("userref",   "ALTER TABLE trades ADD COLUMN userref INTEGER"),
+            ("ordertxid", "ALTER TABLE trades ADD COLUMN ordertxid TEXT"),
+            ("intent_id", "ALTER TABLE trades ADD COLUMN intent_id TEXT"),
+            ("inserted_at","ALTER TABLE trades ADD COLUMN inserted_at REAL"),
+        ]:
+            if col_sql[0] not in cols:
+                try:
+                    conn.execute(col_sql[1])
+                except Exception:
+                    pass
+    except Exception:
+        pass
 
-def insert_trades(rows: List[Dict[str, Any]]) -> int:
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_trades_ts ON trades(ts)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_trades_strategy ON trades(strategy)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_trades_symbol ON trades(symbol)")
+    return conn
+ert_trades(rows: List[Dict[str, Any]]) -> int:
     if not rows:
         return 0
     conn = _db()
@@ -871,6 +895,7 @@ def journal_sync(payload: Dict[str, Any] = Body(default=None)):
       Both phases use retry with exponential backoff on 'EAPI:Rate limit exceeded'
     """
     import time, json as _json, math as _math
+    import broker_kraken
 
     payload     = payload or {}
     dry_run     = bool(payload.get("dry_run", False))
@@ -908,17 +933,22 @@ def journal_sync(payload: Dict[str, Any] = Body(default=None)):
     start_ts0 = int(time.time() - since_hours * 3600)
 
     UPSERT_SQL = """
-    INSERT INTO trades (txid, ts, symbol, side, price, volume, fee, strategy, raw)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    INSERT INTO trades (txid, ts, pair, symbol, side, price, volume, cost, fee, userref, ordertxid, intent_id, strategy, inserted_at, raw)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     ON CONFLICT(txid) DO UPDATE SET
-        ts      = excluded.ts,
-        symbol  = excluded.symbol,
-        side    = excluded.side,
-        price   = excluded.price,
-        volume  = excluded.volume,
-        fee     = excluded.fee,
-        strategy= COALESCE(trades.strategy, excluded.strategy),
-        raw     = excluded.raw
+        ts        = excluded.ts,
+        pair      = COALESCE(excluded.pair, trades.pair),
+        symbol    = excluded.symbol,
+        side      = excluded.side,
+        price     = excluded.price,
+        volume    = excluded.volume,
+        cost      = COALESCE(excluded.cost, trades.cost),
+        fee       = COALESCE(excluded.fee, trades.fee),
+        userref   = COALESCE(trades.userref, excluded.userref),
+        ordertxid = COALESCE(trades.ordertxid, excluded.ordertxid),
+        intent_id = COALESCE(trades.intent_id, excluded.intent_id),
+        strategy  = COALESCE(trades.strategy, excluded.strategy),
+        raw       = excluded.raw
     """
 
     def flush_batch(batch):
@@ -931,30 +961,84 @@ def journal_sync(payload: Dict[str, Any] = Body(default=None)):
         conn.close()
         return n
 
-    def map_row(txid, t):
+    def _load_userref_to_strategy() -> Dict[int, str]:
+        # policy_config/userref_map.json is the source of truth
+        import json as _json
+        from pathlib import Path as _Path
+        cfg_path = _Path(os.getenv("POLICY_CFG_DIR", "policy_config")) / "userref_map.json"
+        try:
+            with cfg_path.open("r", encoding="utf-8") as f:
+                cfg = _json.load(f)
+        except Exception:
+            return {}
+        out: Dict[int, str] = {}
+        if not isinstance(cfg, dict):
+            return out
+        # supports {"101":"c1"} and {"c1":101}
+        for k, v in cfg.items():
+            try:
+                if isinstance(v, str) and str(k).isdigit():
+                    out[int(k)] = v.strip()
+                elif isinstance(v, int):
+                    # inverse
+                    out[int(v)] = str(k).strip()
+            except Exception:
+                continue
+        return out
+
+    _USERREF_TO_STRAT = _load_userref_to_strategy()
+
+    def _strategy_for_userref(userref) -> Optional[str]:
+        try:
+            if userref is None:
+                return None
+            return _USERREF_TO_STRAT.get(int(userref))
+        except Exception:
+            return None
+
+    def map_row(txid, t, details_map: Dict[str, Any], inserted_at: float):
+        # Kraken TradesHistory record
         try:
             ts = float(t.get('time')) if t.get('time') is not None else None
         except Exception:
             ts = None
+
         pair_raw = t.get('pair') or ''
         symbol = from_kraken_pair_to_app(pair_raw)
-        side = t.get('type')
-        try:
-            price = float(t.get('price')) if t.get('price') is not None else None
-        except Exception:
-            price = None
-        try:
-            volume = float(t.get('vol')) if t.get('vol') is not None else None
-        except Exception:
-            volume = None
-        try:
-            fee = float(t.get('fee')) if t.get('fee') is not None else None
-        except Exception:
-            fee = None
-        raw = _json.dumps(t, separators=(',', ':'), ensure_ascii=False)
-        return (str(txid), ts, symbol, side, price, volume, fee, None, raw)
+        side = (t.get('type') or '').lower() or None
 
-    total_writes = 0
+        # Monetary fields: prefer broker details (QueryTrades/Orders) when available
+        det = details_map.get(str(txid)) or {}
+        ordertxid = t.get('ordertxid') or det.get('ordertxid') or None
+        if ordertxid:
+            det2 = details_map.get(str(ordertxid)) or {}
+            # merge, prefer trade-specific keys but allow order row to carry userref
+            det = {**det2, **det}
+
+        def _f(x):
+            try:
+                return float(x) if x is not None else None
+            except Exception:
+                return None
+
+        price  = _f(t.get('price') if t.get('price') is not None else det.get('price'))
+        volume = _f(t.get('vol')   if t.get('vol')   is not None else det.get('vol'))
+        fee    = _f(t.get('fee')   if t.get('fee')   is not None else det.get('fee'))
+        cost   = _f(t.get('cost')  if t.get('cost')  is not None else det.get('cost'))
+        userref = det.get('userref')
+
+        strategy = _strategy_for_userref(userref)
+        raw = _json.dumps(t, separators=(',', ':'), ensure_ascii=False)
+
+        # intent_id: reserved for future (link to intent journal); keep None for now
+        intent_id = None
+
+        return (str(txid), ts, (pair_raw or None), symbol, side, price, volume, cost, fee,
+                (int(userref) if userref is not None else None),
+                (str(ordertxid) if ordertxid else None),
+                intent_id, strategy, inserted_at, raw)
+
+total_writes = 0
     total_pulled = 0
     pages        = 0
     kraken_count = None
@@ -984,7 +1068,15 @@ def journal_sync(payload: Dict[str, Any] = Body(default=None)):
         pages += 1
         total_pulled += len(keys)
 
-        batch = [map_row(txid, trades[txid]) for txid in keys]
+        details_map = {}
+        try:
+            order_ids = [trades[txid].get('ordertxid') for txid in keys if trades[txid].get('ordertxid')]
+            if order_ids:
+                details_map = broker_kraken.trade_details(order_ids)
+        except Exception:
+            details_map = {}
+        inserted_at = time.time()
+        batch = [map_row(txid, trades[txid], details_map, inserted_at) for txid in keys]
         total_writes += flush_batch(batch)
 
         # track max ts for cursor fallback
@@ -1038,8 +1130,16 @@ def journal_sync(payload: Dict[str, Any] = Body(default=None)):
             cursor_pages += 1
             total_pulled += len(keys)
 
-            batch = [map_row(txid, trades[txid]) for txid in keys]
-            total_writes += flush_batch(batch)
+            details_map = {}
+        try:
+            order_ids = [trades[txid].get('ordertxid') for txid in keys if trades[txid].get('ordertxid')]
+            if order_ids:
+                details_map = broker_kraken.trade_details(order_ids)
+        except Exception:
+            details_map = {}
+        inserted_at = time.time()
+        batch = [map_row(txid, trades[txid], details_map, inserted_at) for txid in keys]
+        total_writes += flush_batch(batch)
 
             max_ts = max([trades[k].get("time") or cursor for k in keys])
             cursor = float(max_ts) + 0.5  # nudge ahead
