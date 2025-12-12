@@ -444,7 +444,7 @@ def _db() -> sqlite3.Connection:
     conn.execute("CREATE INDEX IF NOT EXISTS idx_trades_strategy ON trades(strategy)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_trades_symbol ON trades(symbol)")
     return conn
-ert_trades(rows: List[Dict[str, Any]]) -> int:
+def insert_trades(rows: List[Dict[str, Any]]) -> int:
     if not rows:
         return 0
     conn = _db()
