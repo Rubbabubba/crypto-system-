@@ -999,6 +999,7 @@ def get_fills(limit: int = 50, offset: int = 0):
             {
                 "txid": r[0], "ts": r[1], "pair": r[2], "symbol": r[3], "side": r[4],
                 "price": r[5], "volume": r[6], "fee": r[7], "cost": r[8], "strategy": r[9]
+                "userref": r[10], "ordertxid": r[11], "intent_id": r[12]
             }
             for r in cur.fetchall()
         ]
