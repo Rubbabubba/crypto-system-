@@ -304,6 +304,27 @@ def _load_attrib_from_journal_v2(max_lines: int = 250_000) -> Dict[str, Dict[str
             intent_id = ev.get("intent_id")
             strategy  = ev.get("strategy")
 
+            # If not present at top-level, try to extract from broker response payload
+            if not ordertxid:
+                resp = ev.get("response")
+                try:
+                    if isinstance(resp, dict):
+                        ordertxid = resp.get("ordertxid") or resp.get("order_txid") or resp.get("orderId")
+                        if not ordertxid:
+                            r = resp.get("result") if isinstance(resp.get("result"), dict) else None
+                            tx = (r.get("txid") if r else None)
+                            if isinstance(tx, list) and tx:
+                                ordertxid = tx[0]
+                            elif isinstance(tx, str):
+                                ordertxid = tx
+                        if not ordertxid:
+                            tx = resp.get("txid")
+                            if isinstance(tx, list) and tx:
+                                ordertxid = tx[0]
+                            elif isinstance(tx, str):
+                                ordertxid = tx
+                except Exception:
+                    pass
 
             if ordertxid and (intent_id or strategy):
                 rec = m.setdefault(str(ordertxid), {})
@@ -4140,6 +4161,26 @@ def scheduler_run_v2(payload: Dict[str, Any] = Body(default=None)):
     # Apply guard + per-symbol caps + loss-zone no-rebuy; then route
     # ------------------------------------------------------------------
     for intent in final_intents:
+        
+    # ------------------------------------------------------------------
+    # Ensure every intent has a stable id for attribution (intent_id)
+    # ------------------------------------------------------------------
+    intent_id: Optional[str] = None
+    try:
+        meta = getattr(intent, "meta", None)
+        if not isinstance(meta, dict):
+            meta = {}
+            try:
+                setattr(intent, "meta", meta)
+            except Exception:
+                pass
+        intent_id = meta.get("intent_id")
+        if not intent_id:
+            intent_id = uuid.uuid4().hex
+            meta["intent_id"] = intent_id
+    except Exception:
+        intent_id = None
+        
         key = (intent.symbol, intent.strategy)
         pm_pos = positions.get(key)
 
@@ -4317,6 +4358,7 @@ def scheduler_run_v2(payload: Dict[str, Any] = Body(default=None)):
         action_record: Dict[str, Any] = {
             "symbol": intent.symbol,
             "strategy": intent.strategy,
+            "intent_id": intent_id,
             "side": side,
             "kind": intent.kind,
             "notional": final_notional,
@@ -4333,6 +4375,7 @@ def scheduler_run_v2(payload: Dict[str, Any] = Body(default=None)):
                     {
                         "ts": time.time(),
                         "source": "scheduler_v2",
+                        "intent_id": intent_id,
                         "symbol": intent.symbol,
                         "strategy": intent.strategy,
                         "kind": intent.kind,
@@ -4372,6 +4415,33 @@ def scheduler_run_v2(payload: Dict[str, Any] = Body(default=None)):
             )
             action_record["status"] = "sent"
             action_record["response"] = resp
+            
+            # Best-effort: extract broker order txid (Kraken AddOrder returns txid list)
+            ordertxid = None
+            try:
+                if isinstance(resp, dict):
+                    # direct forms
+                    ordertxid = resp.get("ordertxid") or resp.get("order_txid") or resp.get("orderId")
+                    # common Kraken form: {"result":{"txid":["..."]}}
+                    if not ordertxid:
+                        r = resp.get("result") if isinstance(resp.get("result"), dict) else None
+                        tx = (r.get("txid") if r else None)
+                        if isinstance(tx, list) and tx:
+                            ordertxid = tx[0]
+                        elif isinstance(tx, str):
+                            ordertxid = tx
+                    # sometimes top-level "txid"
+                    if not ordertxid:
+                        tx = resp.get("txid")
+                        if isinstance(tx, list) and tx:
+                            ordertxid = tx[0]
+                        elif isinstance(tx, str):
+                            ordertxid = tx
+                if ordertxid:
+                    action_record["ordertxid"] = str(ordertxid)
+            except Exception:
+                pass
+            
         except Exception as e:
             log.error("scheduler_v2: broker error for %s %s: %s", intent.symbol, side, e)
             action_record["status"] = "error"
@@ -4386,6 +4456,8 @@ def scheduler_run_v2(payload: Dict[str, Any] = Body(default=None)):
                 {
                     "ts": time.time(),
                     "source": "scheduler_v2",
+                    "intent_id": intent_id,
+                    "ordertxid": action_record.get("ordertxid"),
                     "symbol": intent.symbol,
                     "strategy": intent.strategy,
                     "kind": intent.kind,
