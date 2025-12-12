@@ -4211,12 +4211,12 @@ def scheduler_run_v2(payload: Dict[str, Any] = Body(default=None)):
         # Ensure every intent has a stable id for attribution
         intent_id = _ensure_intent_id(intent)
         
-    # Force strategy label for global/system intents so they don't land in "misc"
-    try:
-        if not getattr(intent, "strategy", None):
-            intent.strategy = "global"
-    except Exception:
-        pass
+        # Force strategy label for global/system intents so they don't land in "misc"
+        try:
+            if not getattr(intent, "strategy", None):
+                intent.strategy = "global"
+        except Exception:
+            pass
         
         key = (intent.symbol, intent.strategy)
         pm_pos = positions.get(key)
