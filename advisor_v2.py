@@ -1,18 +1,10 @@
-
+from __future__ import annotations
 # advisor_v2.py
 # Advisor v2 + Attribution (Phase 6 core)
 #
 # Source of truth: journal_v2.jsonl + telemetry_v2.jsonl + journal.db (trades table)
 # All paths default under DATA_DIR (env), but can be overridden for testing.
 
-def _fmt_money(x):
-    try:
-        return f"{float(x):.2f}"
-    except Exception:
-        return "n/a"
-
-
-from __future__ import annotations
 
 import json
 import os
@@ -649,12 +641,12 @@ def to_markdown(report: Dict[str, Any], top_n: int = 10) -> str:
     rows = report.get("per_strategy", [])[:]
     rows.sort(key=lambda r: float(r.get("realized_pnl") or 0.0))
     for r in rows[:top_n]:
-        md.append(f"- **{r.get('strategy')}** pnl={_fmt_money(r.get('realized_pnl'))} win_rate={r.get('win_rate')} avg_hold_s={r.get('avg_hold_seconds')}\n")
+        md.append(f"- **{r.get('strategy')}** pnl={r.get('realized_pnl'):.2f} win_rate={r.get('win_rate')} avg_hold_s={r.get('avg_hold_seconds')}\n")
 
     section("Top Losing Pairs (Strategy × Symbol)")
     pairs = report.get("per_pair", [])[:]
     for r in pairs[:top_n]:
-        md.append(f"- **{r.get('strategy')} / {r.get('symbol')}** pnl={_fmt_money(r.get('realized_pnl'))} fills={r.get('fills',0)} win_rate={r.get('win_rate')}\n")
+        md.append(f"- **{r.get('strategy')} / {r.get('symbol')}** pnl={r.get('realized_pnl'):.2f} fills={r.get('fills',0)} win_rate={r.get('win_rate')}\n")
 
     section("Filter / Block Hotspots")
     pf = report.get("per_filter", {})
@@ -670,7 +662,7 @@ def to_markdown(report: Dict[str, Any], top_n: int = 10) -> str:
             items.append((pnl, b, v))
     items.sort(key=lambda x: x[0])
     for pnl, b, v in items[:top_n]:
-        md.append(f"- **{b}** pnl={_fmt_money(pnl)} closed_chunks={v.get('closed_chunks')}\n")
+        md.append(f"- **{b}** pnl={pnl:.2f} closed_chunks={v.get('closed_chunks')}\n")
 
     section("Recommendations")
     for rec in report.get("recommendations", [])[:top_n]:
@@ -704,3 +696,7 @@ def summarize_v2(limit: int = 1000) -> Dict[str, Any]:
         'top_strategies': [{'strategy': k, 'count': v} for k,v in top_strats],
         'top_pairs': [{'pair': k, 'count': v} for k,v in top_pairs],
     }
+
+# Backwards-compatible alias (app.py imports advisor_summary)
+def advisor_summary(limit: int = 1000):
+    return summarize_v2(limit=limit)
