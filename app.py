@@ -264,6 +264,86 @@ def append_journal_v2(event: Dict[str, Any]) -> None:
         # Swallow all I/O errors
         return
 
+def _load_attrib_from_journal_v2(max_lines: int = 250_000) -> Dict[str, Dict[str, str]]:
+    """
+    Build a mapping: ordertxid -> {"intent_id": ..., "strategy": ...}
+    from append-only journal_v2.jsonl. Safe + best-effort.
+    """
+    path = JOURNAL_V2_PATH
+    if not path.exists():
+        return {}
+
+    m: Dict[str, Dict[str, str]] = {}
+    try:
+        with path.open("r", encoding="utf-8") as fh:
+            # tail-ish behavior: read all, but cap lines to avoid OOM on huge files
+            lines = fh.readlines()[-max_lines:]
+        for line in lines:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                ev = json.loads(line)
+            except Exception:
+                continue
+
+            # Common fields we expect in events
+            ordertxid = ev.get("ordertxid") or ev.get("order_txid") or ev.get("orderId")
+            intent_id = ev.get("intent_id")
+            strategy  = ev.get("strategy")
+
+            if ordertxid and (intent_id or strategy):
+                rec = m.setdefault(str(ordertxid), {})
+                if intent_id and "intent_id" not in rec:
+                    rec["intent_id"] = str(intent_id)
+                if strategy and "strategy" not in rec:
+                    rec["strategy"] = str(strategy)
+    except Exception as e:
+        log.warning("attrib load from journal_v2 failed: %s", e)
+
+    return m
+
+
+def reconcile_trade_attribution() -> Dict[str, Any]:
+    """
+    Apply journal_v2 attribution to trades table using ordertxid.
+    Safe, idempotent, and fast enough for a sync call.
+    """
+    attrib = _load_attrib_from_journal_v2()
+    if not attrib:
+        return {"ok": True, "updated": 0, "note": "no_attrib_found"}
+
+    conn = _db()
+    cur = conn.cursor()
+    updated = 0
+
+    try:
+        for ordertxid, rec in attrib.items():
+            intent_id = rec.get("intent_id")
+            strategy  = rec.get("strategy")
+
+            if not (intent_id or strategy):
+                continue
+
+            cur.execute("""
+                UPDATE trades
+                SET
+                    intent_id = COALESCE(intent_id, ?),
+                    strategy  = COALESCE(strategy,  ?)
+                WHERE ordertxid = ?
+            """, (intent_id, strategy, ordertxid))
+
+            updated += cur.rowcount
+
+        conn.commit()
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+    return {"ok": True, "updated": int(updated), "attrib_keys": int(len(attrib))}
+
 
 # Telemetry JSONL log (one row per scheduler event)
 TELEMETRY_PATH = DATA_DIR / "telemetry_v2.jsonl"
@@ -401,7 +481,14 @@ def kraken_private(method: str, data: Dict[str, Any], key: str, secret_b64: str)
 # --------------------------------------------------------------------------------------
 
 def _db() -> sqlite3.Connection:
-    conn = sqlite3.connect(DB_PATH)
+    # One connection per call (safe for FastAPI); always point at DATA_DIR/DB_PATH
+    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+    try:
+        conn.execute("PRAGMA journal_mode=WAL;")
+        conn.execute("PRAGMA synchronous=NORMAL;")
+    except Exception:
+        pass
+
     conn.execute("""
         CREATE TABLE IF NOT EXISTS trades (
             txid TEXT PRIMARY KEY,
@@ -413,28 +500,37 @@ def _db() -> sqlite3.Connection:
             volume REAL,
             cost REAL,
             fee REAL,
+
+            -- attribution fields (persist across redeploy)
             userref INTEGER,
             ordertxid TEXT,
             intent_id TEXT,
             strategy TEXT,
             inserted_at REAL,
+
             raw JSON
         )
     """)
+
     # Lightweight migrations for existing DBs (safe if columns already exist)
     try:
         cur = conn.cursor()
         cur.execute("PRAGMA table_info(trades)")
         cols = {r[1] for r in cur.fetchall()}
-        for col_sql in [
-            ("userref",   "ALTER TABLE trades ADD COLUMN userref INTEGER"),
-            ("ordertxid", "ALTER TABLE trades ADD COLUMN ordertxid TEXT"),
-            ("intent_id", "ALTER TABLE trades ADD COLUMN intent_id TEXT"),
-            ("inserted_at","ALTER TABLE trades ADD COLUMN inserted_at REAL"),
-        ]:
-            if col_sql[0] not in cols:
+
+        migrations = [
+            ("userref",     "ALTER TABLE trades ADD COLUMN userref INTEGER"),
+            ("ordertxid",   "ALTER TABLE trades ADD COLUMN ordertxid TEXT"),
+            ("intent_id",   "ALTER TABLE trades ADD COLUMN intent_id TEXT"),
+            ("inserted_at", "ALTER TABLE trades ADD COLUMN inserted_at REAL"),
+            ("pair",        "ALTER TABLE trades ADD COLUMN pair TEXT"),
+            ("cost",        "ALTER TABLE trades ADD COLUMN cost REAL"),
+            ("strategy",    "ALTER TABLE trades ADD COLUMN strategy TEXT"),
+        ]
+        for col_name, sql in migrations:
+            if col_name not in cols:
                 try:
-                    conn.execute(col_sql[1])
+                    conn.execute(sql)
                 except Exception:
                     pass
     except Exception:
@@ -443,23 +539,33 @@ def _db() -> sqlite3.Connection:
     conn.execute("CREATE INDEX IF NOT EXISTS idx_trades_ts ON trades(ts)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_trades_strategy ON trades(strategy)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_trades_symbol ON trades(symbol)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_trades_ordertxid ON trades(ordertxid)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_trades_intent_id ON trades(intent_id)")
     return conn
+
 def insert_trades(rows: List[Dict[str, Any]]) -> int:
     if not rows:
         return 0
+
     conn = _db()
     cur = conn.cursor()
+
     ins = """
         INSERT OR IGNORE INTO trades
-        (txid, ts, pair, symbol, side, price, volume, cost, fee, raw)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        (txid, ts, pair, symbol, side, price, volume, cost, fee,
+         userref, ordertxid, intent_id, strategy, inserted_at, raw)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?,
+                ?, ?, ?, ?, ?, ?)
     """
+
     count = 0
+    now_ts = time.time()
+
     for r in rows:
         try:
             cur.execute(ins, (
                 r.get("txid"),
-                float(r.get("ts", 0)),
+                float(r.get("ts", 0) or 0),
                 r.get("pair"),
                 r.get("symbol"),
                 r.get("side"),
@@ -467,11 +573,19 @@ def insert_trades(rows: List[Dict[str, Any]]) -> int:
                 float(r.get("volume", 0) or 0),
                 float(r.get("cost", 0) or 0),
                 float(r.get("fee", 0) or 0),
-                json.dumps(r, separators=(",", ":")),
+
+                (int(r.get("userref")) if r.get("userref") is not None else None),
+                r.get("ordertxid"),
+                r.get("intent_id"),
+                r.get("strategy"),
+                float(r.get("inserted_at", now_ts) or now_ts),
+
+                json.dumps(r.get("raw", r), separators=(",", ":"), default=str),
             ))
             count += cur.rowcount
         except Exception as e:
             log.warning(f"insert skip txid={r.get('txid')}: {e}")
+
     conn.commit()
     conn.close()
     return count
@@ -479,18 +593,44 @@ def insert_trades(rows: List[Dict[str, Any]]) -> int:
 def fetch_rows(limit: int = 25, offset: int = 0) -> List[Dict[str, Any]]:
     conn = _db()
     cur = conn.cursor()
-    cur.execute("SELECT txid, ts, pair, symbol, side, price, volume, cost, fee, raw FROM trades ORDER BY ts DESC LIMIT ? OFFSET ?", (limit, offset))
+
+    cur.execute("""
+        SELECT
+            txid, ts, pair, symbol, side, price, volume, cost, fee,
+            userref, ordertxid, intent_id, strategy, inserted_at, raw
+        FROM trades
+        ORDER BY ts DESC
+        LIMIT ? OFFSET ?
+    """, (limit, offset))
+
     out = []
     for row in cur.fetchall():
-        txid, ts_, pair, symbol, side, price, volume, cost, fee, raw = row
+        (txid, ts_, pair, symbol, side, price, volume, cost, fee,
+         userref, ordertxid, intent_id, strategy, inserted_at, raw) = row
+
         try:
             raw_obj = json.loads(raw) if raw else None
         except Exception:
             raw_obj = None
+
         out.append({
-            "txid": txid, "ts": ts_, "pair": pair, "symbol": symbol, "side": side,
-            "price": price, "volume": volume, "cost": cost, "fee": fee, "raw": raw_obj
+            "txid": txid,
+            "ts": ts_,
+            "pair": pair,
+            "symbol": symbol,
+            "side": side,
+            "price": price,
+            "volume": volume,
+            "cost": cost,
+            "fee": fee,
+            "userref": userref,
+            "ordertxid": ordertxid,
+            "intent_id": intent_id,
+            "strategy": strategy,
+            "inserted_at": inserted_at,
+            "raw": raw_obj,
         })
+
     conn.close()
     return out
 
@@ -520,6 +660,15 @@ app.add_middleware(
 STATIC_DIR = Path("./static")
 if STATIC_DIR.exists():
     app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
+    
+@app.on_event("startup")
+def _startup_reconcile():
+    try:
+        log.info("startup: data_dir=%s db=%s journal_v2=%s", str(DATA_DIR), str(DB_PATH), str(JOURNAL_V2_PATH))
+        res = reconcile_trade_attribution()
+        log.info("startup: reconcile_trade_attribution => %s", res)
+    except Exception as e:
+        log.warning("startup reconcile failed: %s", e)
 
 # --------------------------------------------------------------------------------------
 # Models
@@ -895,7 +1044,6 @@ def journal_sync(payload: Dict[str, Any] = Body(default=None)):
       Both phases use retry with exponential backoff on 'EAPI:Rate limit exceeded'
     """
     import time, json as _json, math as _math
-    import broker_kraken
 
     payload     = payload or {}
     dry_run     = bool(payload.get("dry_run", False))
@@ -933,8 +1081,12 @@ def journal_sync(payload: Dict[str, Any] = Body(default=None)):
     start_ts0 = int(time.time() - since_hours * 3600)
 
     UPSERT_SQL = """
-    INSERT INTO trades (txid, ts, pair, symbol, side, price, volume, cost, fee, userref, ordertxid, intent_id, strategy, inserted_at, raw)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    INSERT INTO trades (
+        txid, ts, pair, symbol, side, price, volume, cost, fee,
+        userref, ordertxid, intent_id, strategy, inserted_at, raw
+    )
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?,
+            ?, ?, ?, ?, ?, ?)
     ON CONFLICT(txid) DO UPDATE SET
         ts        = excluded.ts,
         pair      = COALESCE(excluded.pair, trades.pair),
@@ -943,13 +1095,15 @@ def journal_sync(payload: Dict[str, Any] = Body(default=None)):
         price     = excluded.price,
         volume    = excluded.volume,
         cost      = COALESCE(excluded.cost, trades.cost),
-        fee       = COALESCE(excluded.fee, trades.fee),
-        userref   = COALESCE(trades.userref, excluded.userref),
-        ordertxid = COALESCE(trades.ordertxid, excluded.ordertxid),
+        fee       = excluded.fee,
+        userref   = COALESCE(excluded.userref, trades.userref),
+        ordertxid = COALESCE(excluded.ordertxid, trades.ordertxid),
         intent_id = COALESCE(trades.intent_id, excluded.intent_id),
         strategy  = COALESCE(trades.strategy, excluded.strategy),
+        inserted_at = COALESCE(trades.inserted_at, excluded.inserted_at),
         raw       = excluded.raw
     """
+
 
     def flush_batch(batch):
         if dry_run or not batch:
@@ -961,59 +1115,15 @@ def journal_sync(payload: Dict[str, Any] = Body(default=None)):
         conn.close()
         return n
 
-    def _load_userref_to_strategy() -> Dict[int, str]:
-        # policy_config/userref_map.json is the source of truth
-        import json as _json
-        from pathlib import Path as _Path
-        cfg_path = _Path(os.getenv("POLICY_CFG_DIR", "policy_config")) / "userref_map.json"
+    def map_row(txid, t):
         try:
-            with cfg_path.open("r", encoding="utf-8") as f:
-                cfg = _json.load(f)
-        except Exception:
-            return {}
-        out: Dict[int, str] = {}
-        if not isinstance(cfg, dict):
-            return out
-        # supports {"101":"c1"} and {"c1":101}
-        for k, v in cfg.items():
-            try:
-                if isinstance(v, str) and str(k).isdigit():
-                    out[int(k)] = v.strip()
-                elif isinstance(v, int):
-                    # inverse
-                    out[int(v)] = str(k).strip()
-            except Exception:
-                continue
-        return out
-
-    _USERREF_TO_STRAT = _load_userref_to_strategy()
-
-    def _strategy_for_userref(userref) -> Optional[str]:
-        try:
-            if userref is None:
-                return None
-            return _USERREF_TO_STRAT.get(int(userref))
-        except Exception:
-            return None
-
-    def map_row(txid, t, details_map: Dict[str, Any], inserted_at: float):
-        # Kraken TradesHistory record
-        try:
-            ts = float(t.get('time')) if t.get('time') is not None else None
+            ts = float(t.get("time")) if t.get("time") is not None else None
         except Exception:
             ts = None
 
-        pair_raw = t.get('pair') or ''
+        pair_raw = t.get("pair") or ""
         symbol = from_kraken_pair_to_app(pair_raw)
-        side = (t.get('type') or '').lower() or None
-
-        # Monetary fields: prefer broker details (QueryTrades/Orders) when available
-        det = details_map.get(str(txid)) or {}
-        ordertxid = t.get('ordertxid') or det.get('ordertxid') or None
-        if ordertxid:
-            det2 = details_map.get(str(ordertxid)) or {}
-            # merge, prefer trade-specific keys but allow order row to carry userref
-            det = {**det2, **det}
+        side = t.get("type")
 
         def _f(x):
             try:
@@ -1021,24 +1131,32 @@ def journal_sync(payload: Dict[str, Any] = Body(default=None)):
             except Exception:
                 return None
 
-        price  = _f(t.get('price') if t.get('price') is not None else det.get('price'))
-        volume = _f(t.get('vol')   if t.get('vol')   is not None else det.get('vol'))
-        fee    = _f(t.get('fee')   if t.get('fee')   is not None else det.get('fee'))
-        cost   = _f(t.get('cost')  if t.get('cost')  is not None else det.get('cost'))
-        userref = det.get('userref')
+        price  = _f(t.get("price"))
+        volume = _f(t.get("vol"))
+        cost   = _f(t.get("cost"))
+        fee    = _f(t.get("fee"))
 
-        strategy = _strategy_for_userref(userref)
-        raw = _json.dumps(t, separators=(',', ':'), ensure_ascii=False)
+        # Kraken TradesHistory includes ordertxid
+        ordertxid = t.get("ordertxid")
 
-        # intent_id: reserved for future (link to intent journal); keep None for now
-        intent_id = None
+        # userref usually not present in TradesHistory; keep if it is (or if you add it later)
+        userref = t.get("userref")
 
-        return (str(txid), ts, (pair_raw or None), symbol, side, price, volume, cost, fee,
-                (int(userref) if userref is not None else None),
-                (str(ordertxid) if ordertxid else None),
-                intent_id, strategy, inserted_at, raw)
+        raw = _json.dumps(t, separators=(",", ":"), ensure_ascii=False, default=str)
+        inserted_at = time.time()
 
-total_writes = 0
+        return (
+            str(txid), ts, pair_raw, symbol, side, price, volume, cost, fee,
+            (int(userref) if userref is not None else None),
+            (str(ordertxid) if ordertxid else None),
+            None,  # intent_id will be reconciled from journal_v2
+            None,  # strategy will be reconciled from journal_v2 (or manual attach)
+            inserted_at,
+            raw
+        )
+
+
+    total_writes = 0
     total_pulled = 0
     pages        = 0
     kraken_count = None
@@ -1068,15 +1186,7 @@ total_writes = 0
         pages += 1
         total_pulled += len(keys)
 
-        details_map = {}
-        try:
-            order_ids = [trades[txid].get('ordertxid') for txid in keys if trades[txid].get('ordertxid')]
-            if order_ids:
-                details_map = broker_kraken.trade_details(order_ids)
-        except Exception:
-            details_map = {}
-        inserted_at = time.time()
-        batch = [map_row(txid, trades[txid], details_map, inserted_at) for txid in keys]
+        batch = [map_row(txid, trades[txid]) for txid in keys]
         total_writes += flush_batch(batch)
 
         # track max ts for cursor fallback
@@ -1130,16 +1240,8 @@ total_writes = 0
             cursor_pages += 1
             total_pulled += len(keys)
 
-            details_map = {}
-        try:
-            order_ids = [trades[txid].get('ordertxid') for txid in keys if trades[txid].get('ordertxid')]
-            if order_ids:
-                details_map = broker_kraken.trade_details(order_ids)
-        except Exception:
-            details_map = {}
-        inserted_at = time.time()
-        batch = [map_row(txid, trades[txid], details_map, inserted_at) for txid in keys]
-        total_writes += flush_batch(batch)
+            batch = [map_row(txid, trades[txid]) for txid in keys]
+            total_writes += flush_batch(batch)
 
             max_ts = max([trades[k].get("time") or cursor for k in keys])
             cursor = float(max_ts) + 0.5  # nudge ahead
@@ -1158,11 +1260,14 @@ total_writes = 0
     except Exception as e:
         total_rows = None
         notes.append({"post_count_error": str(e)})
+        
+    recon = reconcile_trade_attribution()
 
     return {
         "ok": True,
         "dry_run": dry_run,
         "count": total_writes,
+        "reconcile": recon,
         "debug": {
             "creds_present": True,
             "since_hours": since_hours,
@@ -1372,6 +1477,8 @@ def journal_v2_review(
         "per_strategy": sorted(per_strategy.values(), key=lambda r: r["strategy"]),
         "per_pair": sorted(per_pair.values(), key=lambda r: (r["strategy"], r["symbol"])),
     }
+    
+
 
 
 @app.get("/price/{base}/{quote}")
