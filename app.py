@@ -3272,20 +3272,41 @@ def _startup():
 # Price helper used by scheduler
 # --------------------------------------------------------------------------------------
 
+# ------------------------------------------------------------------
+# Last-price helper for risk calculation + exits
+# ------------------------------------------------------------------
 def _last_price_safe(symbol: str) -> float:
-    sym_can = _canon_symbol(symbol)
-    ctx = contexts.get(sym_can)
-    if not ctx:
-        return 0.0
-    five = ctx.get("five") or {}
-    closes = five.get("close") or []
-    if not closes:
-        return 0.0
-    try:
-        return float(closes[-1])
-    except Exception:
-        return 0.0
+    # 1) Try cached 5m bars
+    ctx = contexts.get(symbol)
+    if ctx:
+        five = ctx.get("five") or {}
+        closes = five.get("close") or []
+        if closes:
+            try:
+                return float(closes[-1])
+            except Exception:
+                pass
 
+    # 2) Fallback: ask broker router for a last price (prevents exit blocks)
+    try:
+        if br is not None:
+            # Prefer a dedicated helper if you have it
+            if hasattr(br, "get_last_price"):
+                px = br.get_last_price(symbol)
+                if px:
+                    return float(px)
+
+            # Otherwise try ticker-like helpers if present
+            if hasattr(br, "get_ticker"):
+                t = br.get_ticker(symbol)
+                if isinstance(t, dict):
+                    for k in ("last", "price", "c", "close"):
+                        if k in t and t[k] is not None:
+                            return float(t[k])
+    except Exception:
+        pass
+
+    return 0.0
 
 
 # --------------------------------------------------------------------------------------
@@ -4102,9 +4123,27 @@ def scheduler_run_v2(payload: Dict[str, Any] = Body(default=None)):
                     vals.append(row[key])
         return vals
 
+def _normalize_symbol_for_bars(sym: str) -> str:
+        # If br_router has a normalizer, use it
+        try:
+            if br is not None and hasattr(br, "normalize_symbol"):
+                return str(br.normalize_symbol(sym))
+        except Exception:
+            pass
+
+        # Minimal Kraken altname fixups (common offenders)
+        if sym == "XLTCZ/USD":
+            return "LTC/USD"
+        if sym == "XXRPZ/USD":
+            return "XRP/USD"
+        return sym
+
+
     for sym in syms:
         sym_can = _canon_symbol(sym)
         try:
+            bars_sym = _normalize_symbol_for_bars(sym)
+            
             one = br.get_bars(sym, timeframe="1Min", limit=limit)
             five = br.get_bars(sym, timeframe=tf,     limit=limit)
 
@@ -4119,6 +4158,8 @@ def scheduler_run_v2(payload: Dict[str, Any] = Body(default=None)):
         except Exception as e:
             contexts[sym_can] = None
             telemetry.append({"symbol": sym, "stage": "preload_bars", "ok": False, "error": f"{e.__class__.__name__}: {e}"})
+
+    
 
 
     # ------------------------------------------------------------------
