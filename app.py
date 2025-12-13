@@ -72,6 +72,7 @@ import time
 import threading
 import broker_kraken
 import requests
+import uuid
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 from symbol_map import KRAKEN_PAIR_MAP, to_kraken
@@ -79,7 +80,6 @@ from position_engine import PositionEngine, Fill
 from position_manager import load_net_positions, Position
 from risk_engine import RiskEngine
 from strategy_api import PositionSnapshot
-from typing import Dict, Any, List
 from strategy_api import PositionSnapshot
 from scheduler_core import SchedulerConfig, SchedulerResult, StrategyBook, ScanRequest, ScanResult,run_scheduler_once
 from risk_engine import RiskEngine
@@ -157,7 +157,7 @@ from pydantic import BaseModel
 # Version / Logging
 # --------------------------------------------------------------------------------------
 
-APP_VERSION = "1.13.0"
+APP_VERSION = "1.12.9-hotfix.1"
 
 logging.basicConfig(
     level=logging.INFO,
@@ -264,6 +264,119 @@ def append_journal_v2(event: Dict[str, Any]) -> None:
         # Swallow all I/O errors
         return
 
+def _load_attrib_from_journal_v2(max_lines: int = 250_000) -> Dict[str, Dict[str, str]]:
+    """
+    Build a mapping: ordertxid -> {"intent_id": ..., "strategy": ...}
+    from append-only journal_v2.jsonl. Safe + best-effort.
+    """
+    path = JOURNAL_V2_PATH
+    if not path.exists():
+        return {}
+
+    m: Dict[str, Dict[str, str]] = {}
+    try:
+        with path.open("r", encoding="utf-8") as fh:
+            # tail-ish behavior: read all, but cap lines to avoid OOM on huge files
+            lines = fh.readlines()[-max_lines:]
+        for line in lines:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                ev = json.loads(line)
+            except Exception:
+                continue
+
+            # Common fields we expect in events (top-level OR inside response/result)
+            ordertxid = ev.get("ordertxid") or ev.get("order_txid") or ev.get("orderId") or ev.get("txid")
+            userref   = ev.get("userref")
+
+            resp = ev.get("response")
+            if (not ordertxid or userref is None) and isinstance(resp, dict):
+                # try inside response itself
+                otx2, ur2 = _extract_ordertxid_userref_from_resp(resp)
+                if not ordertxid and otx2:
+                    ordertxid = otx2
+                if userref is None and ur2 is not None:
+                    userref = ur2
+
+            intent_id = ev.get("intent_id")
+            strategy  = ev.get("strategy")
+
+            # If not present at top-level, try to extract from broker response payload
+            if not ordertxid:
+                resp = ev.get("response")
+                try:
+                    if isinstance(resp, dict):
+                        ordertxid = resp.get("ordertxid") or resp.get("order_txid") or resp.get("orderId")
+                        if not ordertxid:
+                            r = resp.get("result") if isinstance(resp.get("result"), dict) else None
+                            tx = (r.get("txid") if r else None)
+                            if isinstance(tx, list) and tx:
+                                ordertxid = tx[0]
+                            elif isinstance(tx, str):
+                                ordertxid = tx
+                        if not ordertxid:
+                            tx = resp.get("txid")
+                            if isinstance(tx, list) and tx:
+                                ordertxid = tx[0]
+                            elif isinstance(tx, str):
+                                ordertxid = tx
+                except Exception:
+                    pass
+
+            if ordertxid and (intent_id or strategy):
+                rec = m.setdefault(str(ordertxid), {})
+                if intent_id and "intent_id" not in rec:
+                    rec["intent_id"] = str(intent_id)
+                if strategy and "strategy" not in rec:
+                    rec["strategy"] = str(strategy)
+    except Exception as e:
+        log.warning("attrib load from journal_v2 failed: %s", e)
+
+    return m
+
+
+def reconcile_trade_attribution() -> Dict[str, Any]:
+    """
+    Apply journal_v2 attribution to trades table using ordertxid.
+    Safe, idempotent, and fast enough for a sync call.
+    """
+    attrib = _load_attrib_from_journal_v2()
+    if not attrib:
+        return {"ok": True, "updated": 0, "note": "no_attrib_found"}
+
+    conn = _db()
+    cur = conn.cursor()
+    updated = 0
+
+    try:
+        for ordertxid, rec in attrib.items():
+            intent_id = rec.get("intent_id")
+            strategy  = rec.get("strategy")
+
+            if not (intent_id or strategy):
+                continue
+
+            cur.execute("""
+                UPDATE trades
+                SET
+                    intent_id = COALESCE(intent_id, ?),
+                    strategy  = COALESCE(strategy,  ?)
+                WHERE ordertxid = ?
+            """, (intent_id, strategy, ordertxid))
+
+            updated += cur.rowcount
+
+        conn.commit()
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+    return {"ok": True, "updated": int(updated), "attrib_keys": int(len(attrib))}
+
 
 # Telemetry JSONL log (one row per scheduler event)
 TELEMETRY_PATH = DATA_DIR / "telemetry_v2.jsonl"
@@ -292,6 +405,65 @@ def _append_telemetry_rows(rows: List[Dict[str, Any]]) -> None:
     except Exception as e:
         # Telemetry logging must never break the scheduler
         log.warning("failed to append telemetry rows: %s", e)
+        
+def _extract_ordertxid_userref_from_resp(resp: Any) -> Tuple[Optional[str], Optional[int]]:
+    """
+    Best-effort: pull ordertxid + userref out of br_router.market_notional response.
+    Handles shapes like:
+      - {"ordertxid": "...", "userref": 123}
+      - {"txid": "..."} or {"txid": ["..."]}
+      - {"result": {"txid": ["..."]}}
+      - {"result": {"ordertxid": "..."}}
+    """
+    if resp is None:
+        return (None, None)
+
+    # Sometimes response is not a dict
+    if not isinstance(resp, dict):
+        return (None, None)
+
+    # candidates to search
+    cands = [resp]
+    if isinstance(resp.get("result"), dict):
+        cands.append(resp["result"])
+    if isinstance(resp.get("data"), dict):
+        cands.append(resp["data"])
+
+    ordertxid: Optional[str] = None
+    userref: Optional[int] = None
+
+    for d in cands:
+        if not isinstance(d, dict):
+            continue
+
+        # Kraken often returns "txid" as the order tx id in order placement calls
+        otx = d.get("ordertxid") or d.get("order_txid") or d.get("txid") or d.get("orderId")
+        if isinstance(otx, list) and otx:
+            otx = otx[0]
+        if otx and ordertxid is None:
+            ordertxid = str(otx)
+
+        ur = d.get("userref") or d.get("user_ref")
+        if ur is not None and userref is None:
+            try:
+                userref = int(ur)
+            except Exception:
+                userref = None
+
+    return (ordertxid, userref)
+
+
+def _intent_id(intent: Any) -> Optional[str]:
+    """Read the stable intent id you set in intent.meta."""
+    try:
+        meta = getattr(intent, "meta", None)
+        if isinstance(meta, dict):
+            v = meta.get("intent_id")
+            return str(v) if v else None
+    except Exception:
+        pass
+    return None
+
 
 # --------------------------------------------------------------------------------------
 # Scheduler globals
@@ -401,7 +573,14 @@ def kraken_private(method: str, data: Dict[str, Any], key: str, secret_b64: str)
 # --------------------------------------------------------------------------------------
 
 def _db() -> sqlite3.Connection:
-    conn = sqlite3.connect(DB_PATH)
+    # One connection per call (safe for FastAPI); always point at DATA_DIR/DB_PATH
+    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+    try:
+        conn.execute("PRAGMA journal_mode=WAL;")
+        conn.execute("PRAGMA synchronous=NORMAL;")
+    except Exception:
+        pass
+
     conn.execute("""
         CREATE TABLE IF NOT EXISTS trades (
             txid TEXT PRIMARY KEY,
@@ -413,24 +592,66 @@ def _db() -> sqlite3.Connection:
             volume REAL,
             cost REAL,
             fee REAL,
+
+            -- attribution fields (persist across redeploy)
+            userref INTEGER,
+            ordertxid TEXT,
+            intent_id TEXT,
             strategy TEXT,
+            inserted_at REAL,
+
             raw JSON
         )
     """)
+
+    # Lightweight migrations for existing DBs (safe if columns already exist)
+    try:
+        cur = conn.cursor()
+        cur.execute("PRAGMA table_info(trades)")
+        cols = {r[1] for r in cur.fetchall()}
+
+        migrations = [
+            ("userref",     "ALTER TABLE trades ADD COLUMN userref INTEGER"),
+            ("ordertxid",   "ALTER TABLE trades ADD COLUMN ordertxid TEXT"),
+            ("intent_id",   "ALTER TABLE trades ADD COLUMN intent_id TEXT"),
+            ("inserted_at", "ALTER TABLE trades ADD COLUMN inserted_at REAL"),
+            ("pair",        "ALTER TABLE trades ADD COLUMN pair TEXT"),
+            ("cost",        "ALTER TABLE trades ADD COLUMN cost REAL"),
+            ("strategy",    "ALTER TABLE trades ADD COLUMN strategy TEXT"),
+        ]
+        for col_name, sql in migrations:
+            if col_name not in cols:
+                try:
+                    conn.execute(sql)
+                except Exception:
+                    pass
+    except Exception:
+        pass
+
     conn.execute("CREATE INDEX IF NOT EXISTS idx_trades_ts ON trades(ts)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_trades_strategy ON trades(strategy)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_trades_symbol ON trades(symbol)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_trades_ordertxid ON trades(ordertxid)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_trades_intent_id ON trades(intent_id)")
     return conn
 
 def insert_trades(rows: List[Dict[str, Any]]) -> int:
     if not rows:
         return 0
+
     conn = _db()
     cur = conn.cursor()
+
     ins = """
-        INSERT OR IGNORE INTO trades
-        (txid, ts, pair, symbol, side, price, volume, cost, fee, raw)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    INSERT OR IGNORE INTO trades
+    (txid, ts, pair, symbol, side, price, volume, cost, fee, userref, ordertxid, intent_id, strategy, raw)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """
+
+
     count = 0
+    now_ts = time.time()
+
     for r in rows:
         try:
             cur.execute(ins, (
@@ -443,11 +664,17 @@ def insert_trades(rows: List[Dict[str, Any]]) -> int:
                 float(r.get("volume", 0) or 0),
                 float(r.get("cost", 0) or 0),
                 float(r.get("fee", 0) or 0),
-                json.dumps(r, separators=(",", ":")),
+                int(r.get("userref") or 0),
+                (r.get("ordertxid") or None),
+                (r.get("intent_id") or None),
+                (r.get("strategy") or None),
+                json.dumps(r.get("raw") if isinstance(r.get("raw"), dict) else r, separators=(",", ":")),
             ))
+
             count += cur.rowcount
         except Exception as e:
             log.warning(f"insert skip txid={r.get('txid')}: {e}")
+
     conn.commit()
     conn.close()
     return count
@@ -455,18 +682,44 @@ def insert_trades(rows: List[Dict[str, Any]]) -> int:
 def fetch_rows(limit: int = 25, offset: int = 0) -> List[Dict[str, Any]]:
     conn = _db()
     cur = conn.cursor()
-    cur.execute("SELECT txid, ts, pair, symbol, side, price, volume, cost, fee, raw FROM trades ORDER BY ts DESC LIMIT ? OFFSET ?", (limit, offset))
+
+    cur.execute("""
+        SELECT
+            txid, ts, pair, symbol, side, price, volume, cost, fee,
+            userref, ordertxid, intent_id, strategy, inserted_at, raw
+        FROM trades
+        ORDER BY ts DESC
+        LIMIT ? OFFSET ?
+    """, (limit, offset))
+
     out = []
     for row in cur.fetchall():
-        txid, ts_, pair, symbol, side, price, volume, cost, fee, raw = row
+        (txid, ts_, pair, symbol, side, price, volume, cost, fee,
+         userref, ordertxid, intent_id, strategy, inserted_at, raw) = row
+
         try:
             raw_obj = json.loads(raw) if raw else None
         except Exception:
             raw_obj = None
+
         out.append({
-            "txid": txid, "ts": ts_, "pair": pair, "symbol": symbol, "side": side,
-            "price": price, "volume": volume, "cost": cost, "fee": fee, "raw": raw_obj
+            "txid": txid,
+            "ts": ts_,
+            "pair": pair,
+            "symbol": symbol,
+            "side": side,
+            "price": price,
+            "volume": volume,
+            "cost": cost,
+            "fee": fee,
+            "userref": userref,
+            "ordertxid": ordertxid,
+            "intent_id": intent_id,
+            "strategy": strategy,
+            "inserted_at": inserted_at,
+            "raw": raw_obj,
         })
+
     conn.close()
     return out
 
@@ -496,6 +749,15 @@ app.add_middleware(
 STATIC_DIR = Path("./static")
 if STATIC_DIR.exists():
     app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
+    
+@app.on_event("startup")
+def _startup_reconcile():
+    try:
+        log.info("startup: data_dir=%s db=%s journal_v2=%s", str(DATA_DIR), str(DB_PATH), str(JOURNAL_V2_PATH))
+        res = reconcile_trade_attribution()
+        log.info("startup: reconcile_trade_attribution => %s", res)
+    except Exception as e:
+        log.warning("startup reconcile failed: %s", e)
 
 # --------------------------------------------------------------------------------------
 # Models
@@ -525,6 +787,72 @@ def _kraken_error_str(resp: Dict[str, Any]) -> Optional[str]:
     except Exception:
         pass
     return None
+    
+def _extract_ordertxid_and_userref(resp: Any) -> Tuple[Optional[str], Optional[int]]:
+    """
+    Best-effort extraction of ordertxid + userref from whatever the broker/execution layer returns.
+    Handles common shapes:
+      - {"ok": True, "txid": "..."} or {"txid": ["..."]}
+      - {"result": {"txid": ["..."]}}
+      - {"order_txid": "..."} / {"ordertxid": "..."}
+    """
+    try:
+        if resp is None:
+            return (None, None)
+
+        # Sometimes response is a string
+        if isinstance(resp, str):
+            return (None, None)
+
+        # Sometimes response is a list (rare)
+        if isinstance(resp, list):
+            # try first dict in list
+            for x in resp:
+                if isinstance(x, dict):
+                    otx, ur = _extract_ordertxid_and_userref(x)
+                    if otx or ur is not None:
+                        return (otx, ur)
+            return (None, None)
+
+        if not isinstance(resp, dict):
+            return (None, None)
+
+        # unwrap common nesting
+        candidate_dicts = [resp]
+        if isinstance(resp.get("result"), dict):
+            candidate_dicts.append(resp["result"])
+        if isinstance(resp.get("data"), dict):
+            candidate_dicts.append(resp["data"])
+
+        ordertxid: Optional[str] = None
+        userref: Optional[int] = None
+
+        for d in candidate_dicts:
+            # order txid keys
+            val = (
+                d.get("ordertxid")
+                or d.get("order_txid")
+                or d.get("orderTxid")
+                or d.get("txid")     # Kraken often returns txid for order placement
+            )
+            if isinstance(val, list) and val:
+                val = val[0]
+            if val and ordertxid is None:
+                ordertxid = str(val)
+
+            # userref keys
+            ur = d.get("userref") or d.get("user_ref")
+            if ur is not None and userref is None:
+                try:
+                    userref = int(ur)
+                except Exception:
+                    userref = None
+
+        return (ordertxid, userref)
+
+    except Exception:
+        return (None, None)
+
 
 # --------------------------------------------------------------------------------------
 # Routes
@@ -736,6 +1064,9 @@ def _pull_trades_from_kraken(since_hours: int, hard_limit: int) -> Tuple[int, in
                     "volume": float(t.get("vol") or 0),
                     "cost": float(t.get("cost") or 0),
                     "fee": float(t.get("fee") or 0),
+                    "ordertxid": str(t.get("ordertxid") or ""),
+                    "userref": int(t.get("userref") or 0),
+                    "intent_id": None,
                     "strategy": None,
                     "raw": t,
                 })
@@ -810,59 +1141,60 @@ def journal_attach(payload: dict = Body(default=None)):
 
 @app.get("/fills")
 def get_fills(limit: int = 50, offset: int = 0):
-    """Return recent trade fills.
-
-    Note: some deployments may have different `trades` table schemas depending on when
-    journaling was introduced. We dynamically select only the columns that exist so
-    the endpoint stays backward-compatible and doesn't crash on older DBs.
-    """
     conn = _get_db_conn()
     try:
         cur = conn.cursor()
-
-        wanted = [
-            "txid",
-            "ts",
-            "pair",
-            "symbol",
-            "side",
-            "price",
-            "volume",
-            "fee",
-            "cost",
-            "strategy",
-            "userref",
-            "ordertxid",
-            "intent_id",
+        cur.execute(
+            """
+            SELECT txid, ts, pair, symbol, side, price, volume, fee, cost, strategy, userref, ordertxid, intent_id
+            FROM trades
+            ORDER BY ts DESC
+            LIMIT ? OFFSET ?
+            """,
+            (limit, offset),
+        )
+        rows = [
+            {
+                "txid": r[0], "ts": r[1], "pair": r[2], "symbol": r[3], "side": r[4],
+                "price": r[5], "volume": r[6], "fee": r[7], "cost": r[8], "strategy": r[9],
+                "userref": r[10], "ordertxid": r[11], "intent_id": r[12]
+            }
+            for r in cur.fetchall()
         ]
-
-        try:
-            cur.execute("PRAGMA table_info(trades)")
-            existing = {row[1] for row in cur.fetchall()}  # row[1] = column name
-        except Exception:
-            existing = set()
-
-        cols = [c for c in wanted if c in existing]
-        if not cols:
-            return {"ok": True, "rows": []}
-
-        sql = f"SELECT {', '.join(cols)} FROM trades ORDER BY ts DESC LIMIT ? OFFSET ?"
-        cur.execute(sql, (limit, offset))
-        fetched = cur.fetchall()
-
-        rows = []
-        for r in fetched:
-            d = {}
-            for i, c in enumerate(cols):
-                d[c] = r[i]
-            rows.append(d)
-
         return {"ok": True, "rows": rows}
     finally:
+        conn.close()
+        
+        
+@app.get("/attrib/debug")
+def attrib_debug(limit: int = 80):
+    path = JOURNAL_V2_PATH
+    if not path.exists():
+        return {"ok": False, "error": "journal_v2_missing", "path": str(path)}
+
+    out = []
+    with path.open("r", encoding="utf-8") as fh:
+        lines = fh.readlines()[-limit:]
+
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
         try:
-            conn.close()
+            ev = json.loads(line)
         except Exception:
-            pass
+            continue
+
+        out.append({
+            "t": ev.get("t") or ev.get("type"),
+            "ts": ev.get("ts") or ev.get("time"),
+            "ordertxid": ev.get("ordertxid") or ev.get("order_txid") or ev.get("orderId"),
+            "userref": ev.get("userref"),
+            "intent_id": ev.get("intent_id"),
+            "strategy": ev.get("strategy"),
+        })
+
+    return {"ok": True, "path": str(path), "rows": out}
 
 @app.post("/journal/backfill")
 def journal_backfill(payload: Dict[str, Any] = Body(default=None)):
@@ -939,18 +1271,29 @@ def journal_sync(payload: Dict[str, Any] = Body(default=None)):
     start_ts0 = int(time.time() - since_hours * 3600)
 
     UPSERT_SQL = """
-    INSERT INTO trades (txid, ts, symbol, side, price, volume, fee, strategy, raw)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    INSERT INTO trades (
+        txid, ts, pair, symbol, side, price, volume, cost, fee,
+        userref, ordertxid, intent_id, strategy, inserted_at, raw
+    )
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?,
+            ?, ?, ?, ?, ?, ?)
     ON CONFLICT(txid) DO UPDATE SET
-        ts      = excluded.ts,
-        symbol  = excluded.symbol,
-        side    = excluded.side,
-        price   = excluded.price,
-        volume  = excluded.volume,
-        fee     = excluded.fee,
-        strategy= COALESCE(trades.strategy, excluded.strategy),
-        raw     = excluded.raw
+        ts        = excluded.ts,
+        pair      = COALESCE(excluded.pair, trades.pair),
+        symbol    = excluded.symbol,
+        side      = excluded.side,
+        price     = excluded.price,
+        volume    = excluded.volume,
+        cost      = COALESCE(excluded.cost, trades.cost),
+        fee       = excluded.fee,
+        userref   = COALESCE(excluded.userref, trades.userref),
+        ordertxid = COALESCE(excluded.ordertxid, trades.ordertxid),
+        intent_id = COALESCE(trades.intent_id, excluded.intent_id),
+        strategy  = COALESCE(trades.strategy, excluded.strategy),
+        inserted_at = COALESCE(trades.inserted_at, excluded.inserted_at),
+        raw       = excluded.raw
     """
+
 
     def flush_batch(batch):
         if dry_run or not batch:
@@ -964,26 +1307,44 @@ def journal_sync(payload: Dict[str, Any] = Body(default=None)):
 
     def map_row(txid, t):
         try:
-            ts = float(t.get('time')) if t.get('time') is not None else None
+            ts = float(t.get("time")) if t.get("time") is not None else None
         except Exception:
             ts = None
-        pair_raw = t.get('pair') or ''
+
+        pair_raw = t.get("pair") or ""
         symbol = from_kraken_pair_to_app(pair_raw)
-        side = t.get('type')
-        try:
-            price = float(t.get('price')) if t.get('price') is not None else None
-        except Exception:
-            price = None
-        try:
-            volume = float(t.get('vol')) if t.get('vol') is not None else None
-        except Exception:
-            volume = None
-        try:
-            fee = float(t.get('fee')) if t.get('fee') is not None else None
-        except Exception:
-            fee = None
-        raw = _json.dumps(t, separators=(',', ':'), ensure_ascii=False)
-        return (str(txid), ts, symbol, side, price, volume, fee, None, raw)
+        side = t.get("type")
+
+        def _f(x):
+            try:
+                return float(x) if x is not None else None
+            except Exception:
+                return None
+
+        price  = _f(t.get("price"))
+        volume = _f(t.get("vol"))
+        cost   = _f(t.get("cost"))
+        fee    = _f(t.get("fee"))
+
+        # Kraken TradesHistory includes ordertxid
+        ordertxid = t.get("ordertxid")
+
+        # userref usually not present in TradesHistory; keep if it is (or if you add it later)
+        userref = t.get("userref")
+
+        raw = _json.dumps(t, separators=(",", ":"), ensure_ascii=False, default=str)
+        inserted_at = time.time()
+
+        return (
+            str(txid), ts, pair_raw, symbol, side, price, volume, cost, fee,
+            (int(userref) if userref is not None else None),
+            (str(ordertxid) if ordertxid else None),
+            None,  # intent_id will be reconciled from journal_v2
+            None,  # strategy will be reconciled from journal_v2 (or manual attach)
+            inserted_at,
+            raw
+        )
+
 
     total_writes = 0
     total_pulled = 0
@@ -1089,11 +1450,14 @@ def journal_sync(payload: Dict[str, Any] = Body(default=None)):
     except Exception as e:
         total_rows = None
         notes.append({"post_count_error": str(e)})
+        
+    recon = reconcile_trade_attribution()
 
     return {
         "ok": True,
         "dry_run": dry_run,
         "count": total_writes,
+        "reconcile": recon,
         "debug": {
             "creds_present": True,
             "since_hours": since_hours,
@@ -1303,6 +1667,8 @@ def journal_v2_review(
         "per_strategy": sorted(per_strategy.values(), key=lambda r: r["strategy"]),
         "per_pair": sorted(per_pair.values(), key=lambda r: (r["strategy"], r["symbol"])),
     }
+    
+
 
 
 @app.get("/price/{base}/{quote}")
@@ -2656,6 +3022,9 @@ def scheduler_core_debug(payload: Dict[str, Any] = Body(default=None)):
                     vals.append(row[key])
         return vals
 
+
+
+
     for sym in syms:
         try:
             one = br.get_bars(sym, timeframe="1Min", limit=limit)
@@ -2903,25 +3272,40 @@ def _startup():
 # Price helper used by scheduler
 # --------------------------------------------------------------------------------------
 
+# ------------------------------------------------------------------
+# Last-price helper for risk calculation + exits
+# ------------------------------------------------------------------
 def _last_price_safe(symbol: str) -> float:
-    """
-    Best-effort last price lookup that works whether we're using Kraken directly
-    or only have br_router available. Returns 0.0 on any failure.
-    """
-    try:
-        import broker_kraken as _bk  # type: ignore[import]
-    except Exception:
-        try:
-            import br_router as _bk  # type: ignore[import]
-        except Exception:
-            return 0.0
+    # 1) Try cached 5m bars
+    ctx = contexts.get(symbol)
+    if ctx:
+        five = ctx.get("five") or {}
+        closes = five.get("close") or []
+        if closes:
+            try:
+                return float(closes[-1])
+            except Exception:
+                pass
 
+    # 2) Fallback: ask broker router for a last price (prevents exit blocks)
     try:
-        if hasattr(_bk, "last_price"):
-            px = _bk.last_price(symbol)
-            return float(px or 0.0)
+        if br is not None:
+            # Prefer a dedicated helper if you have it
+            if hasattr(br, "get_last_price"):
+                px = br.get_last_price(symbol)
+                if px:
+                    return float(px)
+
+            # Otherwise try ticker-like helpers if present
+            if hasattr(br, "get_ticker"):
+                t = br.get_ticker(symbol)
+                if isinstance(t, dict):
+                    for k in ("last", "price", "c", "close"):
+                        if k in t and t[k] is not None:
+                            return float(t[k])
     except Exception:
-        return 0.0
+        pass
+
     return 0.0
 
 
@@ -3558,33 +3942,38 @@ def scheduler_run(payload: Dict[str, Any] = Body(default=None)):
 @app.post("/scheduler/v2/run")
 def scheduler_run_v2(payload: Dict[str, Any] = Body(default=None)):
     """
-    Scheduler v2
+    Scheduler v2:
 
-    - Uses scheduler_core + RiskEngine to produce explicit OrderIntents (entries + exits).
-    - Applies guard + per-symbol caps + loss-zone no-rebuy for ENTRY/SCALE intents.
+    - Uses scheduler_core + RiskEngine to produce explicit OrderIntents
+      (entries + exits + per-strategy + global exits).
+    - Applies per-symbol caps + loss-zone no-rebuy for ENTRY/SCALE intents.
     - Routes surviving intents through br_router.market_notional when dry=False.
-    - Journals every action to journal_v2 (dry + live) with a stable intent_id for attribution.
 
-    This endpoint is intended to run side-by-side with legacy /scheduler/run until validated.
+    This does NOT remove the legacy /scheduler/run endpoint. Use this side-by-side
+    for testing until you're happy to flip over.
     """
     actions: List[Dict[str, Any]] = []
     telemetry: List[Dict[str, Any]] = []
 
-    payload = payload or {}
+    # small helpers for super-safe config access
+    def _cfg_get(d: Any, key: str, default: Any = None) -> Any:
+        return d.get(key, default) if isinstance(d, dict) else default
 
-    # ---------------------------------------------------------------
-    # Helpers
-    # ---------------------------------------------------------------
+    # ------------------------------------------------------------------
+    # Helper: env bool
+    # ------------------------------------------------------------------
     def _env_bool(key: str, default: bool) -> bool:
         v = os.getenv(key)
         if v is None:
             return default
-        return str(v).strip().lower() in ("1", "true", "yes", "on")
+        return str(v).lower() in ("1", "true", "yes", "on")
 
+    payload = payload or {}
+    
+    # ---------------------------------------------------------------
+    # Helpers: intent_id + broker response extraction (attribution)
+    # ---------------------------------------------------------------
     def _ensure_intent_id(intent_obj: Any) -> Optional[str]:
-        """
-        Ensure each intent has a stable id in intent.meta["intent_id"].
-        """
         try:
             meta = getattr(intent_obj, "meta", None)
             if not isinstance(meta, dict):
@@ -3600,6 +3989,23 @@ def scheduler_run_v2(payload: Dict[str, Any] = Body(default=None)):
             return str(iid)
         except Exception:
             return None
+            
+    def _canon_symbol(sym: str) -> str:
+        s = (sym or "").strip().upper()
+
+        # Common Kraken asset-code wrappers you’re seeing in fills:
+        # XLTCZ/USD -> LTC/USD
+        # XXRPZ/USD -> XRP/USD
+        # Keep USD, normalize base.
+        if "/" in s:
+            base, quote = s.split("/", 1)
+            # Strip leading X/Z wrappers often used by Kraken asset codes
+            base = base.lstrip("XZ")
+            quote = quote.lstrip("XZ")
+            return f"{base}/{quote}"
+
+        return s
+
 
     def _extract_ordertxid_userref(resp: Any) -> Tuple[Optional[str], Optional[str]]:
         """
@@ -3610,7 +4016,8 @@ def scheduler_run_v2(payload: Dict[str, Any] = Body(default=None)):
         userref = None
         try:
             if isinstance(resp, dict):
-                ordertxid = resp.get("ordertxid") or resp.get("order_txid") or resp.get("orderId") or resp.get("id")
+                # direct keys (if you already normalize somewhere)
+                ordertxid = resp.get("ordertxid") or resp.get("order_txid") or resp.get("orderId")
                 userref = resp.get("userref") or resp.get("user_ref")
 
                 # Kraken common: {"result":{"txid":["..."]}}
@@ -3631,30 +4038,24 @@ def scheduler_run_v2(payload: Dict[str, Any] = Body(default=None)):
                         ordertxid = tx
         except Exception:
             pass
+
         return (str(ordertxid) if ordertxid else None, str(userref) if userref else None)
 
-    # ---------------------------------------------------------------
+
     # Dry-run flag: payload.dry overrides SCHED_DRY (default True)
-    # ---------------------------------------------------------------
-    dry_val = payload.get("dry", None)
-    if dry_val is None:
+    dry = payload.get("dry", None)
+    if dry is None:
         dry = _env_bool("SCHED_DRY", True)
-    else:
-        # accept bools, ints, and strings
-        if isinstance(dry_val, bool):
-            dry = dry_val
-        elif isinstance(dry_val, (int, float)):
-            dry = bool(dry_val)
-        else:
-            dry = str(dry_val).strip().lower() in ("1", "true", "yes", "on")
     dry = bool(dry)
 
+    # ------------------------------------------------------------------
     # Minimum order notional (USD) to avoid dust orders
+    # ------------------------------------------------------------------
     MIN_NOTIONAL_USD = float(os.getenv("MIN_ORDER_NOTIONAL_USD", "5.0") or 5.0)
 
-    # ---------------------------------------------------------------
+    # ------------------------------------------------------------------
     # Resolve basic scheduler config from payload + env
-    # ---------------------------------------------------------------
+    # ------------------------------------------------------------------
     tf = str(payload.get("tf", os.getenv("SCHED_TIMEFRAME", "5Min")))
     strats_csv = str(payload.get("strats", os.getenv("SCHED_STRATS", "c1,c2,c3,c4,c5,c6")))
     strats = [s.strip().lower() for s in strats_csv.split(",") if s.strip()]
@@ -3686,79 +4087,84 @@ def scheduler_run_v2(payload: Dict[str, Any] = Body(default=None)):
         ",".join(syms),
     )
 
-    # ---------------------------------------------------------------
-    # Load broker router + optional guard
-    # ---------------------------------------------------------------
-    br = None
+    # ------------------------------------------------------------------
+    # Load broker router + guard
+    # ------------------------------------------------------------------
     try:
         import br_router as br  # type: ignore[import]
     except Exception as e:
         log.error("scheduler_v2: failed to import br_router: %s", e)
-        telemetry.append({"stage": "import_br_router", "ok": False, "error": f"{e.__class__.__name__}: {e}"})
-        # In dry mode, we can still compute intents if contexts are optional; but your StrategyBook needs bars.
-        # We'll proceed with contexts=None for all symbols (scheduler_core should tolerate and emit telemetry).
-        br = None
+        if not dry:
+            return {"ok": False, "error": f"failed to import br_router: {e}", "config": config_snapshot}
+        br = None  # dry mode can still show intents
 
     try:
         from policy.guard import guard_allows  # type: ignore[import]
     except Exception:
         guard_allows = None  # optional; strategies already use guard internally
 
-    # ---------------------------------------------------------------
+    # ------------------------------------------------------------------
     # Load positions & risk config
-    # ---------------------------------------------------------------
+    # ------------------------------------------------------------------
     positions = _load_open_positions_from_trades(use_strategy_col=True)
     risk_cfg = load_risk_config() or {}
     risk_engine = RiskEngine(risk_cfg)
 
-    # ---------------------------------------------------------------
+    # ------------------------------------------------------------------
     # Preload bar contexts once (match /debug/strategy_scan + StrategyBook)
-    # ---------------------------------------------------------------
+    # ------------------------------------------------------------------
     contexts: Dict[str, Any] = {}
 
-    def _safe_series(bars: Any, key: str) -> List[Any]:
-        vals: List[Any] = []
+    def _safe_series(bars, key: str):
+        vals = []
         if isinstance(bars, list):
             for row in bars:
                 if isinstance(row, dict) and key in row:
                     vals.append(row[key])
         return vals
 
+    def _normalize_symbol_for_bars(sym: str) -> str:
+            # If br_router has a normalizer, use it
+            try:
+                if br is not None and hasattr(br, "normalize_symbol"):
+                    return str(br.normalize_symbol(sym))
+            except Exception:
+                pass
+    
+            # Minimal Kraken altname fixups (common offenders)
+            if sym == "XLTCZ/USD":
+                return "LTC/USD"
+            if sym == "XXRPZ/USD":
+                return "XRP/USD"
+            return sym
+    
+    
     for sym in syms:
-        if br is None:
-            contexts[sym] = None
-            telemetry.append({"symbol": sym, "stage": "preload_bars", "ok": False, "reason": "no_br_router"})
-            continue
-
+        sym_can = _canon_symbol(sym)
         try:
+            bars_sym = _normalize_symbol_for_bars(sym)
+            
             one = br.get_bars(sym, timeframe="1Min", limit=limit)
-            five = br.get_bars(sym, timeframe=tf, limit=limit)
+            five = br.get_bars(sym, timeframe=tf,     limit=limit)
 
             if not one or not five:
-                contexts[sym] = None
+                contexts[sym_can] = None
                 telemetry.append({"symbol": sym, "stage": "preload_bars", "ok": False, "reason": "no_bars"})
             else:
-                contexts[sym] = {
-                    "one": {
-                        "close": _safe_series(one, "c"),
-                        "high": _safe_series(one, "h"),
-                        "low": _safe_series(one, "l"),
-                    },
-                    "five": {
-                        "close": _safe_series(five, "c"),
-                        "high": _safe_series(five, "h"),
-                        "low": _safe_series(five, "l"),
-                    },
+                contexts[sym_can] = {
+                    "one":  {"close": _safe_series(one, "c"),  "high": _safe_series(one, "h"),  "low": _safe_series(one, "l")},
+                    "five": {"close": _safe_series(five, "c"), "high": _safe_series(five, "h"), "low": _safe_series(five, "l")},
                 }
         except Exception as e:
-            contexts[sym] = None
-            telemetry.append(
-                {"symbol": sym, "stage": "preload_bars", "ok": False, "error": f"{e.__class__.__name__}: {e}"}
-            )
+            contexts[sym_can] = None
+            telemetry.append({"symbol": sym, "stage": "preload_bars", "ok": False, "error": f"{e.__class__.__name__}: {e}"})
 
-    # ---------------------------------------------------------------
+    
+
+
+    # ------------------------------------------------------------------
     # Last-price helper for risk calculation + exits
-    # ---------------------------------------------------------------
+    # ------------------------------------------------------------------
     def _last_price_safe(symbol: str) -> float:
         ctx = contexts.get(symbol)
         if not ctx:
@@ -3772,9 +4178,9 @@ def scheduler_run_v2(payload: Dict[str, Any] = Body(default=None)):
         except Exception:
             return 0.0
 
-    # ---------------------------------------------------------------
-    # Run scheduler_core once
-    # ---------------------------------------------------------------
+    # ------------------------------------------------------------------
+    # Build SchedulerConfig and run scheduler_core once
+    # ------------------------------------------------------------------
     now = dt.datetime.utcnow()
     cfg = SchedulerConfig(
         now=now,
@@ -3791,44 +4197,46 @@ def scheduler_run_v2(payload: Dict[str, Any] = Body(default=None)):
     result: SchedulerResult = run_scheduler_once(cfg, last_price_fn=_last_price_safe)
     telemetry.extend(result.telemetry)
 
-    # ---------------------------------------------------------------
+    # ------------------------------------------------------------------
     # Deduplicate intents: exits take precedence over entries on same (sym,strat)
-    # ---------------------------------------------------------------
+    # ------------------------------------------------------------------
     exit_kinds = {"exit", "take_profit", "stop_loss"}
     entry_kinds = {"entry", "scale"}
 
     best_exit: Dict[Tuple[str, str], Any] = {}
     entries: List[Any] = []
 
-    for intent in (result.intents or []):
-        try:
-            key = (intent.symbol, intent.strategy)
-        except Exception:
-            entries.append(intent)
-            continue
+    for intent in result.intents:
+        key = (intent.symbol, intent.strategy)
 
-        if getattr(intent, "kind", None) in exit_kinds:
+        if intent.kind in exit_kinds:
             prev = best_exit.get(key)
             if prev is None or _exit_priority(intent.kind) > _exit_priority(prev.kind):
                 best_exit[key] = intent
+        elif intent.kind in entry_kinds:
+            entries.append(intent)
         else:
+            # unknown kind: just pass through as a generic action
             entries.append(intent)
 
+    # Combine exits + entries, making sure no entry is emitted on same pass
+    # when an exit exists for that (symbol,strategy).
     final_intents: List[Any] = []
-    final_intents.extend(best_exit.values())
 
+    # First, add exits
+    for key, intent in best_exit.items():
+        final_intents.append(intent)
+
+    # Then, add entries only where no exit exists
     for intent in entries:
-        key = (getattr(intent, "symbol", None), getattr(intent, "strategy", None))
-        if None in key:
-            final_intents.append(intent)
-            continue
-        if key in best_exit and getattr(intent, "kind", None) in entry_kinds:
+        key = (intent.symbol, intent.strategy)
+        if key in best_exit:
             telemetry.append(
                 {
                     "symbol": intent.symbol,
                     "strategy": intent.strategy,
                     "kind": intent.kind,
-                    "side": getattr(intent, "side", None),
+                    "side": intent.side,
                     "reason": "dropped_entry_due_to_exit_same_pass",
                     "source": "scheduler_v2",
                 }
@@ -3836,209 +4244,288 @@ def scheduler_run_v2(payload: Dict[str, Any] = Body(default=None)):
             continue
         final_intents.append(intent)
 
-    # ---------------------------------------------------------------
+    # ------------------------------------------------------------------
     # Apply guard + per-symbol caps + loss-zone no-rebuy; then route
-    # ---------------------------------------------------------------
+    # ------------------------------------------------------------------
     for intent in final_intents:
+        
+        # Ensure every intent has a stable id for attribution
         intent_id = _ensure_intent_id(intent)
-
-        symbol = getattr(intent, "symbol", None)
-        strategy = getattr(intent, "strategy", None)
-        kind = getattr(intent, "kind", None)
-        side = getattr(intent, "side", None)
-        reason = getattr(intent, "reason", None)
-
-        if not symbol or not strategy or not kind or not side:
-            telemetry.append(
-                {
-                    "symbol": symbol,
-                    "strategy": strategy,
-                    "kind": kind,
-                    "side": side,
-                    "reason": "invalid_intent_missing_fields",
-                    "source": "scheduler_v2",
-                }
-            )
-            continue
-
-        key = (symbol, strategy)
+        
+        # Force strategy label for global/system intents so they don't land in "misc"
+        try:
+            if not getattr(intent, "strategy", None):
+                intent.strategy = "global"
+        except Exception:
+            pass
+        
+        key = (intent.symbol, intent.strategy)
         pm_pos = positions.get(key)
 
         snap = PositionSnapshot(
-            symbol=symbol,
-            strategy=strategy,
+            symbol=intent.symbol,
+            strategy=intent.strategy,
             qty=float(getattr(pm_pos, "qty", 0.0) or 0.0),
             avg_price=getattr(pm_pos, "avg_price", None),
             unrealized_pct=None,
         )
-
-        # Keep unrealized_pct aligned with scheduler_core
+        
+            
+        # Fill unrealized_pct here so loss-zone + any extra logic
+        # see the exact same P&L % that scheduler_core used.
         try:
-            snap.unrealized_pct = risk_engine.compute_unrealized_pct(snap, last_price_fn=_last_price_safe)
+            snap.unrealized_pct = risk_engine.compute_unrealized_pct(
+                snap,
+                last_price_fn=_last_price_safe,
+            )
         except Exception:
             snap.unrealized_pct = None
 
-        # Guard only for entries/scales (exits must still fire)
-        if guard_allows is not None and kind in entry_kinds:
+        guard_allowed = True
+        guard_reason = "ok"
+        if guard_allows is not None and intent.kind in entry_kinds:
             try:
-                guard_allowed, guard_reason = guard_allows(strategy, symbol, now=now)
+                guard_allowed, guard_reason = guard_allows(intent.strategy, intent.symbol, now=now)
             except Exception as e:
-                guard_allowed, guard_reason = False, f"guard_exception:{e}"
+                guard_allowed = False
+                guard_reason = f"guard_exception:{e}"
 
-            if not guard_allowed:
-                telemetry.append(
-                    {"symbol": symbol, "strategy": strategy, "kind": kind, "side": side, "reason": guard_reason, "source": "guard_allows"}
-                )
-                continue
+        if not guard_allowed:
+            telemetry.append(
+                {
+                    "symbol": intent.symbol,
+                    "strategy": intent.strategy,
+                    "kind": intent.kind,
+                    "side": intent.side,
+                    "reason": guard_reason,
+                    "source": "guard_allows",
+                }
+            )
+            continue
+            
+        # NEW: advisory-only guard reasons (e.g. soft whitelist violations).
+        # In this case guard_allowed is True but guard_reason != "ok".
+        if guard_reason and guard_reason != "ok":
+            telemetry.append(
+                {
+                    "symbol": intent.symbol,
+                    "strategy": intent.strategy,
+                    "kind": intent.kind,
+                    "side": intent.side,
+                    "reason": f"guard_warn:{guard_reason}",
+                    "source": "guard_allows",
+                }
+            )
 
-            # advisory reasons
-            if guard_reason and guard_reason != "ok":
-                telemetry.append(
-                    {"symbol": symbol, "strategy": strategy, "kind": kind, "side": side, "reason": f"guard_warn:{guard_reason}", "source": "guard_allows"}
-                )
-
+        # Decide final notional to send
         final_notional: float = 0.0
+        side = intent.side
 
-        # ENTRY / SCALE: enforce cap + loss-zone
-        if kind in entry_kinds:
-            intent_notional = getattr(intent, "notional", None)
-            if intent_notional is None or float(intent_notional) <= 0:
+        # ----- ENTRY / SCALE: use intent.notional (after caps) --------------------
+        if intent.kind in entry_kinds:
+            if intent.notional is None or intent.notional <= 0:
                 telemetry.append(
-                    {"symbol": symbol, "strategy": strategy, "kind": kind, "side": side, "reason": "entry_without_notional", "source": "scheduler_v2"}
+                    {
+                        "symbol": intent.symbol,
+                        "strategy": intent.strategy,
+                        "kind": intent.kind,
+                        "side": intent.side,
+                        "reason": "entry_without_notional",
+                        "source": "scheduler_v2",
+                    }
                 )
                 continue
 
             allowed_cap, adjusted_notional, cap_reason = risk_engine.enforce_symbol_cap(
-                symbol=symbol,
-                strat=strategy,
+                symbol=intent.symbol,
+                strat=intent.strategy,
                 pos=snap,
-                notional_value=float(intent_notional),
+                notional_value=float(intent.notional),
                 last_price_fn=_last_price_safe,
                 now=now,
             )
-            if not allowed_cap or float(adjusted_notional or 0.0) <= 0.0:
+            if not allowed_cap or adjusted_notional <= 0.0:
                 telemetry.append(
-                    {"symbol": symbol, "strategy": strategy, "kind": kind, "side": side, "reason": cap_reason or "blocked_by_symbol_cap", "source": "risk_engine.enforce_symbol_cap"}
+                    {
+                        "symbol": intent.symbol,
+                        "strategy": intent.strategy,
+                        "kind": intent.kind,
+                        "side": intent.side,
+                        "reason": cap_reason or "blocked_by_symbol_cap",
+                        "source": "risk_engine.enforce_symbol_cap",
+                    }
                 )
                 continue
 
             final_notional = float(adjusted_notional)
 
-            if risk_engine.is_loss_zone_norebuy_block(unrealized_pct=snap.unrealized_pct, is_entry_side=True):
+            # Loss-zone no-rebuy below threshold (if we have unrealized_pct wired)
+            if risk_engine.is_loss_zone_norebuy_block(
+                unrealized_pct=snap.unrealized_pct,
+                is_entry_side=True,
+            ):
                 telemetry.append(
-                    {"symbol": symbol, "strategy": strategy, "kind": kind, "side": side, "reason": "loss_zone_no_rebuy_below", "source": "risk_engine.is_loss_zone_norebuy_block"}
+                    {
+                        "symbol": intent.symbol,
+                        "strategy": intent.strategy,
+                        "kind": intent.kind,
+                        "side": intent.side,
+                        "reason": "loss_zone_no_rebuy_below",
+                        "source": "risk_engine.is_loss_zone_norebuy_block",
+                    }
                 )
                 continue
 
-        # EXIT / TP / SL: compute notional from position if missing
+        # ----- EXIT / TP / SL: compute notional from position if missing -------------
         else:
-            px = _last_price_safe(symbol)
+            qty_here = float(getattr(pm_pos, "qty", 0.0) or 0.0)
+            px = _last_price_safe(intent.symbol)
             if px <= 0.0:
-                telemetry.append({"symbol": symbol, "strategy": strategy, "kind": kind, "side": side, "reason": "no_price_for_exit", "source": "scheduler_v2"})
+                telemetry.append(
+                    {
+                        "symbol": intent.symbol,
+                        "strategy": intent.strategy,
+                        "kind": intent.kind,
+                        "side": intent.side,
+                        "reason": "no_price_for_exit",
+                        "source": "scheduler_v2",
+                    }
+                )
                 continue
 
-            intent_notional = getattr(intent, "notional", None)
-            if intent_notional is not None and float(intent_notional) > 0:
-                final_notional = float(intent_notional)
+            if intent.notional is not None and intent.notional > 0:
+                final_notional = float(intent.notional)
             else:
-                qty_here = float(getattr(pm_pos, "qty", 0.0) or 0.0)
-                final_notional = abs(qty_here) * float(px)
+                final_notional = abs(qty_here) * px  # flatten full position
 
+        # If we reached here, we have a valid final_notional
         if final_notional <= 0:
-            telemetry.append({"symbol": symbol, "strategy": strategy, "kind": kind, "side": side, "reason": "non_positive_final_notional", "source": "scheduler_v2"})
+            telemetry.append(
+                {
+                    "symbol": intent.symbol,
+                    "strategy": intent.strategy,
+                    "kind": intent.kind,
+                    "side": intent.side,
+                    "reason": "non_positive_final_notional",
+                    "source": "scheduler_v2",
+                }
+            )
             continue
 
         # Ignore dust for entries + TP/SL; still allow generic exits (e.g. daily_flatten)
-        if final_notional < MIN_NOTIONAL_USD and kind in {"entry", "scale", "take_profit", "stop_loss"}:
-            telemetry.append({"symbol": symbol, "strategy": strategy, "kind": kind, "side": side, "reason": f"below_min_notional:{final_notional:.4f}<{MIN_NOTIONAL_USD}", "source": "scheduler_v2"})
+        if final_notional < MIN_NOTIONAL_USD and intent.kind in {"entry", "scale", "take_profit", "stop_loss"}:
+            telemetry.append(
+                {
+                    "symbol": intent.symbol,
+                    "strategy": intent.strategy,
+                    "kind": intent.kind,
+                    "side": intent.side,
+                    "reason": f"below_min_notional:{final_notional:.4f}<{MIN_NOTIONAL_USD}",
+                    "source": "scheduler_v2",
+                }
+            )
             continue
 
         action_record: Dict[str, Any] = {
-            "symbol": symbol,
-            "strategy": strategy,
+            "symbol": intent.symbol,
+            "strategy": intent.strategy,
             "intent_id": intent_id,
             "side": side,
-            "kind": kind,
+            "kind": intent.kind,
             "notional": final_notional,
-            "reason": reason,
+            "reason": intent.reason,
             "dry": bool(dry),
         }
 
-        # DRY or no broker => skip send but still journal
         if dry or br is None:
             action_record["status"] = "skipped_dry_run"
+
+            # Journal v2: record dry-run / no-broker actions
             try:
-                append_journal_v2(
-                    {
-                        "ts": time.time(),
-                        "source": "scheduler_v2",
-                        "intent_id": intent_id,
-                        "ordertxid": None,
-                        "userref": None,
-                        "symbol": symbol,
-                        "strategy": strategy,
-                        "kind": kind,
-                        "side": side,
-                        "notional": final_notional,
-                        "reason": reason,
-                        "dry": bool(dry),
-                        "status": action_record.get("status"),
-                        "response": None,
-                        "error": None,
-                    }
-                )
+                append_journal_v2({
+                    "ts": time.time(),
+                    "source": "scheduler_v2",
+                    "intent_id": intent_id,
+                    "ordertxid": None,
+                    "userref": None,
+                    "symbol": intent.symbol,
+                    "strategy": intent.strategy,
+                    "kind": intent.kind,
+                    "side": side,
+                    "notional": final_notional,
+                    "reason": intent.reason,
+                    "dry": bool(dry),
+                    "status": action_record.get("status"),
+                    "response": action_record.get("response"),
+                    "error": action_record.get("error"),
+                })
+
+
             except Exception:
+                # Never let logging break the scheduler
                 pass
 
             actions.append(action_record)
             continue
 
-        # LIVE: send to broker via br_router.market_notional
+
+        # ------------------------------------------------------------------
+        # Send to broker via br_router.market_notional
+        # ------------------------------------------------------------------
         try:
-            resp = br.market_notional(symbol=symbol, side=side, notional=final_notional, strategy=strategy)
+            resp = br.market_notional(
+                symbol=intent.symbol,
+                side=side,
+                notional=final_notional,
+                strategy=intent.strategy,
+            )
             action_record["status"] = "sent"
             action_record["response"] = resp
-
+            
             otx, ur = _extract_ordertxid_userref(resp)
             if otx:
                 action_record["ordertxid"] = otx
             if ur:
                 action_record["userref"] = ur
-
+            
+                        
         except Exception as e:
-            log.error("scheduler_v2: broker error for %s %s: %s", symbol, side, e)
+            log.error("scheduler_v2: broker error for %s %s: %s", intent.symbol, side, e)
             action_record["status"] = "error"
             action_record["error"] = f"{e.__class__.__name__}: {e}"
 
+        
         # Journal v2: record every executed (or failed) broker call
         try:
-            append_journal_v2(
-                {
-                    "ts": time.time(),
-                    "source": "scheduler_v2",
-                    "intent_id": intent_id,
-                    "ordertxid": action_record.get("ordertxid"),
-                    "userref": action_record.get("userref"),
-                    "symbol": symbol,
-                    "strategy": strategy,
-                    "kind": kind,
-                    "side": side,
-                    "notional": final_notional,
-                    "reason": reason,
-                    "dry": bool(dry),
-                    "status": action_record.get("status"),
-                    "response": action_record.get("response"),
-                    "error": action_record.get("error"),
-                }
-            )
+            append_journal_v2({
+                "ts": time.time(),
+                "source": "scheduler_v2",
+                "intent_id": intent_id,
+                "ordertxid": action_record.get("ordertxid"),
+                "userref": action_record.get("userref"),
+                "symbol": intent.symbol,
+                "strategy": intent.strategy,
+                "kind": intent.kind,
+                "side": side,
+                "notional": final_notional,
+                "reason": intent.reason,
+                "dry": bool(dry),
+                "status": action_record.get("status"),
+                "response": action_record.get("response"),
+                "error": action_record.get("error"),
+            })
+
+                
         except Exception:
+            # Guard rail: journaling must never crash the scheduler
             pass
 
         actions.append(action_record)
 
-    # ---------------------------------------------------------------
+
+    # ------------------------------------------------------------------
     # Build per-(strategy,symbol) universe summary for debugging
-    # ---------------------------------------------------------------
+    # ------------------------------------------------------------------
     universe_map: Dict[Tuple[str, str], Dict[str, Any]] = {}
 
     def _uni(symbol: str, strategy: str) -> Dict[str, Any]:
@@ -4061,10 +4548,12 @@ def scheduler_run_v2(payload: Dict[str, Any] = Body(default=None)):
             }
         return universe_map[key]
 
+    # Prime universe with all (strat, symbol) pairs from config
     for strat in strats:
         for sym in syms:
             _uni(sym, strat)
 
+    # Fold telemetry into universe_map
     for row in telemetry:
         sym = row.get("symbol")
         strat = row.get("strategy")
@@ -4073,7 +4562,7 @@ def scheduler_run_v2(payload: Dict[str, Any] = Body(default=None)):
         u = _uni(sym, strat)
         kind = row.get("kind")
         source = row.get("source") or ""
-        r = row.get("reason")
+        reason = row.get("reason")
 
         if kind in {"entry", "scale", "entry_skip"}:
             u["had_scan"] = True
@@ -4091,13 +4580,14 @@ def scheduler_run_v2(payload: Dict[str, Any] = Body(default=None)):
             u["blocked_by_cap"] = True
         if source == "risk_engine.is_loss_zone_norebuy_block":
             u["blocked_by_loss_zone"] = True
-        if isinstance(r, str) and r.startswith("below_min_notional:"):
+        if isinstance(reason, str) and reason.startswith("below_min_notional:"):
             u["below_min_notional"] = True
 
-        if r:
-            tag = f"{source}:{r}" if source else str(r)
+        if reason:
+            tag = f"{source}:{reason}" if source else str(reason)
             u["reasons"].append(tag)
 
+    # Fold actions into universe_map
     for act in actions:
         sym = act.get("symbol")
         strat = act.get("strategy")
@@ -4110,26 +4600,41 @@ def scheduler_run_v2(payload: Dict[str, Any] = Body(default=None)):
         elif status == "skipped_dry_run":
             u["actions_dry"] += 1
 
+    # Finalize universe list (dedupe reasons)
     universe: List[Dict[str, Any]] = []
     for (sym, strat), u in universe_map.items():
-        seen: set = set()
-        uniq: List[str] = []
+        seen_reasons = set()
+        uniq_reasons: List[str] = []
         for r in u.get("reasons", []):
-            if r not in seen:
-                uniq.append(r)
-                seen.add(r)
-        u["reasons"] = uniq
+            if r not in seen_reasons:
+                uniq_reasons.append(r)
+                seen_reasons.add(r)
+        u["reasons"] = uniq_reasons
         universe.append(u)
 
-    # ---------------------------------------------------------------
-    # Persist telemetry rows (best-effort)
-    # ---------------------------------------------------------------
+    # ------------------------------------------------------------------
+    # FINAL RETURN — log telemetry, then respond
+    # ------------------------------------------------------------------
     try:
+        # Log telemetry for offline Advisor v2 analysis.
+        # We log regardless of dry/live, but the rows themselves include any
+        # dry/run flags you added at the source.
         _append_telemetry_rows(telemetry)
     except Exception as e:
+        # Never let telemetry logging break the API
         log.warning("scheduler_v2: failed to log telemetry: %s", e)
 
-    return {"ok": True, "dry": bool(dry), "config": config_snapshot, "actions": actions, "telemetry": telemetry, "universe": universe}
+    return {
+        "ok": True,
+        "dry": bool(dry),
+        "config": config_snapshot,
+        "actions": actions,
+        "telemetry": telemetry,
+        "universe": universe,
+    }
+
+
+# ---- New core debug endpoint) ------------------------------------------------------------        
         
 @app.post("/scheduler/core_debug")
 def scheduler_core_debug(payload: Dict[str, Any] = Body(default=None)):
