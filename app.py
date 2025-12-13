@@ -157,7 +157,81 @@ from pydantic import BaseModel
 # Version / Logging
 # --------------------------------------------------------------------------------------
 
-APP_VERSION = "1.13.0"
+APP_VERSION = "1.13.1"
+
+# ---------------------------------------------------------------------------
+# Safety + attribution helpers (v1.13.1)
+# ---------------------------------------------------------------------------
+FLATTEN_EMIT_PATH = os.getenv('FLATTEN_EMIT_PATH', '/var/data/flatten_emit.json')
+LAST_PRICE_CACHE_PATH = os.getenv('LAST_PRICE_CACHE_PATH', '/var/data/last_price_cache.json')
+
+def _json_load(path: str, default: Any) -> Any:
+    try:
+        with open(path, 'r', encoding='utf-8') as f:
+            return json.load(f)
+    except Exception:
+        return default
+
+def _json_save(path: str, data: Any) -> None:
+    tmp = f"{path}.tmp"
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+    except Exception:
+        pass
+    with open(tmp, 'w', encoding='utf-8') as f:
+        json.dump(data, f, sort_keys=True)
+    os.replace(tmp, path)
+
+def _flatten_emit_allowed(strategy: Optional[str], symbol: str, now_ts: float, *,
+                          max_attempts: int = 3, min_interval_sec: int = 1800) -> bool:
+    """Rate-limit repeated flatten intents so we don't hammer the account."""
+    if not strategy:
+        strategy = 'unknown'
+    day = datetime.datetime.utcfromtimestamp(now_ts).strftime('%Y-%m-%d')
+    key = f"{strategy}|{symbol}"
+    data = _json_load(FLATTEN_EMIT_PATH, {'day': day, 'items': {}})
+    if data.get('day') != day:
+        data = {'day': day, 'items': {}}
+    items = data.get('items', {})
+    rec = items.get(key, {'n': 0, 'last_ts': 0.0})
+    n = int(rec.get('n', 0))
+    last_ts = float(rec.get('last_ts', 0.0))
+    if n >= max_attempts:
+        return False
+    if (now_ts - last_ts) < float(min_interval_sec):
+        return False
+    rec = {'n': n + 1, 'last_ts': now_ts}
+    items[key] = rec
+    data['items'] = items
+    try:
+        _json_save(FLATTEN_EMIT_PATH, data)
+    except Exception:
+        # If we can't persist, fail open (still flatten).
+        return True
+    return True
+
+def _ticker_last_cached(symbol: str, *, ttl_sec: int = 60) -> float:
+    """Best-effort last price via Kraken public ticker with a small on-disk cache."""
+    now = time.time()
+    cache = _json_load(LAST_PRICE_CACHE_PATH, {})
+    rec = cache.get(symbol) or {}
+    try:
+        if (now - float(rec.get('ts', 0.0))) <= ttl_sec:
+            return float(rec.get('px', 0.0))
+    except Exception:
+        pass
+    try:
+        # kraken_public_ticker_last is defined later; call via globals()
+        fn = globals().get('kraken_public_ticker_last')
+        px = float(fn(symbol)) if fn else 0.0
+    except Exception:
+        px = 0.0
+    cache[symbol] = {'ts': now, 'px': px}
+    try:
+        _json_save(LAST_PRICE_CACHE_PATH, cache)
+    except Exception:
+        pass
+    return px
 
 logging.basicConfig(
     level=logging.INFO,
@@ -3300,6 +3374,18 @@ def scheduler_run(payload: Dict[str, Any] = Body(default=None)):
                             act["status"] = "dry_ok"
                         else:
                             try:
+                                # HARD GATE: do not place entry orders without a strategy tag
+                                try:
+                                    _strategy = strat
+                                except Exception:
+                                    _strategy = None
+                                if intent.startswith('open') and not _strategy:
+                                    log.warning('BLOCK open without strategy tag: symbol=%s intent=%s', symbol, intent)
+                                    return {'ok': False, 'blocked': True, 'reason': 'missing_strategy_tag'}
+                                # Pair-level risk dampener (does not disable strategy): reduce size on problematic pairs
+                                if intent.startswith('open') and _strategy == 'c2' and symbol in ('BCH/USD','ADA/USD'):
+                                    mult = float(os.getenv('C2_RISK_MULT_BCH_ADA', '0.25'))
+                                    notional_value = float(notional_value) * max(0.0, mult)
                                 resp = br.market_notional(symbol, side, notional_value, strategy=strat)
                                 act["status"] = "live_ok"
                                 act["broker"] = resp
