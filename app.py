@@ -157,7 +157,7 @@ from pydantic import BaseModel
 # Version / Logging
 # --------------------------------------------------------------------------------------
 
-APP_VERSION = "1.12.9"
+APP_VERSION = "1.12.9-hotfix.1"
 
 logging.basicConfig(
     level=logging.INFO,
@@ -4123,22 +4123,22 @@ def scheduler_run_v2(payload: Dict[str, Any] = Body(default=None)):
                     vals.append(row[key])
         return vals
 
-def _normalize_symbol_for_bars(sym: str) -> str:
-        # If br_router has a normalizer, use it
-        try:
-            if br is not None and hasattr(br, "normalize_symbol"):
-                return str(br.normalize_symbol(sym))
-        except Exception:
-            pass
-
-        # Minimal Kraken altname fixups (common offenders)
-        if sym == "XLTCZ/USD":
-            return "LTC/USD"
-        if sym == "XXRPZ/USD":
-            return "XRP/USD"
-        return sym
-
-
+    def _normalize_symbol_for_bars(sym: str) -> str:
+            # If br_router has a normalizer, use it
+            try:
+                if br is not None and hasattr(br, "normalize_symbol"):
+                    return str(br.normalize_symbol(sym))
+            except Exception:
+                pass
+    
+            # Minimal Kraken altname fixups (common offenders)
+            if sym == "XLTCZ/USD":
+                return "LTC/USD"
+            if sym == "XXRPZ/USD":
+                return "XRP/USD"
+            return sym
+    
+    
     for sym in syms:
         sym_can = _canon_symbol(sym)
         try:
