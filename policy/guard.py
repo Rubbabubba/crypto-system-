@@ -83,6 +83,9 @@ def load_policy(cfg_dir: Optional[str] = None) -> Policy:
         if isinstance(wlist_raw, dict):
             for strat, items in wlist_raw.items():
                 s = _norm_strategy(strat)
+    if not s:
+        return False, "missing_strategy"
+
                 if items == "*" or (isinstance(items, str) and items.strip() == "*"):
                     whitelist[s] = {"*"}
                 else:
@@ -193,7 +196,7 @@ def guard_allows(strategy: str, symbol: str, now: Optional[datetime] = None) -> 
     # --------------------
     # Hard blocks: avoid list
     # --------------------
-    avoid_set = _load_avoid_set()
+    avoid_set, avoid_by_strategy = _load_avoid_set()
     if sym in avoid_set:
         return False, "in_avoid_pairs"
 
@@ -234,34 +237,79 @@ def filter_allowed_now(strategies: Iterable[str], symbols: Iterable[str], now: O
 from functools import lru_cache
 
 @lru_cache(maxsize=1)
-def _load_avoid_set() -> Set[str]:
-    """
-    Load the normalized avoid list (e.g. avoid_pairs) from risk.json.
-    Returned symbols are normalized the same way as _norm_symbol.
-    """
-    cfg = load_risk_config()
-    avoid: Set[str] = set()
+def _load_avoid_set() -> tuple[set[str], dict[str, set[str]]]:
+    """Load avoid-pairs configuration.
 
-    # Handle either "avoid_pairs" (preferred) or legacy "avoid" structures
-    raw = cfg.get("avoid_pairs") or cfg.get("avoid") or []
-    # raw might be a list, set, tuple, or dict
-    if isinstance(raw, dict):
-        # Support either {"symbols": [...]} or {"pairs": [...]} etc.
-        if "symbols" in raw and isinstance(raw["symbols"], (list, tuple, set)):
-            raw = raw["symbols"]
-        elif "pairs" in raw and isinstance(raw["pairs"], (list, tuple, set)):
-            raw = raw["pairs"]
+    Backwards compatible formats (in risk.json key: "avoid_pairs"):
+
+    1) List[str] -> global avoid list
+       {"avoid_pairs": ["BTC/USD", "ETH/USD"]}
+
+    2) Dict -> global + per-strategy
+       {"avoid_pairs": {"global": [...], "by_strategy": {"c2": ["ADA/USD"]}}}
+
+    3) List[dict] entries w/ optional strategy and until
+       {"avoid_pairs": [{"symbol":"ADA/USD","strategy":"c2","until":"2025-12-14T20:00:00Z"}]}
+
+    Any entry with an "until" timestamp in the past is ignored.
+    """
+    raw = (_RISK_CFG or {}).get("avoid_pairs", [])
+    now = datetime.now(timezone.utc)
+
+    global_set: set[str] = set()
+    by_strategy: dict[str, set[str]] = {}
+
+    def _is_active(until_val) -> bool:
+        if not until_val:
+            return True
+        try:
+            if isinstance(until_val, (int, float)):
+                until_dt = datetime.fromtimestamp(float(until_val), tz=timezone.utc)
+            else:
+                s = str(until_val).strip()
+                if s.endswith("Z"):
+                    s = s[:-1] + "+00:00"
+                until_dt = datetime.fromisoformat(s)
+                if until_dt.tzinfo is None:
+                    until_dt = until_dt.replace(tzinfo=timezone.utc)
+                else:
+                    until_dt = until_dt.astimezone(timezone.utc)
+            return until_dt > now
+        except Exception:
+            # If we can't parse it, treat as active
+            return True
+
+    def _add(sym: str, strat: Optional[str] = None):
+        n = _norm_symbol(sym)
+        if strat and isinstance(strat, str) and strat.strip():
+            k = strat.strip()
+            by_strategy.setdefault(k, set()).add(n)
         else:
-            raw = list(raw.values())
+            global_set.add(n)
 
-    if isinstance(raw, (list, tuple, set)):
-        for s in raw:
-            if isinstance(s, str):
-                avoid.add(_norm_symbol(s))
+    if isinstance(raw, dict):
+        for sym in raw.get("global", []) or []:
+            _add(sym)
+        bs = raw.get("by_strategy", {}) or {}
+        if isinstance(bs, dict):
+            for strat, syms in bs.items():
+                for sym in (syms or []):
+                    _add(sym, strat)
+    elif isinstance(raw, list):
+        for item in raw:
+            if isinstance(item, str):
+                _add(item)
+            elif isinstance(item, dict):
+                sym = item.get("symbol") or item.get("sym") or item.get("pair")
+                if not sym:
+                    continue
+                if not _is_active(item.get("until")):
+                    continue
+                _add(sym, item.get("strategy"))
+    # else: unknown type -> ignore
 
-    return avoid
+    return global_set, by_strategy
 
-@lru_cache(maxsize=1)
 def load_risk_config(cfg_dir: Optional[str] = None) -> dict:
     """
     Load risk.json from a config directory.
