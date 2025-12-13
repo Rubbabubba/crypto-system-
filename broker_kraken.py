@@ -76,20 +76,20 @@ _STRATEGY_TO_USERREF: Dict[str, int] = _load_strategy_to_userref()
 def _userref_for_strategy(strategy: Optional[str]) -> int:
     """Resolve a stable Kraken userref for a given strategy.
 
-    If a mapping is present in policy_config/userref_map.json, use it.
-    Otherwise, fall back to a deterministic minute-based hash so orders
-    still get some userref for correlation.
+    We require a non-empty strategy tag for all orders so fills can be
+    reliably attributed back to strategy. Prefer explicit mappings from
+    policy_config/userref_map.json; otherwise fall back to a deterministic
+    stable hash of the strategy string.
     """
-    if isinstance(strategy, str):
-        key = strategy.strip()
-        if key in _STRATEGY_TO_USERREF:
-            return _STRATEGY_TO_USERREF[key]
+    if not isinstance(strategy, str) or not strategy.strip():
+        raise ValueError("missing strategy tag for order (strategy is required)")
+    key = strategy.strip()
+    if key in _STRATEGY_TO_USERREF:
+        return int(_STRATEGY_TO_USERREF[key])
 
-    # Fallback: deterministic per-minute hash on strategy name
-    minute = int(time.time() // 60)
-    h = hash(((strategy or "x"), minute))
+    # Stable deterministic fallback (no time component)
+    h = hash(key)
     return int(h & 0x7FFFFFFF)
-
 
 import requests
 
