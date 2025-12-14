@@ -83,8 +83,8 @@ def load_policy(cfg_dir: Optional[str] = None) -> Policy:
         if isinstance(wlist_raw, dict):
             for strat, items in wlist_raw.items():
                 s = _norm_strategy(strat)
-    if not s:
-        return False, "missing_strategy"
+                if not s:
+                    continue
 
                 if items == "*" or (isinstance(items, str) and items.strip() == "*"):
                     whitelist[s] = {"*"}
