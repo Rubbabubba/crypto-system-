@@ -157,7 +157,7 @@ from pydantic import BaseModel
 # Version / Logging
 # --------------------------------------------------------------------------------------
 
-APP_VERSION = "1.12.9-hotfix.1"
+APP_VERSION = "2.0.0-hotfix.1"
 
 logging.basicConfig(
     level=logging.INFO,
@@ -424,6 +424,11 @@ def _extract_ordertxid_userref_from_resp(resp: Any) -> Tuple[Optional[str], Opti
 
     # candidates to search
     cands = [resp]
+    # br_router.market_notional commonly wraps broker response under 'order'
+    if isinstance(resp.get("order"), dict):
+        cands.append(resp["order"])
+        if isinstance(resp["order"].get("result"), dict):
+            cands.append(resp["order"]["result"])
     if isinstance(resp.get("result"), dict):
         cands.append(resp["result"])
     if isinstance(resp.get("data"), dict):
