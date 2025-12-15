@@ -157,7 +157,7 @@ from pydantic import BaseModel
 # Version / Logging
 # --------------------------------------------------------------------------------------
 
-APP_VERSION = "2.0.0-hotfix.1"
+APP_VERSION = "2.0.0-hotfix.2"
 
 logging.basicConfig(
     level=logging.INFO,
@@ -1503,7 +1503,7 @@ def journal_sync(payload: Dict[str, Any] = Body(default=None)):
     if new_cursor_ts:
         _write_journal_cursor(new_cursor_ts, {
             "last_start_ts": int(start_ts0),
-            "last_run_pulled": int(total_pulled),
+            "last_run_pulled": int(pulled),
             "last_run_pages": int(pages),
             "cursor_source": cursor_source,
         })
