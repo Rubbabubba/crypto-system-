@@ -253,7 +253,7 @@ def _load_avoid_set() -> tuple[set[str], dict[str, set[str]]]:
 
     Any entry with an "until" timestamp in the past is ignored.
     """
-    raw = (_RISK_CFG or {}).get("avoid_pairs", [])
+    raw = (load_risk_config() or {}).get("avoid_pairs", [])
     now = datetime.now(timezone.utc)
 
     global_set: set[str] = set()
