@@ -157,7 +157,7 @@ from pydantic import BaseModel
 # Version / Logging
 # --------------------------------------------------------------------------------------
 
-APP_VERSION = "2.0.0-hotfix.2"
+APP_VERSION = "2.0.0-hotfix.3"
 
 logging.basicConfig(
     level=logging.INFO,
@@ -1257,278 +1257,288 @@ def journal_backfill(payload: Dict[str, Any] = Body(default=None)):
 
 @app.post("/journal/sync")
 def journal_sync(payload: Dict[str, Any] = Body(default=None)):
-    """
-    Pull trades from Kraken TradesHistory and upsert into sqlite.
+    try:
+        """
+        Pull trades from Kraken TradesHistory and upsert into sqlite.
 
-    Payload:
-      - since_hours: int (default 72)
-      - limit: int (default 50000) maximum rows to write this call
-      - dry_run: bool (optional) if true, do not write
+        Payload:
+          - since_hours: int (default 72)
+          - limit: int (default 50000) maximum rows to write this call
+          - dry_run: bool (optional) if true, do not write
 
-    Strategy:
-      1) ofs paging
-      2) if plateau or rate-limited, fallback to time-cursor paging
-      Both phases use retry with exponential backoff on 'EAPI:Rate limit exceeded'
-    """
-    import time, json as _json, math as _math
+        Strategy:
+          1) ofs paging
+          2) if plateau or rate-limited, fallback to time-cursor paging
+          Both phases use retry with exponential backoff on 'EAPI:Rate limit exceeded'
+        """
+        import time, json as _json, math as _math
 
-    payload     = payload or {}
-    dry_run     = bool(payload.get("dry_run", False))
-    since_hours = int(payload.get("since_hours", 72) or 72)
-    hard_limit  = int(payload.get("limit", 50000) or 50000)
+        payload     = payload or {}
+        dry_run     = bool(payload.get("dry_run", False))
+        since_hours = int(payload.get("since_hours", 72) or 72)
+        hard_limit  = int(payload.get("limit", 50000) or 50000)
 
-    key, sec, *_ = _kraken_creds()
-    if not (key and sec):
-        return {"ok": False, "error": "missing_credentials"}
+        key, sec, *_ = _kraken_creds()
+        if not (key and sec):
+            return {"ok": False, "error": "missing_credentials"}
 
-    # pacing + retries from env
-    min_delay   = float(os.getenv("KRAKEN_MIN_DELAY", "0.35") or 0.35)   # base delay between calls
-    max_retries = int(os.getenv("KRAKEN_MAX_RETRIES", "6") or 6)         # backoff retries per call
+        # pacing + retries from env
+        min_delay   = float(os.getenv("KRAKEN_MIN_DELAY", "0.35") or 0.35)   # base delay between calls
+        max_retries = int(os.getenv("KRAKEN_MAX_RETRIES", "6") or 6)         # backoff retries per call
 
-    def _sleep_base():
-        time.sleep(min_delay)
+        def _sleep_base():
+            time.sleep(min_delay)
 
-    def _kraken_call(payload):
-        """TradesHistory with backoff on rate limit"""
-        delay = min_delay
-        for attempt in range(max_retries + 1):
-            resp = kraken_private("TradesHistory", payload, key, sec)
-            if not (isinstance(resp, dict) and resp.get("error")):
-                return resp
-            errs = resp.get("error") or []
-            is_rl = any("rate limit" in str(e).lower() for e in errs)
-            if not is_rl:
-                # non rate-limit error: return as-is
-                return resp
-            # rate limited -> exponential backoff with jitter
-            time.sleep(delay)
-            delay = min(delay * 1.7, 8.0)
-        return resp  # return last resp (still error)
+        def _kraken_call(payload):
+            """TradesHistory with backoff on rate limit"""
+            delay = min_delay
+            for attempt in range(max_retries + 1):
+                resp = kraken_private("TradesHistory", payload, key, sec)
+                if not (isinstance(resp, dict) and resp.get("error")):
+                    return resp
+                errs = resp.get("error") or []
+                is_rl = any("rate limit" in str(e).lower() for e in errs)
+                if not is_rl:
+                    # non rate-limit error: return as-is
+                    return resp
+                # rate limited -> exponential backoff with jitter
+                time.sleep(delay)
+                delay = min(delay * 1.7, 8.0)
+            return resp  # return last resp (still error)
 
-    cursor_blob = _read_journal_cursor()
-    cursor_ts = cursor_blob.get("last_seen_ts")
-    now_ts = int(time.time())
-    fallback_ts = now_ts - int(since_hours) * 3600
-    if cursor_ts:
-        # Best practice: always fetch since (last_seen_ts - safety buffer)
-        start_ts0 = max(0, int(cursor_ts) - JOURNAL_SAFETY_BUFFER_SECONDS)
-        cursor_source = "cursor"
-    else:
-        start_ts0 = fallback_ts
-        cursor_source = "since_hours"
+        cursor_blob = _read_journal_cursor()
+        cursor_ts = cursor_blob.get("last_seen_ts")
+        now_ts = int(time.time())
+        fallback_ts = now_ts - int(since_hours) * 3600
+        if cursor_ts:
+            # Best practice: always fetch since (last_seen_ts - safety buffer)
+            start_ts0 = max(0, int(cursor_ts) - JOURNAL_SAFETY_BUFFER_SECONDS)
+            cursor_source = "cursor"
+        else:
+            start_ts0 = fallback_ts
+            cursor_source = "since_hours"
 
-    UPSERT_SQL = """
-    INSERT INTO trades (
-        txid, ts, pair, symbol, side, price, volume, cost, fee,
-        userref, ordertxid, intent_id, strategy, inserted_at, raw
-    )
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?,
-            ?, ?, ?, ?, ?, ?)
-    ON CONFLICT(txid) DO UPDATE SET
-        ts        = excluded.ts,
-        pair      = COALESCE(excluded.pair, trades.pair),
-        symbol    = excluded.symbol,
-        side      = excluded.side,
-        price     = excluded.price,
-        volume    = excluded.volume,
-        cost      = COALESCE(excluded.cost, trades.cost),
-        fee       = excluded.fee,
-        userref   = COALESCE(excluded.userref, trades.userref),
-        ordertxid = COALESCE(excluded.ordertxid, trades.ordertxid),
-        intent_id = COALESCE(trades.intent_id, excluded.intent_id),
-        strategy  = COALESCE(trades.strategy, excluded.strategy),
-        inserted_at = COALESCE(trades.inserted_at, excluded.inserted_at),
-        raw       = excluded.raw
-    """
-
-
-    def flush_batch(batch):
-        if dry_run or not batch:
-            return 0
-        conn = _db(); cur = conn.cursor()
-        cur.executemany(UPSERT_SQL, batch)
-        conn.commit()
-        n = len(batch)
-        conn.close()
-        return n
-
-    def map_row(txid, t):
-        try:
-            ts = float(t.get("time")) if t.get("time") is not None else None
-        except Exception:
-            ts = None
-
-        pair_raw = t.get("pair") or ""
-        symbol = from_kraken_pair_to_app(pair_raw)
-        side = t.get("type")
-
-        def _f(x):
-            try:
-                return float(x) if x is not None else None
-            except Exception:
-                return None
-
-        price  = _f(t.get("price"))
-        volume = _f(t.get("vol"))
-        cost   = _f(t.get("cost"))
-        fee    = _f(t.get("fee"))
-
-        # Kraken TradesHistory includes ordertxid
-        ordertxid = t.get("ordertxid")
-
-        # userref usually not present in TradesHistory; keep if it is (or if you add it later)
-        userref = t.get("userref")
-
-        raw = _json.dumps(t, separators=(",", ":"), ensure_ascii=False, default=str)
-        inserted_at = time.time()
-
-        return (
-            str(txid), ts, pair_raw, symbol, side, price, volume, cost, fee,
-            (int(userref) if userref is not None else None),
-            (str(ordertxid) if ordertxid else None),
-            None,  # intent_id will be reconciled from journal_v2
-            None,  # strategy will be reconciled from journal_v2 (or manual attach)
-            inserted_at,
-            raw
+        UPSERT_SQL = """
+        INSERT INTO trades (
+            txid, ts, pair, symbol, side, price, volume, cost, fee,
+            userref, ordertxid, intent_id, strategy, inserted_at, raw
         )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?,
+                ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(txid) DO UPDATE SET
+            ts        = excluded.ts,
+            pair      = COALESCE(excluded.pair, trades.pair),
+            symbol    = excluded.symbol,
+            side      = excluded.side,
+            price     = excluded.price,
+            volume    = excluded.volume,
+            cost      = COALESCE(excluded.cost, trades.cost),
+            fee       = excluded.fee,
+            userref   = COALESCE(excluded.userref, trades.userref),
+            ordertxid = COALESCE(excluded.ordertxid, trades.ordertxid),
+            intent_id = COALESCE(trades.intent_id, excluded.intent_id),
+            strategy  = COALESCE(trades.strategy, excluded.strategy),
+            inserted_at = COALESCE(trades.inserted_at, excluded.inserted_at),
+            raw       = excluded.raw
+        """
 
 
-    total_writes = 0
-    total_pulled = 0
-    pages        = 0
-    kraken_count = None
-    last_seen_ts = None
-    notes        = []
+        def flush_batch(batch):
+            if dry_run or not batch:
+                return 0
+            conn = _db(); cur = conn.cursor()
+            cur.executemany(UPSERT_SQL, batch)
+            conn.commit()
+            n = len(batch)
+            conn.close()
+            return n
 
-    # ---------- Phase A: ofs paging ----------
-    start_ts = start_ts0
-    ofs      = 0
-    plateau  = False
-
-    while True:
-        _sleep_base()
-        resp = _kraken_call({"start": start_ts, "ofs": ofs})
-        if isinstance(resp, dict) and resp.get("error"):
-            notes.append({"phase":"ofs","ofs":ofs,"error":resp.get("error")})
-            plateau = True
-            break
-
-        res    = (resp.get("result") or {}) if isinstance(resp, dict) else {}
-        trades = res.get("trades") or {}
-        kraken_count = res.get("count", kraken_count)
-        keys = list(trades.keys())
-        if not keys:
-            break
-
-        pages += 1
-        total_pulled += len(keys)
-
-        batch = [map_row(txid, trades[txid]) for txid in keys]
-        total_writes += flush_batch(batch)
-
-        # track max ts for cursor fallback
-        for txid in keys:
-            t = trades[txid]
+        def map_row(txid, t):
             try:
                 ts = float(t.get("time")) if t.get("time") is not None else None
-                if ts is not None:
-                    if last_seen_ts is None or ts > last_seen_ts:
-                        last_seen_ts = ts
-            except:
-                pass
+            except Exception:
+                ts = None
 
-        ofs += len(keys)
+            pair_raw = t.get("pair") or ""
+            symbol = from_kraken_pair_to_app(pair_raw)
+            side = t.get("type")
 
-        if hard_limit and total_writes >= hard_limit:
-            break
+            def _f(x):
+                try:
+                    return float(x) if x is not None else None
+                except Exception:
+                    return None
 
-        # if we’ve pulled a significant chunk but kraken_count indicates more, fallback
-        if total_pulled >= 600 and (kraken_count or 0) and total_pulled < (kraken_count or 999999):
-            plateau = True
-            break
-        if pages > 300:
-            plateau = True
-            break
+            price  = _f(t.get("price"))
+            volume = _f(t.get("vol"))
+            cost   = _f(t.get("cost"))
+            fee    = _f(t.get("fee"))
 
-    # ---------- Phase B: time-cursor fallback ----------
-    if plateau:
-        cursor = (last_seen_ts or start_ts0)
-        # slight backoff to avoid missing trades with identical timestamps
-        cursor = max((cursor - 0.5) if cursor else start_ts0, 0.0)
-        cursor_pages = 0
+            # Kraken TradesHistory includes ordertxid
+            ordertxid = t.get("ordertxid")
+
+            # userref usually not present in TradesHistory; keep if it is (or if you add it later)
+            userref = t.get("userref")
+
+            raw = _json.dumps(t, separators=(",", ":"), ensure_ascii=False, default=str)
+            inserted_at = time.time()
+
+            return (
+                str(txid), ts, pair_raw, symbol, side, price, volume, cost, fee,
+                (int(userref) if userref is not None else None),
+                (str(ordertxid) if ordertxid else None),
+                None,  # intent_id will be reconciled from journal_v2
+                None,  # strategy will be reconciled from journal_v2 (or manual attach)
+                inserted_at,
+                raw
+            )
+
+
+        total_writes = 0
+        total_pulled = 0
+        pages        = 0
+        kraken_count = None
+        last_seen_ts = None
+        notes        = []
+
+        # ---------- Phase A: ofs paging ----------
+        start_ts = start_ts0
+        ofs      = 0
+        plateau  = False
 
         while True:
             _sleep_base()
-            payload = {"start": int(_math.floor(cursor)), "ofs": 0}
-            resp = _kraken_call(payload)
+            resp = _kraken_call({"start": start_ts, "ofs": ofs})
             if isinstance(resp, dict) and resp.get("error"):
-                notes.append({"phase":"cursor","cursor":cursor,"error":resp.get("error")})
+                notes.append({"phase":"ofs","ofs":ofs,"error":resp.get("error")})
+                plateau = True
                 break
 
             res    = (resp.get("result") or {}) if isinstance(resp, dict) else {}
             trades = res.get("trades") or {}
-            keys   = list(trades.keys())
+            kraken_count = res.get("count", kraken_count)
+            keys = list(trades.keys())
             if not keys:
                 break
 
-            # sort by time so we can advance cursor deterministically
-            keys.sort(key=lambda k: trades[k].get("time") or 0)
-            pages        += 1
-            cursor_pages += 1
+            pages += 1
             total_pulled += len(keys)
 
             batch = [map_row(txid, trades[txid]) for txid in keys]
             total_writes += flush_batch(batch)
 
-            max_ts = max([trades[k].get("time") or cursor for k in keys])
-            cursor = float(max_ts) + 0.5  # nudge ahead
+            # track max ts for cursor fallback
+            for txid in keys:
+                t = trades[txid]
+                try:
+                    ts = float(t.get("time")) if t.get("time") is not None else None
+                    if ts is not None:
+                        if last_seen_ts is None or ts > last_seen_ts:
+                            last_seen_ts = ts
+                except:
+                    pass
+
+            ofs += len(keys)
 
             if hard_limit and total_writes >= hard_limit:
                 break
-            if cursor_pages > 600:
-                notes.append({"phase":"cursor","stopped":"cursor_pages_guard"})
+
+            # if we’ve pulled a significant chunk but kraken_count indicates more, fallback
+            if total_pulled >= 600 and (kraken_count or 0) and total_pulled < (kraken_count or 999999):
+                plateau = True
+                break
+            if pages > 300:
+                plateau = True
                 break
 
-    # Count rows post-write
-    try:
-        conn = _db(); cur = conn.cursor()
-        total_rows = cur.execute("SELECT COUNT(*) FROM trades").fetchone()[0]
-        conn.close()
-    except Exception as e:
-        total_rows = None
-        notes.append({"post_count_error": str(e)})
-        
-    # Persist watermark cursor so redeploys don't lose attribution window
-    new_cursor_ts = max(int(cursor_ts or 0), int(last_seen_ts or 0))
-    if new_cursor_ts:
-        _write_journal_cursor(new_cursor_ts, {
-            "last_start_ts": int(start_ts0),
-            "last_run_pulled": int(pulled),
-            "last_run_pages": int(pages),
-            "cursor_source": cursor_source,
-        })
-    recon = reconcile_trade_attribution()
+        # ---------- Phase B: time-cursor fallback ----------
+        if plateau:
+            cursor = (last_seen_ts or start_ts0)
+            # slight backoff to avoid missing trades with identical timestamps
+            cursor = max((cursor - 0.5) if cursor else start_ts0, 0.0)
+            cursor_pages = 0
 
-    return {
-        "ok": True,
-        "dry_run": dry_run,
-        "count": total_writes,
-        "reconcile": recon,
-        "debug": {
-            "creds_present": True,
-            "since_hours": since_hours,
-            "cursor_source": cursor_source,
-            "cursor_file_ts": cursor_ts,
-            "start_ts": start_ts0,
-            "start_iso": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(start_ts0)),
-            "pages": pages,
-            "pulled": total_pulled,
-            "kraken_count": kraken_count,
-            "hard_limit": hard_limit,
-            "post_total_rows": total_rows,
-            "notes": notes
+            while True:
+                _sleep_base()
+                payload = {"start": int(_math.floor(cursor)), "ofs": 0}
+                resp = _kraken_call(payload)
+                if isinstance(resp, dict) and resp.get("error"):
+                    notes.append({"phase":"cursor","cursor":cursor,"error":resp.get("error")})
+                    break
+
+                res    = (resp.get("result") or {}) if isinstance(resp, dict) else {}
+                trades = res.get("trades") or {}
+                keys   = list(trades.keys())
+                if not keys:
+                    break
+
+                # sort by time so we can advance cursor deterministically
+                keys.sort(key=lambda k: trades[k].get("time") or 0)
+                pages        += 1
+                cursor_pages += 1
+                total_pulled += len(keys)
+
+                batch = [map_row(txid, trades[txid]) for txid in keys]
+                total_writes += flush_batch(batch)
+
+                max_ts = max([trades[k].get("time") or cursor for k in keys])
+                cursor = float(max_ts) + 0.5  # nudge ahead
+
+                if hard_limit and total_writes >= hard_limit:
+                    break
+                if cursor_pages > 600:
+                    notes.append({"phase":"cursor","stopped":"cursor_pages_guard"})
+                    break
+
+        # Count rows post-write
+        try:
+            conn = _db(); cur = conn.cursor()
+            total_rows = cur.execute("SELECT COUNT(*) FROM trades").fetchone()[0]
+            conn.close()
+        except Exception as e:
+            total_rows = None
+            notes.append({"post_count_error": str(e)})
+        
+        # Persist watermark cursor so redeploys don't lose attribution window
+        new_cursor_ts = max(int(cursor_ts or 0), int(last_seen_ts or 0))
+        if new_cursor_ts:
+            _write_journal_cursor(new_cursor_ts, {
+                "last_start_ts": int(start_ts0),
+                "last_run_pulled": int(total_pulled),
+                "last_run_pages": int(pages),
+                "cursor_source": cursor_source,
+            })
+        recon = reconcile_trade_attribution()
+
+        return {
+            "ok": True,
+            "dry_run": dry_run,
+            "count": total_writes,
+            "reconcile": recon,
+            "debug": {
+                "creds_present": True,
+                "since_hours": since_hours,
+                "cursor_source": cursor_source,
+                "cursor_file_ts": cursor_ts,
+                "start_ts": start_ts0,
+                "start_iso": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(start_ts0)),
+                "pages": pages,
+                "pulled": total_pulled,
+                "kraken_count": kraken_count,
+                "hard_limit": hard_limit,
+                "post_total_rows": total_rows,
+                "notes": notes
+            }
         }
-    }
+
+    except Exception as e:
+        import traceback
+        tb = traceback.format_exc()
+        try:
+            logger.exception('journal_sync failed')
+        except Exception:
+            pass
+        return {"ok": False, "error": str(e), "trace": tb}
 
 DAILY_JSON = os.path.join(DATA_DIR, "daily.json")
 
