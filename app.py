@@ -208,6 +208,38 @@ def _pick_data_dir() -> Path:
 DATA_DIR = _pick_data_dir()
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 DB_PATH = DATA_DIR / "journal.db"
+# --- Journal sync watermark cursor (persisted on disk) ---
+JOURNAL_CURSOR_PATH = DATA_DIR / "journal_cursor.json"
+JOURNAL_SAFETY_BUFFER_SECONDS = int(os.getenv("JOURNAL_SAFETY_BUFFER_SECONDS", "3600"))
+
+def _read_journal_cursor() -> dict:
+    """Best-effort read of journal cursor file. Returns {} on any error."""
+    try:
+        if JOURNAL_CURSOR_PATH.exists():
+            return json.loads(JOURNAL_CURSOR_PATH.read_text(encoding="utf-8"))
+    except Exception:
+        pass
+    return {}
+
+def _write_journal_cursor(last_seen_ts: int, extra: dict | None = None) -> None:
+    """Atomic-ish best-effort write of journal cursor file. Never raises."""
+    try:
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "last_seen_ts": int(last_seen_ts),
+            "updated_at": int(time.time()),
+            "updated_iso": datetime.datetime.utcnow().replace(microsecond=0).isoformat() + "Z",
+        }
+        if extra:
+            try:
+                payload.update(extra)
+            except Exception:
+                pass
+        tmp = JOURNAL_CURSOR_PATH.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(payload, sort_keys=True), encoding="utf-8")
+        tmp.replace(JOURNAL_CURSOR_PATH)
+    except Exception:
+        pass
 
 # ----------------------------------------------------------------------
 # Journal v2: append-only JSONL log written directly from scheduler_v2
@@ -1273,7 +1305,17 @@ def journal_sync(payload: Dict[str, Any] = Body(default=None)):
             delay = min(delay * 1.7, 8.0)
         return resp  # return last resp (still error)
 
-    start_ts0 = int(time.time() - since_hours * 3600)
+    cursor_blob = _read_journal_cursor()
+    cursor_ts = cursor_blob.get("last_seen_ts")
+    now_ts = int(time.time())
+    fallback_ts = now_ts - int(since_hours) * 3600
+    if cursor_ts:
+        # Best practice: always fetch since (last_seen_ts - safety buffer)
+        start_ts0 = max(0, int(cursor_ts) - JOURNAL_SAFETY_BUFFER_SECONDS)
+        cursor_source = "cursor"
+    else:
+        start_ts0 = fallback_ts
+        cursor_source = "since_hours"
 
     UPSERT_SQL = """
     INSERT INTO trades (
@@ -1456,6 +1498,15 @@ def journal_sync(payload: Dict[str, Any] = Body(default=None)):
         total_rows = None
         notes.append({"post_count_error": str(e)})
         
+    # Persist watermark cursor so redeploys don't lose attribution window
+    new_cursor_ts = max(int(cursor_ts or 0), int(last_seen_ts or 0))
+    if new_cursor_ts:
+        _write_journal_cursor(new_cursor_ts, {
+            "last_start_ts": int(start_ts0),
+            "last_run_pulled": int(pulled),
+            "last_run_pages": int(pages),
+            "cursor_source": cursor_source,
+        })
     recon = reconcile_trade_attribution()
 
     return {
@@ -1466,6 +1517,8 @@ def journal_sync(payload: Dict[str, Any] = Body(default=None)):
         "debug": {
             "creds_present": True,
             "since_hours": since_hours,
+            "cursor_source": cursor_source,
+            "cursor_file_ts": cursor_ts,
             "start_ts": start_ts0,
             "start_iso": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(start_ts0)),
             "pages": pages,
