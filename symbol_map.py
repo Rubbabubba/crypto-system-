@@ -12,6 +12,68 @@ KRAKEN_PAIR_MAP = {
     "BCH/USD": "BCHUSD",
 }
 
+
+# Kraken sometimes uses "X"/"Z" prefixed asset codes (e.g., XXBTZUSD, XETHZUSD, XLTCZUSD).
+# These helpers normalize those to UI symbols like "BTC/USD" for journaling/review/reporting.
+_BASE_MAP = {
+    "XBT": "BTC",
+    "BTC": "BTC",
+    "ETH": "ETH",
+    "LTC": "LTC",
+    "BCH": "BCH",
+    "ADA": "ADA",
+    "SOL": "SOL",
+    "DOT": "DOT",
+    "AVAX": "AVAX",
+    "NEAR": "NEAR",
+    "SUI": "SUI",
+    "XRP": "XRP",
+    "XDG": "DOGE",
+    "DOGE": "DOGE",
+}
+
+_KNOWN_QUOTES = ["USDT", "USD", "EUR", "GBP", "CAD", "AUD", "JPY"]
+
+
+def _normalize_base(base: str) -> str:
+    b = (base or "").upper()
+    # Kraken often prefixes crypto assets with leading X (sometimes double X).
+    # Strip leading X only if it helps match a known mapping.
+    while b.startswith("X") and len(b) > 3:
+        cand = b[1:]
+        if cand in _BASE_MAP:
+            b = cand
+        else:
+            break
+    return _BASE_MAP.get(b, b)
+
+
+def _normalize_quote(quote: str) -> str:
+    q = (quote or "").upper()
+    # Kraken sometimes prefixes fiat quotes with Z (e.g., ZUSD, ZEUR)
+    if q.startswith("Z") and len(q) > 1:
+        q = q[1:]
+    return q
+
+
+def kraken_pair_to_ui(pair: str) -> str:
+    """Best-effort conversion of Kraken pair codes to UI symbols (e.g., XLTCZUSD -> LTC/USD)."""
+    p = str(pair or "").upper().replace(" ", "").replace("/", "")
+    if not p:
+        return p
+
+    # Prefer longest quote match (e.g., USDT before USD)
+    for q in sorted(_KNOWN_QUOTES, key=len, reverse=True):
+        # Handle Z-prefixed quotes first (e.g., ZUSD)
+        if p.endswith("Z" + q):
+            base = p[:-(len(q) + 1)]
+            return f"{_normalize_base(base)}/{_normalize_quote(q)}"
+        if p.endswith(q):
+            base = p[:-len(q)]
+            return f"{_normalize_base(base)}/{_normalize_quote(q)}"
+
+    return p
+
 def to_kraken(pair: str) -> str:
     """
     Convert UI pair to Kraken pair. Accepts 'BTC/USD' or 'BTCUSD' and returns the Kraken pair code.
@@ -26,38 +88,14 @@ def to_kraken(pair: str) -> str:
     return KRAKEN_PAIR_MAP.get(s, s.replace("/", ""))  # default: strip slash
 
 def from_kraken(pair: str) -> str:
-    """
-    Convert Kraken pair back to a UI symbol (best-effort).
-    Also normalizes common Kraken asset-code variants like:
-      - XETHZUSD -> ETH/USD
-      - XLTCZUSD -> LTC/USD
-      - XXRPZUSD -> XRP/USD
-      - XBTUSD   -> BTC/USD
-    """
-    p = str(pair or "").upper().replace("/", "").replace(" ", "")
+    """Convert Kraken pair back to a UI symbol (best-effort)."""
+    p = str(pair or "").upper()
     rev = {v: k for k, v in KRAKEN_PAIR_MAP.items()}
+    # Fast path for known explicit mappings
     if p in rev:
         return rev[p]
-
-    # Best-effort decode of Kraken asset codes.
-    # Example: XXRPZUSD -> base=XXRPZ, quote=USD
-    if p.endswith("USD") and len(p) > 3:
-        base = p[:-3]
-        # Strip leading X/XX and trailing Z patterns that Kraken sometimes uses.
-        if base.startswith("XX"):
-            base = base[2:]
-        elif base.startswith("X"):
-            base = base[1:]
-        if base.endswith("Z") and len(base) > 1:
-            base = base[:-1]
-        if base == "XBT":
-            base = "BTC"
-        # If the base is now a simple alpha ticker, normalize to UI form.
-        if base.isalpha():
-            return f"{base}/USD"
-
-    # Fallback: return raw
-    return p
+    # Otherwise, normalize common Kraken pair formats (e.g., XXBTZUSD, XETHZUSD, XLTCZUSD).
+    return kraken_pair_to_ui(p)
 
 def tf_to_kraken(tf: str) -> str:
     """
