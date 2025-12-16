@@ -375,6 +375,36 @@ def reconcile_trade_attribution() -> Dict[str, Any]:
     Safe, idempotent, and fast enough for a sync call.
     """
     attrib = _load_attrib_from_journal_v2()
+
+    # Best-effort fallback: if journal_v2 attribution is missing (or journal_v2 file isn't present),
+    # build an attribution map from existing trades that already have strategy/intent_id.
+    # This lets us backfill newly-pulled Kraken trades that arrive without attribution.
+    if not attrib:
+        try:
+            conn = _db()
+            cur = conn.cursor()
+            cur.execute("""
+                SELECT ordertxid, intent_id, strategy
+                FROM trades
+                WHERE ordertxid IS NOT NULL
+                  AND (intent_id IS NOT NULL OR strategy IS NOT NULL)
+            """)
+            for otx, iid, strat in cur.fetchall():
+                if not otx:
+                    continue
+                rec = attrib.setdefault(str(otx), {})
+                if iid and "intent_id" not in rec:
+                    rec["intent_id"] = str(iid)
+                if strat and "strategy" not in rec:
+                    rec["strategy"] = str(strat)
+        except Exception as e:
+            log.warning("attrib fallback from trades table failed: %s", e)
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
     if not attrib:
         return {"ok": True, "updated": 0, "note": "no_attrib_found"}
 
@@ -549,9 +579,10 @@ def from_kraken_pair_to_app(pair_raw: str) -> str:
     Convert Kraken pair strings into canonical UI symbols (e.g. 'BTC/USD').
 
     Handles:
-      - configured altname mappings (symbol_map.KRAKEN_PAIR_MAP)
+      - configured altname mappings (symbol_map.KRAKEN_PAIR_MAP) when available
       - common Kraken pair codes like 'XBTUSD', 'ETHUSD'
-      - Kraken "wrapped" pair codes like 'XXBTZUSD', 'XETHZUSD', etc.
+      - Kraken "wrapped" pair codes like 'XXBTZUSD', 'XETHZUSD', 'XLTCZUSD', 'XXRPZUSD', etc.
+      - previously-buggy forms like 'XETHZ/USD', 'XLTCZ/USD' (older fallback artifacts)
 
     This function is intentionally defensive: it never throws.
     """
@@ -559,47 +590,65 @@ def from_kraken_pair_to_app(pair_raw: str) -> str:
         return ""
 
     s = str(pair_raw).upper().strip()
-    if not s:
-        return ""
 
-    # 1) Exact match from our configured map (recommended pairs)
-    if s in _REV_KRAKEN_PAIR_MAP:
-        return _REV_KRAKEN_PAIR_MAP[s]
-
-    def _clean_asset(a: str) -> str:
+    # Helper: clean Kraken asset codes.
+    def _kraken_clean_base(a: str) -> str:
         a = (a or "").upper().strip()
         if not a:
             return ""
 
-        # Kraken sometimes wraps assets with a leading X/Z (and occasionally double X/Z).
-        # Examples: XXBT -> XBT, XETH -> ETH, XLTC -> LTC, XXRP -> XRP
-        if len(a) >= 4 and a[0] in "XZ" and a[1] in "XZ":
+        # Strip common leading wrappers: XXBT -> XBT, XETH -> ETH, ZUSD -> USD, etc.
+        while len(a) >= 4 and a[0] in "XZ" and a[1] in "XZ":
             a = a[1:]
 
-        if len(a) == 4 and a[0] in "XZ" and a[1:] in {"XBT","ETH","LTC","XRP","ADA","SOL","AVAX","DOT","LINK","BCH","NEAR","SUI","DOGE"}:
+        # Strip single leading wrapper if present (XETH -> ETH, XLTC -> LTC, XXRP -> XRP)
+        if len(a) >= 4 and a[0] in "XZ":
             a = a[1:]
 
-        # Common edge-case: 'RP' should be XRP (seen in some telemetry/journal rows)
+        # Some wrapped bases include a trailing Z (XETHZ, XLTCZ, XXBTZ, XXRPZ)
+        if len(a) >= 4 and a.endswith("Z"):
+            a = a[:-1]
+
+        # Canonicalize edge-cases
+        if a == "XBT":
+            a = "BTC"
         if a == "RP":
             a = "XRP"
 
-        # Canonicalize XBT -> BTC
-        if a == "XBT":
-            a = "BTC"
-
         return a
+
+    # Normalize any legacy artifact that already contains a slash, like 'XETHZ/USD'
+    if "/" in s:
+        try:
+            base_raw, quote_raw = s.split("/", 1)
+            base = base_raw.strip()
+            quote = quote_raw.strip()
+            if quote == "USD":
+                base = _kraken_clean_base(base)
+                if base:
+                    return f"{base}/USD"
+        except Exception:
+            pass
+
+    # 1) Exact match from our configured map (recommended pairs)
+    try:
+        if s in _REV_KRAKEN_PAIR_MAP:
+            return _REV_KRAKEN_PAIR_MAP[s]
+    except Exception:
+        # mapping may not be loaded in some minimal configs
+        pass
 
     # 2) Wrapped USD pairs often end with 'ZUSD' (e.g. XXBTZUSD, XETHZUSD)
     if s.endswith("ZUSD") and len(s) > 4:
         base_raw = s[:-4]
-        base = _clean_asset(base_raw)
+        base = _kraken_clean_base(base_raw)
         if base:
             return f"{base}/USD"
 
-    # 3) Generic USD pairs (e.g. XBTUSD, ETHUSD, SOLUSD)
+    # 3) Simple USD pairs end with 'USD' (e.g. XBTUSD, ETHUSD, ADAUSD)
     if s.endswith("USD") and len(s) > 3:
         base_raw = s[:-3]
-        base = _clean_asset(base_raw)
+        base = _kraken_clean_base(base_raw)
         if base:
             return f"{base}/USD"
 
