@@ -1501,34 +1501,53 @@ def journal_sync(payload: Dict[str, Any] = Body(default=None)):
         
         # Persist watermark cursor so redeploys don't lose attribution window
         new_cursor_ts = max(int(cursor_ts or 0), int(last_seen_ts or 0))
-        if new_cursor_ts:
+
+        debug = {
+            "creds_present": True,
+            "since_hours": since_hours,
+            "cursor_source": cursor_source,
+            "cursor_file_ts": cursor_ts,
+            "start_ts": start_ts0,
+            "start_iso": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(start_ts0)),
+            "pages": pages,
+            "pulled": total_pulled,
+            "kraken_count": kraken_count,
+            "hard_limit": hard_limit,
+            "post_total_rows": total_rows,
+            "notes": notes
+        }
+
+        # Reconcile attribution before advancing the watermark so a failed run never "skips" history.
+        if dry_run:
+            recon = {"ok": True, "skipped": True, "note": "dry_run"}
+        else:
+            try:
+                recon = reconcile_trade_attribution()
+            except Exception as e:
+                return {
+                    "ok": False,
+                    "dry_run": dry_run,
+                    "count": total_writes,
+                    "reconcile": {"ok": False, "error": str(e)},
+                    "debug": debug,
+                }
+
+        # Advance cursor only after successful write + successful reconciliation (and never on dry_run)
+        if (not dry_run) and (recon.get("ok") is True) and new_cursor_ts:
             _write_journal_cursor(new_cursor_ts, {
                 "last_start_ts": int(start_ts0),
                 "last_run_pulled": int(total_pulled),
                 "last_run_pages": int(pages),
                 "cursor_source": cursor_source,
             })
-        recon = reconcile_trade_attribution()
 
         return {
             "ok": True,
             "dry_run": dry_run,
             "count": total_writes,
             "reconcile": recon,
-            "debug": {
-                "creds_present": True,
-                "since_hours": since_hours,
-                "cursor_source": cursor_source,
-                "cursor_file_ts": cursor_ts,
-                "start_ts": start_ts0,
-                "start_iso": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(start_ts0)),
-                "pages": pages,
-                "pulled": total_pulled,
-                "kraken_count": kraken_count,
-                "hard_limit": hard_limit,
-                "post_total_rows": total_rows,
-                "notes": notes
-            }
+            "debug": debug
+        }
         }
 
     except Exception as e:
