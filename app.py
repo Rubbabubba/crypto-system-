@@ -4368,24 +4368,24 @@ def scheduler_run_v2(payload: Dict[str, Any] = Body(default=None)):
     result: SchedulerResult = run_scheduler_once(cfg, last_price_fn=_last_price_safe)
     telemetry.extend(result.telemetry)
     
-        # ------------------------------------------------------------------
-        # Helper: exit priority (used for deduplication)
-        # ------------------------------------------------------------------
-        def _exit_priority(kind: str) -> int:
-            """
-            Higher number = higher priority exit.
-            stop_loss > exit > take_profit
-            """
-            if not kind:
-                return 0
-            k = kind.lower()
-            if k == "stop_loss":
-                return 3
-            if k == "exit":
-                return 2
-            if k == "take_profit":
-                return 1
+    # ------------------------------------------------------------------
+    # Helper: exit priority (used for deduplication)
+    # ------------------------------------------------------------------
+    def _exit_priority(kind: str) -> int:
+        """
+        Higher number = higher priority exit.
+        stop_loss > exit > take_profit
+        """
+        if not kind:
             return 0
+        k = kind.lower()
+        if k == "stop_loss":
+            return 3
+        if k == "exit":
+            return 2
+        if k == "take_profit":
+            return 1
+        return 0
 
 
     # ------------------------------------------------------------------
