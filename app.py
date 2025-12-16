@@ -546,30 +546,66 @@ _REV_KRAKEN_PAIR_MAP = {v.upper(): k for k, v in KRAKEN_PAIR_MAP.items()}
 
 def from_kraken_pair_to_app(pair_raw: str) -> str:
     """
-    Convert Kraken pair strings (e.g. 'XBTUSD', 'ETHUSD') into UI symbols
-    (e.g. 'BTC/USD', 'ETH/USD').
+    Convert Kraken pair strings into canonical UI symbols (e.g. 'BTC/USD').
 
-    Uses symbol_map.KRAKEN_PAIR_MAP as the source of truth and falls back
-    to a simple 'BASE/USD' rule with XBT->BTC if needed.
+    Handles:
+      - configured altname mappings (symbol_map.KRAKEN_PAIR_MAP)
+      - common Kraken pair codes like 'XBTUSD', 'ETHUSD'
+      - Kraken "wrapped" pair codes like 'XXBTZUSD', 'XETHZUSD', etc.
+
+    This function is intentionally defensive: it never throws.
     """
     if not pair_raw:
         return ""
 
-    s = str(pair_raw).upper()
+    s = str(pair_raw).upper().strip()
+    if not s:
+        return ""
 
     # 1) Exact match from our configured map (recommended pairs)
     if s in _REV_KRAKEN_PAIR_MAP:
         return _REV_KRAKEN_PAIR_MAP[s]
 
-    # 2) Generic USD pairs (e.g. XBTUSD, ETHUSD, SOLUSD, etc.)
-    if s.endswith("USD"):
-        base = s[:-3]
-        if base == "XBT":
-            base = "BTC"
-        return f"{base}/USD"
+    def _clean_asset(a: str) -> str:
+        a = (a or "").upper().strip()
+        if not a:
+            return ""
 
-    # 3) Fallback – just return the raw pair if we don't know it
+        # Kraken sometimes wraps assets with a leading X/Z (and occasionally double X/Z).
+        # Examples: XXBT -> XBT, XETH -> ETH, XLTC -> LTC, XXRP -> XRP
+        if len(a) >= 4 and a[0] in "XZ" and a[1] in "XZ":
+            a = a[1:]
+
+        if len(a) == 4 and a[0] in "XZ" and a[1:] in {"XBT","ETH","LTC","XRP","ADA","SOL","AVAX","DOT","LINK","BCH","NEAR","SUI","DOGE"}:
+            a = a[1:]
+
+        # Common edge-case: 'RP' should be XRP (seen in some telemetry/journal rows)
+        if a == "RP":
+            a = "XRP"
+
+        # Canonicalize XBT -> BTC
+        if a == "XBT":
+            a = "BTC"
+
+        return a
+
+    # 2) Wrapped USD pairs often end with 'ZUSD' (e.g. XXBTZUSD, XETHZUSD)
+    if s.endswith("ZUSD") and len(s) > 4:
+        base_raw = s[:-4]
+        base = _clean_asset(base_raw)
+        if base:
+            return f"{base}/USD"
+
+    # 3) Generic USD pairs (e.g. XBTUSD, ETHUSD, SOLUSD)
+    if s.endswith("USD") and len(s) > 3:
+        base_raw = s[:-3]
+        base = _clean_asset(base_raw)
+        if base:
+            return f"{base}/USD"
+
+    # 4) Fallback – just return the raw pair if we don't know it
     return pair_raw
+
 
 # --------------------------------------------------------------------------------------
 # Kraken API client (public & private)
