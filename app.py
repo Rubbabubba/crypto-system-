@@ -375,6 +375,36 @@ def reconcile_trade_attribution() -> Dict[str, Any]:
     Safe, idempotent, and fast enough for a sync call.
     """
     attrib = _load_attrib_from_journal_v2()
+
+    # Best-effort fallback: if journal_v2 attribution is missing (or journal_v2 file isn't present),
+    # build an attribution map from existing trades that already have strategy/intent_id.
+    # This lets us backfill newly-pulled Kraken trades that arrive without attribution.
+    if not attrib:
+        try:
+            conn = _db()
+            cur = conn.cursor()
+            cur.execute("""
+                SELECT ordertxid, intent_id, strategy
+                FROM trades
+                WHERE ordertxid IS NOT NULL
+                  AND (intent_id IS NOT NULL OR strategy IS NOT NULL)
+            """)
+            for otx, iid, strat in cur.fetchall():
+                if not otx:
+                    continue
+                rec = attrib.setdefault(str(otx), {})
+                if iid and "intent_id" not in rec:
+                    rec["intent_id"] = str(iid)
+                if strat and "strategy" not in rec:
+                    rec["strategy"] = str(strat)
+        except Exception as e:
+            log.warning("attrib fallback from trades table failed: %s", e)
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
     if not attrib:
         return {"ok": True, "updated": 0, "note": "no_attrib_found"}
 
@@ -546,30 +576,85 @@ _REV_KRAKEN_PAIR_MAP = {v.upper(): k for k, v in KRAKEN_PAIR_MAP.items()}
 
 def from_kraken_pair_to_app(pair_raw: str) -> str:
     """
-    Convert Kraken pair strings (e.g. 'XBTUSD', 'ETHUSD') into UI symbols
-    (e.g. 'BTC/USD', 'ETH/USD').
+    Convert Kraken pair strings into canonical UI symbols (e.g. 'BTC/USD').
 
-    Uses symbol_map.KRAKEN_PAIR_MAP as the source of truth and falls back
-    to a simple 'BASE/USD' rule with XBT->BTC if needed.
+    Handles:
+      - configured altname mappings (symbol_map.KRAKEN_PAIR_MAP) when available
+      - common Kraken pair codes like 'XBTUSD', 'ETHUSD'
+      - Kraken "wrapped" pair codes like 'XXBTZUSD', 'XETHZUSD', 'XLTCZUSD', 'XXRPZUSD', etc.
+      - previously-buggy forms like 'XETHZ/USD', 'XLTCZ/USD' (older fallback artifacts)
+
+    This function is intentionally defensive: it never throws.
     """
     if not pair_raw:
         return ""
 
-    s = str(pair_raw).upper()
+    s = str(pair_raw).upper().strip()
+
+    # Helper: clean Kraken asset codes.
+    def _kraken_clean_base(a: str) -> str:
+        a = (a or "").upper().strip()
+        if not a:
+            return ""
+
+        # Strip common leading wrappers: XXBT -> XBT, XETH -> ETH, ZUSD -> USD, etc.
+        while len(a) >= 4 and a[0] in "XZ" and a[1] in "XZ":
+            a = a[1:]
+
+        # Strip single leading wrapper if present (XETH -> ETH, XLTC -> LTC, XXRP -> XRP)
+        if len(a) >= 4 and a[0] in "XZ":
+            a = a[1:]
+
+        # Some wrapped bases include a trailing Z (XETHZ, XLTCZ, XXBTZ, XXRPZ)
+        if len(a) >= 4 and a.endswith("Z"):
+            a = a[:-1]
+
+        # Canonicalize edge-cases
+        if a == "XBT":
+            a = "BTC"
+        if a == "RP":
+            a = "XRP"
+
+        return a
+
+    # Normalize any legacy artifact that already contains a slash, like 'XETHZ/USD'
+    if "/" in s:
+        try:
+            base_raw, quote_raw = s.split("/", 1)
+            base = base_raw.strip()
+            quote = quote_raw.strip()
+            if quote == "USD":
+                base = _kraken_clean_base(base)
+                if base:
+                    return f"{base}/USD"
+        except Exception:
+            pass
 
     # 1) Exact match from our configured map (recommended pairs)
-    if s in _REV_KRAKEN_PAIR_MAP:
-        return _REV_KRAKEN_PAIR_MAP[s]
+    try:
+        if s in _REV_KRAKEN_PAIR_MAP:
+            return _REV_KRAKEN_PAIR_MAP[s]
+    except Exception:
+        # mapping may not be loaded in some minimal configs
+        pass
 
-    # 2) Generic USD pairs (e.g. XBTUSD, ETHUSD, SOLUSD, etc.)
-    if s.endswith("USD"):
-        base = s[:-3]
-        if base == "XBT":
-            base = "BTC"
-        return f"{base}/USD"
+    # 2) Wrapped USD pairs often end with 'ZUSD' (e.g. XXBTZUSD, XETHZUSD)
+    if s.endswith("ZUSD") and len(s) > 4:
+        base_raw = s[:-4]
+        base = _kraken_clean_base(base_raw)
+        if base:
+            return f"{base}/USD"
 
-    # 3) Fallback – just return the raw pair if we don't know it
+    # 3) Simple USD pairs end with 'USD' (e.g. XBTUSD, ETHUSD, ADAUSD)
+    if s.endswith("USD") and len(s) > 3:
+        base_raw = s[:-3]
+        base = _kraken_clean_base(base_raw)
+        if base:
+            return f"{base}/USD"
+
+    # 4) Fallback – just return the raw pair if we don't know it
     return pair_raw
+
 
 # --------------------------------------------------------------------------------------
 # Kraken API client (public & private)
@@ -1133,31 +1218,6 @@ def _pull_trades_from_kraken(since_hours: int, hard_limit: int) -> Tuple[int, in
 def journal_peek(limit: int = Query(25, ge=1, le=1000), offset: int = Query(0, ge=0)):
 
     rows = fetch_rows(limit=limit, offset=offset)
-    # Canonicalize symbols at read-time so legacy rows never poison Advisor aggregates
-    try:
-        for r in rows:
-            try:
-                pair = r.get('pair') if isinstance(r, dict) else None
-                sym  = r.get('symbol') if isinstance(r, dict) else None
-                if isinstance(r, dict):
-                    if pair and (not sym or str(sym).strip() == '' or str(sym).upper().endswith('Z/USD') or str(sym).upper().startswith('X') or str(sym).upper().startswith('XX')):
-                        r['symbol'] = from_kraken_pair_to_app(pair)
-                    # Final defensive cleanups for known drifts
-                    s = str(r.get('symbol') or '')
-                    sU = s.upper()
-                    if sU == 'XETHZ/USD':
-                        r['symbol'] = 'ETH/USD'
-                    elif sU == 'XLTCZ/USD':
-                        r['symbol'] = 'LTC/USD'
-                    elif sU == 'XXRPZ/USD':
-                        r['symbol'] = 'XRP/USD'
-                    elif sU == 'RP/USD':
-                        r['symbol'] = 'XRP/USD'
-            except Exception:
-                continue
-    except Exception:
-        pass
-
     return {"ok": True, "count": count_rows(), "rows": rows}
     
 @app.post("/journal/attach")
@@ -4065,9 +4125,6 @@ def scheduler_run_v2(payload: Dict[str, Any] = Body(default=None)):
     """
     actions: List[Dict[str, Any]] = []
     telemetry: List[Dict[str, Any]] = []
-    # Stabilization: enforce whitelist only when explicitly enabled
-    enforce_whitelist = str(os.getenv('ENFORCE_STRAT_WHITELIST', 'false')).strip().lower() in ('1','true','yes','y')
-
 
     # small helpers for super-safe config access
     def _cfg_get(d: Any, key: str, default: Any = None) -> Any:
@@ -4310,6 +4367,26 @@ def scheduler_run_v2(payload: Dict[str, Any] = Body(default=None)):
 
     result: SchedulerResult = run_scheduler_once(cfg, last_price_fn=_last_price_safe)
     telemetry.extend(result.telemetry)
+    
+        # ------------------------------------------------------------------
+        # Helper: exit priority (used for deduplication)
+        # ------------------------------------------------------------------
+        def _exit_priority(kind: str) -> int:
+            """
+            Higher number = higher priority exit.
+            stop_loss > exit > take_profit
+            """
+            if not kind:
+                return 0
+            k = kind.lower()
+            if k == "stop_loss":
+                return 3
+            if k == "exit":
+                return 2
+            if k == "take_profit":
+                return 1
+            return 0
+
 
     # ------------------------------------------------------------------
     # Deduplicate intents: exits take precedence over entries on same (sym,strat)
@@ -4397,7 +4474,7 @@ def scheduler_run_v2(payload: Dict[str, Any] = Body(default=None)):
 
         guard_allowed = True
         guard_reason = "ok"
-        if guard_allows is not None and intent.kind in entry_kinds and enforce_whitelist:
+        if guard_allows is not None and intent.kind in entry_kinds:
             try:
                 guard_allowed, guard_reason = guard_allows(intent.strategy, intent.symbol, now=now)
             except Exception as e:
@@ -4586,98 +4663,6 @@ def scheduler_run_v2(payload: Dict[str, Any] = Body(default=None)):
         # ------------------------------------------------------------------
         # Send to broker via br_router.market_notional
         # ------------------------------------------------------------------
-        # ------------------------------------------------------------------
-        # Execution guard: exit/stop sells must not exceed actual position size.
-        # Prevents repeated EOrder:Insufficient funds loops when exits are rejected.
-        # ------------------------------------------------------------------
-        try:
-            if side == 'sell' and intent.kind not in entry_kinds:
-                cur_qty = float(getattr(pm_pos, 'qty', 0.0) or 0.0) if pm_pos is not None else 0.0
-                if cur_qty <= 0.0:
-                    telemetry.append({
-                        'symbol': intent.symbol,
-                        'strategy': intent.strategy,
-                        'kind': 'exit_skip',
-                        'side': side,
-                        'reason': 'no_position_to_sell',
-                        'source': 'exec_guard',
-                    })
-                    action_record['status'] = 'skipped_guard'
-                    action_record['error'] = 'no_position_to_sell'
-                    try:
-                        append_journal_v2({
-                            'ts': time.time(),
-                            'source': 'scheduler_v2',
-                            'intent_id': intent_id,
-                            'ordertxid': None,
-                            'userref': None,
-                            'symbol': intent.symbol,
-                            'strategy': intent.strategy,
-                            'kind': intent.kind,
-                            'side': side,
-                            'notional': final_notional,
-                            'reason': intent.reason,
-                            'dry': bool(dry),
-                            'status': action_record.get('status'),
-                            'response': None,
-                            'error': action_record.get('error'),
-                        })
-                    except Exception:
-                        pass
-                    actions.append(action_record)
-                    continue
-
-                px = _last_price_safe(intent.symbol)
-                if px <= 0.0:
-                    try:
-                        px = float(getattr(pm_pos, 'avg_price', 0.0) or 0.0)
-                    except Exception:
-                        px = 0.0
-
-                max_notional = max(cur_qty, 0.0) * px if px > 0.0 else 0.0
-                cap = max_notional * 0.995  # fee/rounding buffer
-                if cap > 0.0 and final_notional > cap:
-                    action_record['notional_original'] = float(final_notional)
-                    final_notional = float(cap)
-                    action_record['notional'] = float(final_notional)
-                    action_record['note'] = 'capped_to_position_value'
-
-                if final_notional < MIN_NOTIONAL_USD:
-                    telemetry.append({
-                        'symbol': intent.symbol,
-                        'strategy': intent.strategy,
-                        'kind': 'exit_skip',
-                        'side': side,
-                        'reason': f'below_min_notional_after_cap:{final_notional:.4f}<{MIN_NOTIONAL_USD}',
-                        'source': 'exec_guard',
-                    })
-                    action_record['status'] = 'skipped_guard'
-                    action_record['error'] = 'below_min_notional_after_cap'
-                    try:
-                        append_journal_v2({
-                            'ts': time.time(),
-                            'source': 'scheduler_v2',
-                            'intent_id': intent_id,
-                            'ordertxid': None,
-                            'userref': None,
-                            'symbol': intent.symbol,
-                            'strategy': intent.strategy,
-                            'kind': intent.kind,
-                            'side': side,
-                            'notional': final_notional,
-                            'reason': intent.reason,
-                            'dry': bool(dry),
-                            'status': action_record.get('status'),
-                            'response': None,
-                            'error': action_record.get('error'),
-                        })
-                    except Exception:
-                        pass
-                    actions.append(action_record)
-                    continue
-        except Exception:
-            pass
-
         try:
             resp = br.market_notional(
                 symbol=intent.symbol,
