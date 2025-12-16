@@ -1548,13 +1548,12 @@ def journal_sync(payload: Dict[str, Any] = Body(default=None)):
             "reconcile": recon,
             "debug": debug
         }
-        }
 
     except Exception as e:
         import traceback
         tb = traceback.format_exc()
         try:
-            logger.exception('journal_sync failed')
+            log.exception('journal_sync failed')
         except Exception:
             pass
         return {"ok": False, "error": str(e), "trace": tb}
