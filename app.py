@@ -4583,11 +4583,36 @@ def scheduler_run_v2(payload: Dict[str, Any] = Body(default=None)):
                     }
                 )
                 continue
+                
+            # ---------------------------------------------------------------
+            # STOP-THE-BLEED: exits must not sell without a position,
+            # and must never exceed position value (cap).
+            # ---------------------------------------------------------------
+            if side == "sell":
+                if qty_here <= 0.0:
+                    telemetry.append(
+                        {
+                            "symbol": intent.symbol,
+                            "strategy": intent.strategy,
+                            "kind": intent.kind,
+                            "side": intent.side,
+                            "reason": "exit_skipped_no_position_to_sell",
+                            "source": "scheduler_v2",
+                        }
+                    )
+                    continue
 
+                # Cap exit notional to position value (small buffer for fees/rounding)
+                max_notional = abs(qty_here) * px * 0.995
+                
+            
             if intent.notional is not None and intent.notional > 0:
                 final_notional = float(intent.notional)
             else:
                 final_notional = abs(qty_here) * px  # flatten full position
+                
+            if side == "sell":
+                final_notional = min(final_notional, max_notional)
 
         # If we reached here, we have a valid final_notional
         if final_notional <= 0:
