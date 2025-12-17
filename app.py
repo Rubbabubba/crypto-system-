@@ -4593,14 +4593,37 @@ def scheduler_run_v2(payload: Dict[str, Any] = Body(default=None)):
                 )
                 continue
 
-        # ----- EXIT / TP / SL: compute notional from position if missing -------------
+        # ----- EXIT / TP / SL: cap exit notional to actual position -------------
         else:
+            # Canonicalize symbol so positions/contexts match (prevents XLTCZ/USD drift)
+            sym_can = _canon_symbol(intent.symbol)
+
+            # Re-resolve position using canonical symbol
+            key_can = (sym_can, intent.strategy)
+            pm_pos = positions.get(key_can)
+
             qty_here = float(getattr(pm_pos, "qty", 0.0) or 0.0)
-            px = _last_price_safe(intent.symbol)
+
+            # No position => nothing to exit (prevents bogus sells)
+            if abs(qty_here) <= 1e-12:
+                telemetry.append(
+                    {
+                        "symbol": sym_can,
+                        "strategy": intent.strategy,
+                        "kind": intent.kind,
+                        "side": intent.side,
+                        "reason": "exit_skipped_no_position_to_close",
+                        "source": "scheduler_v2",
+                    }
+                )
+                continue
+
+            # Use canonical symbol for price lookup too
+            px = _last_price_safe(sym_can)
             if px <= 0.0:
                 telemetry.append(
                     {
-                        "symbol": intent.symbol,
+                        "symbol": sym_can,
                         "strategy": intent.strategy,
                         "kind": intent.kind,
                         "side": intent.side,
@@ -4609,33 +4632,51 @@ def scheduler_run_v2(payload: Dict[str, Any] = Body(default=None)):
                     }
                 )
                 continue
-                
-            # ---------------------------------------------------------------
-            # STOP-THE-BLEED: exits must not sell without a position,
-            # and must never exceed position value (cap).
-            # ---------------------------------------------------------------
-            if side == "sell":
-                if qty_here <= 0.0:
-                    telemetry.append(
-                        {
-                            "symbol": intent.symbol,
-                            "strategy": intent.strategy,
-                            "kind": intent.kind,
-                            "side": intent.side,
-                            "reason": "exit_skipped_no_position_to_sell",
-                            "source": "scheduler_v2",
-                        }
-                    )
-                    continue
 
-                # Cap exit notional to position value (small buffer for fees/rounding)
-                max_notional = abs(qty_here) * px * 0.995
-                
-            
-            if intent.notional is not None and intent.notional > 0:
-                final_notional = float(intent.notional)
+            # Side sanity (spot-safe):
+            # - SELL exits only make sense if qty > 0
+            # - BUY exits only make sense if qty < 0 (short); if you don't support short, this will skip them
+            s = (intent.side or "").lower()
+            if s == "sell" and qty_here <= 0:
+                telemetry.append(
+                    {
+                        "symbol": sym_can,
+                        "strategy": intent.strategy,
+                        "kind": intent.kind,
+                        "side": intent.side,
+                        "reason": f"exit_skipped_side_qty_mismatch:qty={qty_here}",
+                        "source": "scheduler_v2",
+                    }
+                )
+                continue
+            if s == "buy" and qty_here >= 0:
+                telemetry.append(
+                    {
+                        "symbol": sym_can,
+                        "strategy": intent.strategy,
+                        "kind": intent.kind,
+                        "side": intent.side,
+                        "reason": f"exit_skipped_side_qty_mismatch:qty={qty_here}",
+                        "source": "scheduler_v2",
+                    }
+                )
+                continue
+
+            # Cap exit notional to what we can actually close
+            buffer = float(os.getenv("EXIT_NOTIONAL_BUFFER", "0.995") or 0.995)
+            max_notional = abs(qty_here) * px * buffer
+
+            if intent.notional is not None and float(intent.notional) > 0:
+                final_notional = min(float(intent.notional), max_notional)
             else:
-                final_notional = abs(qty_here) * px  # flatten full position
+                final_notional = max_notional
+
+            # IMPORTANT: also rewrite intent.symbol to canonical so downstream logging stays consistent
+            try:
+                intent.symbol = sym_can
+            except Exception:
+                pass
+
                 
             if side == "sell":
                 final_notional = min(final_notional, max_notional)
