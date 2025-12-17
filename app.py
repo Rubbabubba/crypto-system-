@@ -4209,450 +4209,609 @@ def scheduler_run_v2(payload: Dict[str, Any] = Body(default=None)):
                         ordertxid = tx[0]
                     elif isinstance(tx, str):
                         ordertxid = tx
-        except Exception:    
-            
-            result: SchedulerResult = run_scheduler_once(cfg, last_price_fn=_last_price_safe)
-            telemetry.extend(result.telemetry)
+        except Exception:
+            pass
 
-            # ------------------------------------------------------------------
-            # Helper: exit priority (used for deduplication)
-            # ------------------------------------------------------------------
-            def _exit_priority(kind: str) -> int:
-                """
-                Higher number = higher priority exit.
-                stop_loss > exit > take_profit
-                """
-                if not kind:
-                    return 0
-                k = str(kind).strip().lower()
-                if k == "stop_loss":
-                    return 3
-                if k == "exit":
-                    return 2
-                if k == "take_profit":
-                    return 1
-                return 0
+        return (str(ordertxid) if ordertxid else None, str(userref) if userref else None)
 
-            # ------------------------------------------------------------------
-            # Deduplicate intents: exits take precedence over entries on same (sym,strat)
-            # Canonicalize (kind/symbol/strategy/side) so keys don't drift.
-            # ------------------------------------------------------------------
-            exit_kinds = {"exit", "take_profit", "stop_loss"}
-            entry_kinds = {"entry", "scale"}
 
-            best_exit: Dict[Tuple[str, str], Any] = {}
-            entries: List[Any] = []
+    # Dry-run flag: payload.dry overrides SCHED_DRY (default True)
+    dry = payload.get("dry", None)
+    if dry is None:
+        dry = _env_bool("SCHED_DRY", True)
+    dry = bool(dry)
 
-            for intent in result.intents:
-                # Canonicalize fields defensively
-                k_kind = (str(getattr(intent, "kind", "") or "")).strip().lower()
-                k_sym = _canon_symbol(str(getattr(intent, "symbol", "") or ""))
-                k_str = (str(getattr(intent, "strategy", "") or "")).strip().lower()
-                k_side = (str(getattr(intent, "side", "") or "")).strip().lower()
+    # ------------------------------------------------------------------
+    # Minimum order notional (USD) to avoid dust orders
+    # ------------------------------------------------------------------
+    MIN_NOTIONAL_USD = float(os.getenv("MIN_ORDER_NOTIONAL_USD", "5.0") or 5.0)
 
-                # Write back canonical values so downstream uses consistent values
-                try:
-                    intent.kind = k_kind
-                except Exception:
-                    pass
-                try:
-                    intent.symbol = k_sym
-                except Exception:
-                    pass
-                try:
-                    intent.strategy = k_str
-                except Exception:
-                    pass
-                try:
-                    intent.side = k_side
-                except Exception:
-                    pass
+    # ------------------------------------------------------------------
+    # Resolve basic scheduler config from payload + env
+    # ------------------------------------------------------------------
+    tf = str(payload.get("tf", os.getenv("SCHED_TIMEFRAME", "5Min")))
+    strats_csv = str(payload.get("strats", os.getenv("SCHED_STRATS", "c1,c2,c3,c4,c5,c6")))
+    strats = [s.strip().lower() for s in strats_csv.split(",") if s.strip()]
 
-                key = (k_sym, k_str)
+    symbols_csv = str(payload.get("symbols", os.getenv("SYMBOLS", "BTC/USD,ETH/USD")))
+    syms = [s.strip().upper() for s in symbols_csv.split(",") if s.strip()]
 
-                if k_kind in exit_kinds:
-                    prev = best_exit.get(key)
-                    if prev is None or _exit_priority(k_kind) > _exit_priority(getattr(prev, "kind", "")):
-                        best_exit[key] = intent
-                elif k_kind in entry_kinds:
-                    entries.append(intent)
-                else:
-                    # unknown kind: just pass through as a generic action
-                    entries.append(intent)
+    limit = int(payload.get("limit", int(os.getenv("SCHED_LIMIT", "300") or 300)))
+    notional = float(payload.get("notional", float(os.getenv("SCHED_NOTIONAL", "25") or 25.0)))
 
-            # Combine exits + entries, making sure no entry is emitted on same pass
-            # when an exit exists for that (symbol,strategy).
-            final_intents: List[Any] = []
+    config_snapshot = {
+        "tf": tf,
+        "strats_raw": strats_csv,
+        "strats": strats,
+        "symbols_raw": symbols_csv,
+        "symbols": syms,
+        "limit": limit,
+        "notional": notional,
+        "dry": bool(dry),
+    }
 
-            # First, add exits
-            for _, intent in best_exit.items():
-                final_intents.append(intent)
+    log.info(
+        "Scheduler v2: strats=%s tf=%s limit=%s notional=%s dry=%s symbols=%s",
+        ",".join(strats),
+        tf,
+        limit,
+        notional,
+        dry,
+        ",".join(syms),
+    )
 
-            # Then, add entries only where no exit exists
-            for intent in entries:
-                key = (getattr(intent, "symbol", None), getattr(intent, "strategy", None))
-                if key in best_exit:
-                    telemetry.append(
-                        {
-                            "symbol": getattr(intent, "symbol", None),
-                            "strategy": getattr(intent, "strategy", None),
-                            "kind": getattr(intent, "kind", None),
-                            "side": getattr(intent, "side", None),
-                            "reason": "dropped_entry_due_to_exit_same_pass",
-                            "source": "scheduler_v2",
-                        }
-                    )
-                    continue
-                final_intents.append(intent)
+    # ------------------------------------------------------------------
+    # Load broker router + guard
+    # ------------------------------------------------------------------
+    try:
+        import br_router as br  # type: ignore[import]
+    except Exception as e:
+        log.error("scheduler_v2: failed to import br_router: %s", e)
+        if not dry:
+            return {"ok": False, "error": f"failed to import br_router: {e}", "config": config_snapshot}
+        br = None  # dry mode can still show intents
 
-            # ------------------------------------------------------------------
-            # GLOBAL RISK LATCH:
-            # If we are emitting any global flatten/stop-loss intents, block ALL entries
-            # this pass. This is stop-the-bleed behavior.
-            # ------------------------------------------------------------------
-            global_risk_active = False
+    try:
+        from policy.guard import guard_allows  # type: ignore[import]
+    except Exception:
+        guard_allows = None  # optional; strategies already use guard internally
+
+    # ------------------------------------------------------------------
+    # Load positions & risk config
+    # ------------------------------------------------------------------
+    positions = _load_open_positions_from_trades(use_strategy_col=True)
+    risk_cfg = load_risk_config() or {}
+    risk_engine = RiskEngine(risk_cfg)
+
+    # ------------------------------------------------------------------
+    # Preload bar contexts once (match /debug/strategy_scan + StrategyBook)
+    # ------------------------------------------------------------------
+    contexts: Dict[str, Any] = {}
+
+    def _safe_series(bars, key: str):
+        vals = []
+        if isinstance(bars, list):
+            for row in bars:
+                if isinstance(row, dict) and key in row:
+                    vals.append(row[key])
+        return vals
+
+    def _normalize_symbol_for_bars(sym: str) -> str:
+            # If br_router has a normalizer, use it
             try:
-                for it in final_intents:
-                    r = (str(getattr(it, "reason", "") or "")).lower()
-                    src = (str(getattr(it, "source", "") or "")).lower()
-                    if ("global_daily_flatten" in r) or ("global_stop_loss" in r) or ("global_risk_engine" in src):
-                        global_risk_active = True
-                        break
+                if br is not None and hasattr(br, "normalize_symbol"):
+                    return str(br.normalize_symbol(sym))
             except Exception:
-                global_risk_active = False
+                pass
+    
+            # Minimal Kraken altname fixups (common offenders)
+            if sym == "XLTCZ/USD":
+                return "LTC/USD"
+            if sym == "XXRPZ/USD":
+                return "XRP/USD"
+            return sym
+    
+    
+    for sym in syms:
+        sym_can = _canon_symbol(sym)
+        try:
+            bars_sym = _normalize_symbol_for_bars(sym)
+            
+            one  = br.get_bars(bars_sym, timeframe="1Min", limit=limit)
+            five = br.get_bars(bars_sym, timeframe=tf,     limit=limit)
 
-            # ------------------------------------------------------------------
-            # Apply guard + per-symbol caps + loss-zone no-rebuy; then route
-            # Also: stop-the-bleed duplicate action latch (1 action per (sym,strat) per run)
-            # ------------------------------------------------------------------
-            sent_keys: set = set()
 
-            for intent in final_intents:
-                # Ensure every intent has a stable id for attribution
-                intent_id = _ensure_intent_id(intent)
+            if not one or not five:
+                contexts[sym_can] = None
+                telemetry.append({"symbol": sym, "stage": "preload_bars", "ok": False, "reason": "no_bars"})
+            else:
+                contexts[sym_can] = {
+                    "one":  {"close": _safe_series(one, "c"),  "high": _safe_series(one, "h"),  "low": _safe_series(one, "l")},
+                    "five": {"close": _safe_series(five, "c"), "high": _safe_series(five, "h"), "low": _safe_series(five, "l")},
+                }
+        except Exception as e:
+            contexts[sym_can] = None
+            telemetry.append({"symbol": sym, "stage": "preload_bars", "ok": False, "error": f"{e.__class__.__name__}: {e}"})
 
-                # Normalize side again (belt + suspenders)
-                side = (str(getattr(intent, "side", "") or "")).strip().lower()
-                try:
-                    intent.side = side
-                except Exception:
-                    pass
+    
 
-                # Force strategy label for truly missing strategies (global/system intents)
-                try:
-                    if not getattr(intent, "strategy", None):
-                        intent.strategy = "global"
-                except Exception:
-                    pass
 
-                # Canonicalize symbol for consistent position/context access
-                try:
-                    intent.symbol = _canon_symbol(str(getattr(intent, "symbol", "") or ""))
-                except Exception:
-                    pass
+    # ------------------------------------------------------------------
+    # Last-price helper for risk calculation + exits
+    # ------------------------------------------------------------------
+    def _last_price_safe(symbol: str) -> float:
+        ctx = contexts.get(symbol)
+        if not ctx:
+            return 0.0
+        five = ctx.get("five") or {}
+        closes = five.get("close") or []
+        if not closes:
+            return 0.0
+        try:
+            return float(closes[-1])
+        except Exception:
+            return 0.0
 
-                # Global risk latch: block entries immediately
-                if global_risk_active and getattr(intent, "kind", "") in entry_kinds:
-                    telemetry.append(
-                        {
-                            "symbol": getattr(intent, "symbol", None),
-                            "strategy": getattr(intent, "strategy", None),
-                            "kind": getattr(intent, "kind", None),
-                            "side": side,
-                            "reason": "blocked_entry_due_to_global_risk_active",
-                            "source": "scheduler_v2",
-                        }
-                    )
-                    continue
+    # ------------------------------------------------------------------
+    # Build SchedulerConfig and run scheduler_core once
+    # ------------------------------------------------------------------
+    now = dt.datetime.utcnow()
+    cfg = SchedulerConfig(
+        now=now,
+        timeframe=tf,
+        limit=limit,
+        symbols=syms,
+        strats=strats,
+        notional=notional,
+        positions=positions,
+        contexts=contexts,
+        risk_cfg=risk_cfg,
+    )
 
-                key = (intent.symbol, intent.strategy)
-                pm_pos = positions.get(key)
+    result: SchedulerResult = run_scheduler_once(cfg, last_price_fn=_last_price_safe)
+    telemetry.extend(result.telemetry)
 
-                snap = PositionSnapshot(
-                    symbol=intent.symbol,
-                    strategy=intent.strategy,
-                    qty=float(getattr(pm_pos, "qty", 0.0) or 0.0),
-                    avg_price=getattr(pm_pos, "avg_price", None),
-                    unrealized_pct=None,
-                )
+    # ------------------------------------------------------------------
+    # Helper: exit priority (used for deduplication)
+    # ------------------------------------------------------------------
+    def _exit_priority(kind: str) -> int:
+        """
+        Higher number = higher priority exit.
+        stop_loss > exit > take_profit
+        """
+        if not kind:
+            return 0
+        k = str(kind).strip().lower()
+        if k == "stop_loss":
+            return 3
+        if k == "exit":
+            return 2
+        if k == "take_profit":
+            return 1
+        return 0
 
-                # Fill unrealized_pct here so loss-zone + any extra logic
-                # see the exact same P&L % that scheduler_core used.
-                try:
-                    snap.unrealized_pct = risk_engine.compute_unrealized_pct(
-                        snap,
-                        last_price_fn=_last_price_safe,
-                    )
-                except Exception:
-                    snap.unrealized_pct = None
+    # ------------------------------------------------------------------
+    # Deduplicate intents: exits take precedence over entries on same (sym,strat)
+    # Canonicalize (kind/symbol/strategy/side) so keys don't drift.
+    # ------------------------------------------------------------------
+    exit_kinds = {"exit", "take_profit", "stop_loss"}
+    entry_kinds = {"entry", "scale"}
 
-                guard_allowed = True
-                guard_reason = "ok"
-                if guard_allows is not None and getattr(intent, "kind", "") in entry_kinds:
-                    try:
-                        guard_allowed, guard_reason = guard_allows(intent.strategy, intent.symbol, now=now)
-                    except Exception as e:
-                        guard_allowed = False
-                        guard_reason = f"guard_exception:{e}"
+    best_exit: Dict[Tuple[str, str], Any] = {}
+    entries: List[Any] = []
 
-                if not guard_allowed:
-                    telemetry.append(
-                        {
-                            "symbol": intent.symbol,
-                            "strategy": intent.strategy,
-                            "kind": getattr(intent, "kind", None),
-                            "side": side,
-                            "reason": guard_reason,
-                            "source": "guard_allows",
-                        }
-                    )
-                    continue
+    for intent in result.intents:
+        # Canonicalize fields defensively
+        k_kind = (str(getattr(intent, "kind", "") or "")).strip().lower()
+        k_sym = _canon_symbol(str(getattr(intent, "symbol", "") or ""))
+        k_str = (str(getattr(intent, "strategy", "") or "")).strip().lower()
+        k_side = (str(getattr(intent, "side", "") or "")).strip().lower()
 
-                # Advisory-only guard warnings (allow but log)
-                if guard_reason and guard_reason != "ok":
-                    telemetry.append(
-                        {
-                            "symbol": intent.symbol,
-                            "strategy": intent.strategy,
-                            "kind": getattr(intent, "kind", None),
-                            "side": side,
-                            "reason": f"guard_warn:{guard_reason}",
-                            "source": "guard_allows",
-                        }
-                    )
+        # Write back canonical values so downstream uses consistent values
+        try:
+            intent.kind = k_kind
+        except Exception:
+            pass
+        try:
+            intent.symbol = k_sym
+        except Exception:
+            pass
+        try:
+            intent.strategy = k_str
+        except Exception:
+            pass
+        try:
+            intent.side = k_side
+        except Exception:
+            pass
 
-                # Decide final notional to send
-                final_notional: float = 0.0
+        key = (k_sym, k_str)
 
-                # ----- ENTRY / SCALE: use intent.notional (after caps) --------------------
-                if getattr(intent, "kind", "") in entry_kinds:
-                    if getattr(intent, "notional", None) is None or float(getattr(intent, "notional", 0.0) or 0.0) <= 0.0:
-                        telemetry.append(
-                            {
-                                "symbol": intent.symbol,
-                                "strategy": intent.strategy,
-                                "kind": getattr(intent, "kind", None),
-                                "side": side,
-                                "reason": "entry_without_notional",
-                                "source": "scheduler_v2",
-                            }
-                        )
-                        continue
+        if k_kind in exit_kinds:
+            prev = best_exit.get(key)
+            if prev is None or _exit_priority(k_kind) > _exit_priority(getattr(prev, "kind", "")):
+                best_exit[key] = intent
+        elif k_kind in entry_kinds:
+            entries.append(intent)
+        else:
+            # unknown kind: just pass through as a generic action
+            entries.append(intent)
 
-                    allowed_cap, adjusted_notional, cap_reason = risk_engine.enforce_symbol_cap(
-                        symbol=intent.symbol,
-                        strat=intent.strategy,
-                        pos=snap,
-                        notional_value=float(getattr(intent, "notional", 0.0)),
-                        last_price_fn=_last_price_safe,
-                        now=now,
-                    )
-                    if not allowed_cap or float(adjusted_notional or 0.0) <= 0.0:
-                        telemetry.append(
-                            {
-                                "symbol": intent.symbol,
-                                "strategy": intent.strategy,
-                                "kind": getattr(intent, "kind", None),
-                                "side": side,
-                                "reason": cap_reason or "blocked_by_symbol_cap",
-                                "source": "risk_engine.enforce_symbol_cap",
-                            }
-                        )
-                        continue
+    # Combine exits + entries, making sure no entry is emitted on same pass
+    # when an exit exists for that (symbol,strategy).
+    final_intents: List[Any] = []
 
-                    final_notional = float(adjusted_notional)
+    # First, add exits
+    for _, intent in best_exit.items():
+        final_intents.append(intent)
 
-                    # Loss-zone no-rebuy below threshold (if we have unrealized_pct wired)
-                    if risk_engine.is_loss_zone_norebuy_block(
-                        unrealized_pct=snap.unrealized_pct,
-                        is_entry_side=True,
-                    ):
-                        telemetry.append(
-                            {
-                                "symbol": intent.symbol,
-                                "strategy": intent.strategy,
-                                "kind": getattr(intent, "kind", None),
-                                "side": side,
-                                "reason": "loss_zone_no_rebuy_below",
-                                "source": "risk_engine.is_loss_zone_norebuy_block",
-                            }
-                        )
-                        continue
+    # Then, add entries only where no exit exists
+    for intent in entries:
+        key = (getattr(intent, "symbol", None), getattr(intent, "strategy", None))
+        if key in best_exit:
+            telemetry.append(
+                {
+                    "symbol": getattr(intent, "symbol", None),
+                    "strategy": getattr(intent, "strategy", None),
+                    "kind": getattr(intent, "kind", None),
+                    "side": getattr(intent, "side", None),
+                    "reason": "dropped_entry_due_to_exit_same_pass",
+                    "source": "scheduler_v2",
+                }
+            )
+            continue
+        final_intents.append(intent)
 
-                # ----- EXIT / TP / SL: cap exit to actual position value; never sell w/o qty -----
-                else:
-                    qty_here = float(getattr(pm_pos, "qty", 0.0) or 0.0)
-                    px = _last_price_safe(intent.symbol)
-                    if px <= 0.0:
-                        telemetry.append(
-                            {
-                                "symbol": intent.symbol,
-                                "strategy": intent.strategy,
-                                "kind": getattr(intent, "kind", None),
-                                "side": side,
-                                "reason": "no_price_for_exit",
-                                "source": "scheduler_v2",
-                            }
-                        )
-                        continue
+    # ------------------------------------------------------------------
+    # GLOBAL RISK LATCH:
+    # If we are emitting any global flatten/stop-loss intents, block ALL entries
+    # this pass. This is stop-the-bleed behavior.
+    # ------------------------------------------------------------------
+    global_risk_active = False
+    try:
+        for it in final_intents:
+            r = (str(getattr(it, "reason", "") or "")).lower()
+            src = (str(getattr(it, "source", "") or "")).lower()
+            if ("global_daily_flatten" in r) or ("global_stop_loss" in r) or ("global_risk_engine" in src):
+                global_risk_active = True
+                break
+    except Exception:
+        global_risk_active = False
 
-                    # If broker side is SELL, we must have something to sell
-                    if side == "sell" and qty_here <= 0.0:
-                        telemetry.append(
-                            {
-                                "symbol": intent.symbol,
-                                "strategy": intent.strategy,
-                                "kind": getattr(intent, "kind", None),
-                                "side": side,
-                                "reason": "exit_skipped_no_position_to_sell",
-                                "source": "scheduler_v2",
-                            }
-                        )
-                        continue
+    # ------------------------------------------------------------------
+    # Apply guard + per-symbol caps + loss-zone no-rebuy; then route
+    # Also: stop-the-bleed duplicate action latch (1 action per (sym,strat) per run)
+    # ------------------------------------------------------------------
+    sent_keys: set = set()
 
-                    # Choose exit size (use intent.notional if provided, otherwise flatten)
-                    if getattr(intent, "notional", None) is not None and float(getattr(intent, "notional", 0.0) or 0.0) > 0.0:
-                        final_notional = float(getattr(intent, "notional", 0.0))
-                    else:
-                        final_notional = abs(qty_here) * px  # flatten full position
+    for intent in final_intents:
+        # Ensure every intent has a stable id for attribution
+        intent_id = _ensure_intent_id(intent)
 
-                    # Cap SELL exits so we never try to sell more than position value
-                    if side == "sell":
-                        max_notional = abs(qty_here) * px * 0.995  # buffer for fees/rounding
-                        final_notional = min(final_notional, max_notional)
+        # Normalize side again (belt + suspenders)
+        side = (str(getattr(intent, "side", "") or "")).strip().lower()
+        try:
+            intent.side = side
+        except Exception:
+            pass
 
-                # Valid final_notional?
-                if final_notional <= 0.0:
-                    telemetry.append(
-                        {
-                            "symbol": intent.symbol,
-                            "strategy": intent.strategy,
-                            "kind": getattr(intent, "kind", None),
-                            "side": side,
-                            "reason": "non_positive_final_notional",
-                            "source": "scheduler_v2",
-                        }
-                    )
-                    continue
+        # Force strategy label for truly missing strategies (global/system intents)
+        try:
+            if not getattr(intent, "strategy", None):
+                intent.strategy = "global"
+        except Exception:
+            pass
 
-                # Ignore dust for entries + TP/SL; still allow generic exits (e.g. daily_flatten)
-                if final_notional < MIN_NOTIONAL_USD and getattr(intent, "kind", "") in {"entry", "scale", "take_profit", "stop_loss"}:
-                    telemetry.append(
-                        {
-                            "symbol": intent.symbol,
-                            "strategy": intent.strategy,
-                            "kind": getattr(intent, "kind", None),
-                            "side": side,
-                            "reason": f"below_min_notional:{final_notional:.4f}<{MIN_NOTIONAL_USD}",
-                            "source": "scheduler_v2",
-                        }
-                    )
-                    continue
+        # Canonicalize symbol for consistent position/context access
+        try:
+            intent.symbol = _canon_symbol(str(getattr(intent, "symbol", "") or ""))
+        except Exception:
+            pass
 
-                # Stop-the-bleed: one action per (symbol,strategy) per run
-                send_key = (intent.symbol, intent.strategy)
-                if send_key in sent_keys:
-                    telemetry.append(
-                        {
-                            "symbol": intent.symbol,
-                            "strategy": intent.strategy,
-                            "kind": getattr(intent, "kind", None),
-                            "side": side,
-                            "reason": "blocked_duplicate_action_same_run",
-                            "source": "scheduler_v2",
-                        }
-                    )
-                    continue
-                sent_keys.add(send_key)
+        # Global risk latch: block entries immediately
+        if global_risk_active and getattr(intent, "kind", "") in entry_kinds:
+            telemetry.append(
+                {
+                    "symbol": getattr(intent, "symbol", None),
+                    "strategy": getattr(intent, "strategy", None),
+                    "kind": getattr(intent, "kind", None),
+                    "side": side,
+                    "reason": "blocked_entry_due_to_global_risk_active",
+                    "source": "scheduler_v2",
+                }
+            )
+            continue
 
-                action_record: Dict[str, Any] = {
+        key = (intent.symbol, intent.strategy)
+        pm_pos = positions.get(key)
+
+        snap = PositionSnapshot(
+            symbol=intent.symbol,
+            strategy=intent.strategy,
+            qty=float(getattr(pm_pos, "qty", 0.0) or 0.0),
+            avg_price=getattr(pm_pos, "avg_price", None),
+            unrealized_pct=None,
+        )
+
+        # Fill unrealized_pct here so loss-zone + any extra logic
+        # see the exact same P&L % that scheduler_core used.
+        try:
+            snap.unrealized_pct = risk_engine.compute_unrealized_pct(
+                snap,
+                last_price_fn=_last_price_safe,
+            )
+        except Exception:
+            snap.unrealized_pct = None
+
+        guard_allowed = True
+        guard_reason = "ok"
+        if guard_allows is not None and getattr(intent, "kind", "") in entry_kinds:
+            try:
+                guard_allowed, guard_reason = guard_allows(intent.strategy, intent.symbol, now=now)
+            except Exception as e:
+                guard_allowed = False
+                guard_reason = f"guard_exception:{e}"
+
+        if not guard_allowed:
+            telemetry.append(
+                {
                     "symbol": intent.symbol,
                     "strategy": intent.strategy,
-                    "intent_id": intent_id,
-                    "side": side,
                     "kind": getattr(intent, "kind", None),
+                    "side": side,
+                    "reason": guard_reason,
+                    "source": "guard_allows",
+                }
+            )
+            continue
+
+        # Advisory-only guard warnings (allow but log)
+        if guard_reason and guard_reason != "ok":
+            telemetry.append(
+                {
+                    "symbol": intent.symbol,
+                    "strategy": intent.strategy,
+                    "kind": getattr(intent, "kind", None),
+                    "side": side,
+                    "reason": f"guard_warn:{guard_reason}",
+                    "source": "guard_allows",
+                }
+            )
+
+        # Decide final notional to send
+        final_notional: float = 0.0
+
+        # ----- ENTRY / SCALE: use intent.notional (after caps) --------------------
+        if getattr(intent, "kind", "") in entry_kinds:
+            if getattr(intent, "notional", None) is None or float(getattr(intent, "notional", 0.0) or 0.0) <= 0.0:
+                telemetry.append(
+                    {
+                        "symbol": intent.symbol,
+                        "strategy": intent.strategy,
+                        "kind": getattr(intent, "kind", None),
+                        "side": side,
+                        "reason": "entry_without_notional",
+                        "source": "scheduler_v2",
+                    }
+                )
+                continue
+
+            allowed_cap, adjusted_notional, cap_reason = risk_engine.enforce_symbol_cap(
+                symbol=intent.symbol,
+                strat=intent.strategy,
+                pos=snap,
+                notional_value=float(getattr(intent, "notional", 0.0)),
+                last_price_fn=_last_price_safe,
+                now=now,
+            )
+            if not allowed_cap or float(adjusted_notional or 0.0) <= 0.0:
+                telemetry.append(
+                    {
+                        "symbol": intent.symbol,
+                        "strategy": intent.strategy,
+                        "kind": getattr(intent, "kind", None),
+                        "side": side,
+                        "reason": cap_reason or "blocked_by_symbol_cap",
+                        "source": "risk_engine.enforce_symbol_cap",
+                    }
+                )
+                continue
+
+            final_notional = float(adjusted_notional)
+
+            # Loss-zone no-rebuy below threshold (if we have unrealized_pct wired)
+            if risk_engine.is_loss_zone_norebuy_block(
+                unrealized_pct=snap.unrealized_pct,
+                is_entry_side=True,
+            ):
+                telemetry.append(
+                    {
+                        "symbol": intent.symbol,
+                        "strategy": intent.strategy,
+                        "kind": getattr(intent, "kind", None),
+                        "side": side,
+                        "reason": "loss_zone_no_rebuy_below",
+                        "source": "risk_engine.is_loss_zone_norebuy_block",
+                    }
+                )
+                continue
+
+        # ----- EXIT / TP / SL: cap exit to actual position value; never sell w/o qty -----
+        else:
+            qty_here = float(getattr(pm_pos, "qty", 0.0) or 0.0)
+            px = _last_price_safe(intent.symbol)
+            if px <= 0.0:
+                telemetry.append(
+                    {
+                        "symbol": intent.symbol,
+                        "strategy": intent.strategy,
+                        "kind": getattr(intent, "kind", None),
+                        "side": side,
+                        "reason": "no_price_for_exit",
+                        "source": "scheduler_v2",
+                    }
+                )
+                continue
+
+            # If broker side is SELL, we must have something to sell
+            if side == "sell" and qty_here <= 0.0:
+                telemetry.append(
+                    {
+                        "symbol": intent.symbol,
+                        "strategy": intent.strategy,
+                        "kind": getattr(intent, "kind", None),
+                        "side": side,
+                        "reason": "exit_skipped_no_position_to_sell",
+                        "source": "scheduler_v2",
+                    }
+                )
+                continue
+
+            # Choose exit size (use intent.notional if provided, otherwise flatten)
+            if getattr(intent, "notional", None) is not None and float(getattr(intent, "notional", 0.0) or 0.0) > 0.0:
+                final_notional = float(getattr(intent, "notional", 0.0))
+            else:
+                final_notional = abs(qty_here) * px  # flatten full position
+
+            # Cap SELL exits so we never try to sell more than position value
+            if side == "sell":
+                max_notional = abs(qty_here) * px * 0.995  # buffer for fees/rounding
+                final_notional = min(final_notional, max_notional)
+
+        # Valid final_notional?
+        if final_notional <= 0.0:
+            telemetry.append(
+                {
+                    "symbol": intent.symbol,
+                    "strategy": intent.strategy,
+                    "kind": getattr(intent, "kind", None),
+                    "side": side,
+                    "reason": "non_positive_final_notional",
+                    "source": "scheduler_v2",
+                }
+            )
+            continue
+
+        # Ignore dust for entries + TP/SL; still allow generic exits (e.g. daily_flatten)
+        if final_notional < MIN_NOTIONAL_USD and getattr(intent, "kind", "") in {"entry", "scale", "take_profit", "stop_loss"}:
+            telemetry.append(
+                {
+                    "symbol": intent.symbol,
+                    "strategy": intent.strategy,
+                    "kind": getattr(intent, "kind", None),
+                    "side": side,
+                    "reason": f"below_min_notional:{final_notional:.4f}<{MIN_NOTIONAL_USD}",
+                    "source": "scheduler_v2",
+                }
+            )
+            continue
+
+        # Stop-the-bleed: one action per (symbol,strategy) per run
+        send_key = (intent.symbol, intent.strategy)
+        if send_key in sent_keys:
+            telemetry.append(
+                {
+                    "symbol": intent.symbol,
+                    "strategy": intent.strategy,
+                    "kind": getattr(intent, "kind", None),
+                    "side": side,
+                    "reason": "blocked_duplicate_action_same_run",
+                    "source": "scheduler_v2",
+                }
+            )
+            continue
+        sent_keys.add(send_key)
+
+        action_record: Dict[str, Any] = {
+            "symbol": intent.symbol,
+            "strategy": intent.strategy,
+            "intent_id": intent_id,
+            "side": side,
+            "kind": getattr(intent, "kind", None),
+            "notional": final_notional,
+            "reason": getattr(intent, "reason", None),
+            "dry": bool(dry),
+        }
+
+        if dry or br is None:
+            action_record["status"] = "skipped_dry_run"
+            try:
+                append_journal_v2(
+                    {
+                        "ts": time.time(),
+                        "source": "scheduler_v2",
+                        "intent_id": intent_id,
+                        "ordertxid": None,
+                        "userref": None,
+                        "symbol": intent.symbol,
+                        "strategy": intent.strategy,
+                        "kind": getattr(intent, "kind", None),
+                        "side": side,
+                        "notional": final_notional,
+                        "reason": getattr(intent, "reason", None),
+                        "dry": bool(dry),
+                        "status": action_record.get("status"),
+                        "response": action_record.get("response"),
+                        "error": action_record.get("error"),
+                    }
+                )
+            except Exception:
+                pass
+
+            actions.append(action_record)
+            continue
+
+        # ------------------------------------------------------------------
+        # Send to broker via br_router.market_notional
+        # ------------------------------------------------------------------
+        try:
+            resp = br.market_notional(
+                symbol=intent.symbol,
+                side=side,
+                notional=final_notional,
+                strategy=intent.strategy,
+            )
+            action_record["status"] = "sent"
+            action_record["response"] = resp
+
+            otx, ur = _extract_ordertxid_userref(resp)
+            if otx:
+                action_record["ordertxid"] = otx
+            if ur:
+                action_record["userref"] = ur
+
+        except Exception as e:
+            log.error("scheduler_v2: broker error for %s %s: %s", intent.symbol, side, e)
+            action_record["status"] = "error"
+            action_record["error"] = f"{e.__class__.__name__}: {e}"
+
+        # Journal v2: record every executed (or failed) broker call
+        try:
+            append_journal_v2(
+                {
+                    "ts": time.time(),
+                    "source": "scheduler_v2",
+                    "intent_id": intent_id,
+                    "ordertxid": action_record.get("ordertxid"),
+                    "userref": action_record.get("userref"),
+                    "symbol": intent.symbol,
+                    "strategy": intent.strategy,
+                    "kind": getattr(intent, "kind", None),
+                    "side": side,
                     "notional": final_notional,
                     "reason": getattr(intent, "reason", None),
                     "dry": bool(dry),
+                    "status": action_record.get("status"),
+                    "response": action_record.get("response"),
+                    "error": action_record.get("error"),
                 }
+            )
+        except Exception:
+            pass
 
-                if dry or br is None:
-                    action_record["status"] = "skipped_dry_run"
-                    try:
-                        append_journal_v2(
-                            {
-                                "ts": time.time(),
-                                "source": "scheduler_v2",
-                                "intent_id": intent_id,
-                                "ordertxid": None,
-                                "userref": None,
-                                "symbol": intent.symbol,
-                                "strategy": intent.strategy,
-                                "kind": getattr(intent, "kind", None),
-                                "side": side,
-                                "notional": final_notional,
-                                "reason": getattr(intent, "reason", None),
-                                "dry": bool(dry),
-                                "status": action_record.get("status"),
-                                "response": action_record.get("response"),
-                                "error": action_record.get("error"),
-                            }
-                        )
-                    except Exception:
-                        pass
+        actions.append(action_record)
 
-                    actions.append(action_record)
-                    continue
 
-                # ------------------------------------------------------------------
-                # Send to broker via br_router.market_notional
-                # ------------------------------------------------------------------
-                try:
-                    resp = br.market_notional(
-                        symbol=intent.symbol,
-                        side=side,
-                        notional=final_notional,
-                        strategy=intent.strategy,
-                    )
-                    action_record["status"] = "sent"
-                    action_record["response"] = resp
-
-                    otx, ur = _extract_ordertxid_userref(resp)
-                    if otx:
-                        action_record["ordertxid"] = otx
-                    if ur:
-                        action_record["userref"] = ur
-
-                except Exception as e:
-                    log.error("scheduler_v2: broker error for %s %s: %s", intent.symbol, side, e)
-                    action_record["status"] = "error"
-                    action_record["error"] = f"{e.__class__.__name__}: {e}"
-
-                # Journal v2: record every executed (or failed) broker call
-                try:
-                    append_journal_v2(
-                        {
-                            "ts": time.time(),
-                            "source": "scheduler_v2",
-                            "intent_id": intent_id,
-                            "ordertxid": action_record.get("ordertxid"),
-                            "userref": action_record.get("userref"),
-                            "symbol": intent.symbol,
-                            "strategy": intent.strategy,
-                            "kind": getattr(intent, "kind", None),
-                            "side": side,
-                            "notional": final_notional,
-                            "reason": getattr(intent, "reason", None),
-                            "dry": bool(dry),
-                            "status": action_record.get("status"),
-                            "response": action_record.get("response"),
-                            "error": action_record.get("error"),
-                        }
-                    )
-                except Exception:
-                    pass
-
-                actions.append(action_record)
 
     # ------------------------------------------------------------------
     # Build per-(strategy,symbol) universe summary for debugging
