@@ -104,6 +104,51 @@ except ModuleNotFoundError:
     from symbol_map import to_kraken, from_kraken, tf_to_kraken  # type: ignore
 
 # ---------------------------------------------------------------------------
+# Order cooldown latch (authoritative gateway)
+# ---------------------------------------------------------------------------
+_ORDER_LATCH_LOCK = threading.Lock()
+_ORDER_LATCH: Dict[tuple[str, str], Dict[str, Any]] = {}  # (strategy, UI_SYMBOL) -> {side, ts}
+
+def _cooldown_seconds(name: str, default: int = 0) -> int:
+    try:
+        return int(float(os.getenv(name, str(default)) or default))
+    except Exception:
+        return default
+
+def _cooldown_check_and_latch(strategy: str, ui_symbol: str, side: str) -> None:
+    """Raise if an order should be blocked by cooldown/min-hold; otherwise latch immediately."""
+    same_side = _cooldown_seconds('SCHED_COOLDOWN_SAME_SIDE_SECONDS', 0)
+    flip_side = _cooldown_seconds('SCHED_COOLDOWN_FLIP_SECONDS', 0)
+    min_hold  = _cooldown_seconds('SCHED_MIN_HOLD_SECONDS', 0)
+    if same_side <= 0 and flip_side <= 0 and min_hold <= 0:
+        return
+    now = time.time()
+    key = (strategy, ui_symbol)
+    with _ORDER_LATCH_LOCK:
+        prev = _ORDER_LATCH.get(key)
+        if prev is not None:
+            last_side = str(prev.get('side', '')).lower()
+            last_ts = float(prev.get('ts', 0.0) or 0.0)
+            dt = now - last_ts
+            if last_side == side and same_side > 0 and dt < same_side:
+                raise RuntimeError(f'cooldown_same_side strat={strategy} sym={ui_symbol} dt={dt:.1f}s < {same_side}s')
+            if last_side and last_side != side:
+                if flip_side > 0 and dt < flip_side:
+                    raise RuntimeError(f'cooldown_flip strat={strategy} sym={ui_symbol} {last_side}->{side} dt={dt:.1f}s < {flip_side}s')
+                if min_hold > 0 and dt < min_hold:
+                    raise RuntimeError(f'min_hold strat={strategy} sym={ui_symbol} {last_side}->{side} dt={dt:.1f}s < {min_hold}s')
+        # latch immediately (authoritative gateway). If AddOrder fails, caller rolls back.
+        _ORDER_LATCH[key] = {'side': side, 'ts': now}
+
+def _cooldown_rollback(strategy: str, ui_symbol: str, side: str) -> None:
+    key = (strategy, ui_symbol)
+    with _ORDER_LATCH_LOCK:
+        prev = _ORDER_LATCH.get(key)
+        if prev and str(prev.get('side','')).lower() == side:
+            _ORDER_LATCH.pop(key, None)
+
+
+# ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
 API_BASE = os.getenv("KRAKEN_BASE", "https://api.kraken.com")
@@ -408,6 +453,13 @@ def market_notional(
         raise ValueError("side must be 'buy' or 'sell'")
 
     ui = symbol.upper()
+
+    # Authoritative cooldown/min-hold gateway (applies to all order paths).
+    strat_tag = (strategy or '').strip()
+    if not strat_tag:
+        raise ValueError('missing strategy tag for order (strategy is required)')
+    _cooldown_check_and_latch(strat_tag, ui, side)
+
     pair = to_kraken(ui)
 
     # Use caller-supplied price if valid; otherwise fall back to last_price.
@@ -431,7 +483,11 @@ def market_notional(
             else _userref(ui, side, float(notional))
         ),
     }
-    res = _priv("AddOrder", payload)
+    try:
+        res = _priv("AddOrder", payload)
+    except Exception as e:
+        _cooldown_rollback(strat_tag, ui, side)
+        raise
 
     txid = None
     descr = None
