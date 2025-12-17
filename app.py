@@ -166,6 +166,14 @@ logging.basicConfig(
 )
 log = logging.getLogger("crypto-system-api")
 
+
+# ------------------------------------------------------------------------------
+# Scheduler anti-churn latch (in-memory, updates immediately on send)
+# This avoids relying on journal/trades DB latency to enforce cooldowns.
+# ------------------------------------------------------------------------------
+_LAST_ACTION_LATCH = {}  # (symbol, strategy) -> {ts, side, kind}
+_LAST_ACTION_LATCH_LOCK = threading.Lock()
+
 # --------------------------------------------------------------------------------------
 # Risk config loader (policy_config/risk.json)
 # --------------------------------------------------------------------------------------
@@ -4826,6 +4834,54 @@ def scheduler_run_v2(payload: Dict[str, Any] = Body(default=None)):
         # ------------------------------------------------------------------
         # Send to broker via br_router.market_notional
         # ------------------------------------------------------------------
+
+        # ------------------------------------------------------------------
+        # Stop-the-bleed cooldown latch (prevents rapid churn)
+        # NOTE: enforced using in-memory latch so it applies immediately.
+        # ------------------------------------------------------------------
+        try:
+            cooldown_same = int(os.getenv("SCHED_COOLDOWN_SAME_SIDE_SECONDS", "0") or 0)
+            cooldown_flip = int(os.getenv("SCHED_COOLDOWN_FLIP_SECONDS", "0") or 0)
+            min_hold_exit = int(os.getenv("SCHED_MIN_HOLD_SECONDS", "0") or 0)
+            kind_l = str(getattr(intent, "kind", "") or "").strip().lower()
+
+            # Stop-loss bypasses cooldown/min-hold (safety first)
+            if kind_l != "stop_loss" and (cooldown_same > 0 or cooldown_flip > 0 or (min_hold_exit > 0 and kind_l in ("exit", "take_profit"))):
+                key = (intent.symbol, intent.strategy)
+                now = time.time()
+                with _LAST_ACTION_LATCH_LOCK:
+                    last = _LAST_ACTION_LATCH.get(key)
+
+                if last:
+                    last_ts = float(last.get("ts") or 0.0)
+                    last_side = str(last.get("side") or "").strip().lower()
+                    age = now - last_ts
+
+                    if cooldown_same > 0 and last_side == side and age < cooldown_same:
+                        action_record["status"] = "skipped_cooldown_same_side"
+                        action_record["error"] = f"cooldown_same_side:{age:.1f}s<{cooldown_same}s"
+                        try: log.info("scheduler_v2: %s %s %s blocked (%s)", intent.strategy, intent.symbol, side, action_record["error"])
+                        except Exception: pass
+                        actions.append(action_record)
+                        continue
+
+                    if cooldown_flip > 0 and last_side and last_side != side and age < cooldown_flip:
+                        action_record["status"] = "skipped_cooldown_flip"
+                        action_record["error"] = f"cooldown_flip:{age:.1f}s<{cooldown_flip}s"
+                        try: log.info("scheduler_v2: %s %s %s blocked (%s)", intent.strategy, intent.symbol, side, action_record["error"])
+                        except Exception: pass
+                        actions.append(action_record)
+                        continue
+
+                    if min_hold_exit > 0 and kind_l in ("exit", "take_profit") and age < min_hold_exit:
+                        action_record["status"] = "skipped_min_hold"
+                        action_record["error"] = f"min_hold:{age:.1f}s<{min_hold_exit}s"
+                        try: log.info("scheduler_v2: %s %s %s blocked (%s)", intent.strategy, intent.symbol, side, action_record["error"])
+                        except Exception: pass
+                        actions.append(action_record)
+                        continue
+        except Exception:
+            pass
         try:
             resp = br.market_notional(
                 symbol=intent.symbol,
@@ -4836,6 +4892,17 @@ def scheduler_run_v2(payload: Dict[str, Any] = Body(default=None)):
             action_record["status"] = "sent"
             action_record["response"] = resp
 
+
+            # Update anti-churn latch immediately on send
+            try:
+                with _LAST_ACTION_LATCH_LOCK:
+                    _LAST_ACTION_LATCH[(intent.symbol, intent.strategy)] = {
+                        "ts": time.time(),
+                        "side": side,
+                        "kind": str(getattr(intent, "kind", None) or ""),
+                    }
+            except Exception:
+                pass
             otx, ur = _extract_ordertxid_userref(resp)
             if otx:
                 action_record["ordertxid"] = otx
