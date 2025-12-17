@@ -185,6 +185,47 @@ def load_risk_config() -> dict:
         log.warning("load_risk_config failed: %s", e)
         return {}
 
+
+
+# --------------------------------------------------------------------------------------
+# Whitelist config loader (policy_config/whitelist.json)
+# --------------------------------------------------------------------------------------
+def load_whitelist_config() -> dict:
+    """
+    Load per-strategy whitelist mapping from policy_config/whitelist.json.
+
+    Expected format:
+      { "c1": ["BTC/USD", "ETH/USD"], "c2": ["SOL/USD", ...], ... }
+
+    Returns {} on any error so callers can safely default.
+    """
+    try:
+        cfg_dir = os.getenv("POLICY_CFG_DIR", "policy_config")
+        path = Path(cfg_dir) / "whitelist.json"
+        if not path.exists():
+            return {}
+        with path.open("r", encoding="utf-8") as f:
+            raw = json.load(f)
+        if not isinstance(raw, dict):
+            return {}
+        # Normalize: lower strategy keys, upper symbol values
+        out = {}
+        for k, v in raw.items():
+            if not k:
+                continue
+            strat = str(k).strip().lower()
+            if not strat:
+                continue
+            if isinstance(v, (list, tuple)):
+                syms = [str(s).strip().upper() for s in v if str(s).strip()]
+            else:
+                syms = []
+            out[strat] = sorted(set(syms))
+        return out
+    except Exception as e:
+        log.warning("load_whitelist_config failed: %s", e)
+        return {}
+
 # --------------------------------------------------------------------------------------
 # Data Directory (avoid unwritable /mnt/data on some hosts)
 # --------------------------------------------------------------------------------------
@@ -3542,6 +3583,22 @@ def scheduler_run(payload: Dict[str, Any] = Body(default=None)):
         syms = [s.strip().upper() for s in symbols_csv.split(",") if s.strip()]
         limit = int(payload.get("limit", int(os.getenv("SCHED_LIMIT", "300") or 300)))
         notional = float(payload.get("notional", float(os.getenv("SCHED_NOTIONAL", "25") or 25)))
+
+        # --- whitelist enforcement (per-strategy universe) -------------------
+        enforce_wl = str(os.getenv("ENFORCE_STRAT_WHITELIST", "0")).lower() in ("1", "true", "yes")
+        wl_map: Dict[str, List[str]] = {}
+        if enforce_wl:
+            wl_map = load_whitelist_config() or {}
+        if enforce_wl and wl_map:
+            wl_union: set[str] = set()
+            for _st in strats:
+                _allowed = wl_map.get(_st, [])
+                if _allowed:
+                    wl_union |= set(_allowed)
+            if wl_union:
+                syms = sorted(wl_union)
+                symbols_csv = ",".join(syms)
+                log.info("Whitelist enforced: symbols now=%s", symbols_csv)
         msg = (
             f"Scheduler pass: strats={','.join(strats)} tf={tf} "
             f"limit={limit} notional={notional} dry={dry} symbols={symbols_csv}"
@@ -3696,7 +3753,12 @@ def scheduler_run(payload: Dict[str, Any] = Body(default=None)):
                 notional=notional,
             )
             try:
-                res = book.scan(req, contexts)
+                _ctx = contexts
+                if enforce_wl and wl_map:
+                    _allowed = set(wl_map.get(strat, []) or [])
+                    if _allowed:
+                        _ctx = {s: contexts[s] for s in contexts.keys() if s in _allowed}
+                res = book.scan(req, _ctx)
             except Exception as e:
                 telemetry.append({"strategy": strat, "error": str(e)})
                 continue
@@ -4764,56 +4826,7 @@ def scheduler_run_v2(payload: Dict[str, Any] = Body(default=None)):
         # ------------------------------------------------------------------
         # Send to broker via br_router.market_notional
         # ------------------------------------------------------------------
-        
-        # ------------------------------------------------------------------
-        # Stop-the-bleed cooldown latch across ticks (prevents rapid churn)
-        # ------------------------------------------------------------------
         try:
-            cooldown_same = int(os.getenv("SCHED_COOLDOWN_SAME_SIDE_SECONDS", "90") or 90)
-            cooldown_flip = int(os.getenv("SCHED_COOLDOWN_FLIP_SECONDS", "120") or 120)
-            min_hold_exit = int(os.getenv("SCHED_MIN_HOLD_SECONDS", "90") or 90)
-
-            kind_l = str(getattr(intent, "kind", "") or "").strip().lower()
-            # Stop-loss bypasses cooldowns
-            if kind_l != "stop_loss" and (cooldown_same > 0 or cooldown_flip > 0 or (min_hold_exit > 0 and kind_l in ("exit", "take_profit"))):
-                conn2 = _get_db_conn()
-                row = None
-                try:
-                    cur2 = conn2.cursor()
-                    cur2.execute(
-                        "SELECT ts, side FROM trades WHERE symbol=? AND strategy=? ORDER BY ts DESC LIMIT 1",
-                        (intent.symbol, intent.strategy),
-                    )
-                    row = cur2.fetchone()
-                finally:
-                    try: conn2.close()
-                    except Exception: pass
-
-                if row:
-                    last_ts = float(row[0] or 0.0)
-                    last_side = str(row[1] or "").strip().lower()
-                    age = time.time() - last_ts
-
-                    if cooldown_same > 0 and last_side == side and age < cooldown_same:
-                        action_record["status"] = "skipped_cooldown_same_side"
-                        action_record["error"] = f"cooldown_same_side:{age:.1f}s<{cooldown_same}s"
-                        actions.append(action_record)
-                        continue
-
-                    if cooldown_flip > 0 and last_side and last_side != side and age < cooldown_flip:
-                        action_record["status"] = "skipped_cooldown_flip"
-                        action_record["error"] = f"cooldown_flip:{age:.1f}s<{cooldown_flip}s"
-                        actions.append(action_record)
-                        continue
-
-                    if min_hold_exit > 0 and kind_l in ("exit", "take_profit") and age < min_hold_exit:
-                        action_record["status"] = "skipped_min_hold"
-                        action_record["error"] = f"min_hold:{age:.1f}s<{min_hold_exit}s"
-                        actions.append(action_record)
-                        continue
-        except Exception:
-            pass
-try:
             resp = br.market_notional(
                 symbol=intent.symbol,
                 side=side,
