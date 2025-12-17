@@ -4171,8 +4171,10 @@ def scheduler_run_v2(payload: Dict[str, Any] = Body(default=None)):
         if "/" in s:
             base, quote = s.split("/", 1)
             # Strip leading X/Z wrappers often used by Kraken asset codes
-            base = base.lstrip("XZ")
-            quote = quote.lstrip("XZ")
+            while len(base) > 3 and base[0] in "XZ":
+                base = base[1:]
+            while len(quote) > 3 and quote[0] in "XZ":
+                quote = quote[1:]
             return f"{base}/{quote}"
 
         return s
@@ -4452,6 +4454,30 @@ def scheduler_run_v2(payload: Dict[str, Any] = Body(default=None)):
         
         key = (intent.symbol, intent.strategy)
         pm_pos = positions.get(key)
+
+        # If this intent is coming from global risk, allow a symbol-only fallback
+        # (global_stop_loss / global_daily_flatten should flatten REAL positions even
+        # if the strategy label is "misc" or otherwise mismatched).
+        src = (getattr(intent, "source", "") or "").lower()
+        rsn = (getattr(intent, "reason", "") or "").lower()
+        is_global_risk = ("global_risk_engine" in src) or rsn.startswith("global_")
+
+        if pm_pos is None and is_global_risk:
+            # Find the largest-magnitude position for this symbol across strategies
+            best = None
+            best_abs = 0.0
+            for (sym_k, strat_k), pos_k in positions.items():
+                try:
+                    if sym_k != intent.symbol:
+                        continue
+                    q = float(getattr(pos_k, "qty", 0.0) or 0.0)
+                    if abs(q) > best_abs:
+                        best = pos_k
+                        best_abs = abs(q)
+                except Exception:
+                    continue
+            pm_pos = best
+
 
         snap = PositionSnapshot(
             symbol=intent.symbol,
