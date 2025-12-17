@@ -107,7 +107,7 @@ except ModuleNotFoundError:
 # Order cooldown latch (authoritative gateway)
 # ---------------------------------------------------------------------------
 _ORDER_LATCH_LOCK = threading.Lock()
-_ORDER_LATCH: Dict[tuple[str, str], Dict[str, Any]] = {}  # (strategy, UI_SYMBOL) -> {side, ts}
+_ORDER_LATCH: Dict[str, Dict[str, Any]] = {}  # UI_SYMBOL -> {side, ts, strategy}
 
 def _cooldown_seconds(name: str, default: int = 0) -> int:
     try:
@@ -123,7 +123,7 @@ def _cooldown_check_and_latch(strategy: str, ui_symbol: str, side: str) -> None:
     if same_side <= 0 and flip_side <= 0 and min_hold <= 0:
         return
     now = time.time()
-    key = (strategy, ui_symbol)
+    key = ui_symbol
     with _ORDER_LATCH_LOCK:
         prev = _ORDER_LATCH.get(key)
         if prev is not None:
@@ -138,14 +138,20 @@ def _cooldown_check_and_latch(strategy: str, ui_symbol: str, side: str) -> None:
                 if min_hold > 0 and dt < min_hold:
                     raise RuntimeError(f'min_hold strat={strategy} sym={ui_symbol} {last_side}->{side} dt={dt:.1f}s < {min_hold}s')
         # latch immediately (authoritative gateway). If AddOrder fails, caller rolls back.
-        _ORDER_LATCH[key] = {'side': side, 'ts': now}
+        _ORDER_LATCH[key] = {'side': side, 'ts': now, 'strategy': strategy}
 
 def _cooldown_rollback(strategy: str, ui_symbol: str, side: str) -> None:
-    key = (strategy, ui_symbol)
+    key = ui_symbol
     with _ORDER_LATCH_LOCK:
         prev = _ORDER_LATCH.get(key)
-        if prev and str(prev.get('side','')).lower() == side:
+        if not prev:
+            return
+        if str(prev.get('side','')).lower() != side:
+            return
+        # Only roll back if the latch was set by this same strategy; otherwise leave it.
+        if str(prev.get('strategy','')) == strategy:
             _ORDER_LATCH.pop(key, None)
+
 
 
 # ---------------------------------------------------------------------------
