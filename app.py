@@ -189,6 +189,50 @@ def load_risk_config() -> dict:
 # Data Directory (avoid unwritable /mnt/data on some hosts)
 # --------------------------------------------------------------------------------------
 
+# --------------------------------------------------------------------------------------
+# Whitelist config loader (policy_config/whitelist.json)
+# --------------------------------------------------------------------------------------
+def load_whitelist_config() -> dict:
+    """
+    Load per-strategy whitelist mapping from policy_config/whitelist.json.
+
+    Expected format:
+      { "c1": ["BTC/USD","ETH/USD"], "c2": ["..."], ... }
+
+    Returns {} on any error so callers can safely default.
+    """
+    try:
+        cfg_dir = os.getenv("POLICY_CFG_DIR", "policy_config")
+        path = Path(cfg_dir) / "whitelist.json"
+        if not path.exists():
+            return {}
+        data = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(data, dict):
+            return {}
+        out = {}
+        for k, v in data.items():
+            if not isinstance(k, str):
+                continue
+            if not isinstance(v, (list, tuple)):
+                continue
+            sym_list = []
+            for s in v:
+                try:
+                    s2 = str(s).strip().upper()
+                except Exception:
+                    continue
+                if not s2:
+                    continue
+                if s2 not in sym_list:
+                    sym_list.append(s2)
+            out[k.strip().lower()] = sym_list
+        return out
+    except Exception as e:
+        try:
+            log.warning("load_whitelist_config failed: %s", e)
+        except Exception:
+            pass
+        return {}
 def _pick_data_dir() -> Path:
     candidate = os.getenv("DATA_DIR", "./data")
     p = Path(candidate)
@@ -3540,6 +3584,27 @@ def scheduler_run(payload: Dict[str, Any] = Body(default=None)):
         ]
         symbols_csv = str(payload.get("symbols", os.getenv("SYMBOLS", "BTC/USD,ETH/USD")))
         syms = [s.strip().upper() for s in symbols_csv.split(",") if s.strip()]
+
+        # Optional per-strategy whitelist enforcement via policy_config/whitelist.json
+        enforce_whitelist = str(os.getenv("ENFORCE_STRAT_WHITELIST", "false")).lower() in ("1","true","yes","on")
+        wl = load_whitelist_config() if enforce_whitelist else {}
+        if enforce_whitelist and isinstance(wl, dict) and wl:
+            union = []
+            missing = []
+            for _st in strats:
+                allowed = wl.get(_st) or []
+                if allowed:
+                    for _sym in allowed:
+                        if _sym not in union:
+                            union.append(_sym)
+                else:
+                    missing.append(_st)
+            if union:
+                # Replace the scan universe with the union of whitelisted symbols
+                syms = union
+                symbols_csv = ",".join(syms)
+            if missing:
+                log.warning("Whitelist enabled but no symbols configured for strategies: %s", ",".join(missing))
         limit = int(payload.get("limit", int(os.getenv("SCHED_LIMIT", "300") or 300)))
         notional = float(payload.get("notional", float(os.getenv("SCHED_NOTIONAL", "25") or 25)))
         msg = (
@@ -3695,8 +3760,14 @@ def scheduler_run(payload: Dict[str, Any] = Body(default=None)):
                 min_score=min_score,
                 notional=notional,
             )
+            # Enforce per-strategy universe if enabled
+            ctx_use = contexts
+            if enforce_whitelist and isinstance(wl, dict) and wl:
+                _allowed = set(wl.get(strat) or [])
+                if _allowed:
+                    ctx_use = {k: v for (k, v) in contexts.items() if k in _allowed}
             try:
-                res = book.scan(req, contexts)
+                res = book.scan(req, ctx_use)
             except Exception as e:
                 telemetry.append({"strategy": strat, "error": str(e)})
                 continue
