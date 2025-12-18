@@ -66,7 +66,6 @@ import hmac
 import json
 import logging
 import os
-import math
 import sqlite3
 import sys
 import time
@@ -174,62 +173,6 @@ log = logging.getLogger("crypto-system-api")
 # ------------------------------------------------------------------------------
 _LAST_ACTION_LATCH = {}  # (symbol, strategy) -> {ts, side, kind}
 _LAST_ACTION_LATCH_LOCK = threading.Lock()
-
-# Global per-symbol latch (independent of strategy) to avoid N strategies all trying the same symbol-side
-# within the same cooldown/min-hold window. This reduces broker-side cooldown spam and avoids wasted calls.
-_GLOBAL_SYMBOL_LATCH: dict = {}  # symbol -> {ts, side, strategy}
-_GLOBAL_SYMBOL_LATCH_LOCK = threading.Lock()
-
-def _cooldown_env_seconds(name: str, default: float = 0.0) -> float:
-    try:
-        v = float(os.getenv(name, str(default)).strip() or default)
-        if not math.isfinite(v):
-            return float(default)
-        return max(0.0, v)
-    except Exception:
-        return float(default)
-
-def _global_symbol_cooldown_check_and_latch(symbol: str, side: str, strategy: str) -> Optional[str]:
-    """Return a human-readable block reason if blocked; otherwise latch and return None."""
-    same_side = _cooldown_env_seconds('SCHED_COOLDOWN_SAME_SIDE_SECONDS', 0.0)
-    flip_side = _cooldown_env_seconds('SCHED_COOLDOWN_FLIP_SECONDS', 0.0)
-    min_hold  = _cooldown_env_seconds('SCHED_MIN_HOLD_SECONDS', 0.0)
-    if same_side <= 0 and flip_side <= 0 and min_hold <= 0:
-        return None
-
-    key = str(symbol or '').upper()
-    now = time.time()
-
-    with _GLOBAL_SYMBOL_LATCH_LOCK:
-        prev = _GLOBAL_SYMBOL_LATCH.get(key)
-        if prev is not None:
-            last_side = str(prev.get('side', '')).lower()
-            last_ts = float(prev.get('ts', 0.0) or 0.0)
-            dt = now - last_ts
-
-            if last_side == side and same_side > 0 and dt < same_side:
-                return f'global_cooldown_same_side:{dt:.1f}s<{same_side:.0f}s'
-            if last_side and last_side != side:
-                if flip_side > 0 and dt < flip_side:
-                    return f'global_cooldown_flip:{dt:.1f}s<{flip_side:.0f}s'
-                if min_hold > 0 and dt < min_hold:
-                    return f'global_min_hold:{dt:.1f}s<{min_hold:.0f}s'
-
-        # latch immediately (mirrors broker gateway). caller rolls back on send failure.
-        _GLOBAL_SYMBOL_LATCH[key] = {'ts': now, 'side': side, 'strategy': strategy}
-    return None
-
-def _global_symbol_cooldown_rollback(symbol: str, side: str, strategy: str) -> None:
-    key = str(symbol or '').upper()
-    with _GLOBAL_SYMBOL_LATCH_LOCK:
-        prev = _GLOBAL_SYMBOL_LATCH.get(key)
-        if not prev:
-            return
-        if str(prev.get('side','')).lower() != str(side or '').lower():
-            return
-        if str(prev.get('strategy','')) == str(strategy or ''):
-            _GLOBAL_SYMBOL_LATCH.pop(key, None)
-
 
 # --------------------------------------------------------------------------------------
 # Risk config loader (policy_config/risk.json)
@@ -4605,7 +4548,76 @@ def scheduler_run_v2(payload: Dict[str, Any] = Body(default=None)):
     except Exception:
         global_risk_active = False
 
+    
     # ------------------------------------------------------------------
+    # GLOBAL SYMBOL GATE:
+    # Allow at most ONE action per *symbol* per scheduler pass, even if multiple
+    # strategies emit intents for the same symbol. This prevents burst trading
+    # (e.g., two different strategies both buying SUI in the same tick).
+    #
+    # Selection rules (per symbol):
+    #   1) Prefer exits over entries
+    #   2) Prefer stop_loss > exit > take_profit > entry/scale > other
+    #   3) If tie, keep the first encountered (stable)
+    # ------------------------------------------------------------------
+    def _symbol_kind_priority(kind: str) -> int:
+        k = (str(kind or "")).strip().lower()
+        if k == "stop_loss":
+            return 50
+        if k == "exit":
+            return 40
+        if k == "take_profit":
+            return 30
+        if k in ("entry", "scale"):
+            return 10
+        return 0
+
+    best_by_symbol: Dict[str, Any] = {}
+    dropped_by_symbol: List[Any] = []
+
+    try:
+        for it in list(final_intents):
+            sym_k = _canon_symbol(str(getattr(it, "symbol", "") or ""))
+            kind_k = (str(getattr(it, "kind", "") or "")).strip().lower()
+            pr = _symbol_kind_priority(kind_k)
+
+            prev = best_by_symbol.get(sym_k)
+            if prev is None:
+                best_by_symbol[sym_k] = it
+                continue
+
+            prev_kind = (str(getattr(prev, "kind", "") or "")).strip().lower()
+            prev_pr = _symbol_kind_priority(prev_kind)
+
+            if pr > prev_pr:
+                dropped_by_symbol.append(prev)
+                best_by_symbol[sym_k] = it
+            else:
+                dropped_by_symbol.append(it)
+
+        if dropped_by_symbol:
+            for it in dropped_by_symbol:
+                telemetry.append(
+                    {
+                        "symbol": getattr(it, "symbol", None),
+                        "strategy": getattr(it, "strategy", None),
+                        "kind": getattr(it, "kind", None),
+                        "side": getattr(it, "side", None),
+                        "reason": "blocked_by_global_symbol_gate",
+                        "source": "scheduler_v2",
+                    }
+                )
+
+        # Replace final_intents with gated list (stable order: original order filtered)
+        gated: List[Any] = []
+        keep_ids = set(id(v) for v in best_by_symbol.values())
+        for it in final_intents:
+            if id(it) in keep_ids:
+                gated.append(it)
+        final_intents = gated
+    except Exception as e:
+        telemetry.append({"stage": "global_symbol_gate", "ok": False, "error": f"{e.__class__.__name__}: {e}"})
+# ------------------------------------------------------------------
     # Apply guard + per-symbol caps + loss-zone no-rebuy; then route
     # Also: stop-the-bleed duplicate action latch (1 action per (sym,strat) per run)
     # ------------------------------------------------------------------
@@ -4939,14 +4951,6 @@ def scheduler_run_v2(payload: Dict[str, Any] = Body(default=None)):
                         continue
         except Exception:
             pass
-        # Global per-symbol cooldown gateway (prevents N strategies from spamming the broker gateway).
-        block_reason = _global_symbol_cooldown_check_and_latch(intent.symbol, side, intent.strategy)
-        if block_reason:
-            action_record["status"] = "blocked"
-            action_record["error"] = block_reason
-            actions.append(action_record)
-            continue
-
         try:
             resp = br.market_notional(
                 symbol=intent.symbol,
@@ -4975,7 +4979,6 @@ def scheduler_run_v2(payload: Dict[str, Any] = Body(default=None)):
                 action_record["userref"] = ur
 
         except Exception as e:
-            _global_symbol_cooldown_rollback(intent.symbol, side, intent.strategy)
             log.error("scheduler_v2: broker error for %s %s: %s", intent.symbol, side, e)
             action_record["status"] = "error"
             action_record["error"] = f"{e.__class__.__name__}: {e}"
