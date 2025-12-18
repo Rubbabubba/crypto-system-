@@ -195,7 +195,7 @@ def _get_env_first(*names: str):
 def _get_kraken_creds():
     key, key_name = _get_env_first(*_KRAKEN_KEY_NAMES)
     sec, sec_name = _get_env_first(*_KRAKEN_SECRET_NAMES)
-    return key, sec, key_name, sec_nam
+    return key, sec, key_name, sec_name
 
 SESSION = requests.Session()
 _GATE_LOCK = threading.Lock()

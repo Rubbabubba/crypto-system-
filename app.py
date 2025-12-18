@@ -624,7 +624,7 @@ def _kraken_creds():
     sec = sec or ""
 
     used = f"{key_name or '∅'}/{sec_name or '∅'}"
-    logger.info(f"_kraken_creds: using envs={used}; key_len={len(key)} sec_len={len(sec)}")
+    log.info(f"_kraken_creds: using pair={key_name}/{sec_name}; key_len={len(key) if key else 0} sec_len={len(sec) if sec else 0}")
     return key, sec, key_name, sec_name
 
 
