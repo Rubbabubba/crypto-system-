@@ -171,7 +171,7 @@ log = logging.getLogger("crypto-system-api")
 # Scheduler anti-churn latch (in-memory, updates immediately on send)
 # This avoids relying on journal/trades DB latency to enforce cooldowns.
 # ------------------------------------------------------------------------------
-_LAST_ACTION_LATCH = {}  # symbol -> {ts, side, kind, strategy}
+_LAST_ACTION_LATCH = {}  # (symbol, strategy) -> {ts, side, kind}
 _LAST_ACTION_LATCH_LOCK = threading.Lock()
 
 # --------------------------------------------------------------------------------------
@@ -742,6 +742,51 @@ def kraken_private(method: str, data: Dict[str, Any], key: str, secret_b64: str)
 # --------------------------------------------------------------------------------------
 # SQLite Journal store
 # --------------------------------------------------------------------------------------
+
+
+# --- Open Orders Guard (patch #2) -------------------------------------------
+# Prevent duplicate/stacked entries when an order is still open on Kraken.
+# We treat *any* open order on the same Kraken pair as a block for new entries.
+
+_OPEN_ORDERS_CACHE = {"ts": 0.0, "pairs": set()}
+
+def _parse_bool_env(name: str, default: bool = False) -> bool:
+    v = os.getenv(name)
+    if v is None:
+        return default
+    return str(v).strip().lower() in ("1", "true", "yes", "y", "on")
+
+def kraken_open_orders_pairs_cached(ttl_sec: float = 20.0) -> set:
+    """Return a set of Kraken pair strings with open orders (cached briefly)."""
+    now = time.time()
+    try:
+        ts = float(_OPEN_ORDERS_CACHE.get("ts") or 0.0)
+    except Exception:
+        ts = 0.0
+
+    pairs_obj = _OPEN_ORDERS_CACHE.get("pairs")
+    if (now - ts) < float(ttl_sec) and isinstance(pairs_obj, set):
+        return pairs_obj
+
+    pairs = set()
+    try:
+        resp = kraken_private("OpenOrders", {"trades": True})
+        result = (resp or {}).get("result") or {}
+        open_orders = result.get("open") or {}
+        for _txid, od in (open_orders or {}).items():
+            descr = (od or {}).get("descr") or {}
+            pair = descr.get("pair")
+            if pair:
+                pairs.add(str(pair))
+    except Exception as e:
+        # Fail open: if we can't fetch open orders, don't block trading.
+        log.warning("OpenOrders guard: failed to fetch open orders: %s", e)
+
+    _OPEN_ORDERS_CACHE["ts"] = now
+    _OPEN_ORDERS_CACHE["pairs"] = pairs
+    return pairs
+
+# ---------------------------------------------------------------------------
 
 def _db() -> sqlite3.Connection:
     # One connection per call (safe for FastAPI); always point at DATA_DIR/DB_PATH
@@ -4661,7 +4706,7 @@ def scheduler_run_v2(payload: Dict[str, Any] = Body(default=None)):
             )
             continue
 
-        key = intent.symbol
+        key = (intent.symbol, intent.strategy)
         pm_pos = positions.get(key)
 
         snap = PositionSnapshot(
@@ -4846,7 +4891,7 @@ def scheduler_run_v2(payload: Dict[str, Any] = Body(default=None)):
             continue
 
         # Stop-the-bleed: one action per (symbol,strategy) per run
-        send_key = intent.symbol
+        send_key = (intent.symbol, intent.strategy)
         if send_key in sent_keys:
             telemetry.append(
                 {
@@ -4916,7 +4961,7 @@ def scheduler_run_v2(payload: Dict[str, Any] = Body(default=None)):
 
             # Stop-loss bypasses cooldown/min-hold (safety first)
             if kind_l != "stop_loss" and (cooldown_same > 0 or cooldown_flip > 0 or (min_hold_exit > 0 and kind_l in ("exit", "take_profit"))):
-                key = intent.symbol
+                key = (intent.symbol, intent.strategy)
                 now = time.time()
                 with _LAST_ACTION_LATCH_LOCK:
                     last = _LAST_ACTION_LATCH.get(key)
@@ -4952,6 +4997,23 @@ def scheduler_run_v2(payload: Dict[str, Any] = Body(default=None)):
         except Exception:
             pass
         try:
+            # Open-orders guard (patch #2): optionally skip entries for pairs that already have an open order.
+            if _parse_bool_env("OPENORDER_GUARD", True) and not cfg.get("dry"):
+                try:
+                    ttl = float(os.getenv("OPENORDER_GUARD_TTL", "20"))
+                except Exception:
+                    ttl = 20.0
+                try:
+                    kpair = to_kraken(intent.symbol)
+                except Exception:
+                    kpair = None
+                if kpair:
+                    open_pairs = kraken_open_orders_pairs_cached(ttl_sec=ttl)
+                    if kpair in open_pairs:
+                        log.info("OpenOrders guard: skip %s (pair=%s) because open order exists", intent.symbol, kpair)
+                        telemetry.append({"t": "skip_open_order", "symbol": intent.symbol, "pair": kpair, "strat": intent.strat})
+                        continue
+
             resp = br.market_notional(
                 symbol=intent.symbol,
                 side=side,
@@ -4965,7 +5027,7 @@ def scheduler_run_v2(payload: Dict[str, Any] = Body(default=None)):
             # Update anti-churn latch immediately on send
             try:
                 with _LAST_ACTION_LATCH_LOCK:
-                    _LAST_ACTION_LATCH[intent.symbol] = {
+                    _LAST_ACTION_LATCH[(intent.symbol, intent.strategy)] = {
                         "ts": time.time(),
                         "side": side,
                         "kind": str(getattr(intent, "kind", None) or ""),
@@ -5229,7 +5291,7 @@ def scheduler_core_debug_risk(payload: Dict[str, Any] = Body(default=None)):
     re_engine = RiskEngine(risk_cfg)
     intents_after_risk: List[Dict[str, Any]] = []
     for intent in sched_result.intents:
-        key = intent.symbol
+        key = (intent.symbol, intent.strategy)
         pm_pos = positions.get(key)
         snap = PositionSnapshot(
             symbol=intent.symbol,
