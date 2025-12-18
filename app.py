@@ -597,25 +597,35 @@ _SCHED_LAST_LOCK = threading.Lock()
 # Kraken credentials & normalization helpers
 # --------------------------------------------------------------------------------------
 
-def _get_env_first(*names: str) -> Optional[str]:
+def _get_env_first(*names: str, return_name: bool = False):
+    """Return the first non-empty env var among `names`.
+
+    If return_name=False (default): returns the value or None.
+    If return_name=True: returns a tuple (value_or_None, env_name_used_or_empty).
+    """
     for n in names:
         v = os.getenv(n)
         if v:
-            return v
-    return None
+            return (v, n) if return_name else v
+    return (None, "") if return_name else None
 
 
 def _kraken_creds():
-    key = os.getenv("KRAKEN_API_KEY") or os.getenv("KRAKEN_KEY") or ""
-    sec = os.getenv("KRAKEN_API_SECRET") or os.getenv("KRAKEN_SECRET") or ""
-    user = os.getenv("KRAKEN_USER") or ""
-    pwd  = os.getenv("KRAKEN_PASS") or ""
-    used = "KRAKEN_API_KEY/SECRET" if os.getenv("KRAKEN_API_KEY") or os.getenv("KRAKEN_API_SECRET") else            ("KRAKEN_KEY/SECRET" if os.getenv("KRAKEN_KEY") or os.getenv("KRAKEN_SECRET") else "none")
-    try:
-        log.info("_kraken_creds: using pair=%s; key_len=%d sec_len=%d", used, len(key), len(sec))
-    except Exception:
-        pass
-    return key, sec, user, pwd
+    key, key_name = _get_env_first(
+        "KRAKEN_API_KEY", "KRAKEN_KEY", "KRAKEN_KEY_1", "KRAKEN_API_KEY_1",
+        return_name=True
+    )
+    sec, sec_name = _get_env_first(
+        "KRAKEN_API_SECRET", "KRAKEN_SECRET", "KRAKEN_SECRET_1", "KRAKEN_API_SECRET_1",
+        return_name=True
+    )
+
+    key = key or ""
+    sec = sec or ""
+
+    used = f"{key_name or '∅'}/{sec_name or '∅'}"
+    logger.info(f"_kraken_creds: using envs={used}; key_len={len(key)} sec_len={len(sec)}")
+    return key, sec, key_name, sec_name
 
 
 # ------------------------------------------------------------------------------

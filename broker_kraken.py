@@ -167,8 +167,35 @@ MIN_DELAY = float(os.getenv("KRAKEN_MIN_DELAY", "0.35"))  # seconds between call
 MAX_RETRIES = int(os.getenv("KRAKEN_MAX_RETRIES", "4"))
 BACKOFF_BASE = float(os.getenv("KRAKEN_BACKOFF_BASE", "0.8"))
 
-API_KEY = os.getenv("KRAKEN_KEY", "")
-API_SECRET = os.getenv("KRAKEN_SECRET", "")
+# Keep broker env resolution in sync with app.py.
+# We accept both naming schemes so either set works:
+# - New:    KRAKEN_API_KEY / KRAKEN_API_SECRET
+# - Legacy: KRAKEN_KEY / KRAKEN_SECRET
+# - Also optional "_1" suffixed variants used in some deployments.
+_KRAKEN_KEY_NAMES = (
+    "KRAKEN_API_KEY",
+    "KRAKEN_KEY",
+    "KRAKEN_KEY_1",
+    "KRAKEN_API_KEY_1",
+)
+_KRAKEN_SECRET_NAMES = (
+    "KRAKEN_API_SECRET",
+    "KRAKEN_SECRET",
+    "KRAKEN_SECRET_1",
+    "KRAKEN_API_SECRET_1",
+)
+
+def _get_env_first(*names: str):
+    for n in names:
+        v = os.getenv(n)
+        if v:
+            return v, n
+    return "", ""
+
+def _get_kraken_creds():
+    key, key_name = _get_env_first(*_KRAKEN_KEY_NAMES)
+    sec, sec_name = _get_env_first(*_KRAKEN_SECRET_NAMES)
+    return key, sec, key_name, sec_nam
 
 SESSION = requests.Session()
 _GATE_LOCK = threading.Lock()
@@ -214,16 +241,22 @@ def _pub(path: str, params: Dict[str, Any] | None = None) -> Dict[str, Any]:
     return {}
 
 def _sign(urlpath: str, data: Dict[str, Any]) -> Dict[str, str]:
+    api_key, api_secret, _, _ = _get_kraken_creds()
     postdata = "&".join(f"{k}={data[k]}" for k in data)
     message = (str(data["nonce"]) + postdata).encode()
     sha256 = hashlib.sha256(message).digest()
-    mac = hmac.new(base64.b64decode(API_SECRET), urlpath.encode() + sha256, hashlib.sha512)
+    mac = hmac.new(base64.b64decode(api_secret), urlpath.encode() + sha256, hashlib.sha512)
     sig = base64.b64encode(mac.digest()).decode()
-    return {"API-Key": API_KEY, "API-Sign": sig}
+    return {"API-Key": api_key, "API-Sign": sig}
 
 def _priv(path: str, params: Dict[str, Any] | None = None) -> Dict[str, Any]:
-    if not API_KEY or not API_SECRET:
-        raise RuntimeError("Missing KRAKEN_KEY / KRAKEN_SECRET for private call")
+    api_key, api_secret, key_name, sec_name = _get_kraken_creds()
+    if not api_key or not api_secret:
+        raise RuntimeError(
+            "Missing Kraken API creds. Set one of: "
+            f"{_KRAKEN_KEY_NAMES} and {_KRAKEN_SECRET_NAMES}. "
+            f"Detected key_env='{key_name}' secret_env='{sec_name}'."
+        )
     urlpath = f"/0/private/{path}"
     url = f"{API_BASE}{urlpath}"
     for attempt in range(MAX_RETRIES):
