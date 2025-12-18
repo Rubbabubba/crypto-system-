@@ -171,7 +171,7 @@ log = logging.getLogger("crypto-system-api")
 # Scheduler anti-churn latch (in-memory, updates immediately on send)
 # This avoids relying on journal/trades DB latency to enforce cooldowns.
 # ------------------------------------------------------------------------------
-_LAST_ACTION_LATCH = {}  # (symbol, strategy) -> {ts, side, kind}
+_LAST_ACTION_LATCH = {}  # symbol -> {ts, side, kind, strategy}
 _LAST_ACTION_LATCH_LOCK = threading.Lock()
 
 # --------------------------------------------------------------------------------------
@@ -4661,7 +4661,7 @@ def scheduler_run_v2(payload: Dict[str, Any] = Body(default=None)):
             )
             continue
 
-        key = (intent.symbol, intent.strategy)
+        key = intent.symbol
         pm_pos = positions.get(key)
 
         snap = PositionSnapshot(
@@ -4846,7 +4846,7 @@ def scheduler_run_v2(payload: Dict[str, Any] = Body(default=None)):
             continue
 
         # Stop-the-bleed: one action per (symbol,strategy) per run
-        send_key = (intent.symbol, intent.strategy)
+        send_key = intent.symbol
         if send_key in sent_keys:
             telemetry.append(
                 {
@@ -4916,7 +4916,7 @@ def scheduler_run_v2(payload: Dict[str, Any] = Body(default=None)):
 
             # Stop-loss bypasses cooldown/min-hold (safety first)
             if kind_l != "stop_loss" and (cooldown_same > 0 or cooldown_flip > 0 or (min_hold_exit > 0 and kind_l in ("exit", "take_profit"))):
-                key = (intent.symbol, intent.strategy)
+                key = intent.symbol
                 now = time.time()
                 with _LAST_ACTION_LATCH_LOCK:
                     last = _LAST_ACTION_LATCH.get(key)
@@ -4965,7 +4965,7 @@ def scheduler_run_v2(payload: Dict[str, Any] = Body(default=None)):
             # Update anti-churn latch immediately on send
             try:
                 with _LAST_ACTION_LATCH_LOCK:
-                    _LAST_ACTION_LATCH[(intent.symbol, intent.strategy)] = {
+                    _LAST_ACTION_LATCH[intent.symbol] = {
                         "ts": time.time(),
                         "side": side,
                         "kind": str(getattr(intent, "kind", None) or ""),
@@ -5229,7 +5229,7 @@ def scheduler_core_debug_risk(payload: Dict[str, Any] = Body(default=None)):
     re_engine = RiskEngine(risk_cfg)
     intents_after_risk: List[Dict[str, Any]] = []
     for intent in sched_result.intents:
-        key = (intent.symbol, intent.strategy)
+        key = intent.symbol
         pm_pos = positions.get(key)
         snap = PositionSnapshot(
             symbol=intent.symbol,
