@@ -624,7 +624,13 @@ def _kraken_creds():
     sec = sec or ""
 
     used = f"{key_name or '∅'}/{sec_name or '∅'}"
-    log.info(f"_kraken_creds: using pair={key_name}/{sec_name}; key_len={len(key) if key else 0} sec_len={len(sec) if sec else 0}")
+    try:
+        log.info(
+            f"_kraken_creds: using pair={key_name}/{sec_name}; "
+            f"key_len={len(key) if key else 0} sec_len={len(sec) if sec else 0}"
+        )
+    except Exception:
+        pass
     return key, sec, key_name, sec_name
 
 
@@ -1227,8 +1233,12 @@ def get_config():
     }
 @app.get("/debug/config")
 def debug_config():
-    key, sec, key_name, sec_name = _kraken_creds()
-    now = int(time.time())
+    try:
+        key, sec, key_name, sec_name = _kraken_creds()
+        now = int(time.time())
+    except Exception as e:
+        # Make this endpoint diagnostic-only; it should never hard-500.
+        return {"ok": False, "error": f"debug_config_failed: {e}"}
     return {
         "ok": True,
         "kraken_env_detected": {
