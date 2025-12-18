@@ -25,6 +25,25 @@ class SchedulerConfig:
     contexts: Dict[str, Dict[str, Any]]
     risk_cfg: Dict[str, Any] = field(default_factory=dict)
 
+    # Compatibility: some legacy code paths treat scheduler config like a dict
+    # and call `.get()`. SchedulerConfig is a dataclass, so provide a safe
+    # adapter that falls back to dataclass attributes or risk_cfg.
+    def get(self, key: str, default: Any = None) -> Any:
+        # 1) Direct attribute
+        if hasattr(self, key):
+            return getattr(self, key)
+
+        # 2) Allow common uppercase env-style keys to map to fields
+        k = key.lower()
+        if hasattr(self, k):
+            return getattr(self, k)
+
+        # 3) Finally, check risk_cfg (often used as a dict of extra flags)
+        if isinstance(self.risk_cfg, dict):
+            return self.risk_cfg.get(key, self.risk_cfg.get(k, default))
+
+        return default
+
 
 @dataclass
 class SchedulerResult:
