@@ -770,7 +770,8 @@ def kraken_open_orders_pairs_cached(ttl_sec: float = 20.0) -> set:
 
     pairs = set()
     try:
-        resp = kraken_private("OpenOrders", {"trades": True})
+        key, secret_b64, _, _ = _kraken_creds()
+        resp = kraken_private("OpenOrders", {"trades": True}, key, secret_b64)
         result = (resp or {}).get("result") or {}
         open_orders = result.get("open") or {}
         for _txid, od in (open_orders or {}).items():
