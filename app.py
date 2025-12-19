@@ -1,5 +1,5 @@
 """
-crypto-system-api (app.py) — v2.4.1
+crypto-system-api (app.py) — v2.4.2
 ------------------------------------
 Full drop-in FastAPI app.
 
@@ -776,19 +776,79 @@ def _kraken_sign(path: str, data: Dict[str, Any], secret_b64: str) -> str:
     mac = hmac.new(base64.b64decode(secret_b64), (path.encode() + sha256), hashlib.sha512)
     return base64.b64encode(mac.digest()).decode()
 
+# --- Kraken Nonce Guard (patch #2.4) ----------------------------------------
+# Kraken private endpoints require a strictly increasing nonce per API key.
+# Time-based nonces can collide during fast loops or concurrent requests, causing:
+#   EAPI:Invalid nonce
+#
+# We serialize private calls and persist the last nonce to DATA_DIR so restarts
+# can't regress the sequence.
+
+_KRAKEN_NONCE_LOCK = threading.Lock()
+_KRAKEN_NONCE_FILE = DATA_DIR / "kraken_nonce.json"
+_KRAKEN_NONCE_STATE = {"last": 0}
+
+def _load_kraken_nonce_state() -> None:
+    try:
+        if _KRAKEN_NONCE_FILE.exists():
+            obj = json.loads(_KRAKEN_NONCE_FILE.read_text(encoding="utf-8") or "{}")
+            _KRAKEN_NONCE_STATE["last"] = int(obj.get("last", 0) or 0)
+    except Exception:
+        # best-effort
+        pass
+
+def _save_kraken_nonce_state(last_nonce: int) -> None:
+    try:
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        tmp = _KRAKEN_NONCE_FILE.with_suffix(".tmp")
+        tmp.write_text(json.dumps({"last": int(last_nonce), "updated_at": int(time.time())}), encoding="utf-8")
+        os.replace(tmp, _KRAKEN_NONCE_FILE)
+    except Exception:
+        pass
+
+def _next_kraken_nonce() -> int:
+    # Must be called under _KRAKEN_NONCE_LOCK
+    now = int(time.time() * 1000)
+    last = int(_KRAKEN_NONCE_STATE.get("last", 0) or 0)
+    n = max(now, last + 1)
+    _KRAKEN_NONCE_STATE["last"] = n
+    _save_kraken_nonce_state(n)
+    return n
+
+# initialize nonce state on import
+_load_kraken_nonce_state()
+
 def kraken_private(method: str, data: Dict[str, Any], key: str, secret_b64: str) -> Dict[str, Any]:
+    """Kraken private API call with nonce serialization + retry on Invalid nonce."""
     path = f"/0/private/{method}"
     url = f"{KRAKEN_API_BASE}{path}"
-    data = dict(data) if data else {}
-    data["nonce"] = int(time.time() * 1000)
-    headers = {
-        "API-Key": key,
-        "API-Sign": _kraken_sign(path, data, secret_b64),
-        "Content-Type": "application/x-www-form-urlencoded",
-    }
-    r = requests.post(url, headers=headers, data=data, timeout=30)
-    r.raise_for_status()
-    return r.json()
+    payload = dict(data) if data else {}
+
+    # Serialize requests to ensure monotonic nonce ordering per key.
+    with _KRAKEN_NONCE_LOCK:
+        # Small bounded retry for transient Invalid nonce responses.
+        for attempt in range(6):
+            payload["nonce"] = _next_kraken_nonce()
+            headers = {
+                "API-Key": key,
+                "API-Sign": _kraken_sign(path, payload, secret_b64),
+                "Content-Type": "application/x-www-form-urlencoded",
+            }
+
+            r = requests.post(url, headers=headers, data=payload, timeout=30)
+            r.raise_for_status()
+            out = r.json()
+
+            errs = out.get("error") or []
+            if any("Invalid nonce" in str(e) for e in errs):
+                # backoff slightly and retry with a bumped nonce
+                time.sleep(0.6 + 0.4 * attempt)
+                continue
+
+            return out
+
+    # If we got here, we exhausted retries while still seeing Invalid nonce.
+    return {"error": ["EAPI:Invalid nonce (retries exhausted)"], "result": None}
 
 # --------------------------------------------------------------------------------------
 # SQLite Journal store
@@ -2124,6 +2184,19 @@ def journal_reconcile_ledgers_trades(limit: int = 50):
         ledgers_n = int(cur.fetchone()[0] or 0)
         cur.execute("SELECT COUNT(*) FROM ledgers WHERE type='trade'")
         ledgers_trade_n = int(cur.fetchone()[0] or 0)
+        # distinct trade refids present in ledgers (one trade => typically 2 ledger rows)
+        cur.execute('''
+            SELECT COUNT(DISTINCT l.refid)
+            FROM ledgers l
+            JOIN trades t ON t.txid = l.refid
+            WHERE l.type='trade' AND l.refid IS NOT NULL
+        ''')
+        ledgers_trade_refids_n = int(cur.fetchone()[0] or 0)
+
+        # non-trade ledgers (staking, transfers, etc.)
+        cur.execute("SELECT COUNT(*) FROM ledgers WHERE type IS NULL OR type <> 'trade'")
+        ledgers_non_trade_n = int(cur.fetchone()[0] or 0)
+
 
         # trades missing any trade-ledger rows
         cur.execute("""
@@ -2142,6 +2215,15 @@ def journal_reconcile_ledgers_trades(limit: int = 50):
               AND NOT EXISTS (SELECT 1 FROM trades t WHERE t.txid = l.refid)
         """)
         ledgers_missing_trades = int(cur.fetchone()[0] or 0)
+
+        # distinct trade refids in ledgers that do not exist in trades
+        cur.execute('''
+            SELECT COUNT(DISTINCT l.refid)
+            FROM ledgers l
+            WHERE l.type='trade' AND l.refid IS NOT NULL
+              AND NOT EXISTS (SELECT 1 FROM trades t WHERE t.txid = l.refid)
+        ''')
+        ledgers_missing_trades_distinct_n = int(cur.fetchone()[0] or 0)
 
         # fee mismatches (asset-aware): Kraken may charge fees in base asset (e.g., DOT) or quote (e.g., ZUSD).
         # We estimate the fee-in-USD from ledger rows by using the implied trade price from the ledger legs:
@@ -2240,11 +2322,14 @@ def journal_reconcile_ledgers_trades(limit: int = 50):
                 "trades": trades_n,
                 "ledgers": ledgers_n,
                 "ledgers_trade": ledgers_trade_n,
+                "ledgers_trade_refids": ledgers_trade_refids_n,
+                "ledgers_non_trade": ledgers_non_trade_n,
                 "trades_missing_ledgers": trades_missing_ledgers,
                 "ledgers_missing_trades": ledgers_missing_trades,
+                "ledgers_missing_trades_distinct": ledgers_missing_trades_distinct_n,
                 "fee_mismatch": len(fee_mismatches),
                 "cost_mismatch": len(cost_mismatches),
-                "coverage_pct": (float(ledgers_trade_n) / float(trades_n) if trades_n else 0.0),
+                "coverage_pct": (float(ledgers_trade_refids_n) / float(trades_n) if trades_n else 0.0),
                 "fee_eps": float(LEDGER_FEE_EPS),
                 "usd_eps": float(LEDGER_USD_EPS),
             },
