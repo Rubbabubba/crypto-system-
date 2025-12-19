@@ -1,5 +1,5 @@
 """
-crypto-system-api (app.py) — v2.4.0
+crypto-system-api (app.py) — v2.4.1
 ------------------------------------
 Full drop-in FastAPI app.
 
@@ -1892,6 +1892,8 @@ def journal_sync(payload: Dict[str, Any] = Body(default=None)):
             "creds_present": True,
             "since_hours": since_hours,
             "cursor_source": cursor_source,
+            "mode": mode,
+            "advance_cursor": advance_cursor,
             "cursor_file_ts": cursor_ts,
             "start_ts": start_ts0,
             "start_iso": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(start_ts0)),
@@ -1965,16 +1967,28 @@ def journal_ledgers_sync(payload: Dict[str, Any] = Body(default=None)):
         max_retries = int(os.getenv("KRAKEN_MAX_RETRIES", "6") or 6)
         timeout     = float(os.getenv("KRAKEN_TIMEOUT", "10") or 10)
 
+        mode = str(payload.get("mode", "cursor") or "cursor").lower()
+        advance_cursor = bool(payload.get("advance_cursor", False))
+
         cursor_blob = _read_ledger_cursor()
         cursor_ts = cursor_blob.get("last_seen_ts")
         now_ts = int(time.time())
         fallback_ts = now_ts - int(since_hours) * 3600
-        if cursor_ts:
-            start_ts0 = max(0, int(cursor_ts) - JOURNAL_SAFETY_BUFFER_SECONDS)
-            cursor_source = "cursor"
-        else:
+
+        # mode=backfill ignores the durable cursor for this run (safe because upserts are idempotent).
+        # By default it does NOT advance the durable cursor unless advance_cursor=true.
+        if mode == "backfill":
             start_ts0 = fallback_ts
-            cursor_source = "fallback"
+            cursor_source = "backfill"
+            cursor_ts_effective = 0
+        else:
+            if cursor_ts:
+                start_ts0 = max(0, int(cursor_ts) - JOURNAL_SAFETY_BUFFER_SECONDS)
+                cursor_source = "cursor"
+            else:
+                start_ts0 = fallback_ts
+                cursor_source = "fallback"
+            cursor_ts_effective = int(cursor_ts or 0)
 
         # Kraken paging
         ofs = 0
@@ -1983,7 +1997,7 @@ def journal_ledgers_sync(payload: Dict[str, Any] = Body(default=None)):
         inserted_total = 0
         updated_total = 0
         pages = 0
-        max_seen_ts = int(cursor_ts) if cursor_ts else 0
+        max_seen_ts = int(cursor_ts_effective) if cursor_ts_effective else 0
 
         def call_ledgers(payload: Dict[str, Any]) -> Dict[str, Any]:
             delay = min_delay
@@ -2075,7 +2089,7 @@ def journal_ledgers_sync(payload: Dict[str, Any] = Body(default=None)):
                 break
 
         # write cursor only if we observed newer data AND not dry_run
-        if (not dry_run) and max_seen_ts and (int(max_seen_ts) > int(cursor_ts or 0)):
+        if (not dry_run) and max_seen_ts and (int(max_seen_ts) > int(cursor_ts_effective)) and (mode != "backfill" or advance_cursor):
             _write_ledger_cursor(int(max_seen_ts), {"source": "kraken"})
 
         return {
@@ -2134,25 +2148,75 @@ def journal_reconcile_ledgers_trades(limit: int = 50):
         """)
         ledgers_missing_trades = int(cur.fetchone()[0] or 0)
 
-        # fee mismatches (sum ledger fee by refid vs trade fee)
+        # fee mismatches (asset-aware): Kraken may charge fees in base asset (e.g., DOT) or quote (e.g., ZUSD).
+        # We estimate the fee-in-USD from ledger rows by using the implied trade price from the ledger legs:
+        #   implied_px_usd = abs(usd_amount) / abs(base_amount)
+        # Then:
+        #   fee_usd_est = usd_fee + (base_fee * implied_px_usd)  (plus any other fee assets we can convert similarly)
+        #
+        # This reconciles cases like:
+        #   trade_fee=0.23992 USD, ledger_fee=0.11767129 DOT, implied_px≈2.038 USD/DOT => 0.11767129*2.038≈0.2399 USD
         cur.execute("""
-            WITH lf AS (
-              SELECT refid, SUM(COALESCE(fee,0)) AS fee_sum
-              FROM ledgers
-              WHERE refid IS NOT NULL
-              GROUP BY refid
-            )
-            SELECT t.txid, COALESCE(t.fee,0) AS trade_fee, COALESCE(lf.fee_sum,0) AS ledger_fee
+            SELECT t.txid, COALESCE(t.fee,0) AS trade_fee
             FROM trades t
-            JOIN lf ON lf.refid = t.txid
-            WHERE ABS(COALESCE(t.fee,0) - COALESCE(lf.fee_sum,0)) > ?
-            ORDER BY ABS(COALESCE(t.fee,0) - COALESCE(lf.fee_sum,0)) DESC
-            LIMIT ?
-        """, (float(LEDGER_FEE_EPS), int(limit)))
-        fee_mismatches = [
-            {"txid": r[0], "trade_fee": float(r[1] or 0), "ledger_fee": float(r[2] or 0)}
-            for r in (cur.fetchall() or [])
-        ]
+            WHERE EXISTS (SELECT 1 FROM ledgers l WHERE l.refid = t.txid AND l.type='trade')
+        """)
+        trade_fee_rows = cur.fetchall() or []
+
+        def _is_usd_asset(a: str) -> bool:
+            a = (a or "").upper()
+            return ("USD" in a) or (a in {"ZUSD", "USD"})
+
+        fee_mismatches = []
+        for (txid, trade_fee) in trade_fee_rows:
+            cur.execute("""
+                SELECT asset, COALESCE(amount,0) AS amount, COALESCE(fee,0) AS fee
+                FROM ledgers
+                WHERE refid = ? AND type='trade'
+            """, (txid,))
+            lrows = cur.fetchall() or []
+
+            # Aggregate ledger legs
+            fee_by_asset = {}
+            amt_by_asset = {}
+            for asset, amount, fee in lrows:
+                asset = asset or ""
+                fee_by_asset[asset] = float(fee_by_asset.get(asset, 0.0)) + float(fee or 0.0)
+                amt_by_asset[asset] = float(amt_by_asset.get(asset, 0.0)) + float(amount or 0.0)
+
+            # Identify implied price using USD leg vs non-USD leg(s).
+            usd_amt = sum(abs(v) for a, v in amt_by_asset.items() if _is_usd_asset(a))
+            non_usd_assets = [a for a in amt_by_asset.keys() if not _is_usd_asset(a)]
+            base_amt = sum(abs(amt_by_asset[a]) for a in non_usd_assets)
+
+            implied_px = (usd_amt / base_amt) if (usd_amt and base_amt) else None
+
+            # Convert fees to USD estimate
+            fee_usd_est = 0.0
+            fee_usd_direct = sum(float(v) for a, v in fee_by_asset.items() if _is_usd_asset(a))
+            fee_usd_est += fee_usd_direct
+
+            # If fee is charged in a non-USD asset and we have implied price, convert it.
+            fee_converted = {}
+            if implied_px:
+                for a, v in fee_by_asset.items():
+                    if _is_usd_asset(a):
+                        continue
+                    # best-effort: treat non-USD fee asset as base leg for conversion
+                    fee_converted[a] = float(v) * float(implied_px)
+                    fee_usd_est += fee_converted[a]
+
+            trade_fee_f = float(trade_fee or 0.0)
+            if abs(trade_fee_f - fee_usd_est) > float(LEDGER_FEE_EPS):
+                fee_mismatches.append({
+                    "txid": txid,
+                    "trade_fee": trade_fee_f,
+                    "ledger_fee_usd_est": float(fee_usd_est),
+                    "ledger_fee_by_asset": {k: float(v) for k, v in fee_by_asset.items() if abs(float(v)) > 0},
+                    "implied_px_usd": float(implied_px) if implied_px else None,
+                })
+
+        # cost mismatches (compare trade.cost vs abs(sum USD ledger amounts) when asset USD present)
 
         # cost mismatches (compare trade.cost vs abs(sum USD ledger amounts) when asset USD present)
         cur.execute("""
