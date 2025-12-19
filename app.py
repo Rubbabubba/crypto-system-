@@ -2020,8 +2020,7 @@ def journal_ledgers_sync(payload: Dict[str, Any] = Body(default=None)):
             return last or {"error": ["unknown_error"]}
 
         # Phase 1: ofs paging on start window
-        plateau = 0
-        last_count = None
+        max_pages = int(payload.get("max_pages", os.getenv("KRAKEN_MAX_PAGES", "500")) or 500)
         while inserted_total < hard_limit:
             payload = {"start": int(start_ts0), "ofs": int(ofs)}
             resp = call_ledgers(payload)
@@ -2066,22 +2065,18 @@ def journal_ledgers_sync(payload: Dict[str, Any] = Body(default=None)):
                 ins_res = insert_ledgers(rows)
                 inserted_total += int(ins_res.get('inserted', 0))
                 updated_total += int(ins_res.get('updated', 0))
-
-            # plateau detection
-            if last_count is not None and count == last_count:
-                plateau += 1
-            else:
-                plateau = 0
-            last_count = count
-
-            # Kraken uses ofs; stop when fewer than page_size-ish returned
+# Kraken uses ofs; stop when fewer than page_size-ish returned
             if not ledger_map or len(ledger_map) == 0:
                 break
 
             ofs += len(ledger_map)
 
-            # safety: if plateau a few times, stop
-            if plateau >= 3:
+            # stop when we've reached Kraken's reported count (if provided)
+            if count and ofs >= count:
+                break
+
+            # safety: cap pages to avoid runaway loops
+            if pages >= max_pages:
                 break
 
             # safety: don't spin forever
