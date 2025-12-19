@@ -298,6 +298,37 @@ JOURNAL_V2_MAX_BYTES = int(os.getenv("JOURNAL_V2_MAX_BYTES", str(5 * 1024 * 1024
 _JOURNAL_V2_LOCK = threading.Lock()
 
 
+# --- Ledgers sync watermark cursor (persisted on disk) ---
+LEDGER_CURSOR_PATH = DATA_DIR / "ledger_cursor.json"
+
+def _read_ledger_cursor() -> dict:
+    """Best-effort read of ledger cursor file. Returns {} on any error."""
+    try:
+        if LEDGER_CURSOR_PATH.exists():
+            return json.loads(LEDGER_CURSOR_PATH.read_text(encoding="utf-8"))
+    except Exception:
+        pass
+    return {}
+
+def _write_ledger_cursor(last_seen_ts: int, extra: dict | None = None) -> None:
+    """Atomic-ish best-effort write of ledger cursor file. Never raises."""
+    try:
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "last_seen_ts": int(last_seen_ts),
+            "updated_at": int(time.time()),
+            "updated_iso": datetime.datetime.utcnow().replace(microsecond=0).isoformat() + "Z",
+        }
+        if extra:
+            try:
+                payload.update(extra)
+            except Exception:
+                pass
+        tmp = LEDGER_CURSOR_PATH.with_suffix(".tmp")
+        tmp.write_text(json.dumps(payload, separators=(",", ":")), encoding="utf-8")
+        os.replace(str(tmp), str(LEDGER_CURSOR_PATH))
+    except Exception:
+        pass
 def append_journal_v2(event: Dict[str, Any]) -> None:
     """
     Append a single JSON event to journal_v2.jsonl with very defensive
@@ -836,6 +867,27 @@ def _db() -> sqlite3.Connection:
             raw JSON
         )
     """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS ledgers (
+            txid TEXT PRIMARY KEY,
+            refid TEXT,
+            ts REAL,
+            type TEXT,
+            subtype TEXT,
+            aclass TEXT,
+            subclass TEXT,
+            asset TEXT,
+            wallet TEXT,
+            amount REAL,
+            fee REAL,
+            balance REAL,
+            raw TEXT,
+            inserted_at REAL
+        )
+    """)
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_ledgers_refid ON ledgers(refid)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_ledgers_ts ON ledgers(ts)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_ledgers_asset ON ledgers(asset)")
 
     # Lightweight migrations for existing DBs (safe if columns already exist)
     try:
@@ -912,6 +964,60 @@ def insert_trades(rows: List[Dict[str, Any]]) -> int:
     conn.close()
     return count
 
+def insert_ledgers(rows: List[Dict[str, Any]]) -> int:
+    """Upsert ledgers into sqlite. Idempotent on txid."""
+    if not rows:
+        return 0
+
+    conn = _db()
+    cur = conn.cursor()
+
+    ins = """
+    INSERT INTO ledgers
+    (txid, refid, ts, type, subtype, aclass, subclass, asset, wallet, amount, fee, balance, raw, inserted_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(txid) DO UPDATE SET
+        refid = COALESCE(excluded.refid, ledgers.refid),
+        ts = excluded.ts,
+        type = COALESCE(excluded.type, ledgers.type),
+        subtype = COALESCE(excluded.subtype, ledgers.subtype),
+        aclass = COALESCE(excluded.aclass, ledgers.aclass),
+        subclass = COALESCE(excluded.subclass, ledgers.subclass),
+        asset = COALESCE(excluded.asset, ledgers.asset),
+        wallet = COALESCE(excluded.wallet, ledgers.wallet),
+        amount = excluded.amount,
+        fee = excluded.fee,
+        balance = excluded.balance,
+        raw = excluded.raw
+    """
+
+    now = time.time()
+    count = 0
+    for r in rows:
+        try:
+            cur.execute(ins, (
+                str(r.get("txid") or ""),
+                (r.get("refid") or None),
+                float(r.get("ts", 0) or 0),
+                (r.get("type") or None),
+                (r.get("subtype") or None),
+                (r.get("aclass") or None),
+                (r.get("subclass") or None),
+                (r.get("asset") or None),
+                (r.get("wallet") or None),
+                float(r.get("amount", 0) or 0),
+                float(r.get("fee", 0) or 0),
+                float(r.get("balance", 0) or 0),
+                json.dumps(r.get("raw") if isinstance(r.get("raw"), dict) else r, separators=(",", ":")),
+                now,
+            ))
+            count += cur.rowcount
+        except Exception as e:
+            log.warning(f"insert ledger skip txid={r.get('txid')}: {e}")
+
+    conn.commit()
+    conn.close()
+    return int(count)
 def fetch_rows(limit: int = 25, offset: int = 0) -> List[Dict[str, Any]]:
     conn = _db()
     cur = conn.cursor()
@@ -1760,6 +1866,250 @@ def journal_sync(payload: Dict[str, Any] = Body(default=None)):
 
 DAILY_JSON = os.path.join(DATA_DIR, "daily.json")
 
+@app.post("/journal/ledgers/sync")
+def journal_ledgers_sync(payload: Dict[str, Any] = Body(default=None)):
+    """Incremental sync of Kraken Ledgers into sqlite, with durable cursor."""
+    try:
+        import time, json as _json
+
+        payload     = payload or {}
+        dry_run     = bool(payload.get("dry_run", False))
+        since_hours = int(payload.get("since_hours", 72) or 72)
+        hard_limit  = int(payload.get("limit", 50000) or 50000)
+
+        key, sec, *_ = _kraken_creds()
+        if not (key and sec):
+            return {"ok": False, "error": "missing_credentials"}
+
+        min_delay   = float(os.getenv("KRAKEN_MIN_DELAY", "0.35") or 0.35)
+        max_retries = int(os.getenv("KRAKEN_MAX_RETRIES", "6") or 6)
+        timeout     = float(os.getenv("KRAKEN_TIMEOUT", "10") or 10)
+
+        cursor_blob = _read_ledger_cursor()
+        cursor_ts = cursor_blob.get("last_seen_ts")
+        now_ts = int(time.time())
+        fallback_ts = now_ts - int(since_hours) * 3600
+        if cursor_ts:
+            start_ts0 = max(0, int(cursor_ts) - JOURNAL_SAFETY_BUFFER_SECONDS)
+            cursor_source = "cursor"
+        else:
+            start_ts0 = fallback_ts
+            cursor_source = "fallback"
+
+        # Kraken paging
+        ofs = 0
+        seen_total = 0
+        pulled_total = 0
+        inserted_total = 0
+        pages = 0
+        max_seen_ts = int(cursor_ts) if cursor_ts else 0
+
+        def call_ledgers(payload: Dict[str, Any]) -> Dict[str, Any]:
+            delay = min_delay
+            last = None
+            for _ in range(max_retries):
+                time.sleep(min_delay)
+                try:
+                    resp = kraken_private("Ledgers", payload, key, sec)
+                except Exception as e:
+                    resp = {"error": [str(e)]}
+                last = resp
+                errs = (resp or {}).get("error") or []
+                if not errs:
+                    return resp
+                if any("Rate limit" in str(e) for e in errs):
+                    time.sleep(delay)
+                    delay = min(delay * 1.7, 8.0)
+                    continue
+                return resp
+            return last or {"error": ["unknown_error"]}
+
+        # Phase 1: ofs paging on start window
+        plateau = 0
+        last_count = None
+        while inserted_total < hard_limit:
+            payload = {"start": int(start_ts0), "ofs": int(ofs)}
+            resp = call_ledgers(payload)
+            errs = (resp or {}).get("error") or []
+            if errs:
+                # bail out safely; do not advance cursor
+                return {"ok": False, "dry_run": dry_run, "error": errs, "debug": {"cursor_source": cursor_source, "start_ts": start_ts0, "ofs": ofs}}
+
+            result = (resp or {}).get("result") or {}
+            ledger_map = result.get("ledger") or {}
+            count = int(result.get("count") or 0)
+            pages += 1
+
+            rows = []
+            for txid, v in (ledger_map or {}).items():
+                try:
+                    ts = float(v.get("time") or 0)
+                except Exception:
+                    ts = 0.0
+                if ts > max_seen_ts:
+                    max_seen_ts = int(ts)
+                rows.append({
+                    "txid": str(txid),
+                    "refid": v.get("refid"),
+                    "ts": ts,
+                    "type": v.get("type"),
+                    "subtype": v.get("subtype"),
+                    "aclass": v.get("aclass"),
+                    "subclass": v.get("subclass"),
+                    "asset": v.get("asset"),
+                    "wallet": v.get("wallet"),
+                    "amount": v.get("amount"),
+                    "fee": v.get("fee"),
+                    "balance": v.get("balance"),
+                    "raw": v,
+                })
+
+            seen_total += len(rows)
+            pulled_total += len(rows)
+
+            if not dry_run and rows:
+                inserted_total += insert_ledgers(rows)
+
+            # plateau detection
+            if last_count is not None and count == last_count:
+                plateau += 1
+            else:
+                plateau = 0
+            last_count = count
+
+            # Kraken uses ofs; stop when fewer than page_size-ish returned
+            if not ledger_map or len(ledger_map) == 0:
+                break
+
+            ofs += len(ledger_map)
+
+            # safety: if plateau a few times, stop
+            if plateau >= 3:
+                break
+
+            # safety: don't spin forever
+            if ofs > 200000:
+                break
+
+        # write cursor only if we observed newer data AND not dry_run
+        if (not dry_run) and max_seen_ts and (int(max_seen_ts) > int(cursor_ts or 0)):
+            _write_ledger_cursor(int(max_seen_ts), {"source": "kraken"})
+
+        return {
+            "ok": True,
+            "dry_run": dry_run,
+            "count": int(pulled_total),
+            "inserted": int(inserted_total),
+            "debug": {
+                "cursor_source": cursor_source,
+                "cursor_file_ts": int(cursor_ts or 0),
+                "start_ts": int(start_ts0),
+                "start_iso": datetime.datetime.utcfromtimestamp(int(start_ts0)).replace(microsecond=0).isoformat() + "Z" if start_ts0 else None,
+                "pages": int(pages),
+                "pulled": int(pulled_total),
+                "kraken_count": int(seen_total),
+                "hard_limit": int(hard_limit),
+                "max_seen_ts": int(max_seen_ts or 0),
+            }
+        }
+    except Exception as e:
+        log.exception("journal_ledgers_sync failed")
+        return {"ok": False, "error": str(e)}
+
+
+@app.get("/journal/reconcile/ledgers-trades")
+def journal_reconcile_ledgers_trades(limit: int = 50):
+    """Cross-check invariants between trades and ledgers (Kraken)."""
+    try:
+        conn = _db()
+        cur = conn.cursor()
+
+        # counts
+        cur.execute("SELECT COUNT(*) FROM trades")
+        trades_n = int(cur.fetchone()[0] or 0)
+        cur.execute("SELECT COUNT(*) FROM ledgers")
+        ledgers_n = int(cur.fetchone()[0] or 0)
+        cur.execute("SELECT COUNT(*) FROM ledgers WHERE type='trade'")
+        ledgers_trade_n = int(cur.fetchone()[0] or 0)
+
+        # trades missing any trade-ledger rows
+        cur.execute("""
+            SELECT COUNT(*) FROM trades t
+            WHERE NOT EXISTS (
+                SELECT 1 FROM ledgers l
+                WHERE l.refid = t.txid AND l.type='trade'
+            )
+        """)
+        trades_missing_ledgers = int(cur.fetchone()[0] or 0)
+
+        # trade-ledgers missing a trade row
+        cur.execute("""
+            SELECT COUNT(*) FROM ledgers l
+            WHERE l.type='trade' AND l.refid IS NOT NULL
+              AND NOT EXISTS (SELECT 1 FROM trades t WHERE t.txid = l.refid)
+        """)
+        ledgers_missing_trades = int(cur.fetchone()[0] or 0)
+
+        # fee mismatches (sum ledger fee by refid vs trade fee)
+        cur.execute("""
+            WITH lf AS (
+              SELECT refid, SUM(COALESCE(fee,0)) AS fee_sum
+              FROM ledgers
+              WHERE type='trade' AND refid IS NOT NULL
+              GROUP BY refid
+            )
+            SELECT t.txid, COALESCE(t.fee,0) AS trade_fee, COALESCE(lf.fee_sum,0) AS ledger_fee
+            FROM trades t
+            JOIN lf ON lf.refid = t.txid
+            WHERE ABS(COALESCE(t.fee,0) - COALESCE(lf.fee_sum,0)) > 1e-8
+            ORDER BY ABS(COALESCE(t.fee,0) - COALESCE(lf.fee_sum,0)) DESC
+            LIMIT ?
+        """, (int(limit),))
+        fee_mismatches = [
+            {"txid": r[0], "trade_fee": float(r[1] or 0), "ledger_fee": float(r[2] or 0)}
+            for r in (cur.fetchall() or [])
+        ]
+
+        # cost mismatches (compare trade.cost vs abs(sum USD ledger amounts) when asset USD present)
+        cur.execute("""
+            WITH usd AS (
+              SELECT refid, ABS(SUM(COALESCE(amount,0))) AS usd_amt
+              FROM ledgers
+              WHERE type='trade' AND refid IS NOT NULL AND asset LIKE '%USD%'
+              GROUP BY refid
+            )
+            SELECT t.txid, COALESCE(t.cost,0) AS trade_cost, COALESCE(usd.usd_amt,0) AS ledger_usd
+            FROM trades t
+            JOIN usd ON usd.refid = t.txid
+            WHERE ABS(COALESCE(t.cost,0) - COALESCE(usd.usd_amt,0)) > 1e-6
+            ORDER BY ABS(COALESCE(t.cost,0) - COALESCE(usd.usd_amt,0)) DESC
+            LIMIT ?
+        """, (int(limit),))
+        cost_mismatches = [
+            {"txid": r[0], "trade_cost": float(r[1] or 0), "ledger_usd": float(r[2] or 0)}
+            for r in (cur.fetchall() or [])
+        ]
+
+        conn.close()
+        return {
+            "ok": True,
+            "counts": {
+                "trades": trades_n,
+                "ledgers": ledgers_n,
+                "ledgers_trade": ledgers_trade_n,
+                "trades_missing_ledgers": trades_missing_ledgers,
+                "ledgers_missing_trades": ledgers_missing_trades,
+                "fee_mismatch": len(fee_mismatches),
+                "cost_mismatch": len(cost_mismatches),
+            },
+            "samples": {
+                "fee_mismatches": fee_mismatches,
+                "cost_mismatches": cost_mismatches,
+            }
+        }
+    except Exception as e:
+        log.exception("journal_reconcile_ledgers_trades failed")
+        return {"ok": False, "error": str(e)}
 @app.get("/advisor/daily")
 def advisor_daily():
     try:
