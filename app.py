@@ -260,6 +260,10 @@ DB_PATH = DATA_DIR / "journal.db"
 # --- Journal sync watermark cursor (persisted on disk) ---
 JOURNAL_CURSOR_PATH = DATA_DIR / "journal_cursor.json"
 JOURNAL_SAFETY_BUFFER_SECONDS = int(os.getenv("JOURNAL_SAFETY_BUFFER_SECONDS", "3600"))
+# Reconcile tolerances (avoid false mismatches from Kraken rounding/precision)
+LEDGER_FEE_EPS = float(os.getenv("LEDGER_FEE_EPS", "0.0002"))
+LEDGER_USD_EPS = float(os.getenv("LEDGER_USD_EPS", "0.0002"))
+
 
 def _read_journal_cursor() -> dict:
     """Best-effort read of journal cursor file. Returns {} on any error."""
@@ -964,60 +968,81 @@ def insert_trades(rows: List[Dict[str, Any]]) -> int:
     conn.close()
     return count
 
-def insert_ledgers(rows: List[Dict[str, Any]]) -> int:
-    """Upsert ledgers into sqlite. Idempotent on txid."""
+
+def insert_ledgers(rows: List[Dict[str, Any]]) -> Dict[str, int]:
+    """
+    Insert ledgers into sqlite with true idempotency.
+    - Uses INSERT OR IGNORE so overlap replays do not churn the DB.
+    - Performs a lightweight UPDATE only if key fields are currently NULL/empty (backfill).
+    Returns: {"inserted": int, "updated": int}
+    """
     if not rows:
-        return 0
+        return {"inserted": 0, "updated": 0}
 
     conn = _db()
     cur = conn.cursor()
 
     ins = """
-    INSERT INTO ledgers
+    INSERT OR IGNORE INTO ledgers
     (txid, refid, ts, type, subtype, aclass, subclass, asset, wallet, amount, fee, balance, raw, inserted_at)
     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    ON CONFLICT(txid) DO UPDATE SET
-        refid = COALESCE(excluded.refid, ledgers.refid),
-        ts = excluded.ts,
-        type = COALESCE(excluded.type, ledgers.type),
-        subtype = COALESCE(excluded.subtype, ledgers.subtype),
-        aclass = COALESCE(excluded.aclass, ledgers.aclass),
-        subclass = COALESCE(excluded.subclass, ledgers.subclass),
-        asset = COALESCE(excluded.asset, ledgers.asset),
-        wallet = COALESCE(excluded.wallet, ledgers.wallet),
-        amount = excluded.amount,
-        fee = excluded.fee,
-        balance = excluded.balance,
-        raw = excluded.raw
+    """
+
+    upd = """
+    UPDATE ledgers SET
+        refid = COALESCE(?, refid),
+        ts = COALESCE(?, ts),
+        type = COALESCE(?, type),
+        subtype = COALESCE(?, subtype),
+        aclass = COALESCE(?, aclass),
+        subclass = COALESCE(?, subclass),
+        asset = COALESCE(?, asset),
+        wallet = COALESCE(?, wallet),
+        amount = COALESCE(?, amount),
+        fee = COALESCE(?, fee),
+        balance = COALESCE(?, balance),
+        raw = COALESCE(?, raw)
+    WHERE txid = ?
+      AND (
+        refid IS NULL OR type IS NULL OR asset IS NULL OR raw IS NULL OR raw = ''
+      )
     """
 
     now = time.time()
-    count = 0
+    inserted = 0
+    updated = 0
+
     for r in rows:
         try:
-            cur.execute(ins, (
-                str(r.get("txid") or ""),
-                (r.get("refid") or None),
-                float(r.get("ts", 0) or 0),
-                (r.get("type") or None),
-                (r.get("subtype") or None),
-                (r.get("aclass") or None),
-                (r.get("subclass") or None),
-                (r.get("asset") or None),
-                (r.get("wallet") or None),
-                float(r.get("amount", 0) or 0),
-                float(r.get("fee", 0) or 0),
-                float(r.get("balance", 0) or 0),
-                json.dumps(r.get("raw") if isinstance(r.get("raw"), dict) else r, separators=(",", ":")),
-                now,
-            ))
-            count += cur.rowcount
+            txid = str(r.get("txid") or "")
+            refid = (r.get("refid") or None)
+            ts = float(r.get("ts", 0) or 0)
+            typ = (r.get("type") or None)
+            subtype = (r.get("subtype") or None)
+            aclass = (r.get("aclass") or None)
+            subclass = (r.get("subclass") or None)
+            asset = (r.get("asset") or None)
+            wallet = (r.get("wallet") or None)
+            amount = float(r.get("amount", 0) or 0)
+            fee = float(r.get("fee", 0) or 0)
+            balance = float(r.get("balance", 0) or 0)
+            raw = json.dumps(r.get("raw") if isinstance(r.get("raw"), dict) else r, separators=(",", ":"))
+
+            cur.execute(ins, (txid, refid, ts, typ, subtype, aclass, subclass, asset, wallet, amount, fee, balance, raw, now))
+            if cur.rowcount == 1:
+                inserted += 1
+            else:
+                # Optional backfill for older rows with missing metadata; does not churn every run.
+                cur.execute(upd, (refid, ts, typ, subtype, aclass, subclass, asset, wallet, amount, fee, balance, raw, txid))
+                if cur.rowcount == 1:
+                    updated += 1
         except Exception as e:
             log.warning(f"insert ledger skip txid={r.get('txid')}: {e}")
 
     conn.commit()
     conn.close()
-    return int(count)
+    return {"inserted": int(inserted), "updated": int(updated)}
+
 def fetch_rows(limit: int = 25, offset: int = 0) -> List[Dict[str, Any]]:
     conn = _db()
     cur = conn.cursor()
@@ -1441,6 +1466,61 @@ def journal_peek(limit: int = Query(25, ge=1, le=1000), offset: int = Query(0, g
     rows = fetch_rows(limit=limit, offset=offset)
     return {"ok": True, "count": count_rows(), "rows": rows}
     
+
+@app.get("/journal/ledgers")
+def journal_ledgers_peek(
+    limit: int = Query(25, ge=1, le=2000),
+    offset: int = Query(0, ge=0),
+    type: Optional[str] = Query(None, description="Optional ledger type filter, e.g. trade/deposit/withdrawal"),
+    asset: Optional[str] = Query(None, description="Optional asset filter, e.g. ZUSD, XXBT, ETH"),
+    refid: Optional[str] = Query(None, description="Optional refid (often trade txid)"),
+):
+    """
+    Inspect ingested Kraken ledger rows (for debugging + reconciliation).
+    """
+    conn = _db()
+    cur = conn.cursor()
+
+    where = []
+    args: List[Any] = []
+    if type:
+        where.append("type = ?")
+        args.append(type)
+    if asset:
+        where.append("asset LIKE ?")
+        args.append(f"%{asset}%")
+    if refid:
+        where.append("refid = ?")
+        args.append(refid)
+
+    wsql = ("WHERE " + " AND ".join(where)) if where else ""
+    cur.execute(f"SELECT COUNT(*) FROM ledgers {wsql}", tuple(args))
+    total = int(cur.fetchone()[0] or 0)
+
+    cur.execute(f"""
+        SELECT txid, refid, ts, type, subtype, asset, amount, fee, balance
+        FROM ledgers
+        {wsql}
+        ORDER BY ts DESC
+        LIMIT ? OFFSET ?
+    """, tuple(args + [int(limit), int(offset)]))
+    rows = []
+    for r in (cur.fetchall() or []):
+        rows.append({
+            "txid": r[0],
+            "refid": r[1],
+            "ts": float(r[2] or 0),
+            "type": r[3],
+            "subtype": r[4],
+            "asset": r[5],
+            "amount": float(r[6] or 0),
+            "fee": float(r[7] or 0),
+            "balance": float(r[8] or 0),
+        })
+    conn.close()
+    return {"ok": True, "count": total, "rows": rows}
+
+
 @app.post("/journal/attach")
 def journal_attach(payload: dict = Body(default=None)):
     """
@@ -1901,6 +1981,7 @@ def journal_ledgers_sync(payload: Dict[str, Any] = Body(default=None)):
         seen_total = 0
         pulled_total = 0
         inserted_total = 0
+        updated_total = 0
         pages = 0
         max_seen_ts = int(cursor_ts) if cursor_ts else 0
 
@@ -1968,7 +2049,9 @@ def journal_ledgers_sync(payload: Dict[str, Any] = Body(default=None)):
             pulled_total += len(rows)
 
             if not dry_run and rows:
-                inserted_total += insert_ledgers(rows)
+                ins_res = insert_ledgers(rows)
+                inserted_total += int(ins_res.get('inserted', 0))
+                updated_total += int(ins_res.get('updated', 0))
 
             # plateau detection
             if last_count is not None and count == last_count:
@@ -2000,6 +2083,7 @@ def journal_ledgers_sync(payload: Dict[str, Any] = Body(default=None)):
             "dry_run": dry_run,
             "count": int(pulled_total),
             "inserted": int(inserted_total),
+            "updated": int(updated_total),
             "debug": {
                 "cursor_source": cursor_source,
                 "cursor_file_ts": int(cursor_ts or 0),
@@ -2055,16 +2139,16 @@ def journal_reconcile_ledgers_trades(limit: int = 50):
             WITH lf AS (
               SELECT refid, SUM(COALESCE(fee,0)) AS fee_sum
               FROM ledgers
-              WHERE type='trade' AND refid IS NOT NULL
+              WHERE refid IS NOT NULL
               GROUP BY refid
             )
             SELECT t.txid, COALESCE(t.fee,0) AS trade_fee, COALESCE(lf.fee_sum,0) AS ledger_fee
             FROM trades t
             JOIN lf ON lf.refid = t.txid
-            WHERE ABS(COALESCE(t.fee,0) - COALESCE(lf.fee_sum,0)) > 1e-8
+            WHERE ABS(COALESCE(t.fee,0) - COALESCE(lf.fee_sum,0)) > ?
             ORDER BY ABS(COALESCE(t.fee,0) - COALESCE(lf.fee_sum,0)) DESC
             LIMIT ?
-        """, (int(limit),))
+        """, (float(LEDGER_FEE_EPS), int(limit)))
         fee_mismatches = [
             {"txid": r[0], "trade_fee": float(r[1] or 0), "ledger_fee": float(r[2] or 0)}
             for r in (cur.fetchall() or [])
@@ -2081,10 +2165,10 @@ def journal_reconcile_ledgers_trades(limit: int = 50):
             SELECT t.txid, COALESCE(t.cost,0) AS trade_cost, COALESCE(usd.usd_amt,0) AS ledger_usd
             FROM trades t
             JOIN usd ON usd.refid = t.txid
-            WHERE ABS(COALESCE(t.cost,0) - COALESCE(usd.usd_amt,0)) > 1e-6
+            WHERE ABS(COALESCE(t.cost,0) - COALESCE(usd.usd_amt,0)) > ?
             ORDER BY ABS(COALESCE(t.cost,0) - COALESCE(usd.usd_amt,0)) DESC
             LIMIT ?
-        """, (int(limit),))
+        """, (float(LEDGER_USD_EPS), int(limit)))
         cost_mismatches = [
             {"txid": r[0], "trade_cost": float(r[1] or 0), "ledger_usd": float(r[2] or 0)}
             for r in (cur.fetchall() or [])
@@ -2101,11 +2185,15 @@ def journal_reconcile_ledgers_trades(limit: int = 50):
                 "ledgers_missing_trades": ledgers_missing_trades,
                 "fee_mismatch": len(fee_mismatches),
                 "cost_mismatch": len(cost_mismatches),
+                "coverage_pct": (float(ledgers_trade_n) / float(trades_n) if trades_n else 0.0),
+                "fee_eps": float(LEDGER_FEE_EPS),
+                "usd_eps": float(LEDGER_USD_EPS),
             },
             "samples": {
                 "fee_mismatches": fee_mismatches,
                 "cost_mismatches": cost_mismatches,
-            }
+            },
+            "notes": ([f"Ledger coverage is low: {ledgers_trade_n}/{trades_n} trades have matching ledgers. Consider running /journal/ledgers/sync with a larger since_hours to backfill."] if (trades_n and ledgers_trade_n < trades_n) else [])
         }
     except Exception as e:
         log.exception("journal_reconcile_ledgers_trades failed")
