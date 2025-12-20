@@ -14,6 +14,40 @@ from dataclasses import dataclass, asdict
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
+
+
+# --- Symbol canonicalization (Step C) ---
+try:
+    from symbol_map import from_kraken as _from_kraken
+except Exception:
+    _from_kraken = None
+
+def _canon_symbol(symbol: Any, pair: Any = None) -> str:
+    """
+    Return canonical UI symbol (e.g., 'ETH/USD') from potentially messy inputs:
+    - 'XETHZUSD', 'XETHZ/USD', 'ETHUSD', 'ETH/USD', etc.
+    """
+    s = (str(symbol or "")).strip()
+    p = (str(pair or "")).strip()
+    # Prefer explicit symbol if present, otherwise fall back to pair
+    cand = s or p
+    if not cand:
+        return ""
+    if _from_kraken:
+        try:
+            out = _from_kraken(cand)
+            if out:
+                return out
+        except Exception:
+            pass
+    # Basic fallback: inject slash for USD/USDT if missing
+    u = cand.upper().replace(" ", "")
+    if "/" not in u:
+        if u.endswith("USD") and len(u) > 3:
+            u = u[:-3] + "/USD"
+        elif u.endswith("USDT") and len(u) > 4:
+            u = u[:-4] + "/USDT"
+    return u
 # -----------------------
 # Paths (match app.py)
 # -----------------------
@@ -103,7 +137,7 @@ def _fetch_trades_since(since_ts: float) -> List[Dict[str, Any]]:
                     "txid": r[0],
                     "ts": float(r[1] or 0),
                     "pair": r[2],
-                    "symbol": r[3],
+                    "symbol": _canon_symbol(r[3], r[2]),
                     "side": r[4],
                     "price": float(r[5] or 0),
                     "volume": float(r[6] or 0),

@@ -461,6 +461,39 @@ def reconcile_trade_attribution() -> Dict[str, Any]:
     """
     attrib = _load_attrib_from_journal_v2()
 
+    # --- Step C: symbol normalization (canonical) ---
+    # Legacy runs may have written non-canonical symbols like "XETHZ/USD" or "XLTCZ/USD".
+    # Normalize stored trades.symbol to canonical UI form (e.g., "ETH/USD") using Kraken pair codes.
+    try:
+        conn = _db()
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT DISTINCT pair, symbol
+            FROM trades
+            WHERE symbol IS NOT NULL
+              AND symbol LIKE '%/%'
+              AND (symbol LIKE 'X%/%' OR symbol LIKE 'Z%/%' OR symbol LIKE '%Z/%')
+            LIMIT 5000
+            """
+        )
+        fixes = []
+        for pair_raw, sym_raw in cur.fetchall():
+            pair_raw = pair_raw or ""
+            sym_raw  = sym_raw or ""
+            canon = from_kraken_pair_to_app(pair_raw) or from_kraken_pair_to_app(sym_raw) or sym_raw
+            if canon and canon != sym_raw:
+                fixes.append((canon, sym_raw))
+        if fixes:
+            cur.executemany("UPDATE trades SET symbol = ? WHERE symbol = ?", fixes)
+            conn.commit()
+        try:
+            conn.close()
+        except Exception:
+            pass
+    except Exception:
+        pass
+
     # Best-effort fallback: if journal_v2 attribution is missing (or journal_v2 file isn't present),
     # build an attribution map from existing trades that already have strategy/intent_id.
     # This lets us backfill newly-pulled Kraken trades that arrive without attribution.
@@ -1725,13 +1758,6 @@ def journal_sync(payload: Dict[str, Any] = Body(default=None)):
         since_hours = int(payload.get("since_hours", 72) or 72)
         hard_limit  = int(payload.get("limit", 50000) or 50000)
 
-        # mode controls how the start window is chosen. Default keeps existing behavior (cursor-based incremental).
-        # - mode=cursor   : use durable cursor if present, otherwise fallback to since_hours window
-        # - mode=backfill : ignore durable cursor for this run (safe because upserts are idempotent)
-        # advance_cursor (default True) controls whether we advance the durable cursor after a successful run.
-        mode = str(payload.get("mode", "cursor") or "cursor").lower()
-        advance_cursor = bool(payload.get("advance_cursor", True))
-
         key, sec, *_ = _kraken_creds()
         if not (key and sec):
             return {"ok": False, "error": "missing_credentials"}
@@ -1764,23 +1790,13 @@ def journal_sync(payload: Dict[str, Any] = Body(default=None)):
         cursor_ts = cursor_blob.get("last_seen_ts")
         now_ts = int(time.time())
         fallback_ts = now_ts - int(since_hours) * 3600
-
-        # mode=backfill ignores the durable cursor for this run (safe because upserts are idempotent).
-        # By default it DOES advance the durable cursor (advance_cursor=True) after a successful run.
-        if mode == "backfill":
-            start_ts0 = fallback_ts
-            cursor_source = "backfill"
-            cursor_ts_effective = 0
+        if cursor_ts:
+            # Best practice: always fetch since (last_seen_ts - safety buffer)
+            start_ts0 = max(0, int(cursor_ts) - JOURNAL_SAFETY_BUFFER_SECONDS)
+            cursor_source = "cursor"
         else:
-            if cursor_ts:
-                # Best practice: always fetch since (last_seen_ts - safety buffer)
-                start_ts0 = max(0, int(cursor_ts) - JOURNAL_SAFETY_BUFFER_SECONDS)
-                cursor_source = "cursor"
-            else:
-                start_ts0 = fallback_ts
-                cursor_source = "since_hours"
-            cursor_ts_effective = int(cursor_ts or 0)
-
+            start_ts0 = fallback_ts
+            cursor_source = "since_hours"
 
         UPSERT_SQL = """
         INSERT INTO trades (
@@ -1963,14 +1979,8 @@ def journal_sync(payload: Dict[str, Any] = Body(default=None)):
             total_rows = None
             notes.append({"post_count_error": str(e)})
         
-        # Persist watermark cursor so redeploys don't lose attribution window.
-        # In backfill mode, do not advance the durable cursor unless advance_cursor=true.
-        candidate_ts = int(last_seen_ts or 0)
-        base_ts      = int(cursor_ts_effective or 0)
-        if mode == "backfill" and (not advance_cursor):
-            new_cursor_ts = 0
-        else:
-            new_cursor_ts = max(base_ts, candidate_ts)
+        # Persist watermark cursor so redeploys don't lose attribution window
+        new_cursor_ts = max(int(cursor_ts or 0), int(last_seen_ts or 0))
 
         debug = {
             "creds_present": True,
