@@ -29,23 +29,6 @@ import threading
 import json
 from pathlib import Path
 from typing import Any, Dict, List, Optional
-import logging
-log = logging.getLogger(__name__)
-
-# Kraken requires a strictly increasing nonce for private endpoints.
-# This helper guarantees monotonicity across rapid calls / threads in a single process.
-_nonce_lock = threading.Lock()
-_last_nonce_ms = 0
-
-def _next_nonce_ms() -> str:
-    global _last_nonce_ms
-    with _nonce_lock:
-        now = int(time.time() * 1000)
-        if now <= _last_nonce_ms:
-            now = _last_nonce_ms + 1
-        _last_nonce_ms = now
-        return str(now)
-
 
 
 def _load_strategy_to_userref() -> Dict[str, int]:
@@ -266,48 +249,57 @@ def _sign(urlpath: str, data: Dict[str, Any]) -> Dict[str, str]:
     sig = base64.b64encode(mac.digest()).decode()
     return {"API-Key": api_key, "API-Sign": sig}
 
-def _priv(path: str, params: Dict[str, Any] | None = None) -> Dict[str, Any]:
-    api_key, api_secret, key_name, sec_name = _get_kraken_creds()
-    if not api_key or not api_secret:
-        raise RuntimeError(
-            "Missing Kraken API creds. Set one of: "
-            f"{_KRAKEN_KEY_NAMES} and {_KRAKEN_SECRET_NAMES}. "
-            f"Detected key_env='{key_name}' secret_env='{sec_name}'."
-        )
+def _priv(path: str, data: Dict[str, Any], timeout: float = 30.0) -> Dict[str, Any]:
+    """Kraken private endpoint helper.
+
+    IMPORTANT: Kraken returns HTTP 200 even when the call failed. The failure is
+    encoded in the JSON payload: {"error":[...]}.
+
+    This helper logs the endpoint + errors and raises if errors are present.
+    """
     urlpath = f"/0/private/{path}"
-    url = f"{API_BASE}{urlpath}"
-    for attempt in range(MAX_RETRIES):
+    url = _KRAKEN_API + urlpath
+
+    # Kraken requires an always-increasing nonce (int). Milliseconds since epoch is fine.
+    data = dict(data or {})
+    data["nonce"] = int(time.time() * 1000)
+
+    headers = {"User-Agent": "crypto-system-api/kraken"}
+    headers.update(_sign(urlpath, data))
+    headers["Content-Type"] = "application/x-www-form-urlencoded"
+
+    # NOTE: requests encodes dict -> form body by default
+    r = requests.post(url, data=data, headers=headers, timeout=timeout)
+
+    # Rate limit
+    if r.status_code == 429:
+        raise RuntimeError(f"Kraken rate limited (HTTP 429) on {path}")
+
+    try:
+        payload = r.json()
+    except Exception as e:
+        logger.error("kraken._priv non-json response: path=%s status=%s body=%r", path, r.status_code, r.text[:500])
+        raise
+
+    errors = payload.get("error") or []
+    if errors:
+        # Log full error list; keep request params minimal to avoid leaking secrets
+        safe_keys = {k: data.get(k) for k in ("pair","type","ordertype","volume","price","price2","leverage","oflags","timeinforce") if k in data}
+        logger.error("kraken._priv ERROR: path=%s status=%s errors=%s req=%s", path, r.status_code, errors, safe_keys)
+        raise RuntimeError(f"Kraken private call failed: {path} errors={errors}")
+
+    result = payload.get("result")
+    # Useful for confirming trades are actually being placed:
+    if path == "AddOrder":
+        txid = None
         try:
-            _rate_gate()
-            payload = dict(params or {})
-            payload["nonce"] = str(int(time.time() * 1000))
-            headers = _sign(urlpath, payload)
-            r = SESSION.post(url, data=payload, headers=headers, timeout=TIMEOUT)
-            if r.status_code == 429:
-                time.sleep(BACKOFF_BASE * (2 ** attempt))
-                continue
-            r.raise_for_status()
-            data = r.json()
-            if data.get("error"):
-                errtxt = ";".join(data["error"])
-                transient = any(code in errtxt for code in (
-                    "EGeneral:Internal error",
-                    "EAPI:Rate limit exceeded",
-                    "EService:Unavailable",
-                    "EService:Timeout",
-                ))
-                if transient and attempt < MAX_RETRIES - 1:
-                    time.sleep(BACKOFF_BASE * (2 ** attempt))
-                    continue
-                raise RuntimeError(f"Kraken private error: {errtxt}")
-            return data.get("result", {})
-        except requests.RequestException as e:
-            if attempt < MAX_RETRIES - 1:
-                time.sleep(BACKOFF_BASE * (2 ** attempt))
-                continue
-            raise RuntimeError(f"HTTP private error: {e}") from e
-    return {}
-    
+            txid = (result or {}).get("txid")
+        except Exception:
+            txid = None
+        logger.info("kraken AddOrder ok: txid=%s pair=%s type=%s ordertype=%s vol=%s",
+                    txid, data.get("pair"), data.get("type"), data.get("ordertype"), data.get("volume"))
+
+    return result or {}
 def close_notional_for_qty(symbol: str, qty: float) -> float:
     """
     Helper for position-aware scheduler: compute notional needed to close `qty` at current price.
