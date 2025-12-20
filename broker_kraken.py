@@ -16,21 +16,6 @@ Public API used by app/strategies:
 
 from __future__ import annotations
 
-
-# --- Nonce handling (Kraken requires strictly increasing nonces per API key) ---
-_nonce_lock = threading.Lock()
-_last_nonce_ms = 0
-
-def _next_nonce_ms() -> int:
-    """Return a strictly increasing millisecond nonce (process-wide)."""
-    global _last_nonce_ms
-    now = int(time.time() * 1000)
-    with _nonce_lock:
-        if now <= _last_nonce_ms:
-            now = _last_nonce_ms + 1
-        _last_nonce_ms = now
-    return now
-
 __version__ = "2.1.0"
 
 import os
@@ -44,6 +29,23 @@ import threading
 import json
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+import logging
+log = logging.getLogger(__name__)
+
+# Kraken requires a strictly increasing nonce for private endpoints.
+# This helper guarantees monotonicity across rapid calls / threads in a single process.
+_nonce_lock = threading.Lock()
+_last_nonce_ms = 0
+
+def _next_nonce_ms() -> str:
+    global _last_nonce_ms
+    with _nonce_lock:
+        now = int(time.time() * 1000)
+        if now <= _last_nonce_ms:
+            now = _last_nonce_ms + 1
+        _last_nonce_ms = now
+        return str(now)
+
 
 
 def _load_strategy_to_userref() -> Dict[str, int]:
