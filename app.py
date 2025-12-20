@@ -166,6 +166,25 @@ logging.basicConfig(
 )
 log = logging.getLogger("crypto-system-api")
 
+# --- scheduler v2 bar-guard (prevents duplicate orders within same bar) ---
+_BAR_GUARD_LAST = {}  # key=strat|symbol|side -> bar_id
+
+def _tf_to_seconds(tf: str) -> int:
+    """Best-effort timeframe parser (e.g. '5Min', '15Min', '1H')."""
+    if not tf:
+        return 0
+    try:
+        tf = str(tf).strip()
+        if tf.endswith('Min'):
+            return int(tf[:-3]) * 60
+        if tf.endswith('H'):
+            return int(tf[:-1]) * 3600
+    except Exception:
+        return 0
+    return 0
+# -------------------------------------------------------------------------
+
+
 
 # ------------------------------------------------------------------------------
 # Scheduler anti-churn latch (in-memory, updates immediately on send)
@@ -4603,6 +4622,19 @@ def scheduler_run(payload: Dict[str, Any] = Body(default=None)):
                         if dry:
                             act["status"] = "dry_ok"
                         else:
+                            # Bar guard: allow at most one order per (strat,symbol,side) per bar
+                            tf_sec = _tf_to_seconds(config.tf) or 0
+                            bar_id = int(time.time() // (tf_sec if tf_sec else 300))
+                            bar_key = f"{strat}|{symbol}|{side}"
+                            if _BAR_GUARD_LAST.get(bar_key) == bar_id:
+                                log.info(f"scheduler_v2: {strat} {symbol} {side} blocked (bar_guard: bar_id={bar_id} tf={config.tf})")
+                                act["status"] = "blocked_bar_guard"
+                                continue
+                            _BAR_GUARD_LAST[bar_key] = bar_id
+                            if len(_BAR_GUARD_LAST) > 5000:
+                                # prevent unbounded growth in long-running processes
+                                _BAR_GUARD_LAST.clear()
+
                             try:
                                 resp = br.market_notional(symbol, side, notional_value, strategy=strat)
                                 act["status"] = "live_ok"
