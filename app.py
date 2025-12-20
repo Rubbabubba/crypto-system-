@@ -143,7 +143,7 @@ logging.basicConfig(
     force=True,
 )
 log = logging.getLogger("crypto-system")
-logger = log  # backwards-compat alias (some code paths use `logger`)
+logger = log  # backwards-compat alias (some patches referenced `logger`)
 log.info("Logging initialized at level %s", LOG_LEVEL)
 __version__ = '2.3.4'
 
