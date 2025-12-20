@@ -70,6 +70,10 @@ class OrderIntent:
     meta: Dict[str, Any] = field(default_factory=dict)
 
 
+    def get(self, key: str, default=None):
+        """Dict-like accessor for compatibility with older intent-handling code."""
+        return getattr(self, key, default)
+
 class BaseStrategy(Protocol):
     """
     Protocol that concrete strategies (c1–c6) should follow.

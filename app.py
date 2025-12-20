@@ -143,6 +143,7 @@ logging.basicConfig(
     force=True,
 )
 log = logging.getLogger("crypto-system")
+logger = log  # backwards-compat alias (some code paths use `logger`)
 log.info("Logging initialized at level %s", LOG_LEVEL)
 __version__ = '2.3.4'
 
@@ -5265,29 +5266,6 @@ def scheduler_run_v2(payload: Dict[str, Any] = Body(default=None)):
         final_intents = gated
     except Exception as e:
         telemetry.append({"stage": "global_symbol_gate", "ok": False, "error": f"{e.__class__.__name__}: {e}"})
-    # --- intent summary logging (helps diagnose "no trades") ---
-    try:
-        _raw_intents = list(getattr(result, 'intents', None) or [])
-        _final_intents = list(final_intents or [])
-        _raw_entries = sum(1 for x in _raw_intents if str((x or {}).get('kind','')).startswith('entry'))
-        _raw_exits = sum(1 for x in _raw_intents if str((x or {}).get('kind','')).startswith('exit'))
-        _final_entries = sum(1 for x in _final_intents if str((x or {}).get('kind','')).startswith('entry'))
-        _final_exits = sum(1 for x in _final_intents if str((x or {}).get('kind','')).startswith('exit'))
-        logger.info(
-            "scheduler v2 intents: raw=%d (entry=%d exit=%d) final=%d (entry=%d exit=%d)",
-            len(_raw_intents), _raw_entries, _raw_exits, len(_final_intents), _final_entries, _final_exits,
-        )
-        if len(_final_intents) == 0:
-            _scans = [t for t in telemetry if isinstance(t, dict) and t.get('stage') == 'scan_summary']
-            if _scans:
-                _top = sorted(_scans, key=lambda d: float(d.get('max_score', 0.0) or 0.0), reverse=True)[:8]
-                _msg = ", ".join([
-                    f"{d.get('strat')} sel={d.get('selected')}/{d.get('total')} max={float(d.get('max_score',0.0) or 0.0):.4f} (min={float(d.get('min_score',0.0) or 0.0):.4f}) min_req={float(d.get('book_min_score',0.0) or 0.0):.4f} topk={d.get('book_topk')}"
-                    for d in _top
-                ])
-                logger.info("scheduler v2 scan_summary top: %s", _msg)
-    except Exception as _e:
-        logger.debug("intent summary logging failed: %s", _e)
 # ------------------------------------------------------------------
     # Apply guard + per-symbol caps + loss-zone no-rebuy; then route
     # Also: stop-the-bleed duplicate action latch (1 action per (sym,strat) per run)

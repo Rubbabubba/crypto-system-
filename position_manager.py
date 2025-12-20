@@ -28,6 +28,10 @@ class OrderIntent:
     intent: str     # "open_long", "close_short", "flip_long_to_short", etc.
 
 
+
+    def get(self, key, default=None):
+        """Dict-like accessor for compatibility with older intent-handling code."""
+        return getattr(self, key, default)
 def load_net_positions(
     con,
     table: str = "trades",
