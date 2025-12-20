@@ -5144,6 +5144,19 @@ def scheduler_run_v2(payload: Dict[str, Any] = Body(default=None)):
         except Exception:
             pass
 
+        # Spot safety: block sell-to-open (short entries) because Kraken adapter submits spot market orders.
+        # Shorts require margin/leverage support which is not enabled in this system.
+        if k_kind in {"entry", "scale"} and k_side == "sell":
+            telemetry.append({
+                "symbol": k_sym,
+                "strategy": k_str,
+                "kind": k_kind,
+                "side": k_side,
+                "reason": "blocked_sell_to_open_spot",
+                "source": "scheduler_v2",
+            })
+            continue
+
         key = (k_sym, k_str)
 
         if k_kind in exit_kinds:
@@ -5624,6 +5637,14 @@ def scheduler_run_v2(payload: Dict[str, Any] = Body(default=None)):
                 notional=final_notional,
                 strategy=intent.strategy,
             )
+
+            # If broker layer blocked placement (e.g., kill-switch), treat as skipped and do NOT latch.
+            if isinstance(resp, dict) and resp.get("blocked"):
+                action_record["status"] = "skipped_kill_switch"
+                action_record["response"] = resp
+                actions.append(action_record)
+                continue
+
             action_record["status"] = "sent"
             action_record["response"] = resp
 

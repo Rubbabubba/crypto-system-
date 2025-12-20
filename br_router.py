@@ -225,6 +225,12 @@ def market_notional(
     - Forward all kwargs (including 'strategy') to the underlying broker
       adapter so strategy tagging via userref/comment works end-to-end.
     """
+
+    # Emergency kill-switch: disable all order placement while keeping data fetch/ticks alive.
+    # Set TRADING_ENABLED=0 to block broker submissions.
+    if not _env_true("TRADING_ENABLED"):
+        return {"ok": False, "blocked": True, "reason": "trading_disabled"}
+
     # Cap notional
     capped = _cap_notional(notional)
 
