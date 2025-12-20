@@ -143,6 +143,7 @@ logging.basicConfig(
     force=True,
 )
 log = logging.getLogger("crypto-system")
+logger = log  # alias for older patches
 log.info("Logging initialized at level %s", LOG_LEVEL)
 __version__ = '2.3.4'
 
@@ -6382,4 +6383,4 @@ def pnl2_by_symbol(start: Optional[str] = None, end: Optional[str] = None):
     except Exception as e:
         return {"ok": False, "error": f"/pnl2/by_symbol failed: {e.__class__.__name__}: {e}"}
 
-# ---- END PATCH v2.0.0 ------------------------I'm-----------------------------------------------
+# ---- END PATCH v2.0.0 -----------------------------------------------------------------------
