@@ -242,6 +242,23 @@ def run_scheduler_once(
         )
 
         scan_results: List[ScanResult] = book.scan(sreq, cfg.contexts) or []
+        # --- diagnostics: summarize scan results so "no trades" is explainable in logs/telemetry ---
+        try:
+            _scores = [float(getattr(r, 'score', 0.0) if hasattr(r, 'score') else (r.get('score', 0.0) if isinstance(r, dict) else 0.0)) for r in (scan_results or [])]
+            _selected = [bool(getattr(r, 'selected', False) if hasattr(r, 'selected') else (r.get('selected', False) if isinstance(r, dict) else False)) for r in (scan_results or [])]
+            telemetry.append({
+                'stage': 'scan_summary',
+                'strat': strat,
+                'tf': cfg.tf,
+                'total': len(scan_results or []),
+                'selected': int(sum(1 for s in _selected if s)),
+                'max_score': max(_scores) if _scores else 0.0,
+                'min_score': min(_scores) if _scores else 0.0,
+                'book_min_score': float(getattr(cfg, 'book_min_score', 0.0) or 0.0),
+                'book_topk': int(getattr(cfg, 'book_topk', 0) or 0),
+            })
+        except Exception as _e:
+            telemetry.append({'stage': 'scan_summary_error', 'strat': strat, 'err': str(_e)})
 
         for r in scan_results:
             if not isinstance(r, ScanResult):

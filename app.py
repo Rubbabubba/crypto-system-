@@ -166,25 +166,6 @@ logging.basicConfig(
 )
 log = logging.getLogger("crypto-system-api")
 
-# --- scheduler v2 bar-guard (prevents duplicate orders within same bar) ---
-_BAR_GUARD_LAST = {}  # key=strat|symbol|side -> bar_id
-
-def _tf_to_seconds(tf: str) -> int:
-    """Best-effort timeframe parser (e.g. '5Min', '15Min', '1H')."""
-    if not tf:
-        return 0
-    try:
-        tf = str(tf).strip()
-        if tf.endswith('Min'):
-            return int(tf[:-3]) * 60
-        if tf.endswith('H'):
-            return int(tf[:-1]) * 3600
-    except Exception:
-        return 0
-    return 0
-# -------------------------------------------------------------------------
-
-
 
 # ------------------------------------------------------------------------------
 # Scheduler anti-churn latch (in-memory, updates immediately on send)
@@ -4622,20 +4603,6 @@ def scheduler_run(payload: Dict[str, Any] = Body(default=None)):
                         if dry:
                             act["status"] = "dry_ok"
                         else:
-                            # Bar guard: allow at most one order per (strat,symbol,side) per bar
-                            tf_sec = _tf_to_seconds(config.tf) or 0
-                            bar_id = int(time.time() // (tf_sec if tf_sec else 300))
-                            bar_key = f"{strat}|{symbol}|{side}"
-                            if _BAR_GUARD_LAST.get(bar_key) == bar_id:
-                                log.info(f"scheduler_v2: {strat} {symbol} {side} blocked (bar_guard: bar_id={bar_id} tf={config.tf})")
-                                act["status"] = "blocked_bar_guard"
-                                actions.append(act)
-                                return
-                            _BAR_GUARD_LAST[bar_key] = bar_id
-                            if len(_BAR_GUARD_LAST) > 5000:
-                                # prevent unbounded growth in long-running processes
-                                _BAR_GUARD_LAST.clear()
-
                             try:
                                 resp = br.market_notional(symbol, side, notional_value, strategy=strat)
                                 act["status"] = "live_ok"
@@ -5298,6 +5265,29 @@ def scheduler_run_v2(payload: Dict[str, Any] = Body(default=None)):
         final_intents = gated
     except Exception as e:
         telemetry.append({"stage": "global_symbol_gate", "ok": False, "error": f"{e.__class__.__name__}: {e}"})
+    # --- intent summary logging (helps diagnose "no trades") ---
+    try:
+        _raw_intents = list(getattr(result, 'intents', None) or [])
+        _final_intents = list(final_intents or [])
+        _raw_entries = sum(1 for x in _raw_intents if str((x or {}).get('kind','')).startswith('entry'))
+        _raw_exits = sum(1 for x in _raw_intents if str((x or {}).get('kind','')).startswith('exit'))
+        _final_entries = sum(1 for x in _final_intents if str((x or {}).get('kind','')).startswith('entry'))
+        _final_exits = sum(1 for x in _final_intents if str((x or {}).get('kind','')).startswith('exit'))
+        logger.info(
+            "scheduler v2 intents: raw=%d (entry=%d exit=%d) final=%d (entry=%d exit=%d)",
+            len(_raw_intents), _raw_entries, _raw_exits, len(_final_intents), _final_entries, _final_exits,
+        )
+        if len(_final_intents) == 0:
+            _scans = [t for t in telemetry if isinstance(t, dict) and t.get('stage') == 'scan_summary']
+            if _scans:
+                _top = sorted(_scans, key=lambda d: float(d.get('max_score', 0.0) or 0.0), reverse=True)[:8]
+                _msg = ", ".join([
+                    f"{d.get('strat')} sel={d.get('selected')}/{d.get('total')} max={float(d.get('max_score',0.0) or 0.0):.4f} (min={float(d.get('min_score',0.0) or 0.0):.4f}) min_req={float(d.get('book_min_score',0.0) or 0.0):.4f} topk={d.get('book_topk')}"
+                    for d in _top
+                ])
+                logger.info("scheduler v2 scan_summary top: %s", _msg)
+    except Exception as _e:
+        logger.debug("intent summary logging failed: %s", _e)
 # ------------------------------------------------------------------
     # Apply guard + per-symbol caps + loss-zone no-rebuy; then route
     # Also: stop-the-bleed duplicate action latch (1 action per (sym,strat) per run)
