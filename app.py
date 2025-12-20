@@ -4629,7 +4629,8 @@ def scheduler_run(payload: Dict[str, Any] = Body(default=None)):
                             if _BAR_GUARD_LAST.get(bar_key) == bar_id:
                                 log.info(f"scheduler_v2: {strat} {symbol} {side} blocked (bar_guard: bar_id={bar_id} tf={config.tf})")
                                 act["status"] = "blocked_bar_guard"
-                                continue
+                                actions.append(act)
+                                return
                             _BAR_GUARD_LAST[bar_key] = bar_id
                             if len(_BAR_GUARD_LAST) > 5000:
                                 # prevent unbounded growth in long-running processes
