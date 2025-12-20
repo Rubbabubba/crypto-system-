@@ -561,7 +561,6 @@ def reconcile_trade_attribution() -> Dict[str, Any]:
 # Telemetry JSONL log (one row per scheduler event)
 TELEMETRY_PATH = DATA_DIR / "telemetry_v2.jsonl"
 
-
 def _append_telemetry_rows(rows: List[Dict[str, Any]]) -> None:
     """
     Append scheduler_v2 telemetry rows to a JSONL file on disk.
@@ -1758,6 +1757,13 @@ def journal_sync(payload: Dict[str, Any] = Body(default=None)):
         since_hours = int(payload.get("since_hours", 72) or 72)
         hard_limit  = int(payload.get("limit", 50000) or 50000)
 
+        # mode controls how the start window is chosen. Default keeps existing behavior (cursor-based incremental).
+        # - mode=cursor   : use durable cursor if present, otherwise fallback to since_hours window
+        # - mode=backfill : ignore durable cursor for this run (safe because upserts are idempotent)
+        # advance_cursor (default True) controls whether we advance the durable cursor after a successful run.
+        mode = str(payload.get("mode", "cursor") or "cursor").lower()
+        advance_cursor = bool(payload.get("advance_cursor", True))
+
         key, sec, *_ = _kraken_creds()
         if not (key and sec):
             return {"ok": False, "error": "missing_credentials"}
@@ -1790,13 +1796,23 @@ def journal_sync(payload: Dict[str, Any] = Body(default=None)):
         cursor_ts = cursor_blob.get("last_seen_ts")
         now_ts = int(time.time())
         fallback_ts = now_ts - int(since_hours) * 3600
-        if cursor_ts:
-            # Best practice: always fetch since (last_seen_ts - safety buffer)
-            start_ts0 = max(0, int(cursor_ts) - JOURNAL_SAFETY_BUFFER_SECONDS)
-            cursor_source = "cursor"
-        else:
+
+        # mode=backfill ignores the durable cursor for this run (safe because upserts are idempotent).
+        # By default it DOES advance the durable cursor (advance_cursor=True) after a successful run.
+        if mode == "backfill":
             start_ts0 = fallback_ts
-            cursor_source = "since_hours"
+            cursor_source = "backfill"
+            cursor_ts_effective = 0
+        else:
+            if cursor_ts:
+                # Best practice: always fetch since (last_seen_ts - safety buffer)
+                start_ts0 = max(0, int(cursor_ts) - JOURNAL_SAFETY_BUFFER_SECONDS)
+                cursor_source = "cursor"
+            else:
+                start_ts0 = fallback_ts
+                cursor_source = "since_hours"
+            cursor_ts_effective = int(cursor_ts or 0)
+
 
         UPSERT_SQL = """
         INSERT INTO trades (
@@ -1979,8 +1995,14 @@ def journal_sync(payload: Dict[str, Any] = Body(default=None)):
             total_rows = None
             notes.append({"post_count_error": str(e)})
         
-        # Persist watermark cursor so redeploys don't lose attribution window
-        new_cursor_ts = max(int(cursor_ts or 0), int(last_seen_ts or 0))
+        # Persist watermark cursor so redeploys don't lose attribution window.
+        # In backfill mode, do not advance the durable cursor unless advance_cursor=true.
+        candidate_ts = int(last_seen_ts or 0)
+        base_ts      = int(cursor_ts_effective or 0)
+        if mode == "backfill" and (not advance_cursor):
+            new_cursor_ts = 0
+        else:
+            new_cursor_ts = max(base_ts, candidate_ts)
 
         debug = {
             "creds_present": True,
