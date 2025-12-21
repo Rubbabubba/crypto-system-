@@ -259,8 +259,12 @@ def _cooldown_seconds(name: str, default: int = 0) -> int:
     except Exception:
         return default
 
-def _cooldown_check_and_latch(strategy: str, kraken_pair: str, side: str) -> None:
-    """Raise if an order should be blocked by cooldown/min-hold; otherwise latch immediately."""
+def _cooldown_check(strategy: str, kraken_pair: str, side: str) -> None:
+    """Raise if an order should be blocked by cooldown/min-hold.
+
+    IMPORTANT: This does *not* latch. We only latch after a successful AddOrder,
+    so failed preflights (balance/min-volume/etc.) do not poison the cooldown gate.
+    """
     same_side = _cooldown_seconds('SCHED_COOLDOWN_SAME_SIDE_SECONDS', 0)
     flip_side = _cooldown_seconds('SCHED_COOLDOWN_FLIP_SECONDS', 0)
     min_hold  = _cooldown_seconds('SCHED_MIN_HOLD_SECONDS', 0)
@@ -268,39 +272,35 @@ def _cooldown_check_and_latch(strategy: str, kraken_pair: str, side: str) -> Non
         return
 
     now = time.time()
-    key = str(kraken_pair or "").upper()  # IMPORTANT: latch on the exchange pair string
-
-    with _ORDER_LATCH_LOCK:
-        prev = _ORDER_LATCH.get(key)
-        if prev is not None:
-            last_side = str(prev.get('side', '')).lower()
-            last_ts = float(prev.get('ts', 0.0) or 0.0)
-            dt = now - last_ts
-
-            if last_side == side and same_side > 0 and dt < same_side:
-                raise RuntimeError(f'cooldown_same_side strat={strategy} pair={key} dt={dt:.1f}s < {same_side}s')
-
-            if last_side and last_side != side:
-                if flip_side > 0 and dt < flip_side:
-                    raise RuntimeError(f'cooldown_flip strat={strategy} pair={key} {last_side}->{side} dt={dt:.1f}s < {flip_side}s')
-                if min_hold > 0 and dt < min_hold:
-                    raise RuntimeError(f'min_hold strat={strategy} pair={key} {last_side}->{side} dt={dt:.1f}s < {min_hold}s')
-
-        # latch immediately (authoritative gateway). If AddOrder fails, caller rolls back.
-        _ORDER_LATCH[key] = {'side': side, 'ts': now, 'strategy': strategy}
-
-def _cooldown_rollback(strategy: str, kraken_pair: str, side: str) -> None:
     key = str(kraken_pair or "").upper()
+
     with _ORDER_LATCH_LOCK:
         prev = _ORDER_LATCH.get(key)
-        if not prev:
+        if prev is None:
             return
-        if str(prev.get('side','')).lower() != side:
-            return
-        # Only roll back if the latch was set by this same strategy; otherwise leave it.
-        if str(prev.get('strategy','')) == strategy:
-            _ORDER_LATCH.pop(key, None)
 
+        last_side = str(prev.get('side', '')).lower()
+        last_ts = float(prev.get('ts', 0.0) or 0.0)
+        dt = now - last_ts
+
+        if last_side == side and same_side > 0 and dt < same_side:
+            raise RuntimeError(f'cooldown_same_side strat={strategy} pair={key} dt={dt:.1f}s < {same_side}s')
+
+        if last_side and last_side != side:
+            if flip_side > 0 and dt < flip_side:
+                raise RuntimeError(f'cooldown_flip strat={strategy} pair={key} {last_side}->{side} dt={dt:.1f}s < {flip_side}s')
+            if min_hold > 0 and dt < min_hold:
+                raise RuntimeError(f'min_hold strat={strategy} pair={key} {last_side}->{side} dt={dt:.1f}s < {min_hold}s')
+
+
+def _cooldown_latch(strategy: str, kraken_pair: str, side: str) -> None:
+    """Latch a successful order for cooldown checks."""
+    key = str(kraken_pair or "").upper()
+    if not key:
+        return
+    now = time.time()
+    with _ORDER_LATCH_LOCK:
+        _ORDER_LATCH[key] = {'side': side, 'ts': now, 'strategy': strategy}
 
 # ---------------------------------------------------------------------------
 # Config
@@ -658,7 +658,7 @@ def market_notional(
         raise ValueError('missing strategy tag for order (strategy is required)')
 
     # Authoritative cooldown/min-hold gateway (keyed on KRAKEN pair)
-    _cooldown_check_and_latch(strat_tag, pair, side)
+    _cooldown_check(strat_tag, pair, side)
 
     # Use caller-supplied price if valid; otherwise fall back to last_price.
     if isinstance(price, (int, float)) and math.isfinite(float(price)) and float(price) > 0:
@@ -718,7 +718,6 @@ def market_notional(
     try:
         res = _priv("AddOrder", payload)
     except Exception:
-        _cooldown_rollback(strat_tag, pair, side)  # rollback MUST use the same key as latch
         raise
 
     txid = None
@@ -729,6 +728,7 @@ def market_notional(
     except Exception:
         pass
 
+    _cooldown_latch(strat_tag, pair, side)
     return {
         "pair": pair,
         "side": side,
