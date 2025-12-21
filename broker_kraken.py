@@ -146,26 +146,16 @@ def _get_balance_float(bal: dict, ui_asset: str) -> float:
     return 0.0
 
 def _fetch_balances() -> dict:
-    """Fetch balances from Kraken.
-
-    Kraken libraries/clients differ in whether they return keys named
-    'error' (Kraken-style) vs 'errors' (wrapper-style). We normalize
-    both to avoid regressions.
-    """
-    resp = _KRAKEN_API.private("Balance", {})
-    if not isinstance(resp, dict):
-        raise RuntimeError(f"Kraken private call failed: Balance non-dict response: {type(resp)}")
-    ok = bool(resp.get("ok", False))
-    if not ok:
-        errs = resp.get("error") or resp.get("errors") or []
-        raise RuntimeError(f"Kraken private call failed: Balance errors={errs}")
+    # Kraken private Balance endpoint
+    resp = _priv("Balance", {})  # use module-level private call
+    if not resp.get("ok"):
+        raise RuntimeError(f"Kraken private call failed: Balance errors={resp.get('errors')}")
     return resp.get("result", {}) or {}
 # ---------------------------------------------------------------------------
 # Order cooldown latch (authoritative gateway)
 # ---------------------------------------------------------------------------
 _ORDER_LATCH_LOCK = threading.Lock()
 _ORDER_LATCH: Dict[str, Dict[str, Any]] = {}  # KRAKEN_PAIR (e.g. SUIUSD/XBTUSD) -> {side, ts, strategy}
-
 def _cooldown_seconds(name: str, default: int = 0) -> int:
     try:
         return int(float(os.getenv(name, str(default)) or default))
