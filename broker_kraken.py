@@ -27,6 +27,7 @@ import base64
 import hashlib
 import threading
 import json
+import logging
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -92,6 +93,8 @@ def _userref_for_strategy(strategy: Optional[str]) -> int:
     return int(h & 0x7FFFFFFF)
 
 import requests
+
+logger = logging.getLogger("broker_kraken")
 
 # ---------------------------------------------------------------------------
 # Robust local import of symbol_map helpers (works in flat or packaged repo)
@@ -162,7 +165,6 @@ def _cooldown_rollback(strategy: str, kraken_pair: str, side: str) -> None:
 # Config
 # ---------------------------------------------------------------------------
 API_BASE = os.getenv("KRAKEN_BASE", "https://api.kraken.com")
-_KRAKEN_API = API_BASE  # alias for legacy references
 TIMEOUT = float(os.getenv("KRAKEN_TIMEOUT", "10"))        # seconds
 MIN_DELAY = float(os.getenv("KRAKEN_MIN_DELAY", "0.35"))  # seconds between calls (simple gate)
 MAX_RETRIES = int(os.getenv("KRAKEN_MAX_RETRIES", "4"))
@@ -259,7 +261,7 @@ def _priv(path: str, data: Dict[str, Any], timeout: float = 30.0) -> Dict[str, A
     This helper logs the endpoint + errors and raises if errors are present.
     """
     urlpath = f"/0/private/{path}"
-    url = f"{API_BASE}{urlpath}"
+    url = _KRAKEN_API + urlpath
 
     # Kraken requires an always-increasing nonce (int). Milliseconds since epoch is fine.
     data = dict(data or {})
