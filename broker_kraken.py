@@ -106,6 +106,51 @@ except ModuleNotFoundError:
     sys.path.append(os.path.dirname(os.path.abspath(__file__)))
     from symbol_map import to_kraken, from_kraken, tf_to_kraken  # type: ignore
 
+
+# ---------------------------------------------------------------------------
+# Balance helpers (spot-safe preflight)
+# ---------------------------------------------------------------------------
+_ASSET_CODE_OVERRIDES = {
+    "BTC": "XXBT",
+    "XBT": "XXBT",
+    "ETH": "XETH",
+    "USD": "ZUSD",
+    "USDT": "USDT",
+    "USDC": "USDC",
+}
+
+def _asset_code_candidates(ui_asset: str) -> list:
+    a = (ui_asset or "").upper().strip()
+    cands = []
+    if not a:
+        return cands
+    if a in _ASSET_CODE_OVERRIDES:
+        cands.append(_ASSET_CODE_OVERRIDES[a])
+    # common patterns in Kraken balances
+    cands.extend([a, f"X{a}", f"Z{a}", f"XX{a}", f"ZZ{a}"])
+    # de-dupe, preserve order
+    out = []
+    seen = set()
+    for x in cands:
+        if x and x not in seen:
+            out.append(x); seen.add(x)
+    return out
+
+def _get_balance_float(bal: dict, ui_asset: str) -> float:
+    for k in _asset_code_candidates(ui_asset):
+        if k in bal:
+            try:
+                return float(bal[k])
+            except Exception:
+                continue
+    return 0.0
+
+def _fetch_balances() -> dict:
+    # Kraken private Balance endpoint
+    resp = _KRAKEN_API.private("Balance", {})
+    if not resp.get("ok"):
+        raise RuntimeError(f"Kraken private call failed: Balance errors={resp.get('errors')}")
+    return resp.get("result", {}) or {}
 # ---------------------------------------------------------------------------
 # Order cooldown latch (authoritative gateway)
 # ---------------------------------------------------------------------------
@@ -526,6 +571,35 @@ def market_notional(
         px = _ensure_price(ui)
 
     volume = _round_qty(float(notional) / px)
+
+# Spot-safe preflight: cap order size to available balances so exits don't try to "short"
+try:
+    bal = _fetch_balances()
+except Exception as e:
+    return {"ok": False, "error": f"market_notional failed: {e}"}
+
+base_ui = symbol.split("/")[0].upper()
+quote_ui = symbol.split("/")[1].upper() if "/" in symbol else "USD"
+
+if side.lower() == "sell":
+    avail_base = _get_balance_float(bal, base_ui)
+    # tiny buffer to avoid dust / fee rounding issues
+    max_base = max(0.0, avail_base * 0.999)
+    if max_base <= 0:
+        return {"ok": False, "error": f"market_notional failed: no {base_ui} balance to sell (avail={avail_base})"}
+    if float(volume) > max_base:
+        volume = _round_qty(max_base)
+else:
+    avail_quote = _get_balance_float(bal, quote_ui)
+    max_quote = max(0.0, avail_quote * 0.999)
+    if max_quote <= 0:
+        return {"ok": False, "error": f"market_notional failed: no {quote_ui} balance to buy with (avail={avail_quote})"}
+    if float(notional) > max_quote:
+        notional = max_quote
+        volume = _round_qty(float(notional) / px)
+
+if float(volume) <= 0:
+    return {"ok": False, "error": "market_notional failed: volume rounded to 0 after balance cap"}
     if volume <= 0:
         raise ValueError("computed volume <= 0")
 
