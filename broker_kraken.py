@@ -147,9 +147,9 @@ def _get_balance_float(bal: dict, ui_asset: str) -> float:
 
 def _fetch_balances() -> dict:
     # Kraken private Balance endpoint
-    resp = _KRAKEN_API.private("Balance", {})
+    resp = _priv("Balance", {})  # use module-level private call
     if not resp.get("ok"):
-        raise RuntimeError(f"Kraken private call failed: Balance error={resp.get('error')} errors={resp.get('errors')}")
+        raise RuntimeError(f"Kraken private call failed: Balance errors={resp.get('errors')}")
     return resp.get("result", {}) or {}
 # ---------------------------------------------------------------------------
 # Order cooldown latch (authoritative gateway)
@@ -330,13 +330,9 @@ def _priv(path: str, data: Dict[str, Any], timeout: float = 30.0) -> Dict[str, A
         raise
 
     errors = payload.get("error") or []
-    if errors is None:
-        errors = []
-    if not isinstance(errors, list):
-        errors = [str(errors)]
     if errors:
         # Log full error list; keep request params minimal to avoid leaking secrets
-        safe_keys = {k: data.get(k) for k in ("pair","type","ordertype","volume","price","price2","leverage","oflags","timeinforce") if k in data}
+        safe_keys = {k: data.get(k) for k in ("pair","type","ordertype","price","price2","volume","leverage","oflags","timeinforce") if k in data}
         logger.error("kraken._priv ERROR: path=%s status=%s errors=%s req=%s", path, r.status_code, errors, safe_keys)
         raise RuntimeError(f"Kraken private call failed: {path} errors={errors}")
 
