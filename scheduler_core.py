@@ -28,6 +28,12 @@ class SchedulerConfig:
     # Compatibility: some legacy code paths treat scheduler config like a dict
     # and call `.get()`. SchedulerConfig is a dataclass, so provide a safe
     # adapter that falls back to dataclass attributes or risk_cfg.
+
+# Back-compat: older code paths expect cfg.tf (timeframe)
+@property
+def tf(self) -> str:
+    return getattr(self, "timeframe", "")
+
     def get(self, key: str, default: Any = None) -> Any:
         # 1) Direct attribute
         if hasattr(self, key):
