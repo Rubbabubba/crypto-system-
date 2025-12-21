@@ -10,48 +10,53 @@ from position_manager import Position as PMPosition
 from risk_engine import RiskEngine
 
 
-@dataclass
+@dataclass(kw_only=True)
 class SchedulerConfig:
-    # NOTE: dataclasses require all non-default fields to come before default fields.
-    # We keep everything defaulted for backwards compatibility with older call sites.
+    """
+    Normalized config object passed into scheduler_core.
 
-    tf: str = "5Min"
-    strats_raw: str = ""
-    symbols_raw: str = ""
+    IMPORTANT: this class is used by both legacy code that expects:
+      - cfg.tf (string like "5Min")
+      - cfg.get("tf") / cfg.get("timeframe")
+
+    …and newer code that may pass:
+      - timeframe="5Min" as an init kwarg (from app.py)
+
+    So we accept BOTH and normalize to cfg.tf.
+    """
+    now: dt.datetime
+    # Canonical timeframe string used throughout the scheduler
+    tf: str = ""
+    # Backward-compatible alias accepted by app.py (and older code)
+    timeframe: Optional[str] = None
+
     limit: int = 300
+    symbols: List[str] = field(default_factory=list)
+    strats: List[str] = field(default_factory=list)
     notional: float = 0.0
 
-    # put contexts before dry to avoid dataclass init ordering errors in some merges
-    contexts: dict = field(default_factory=dict)
+    # Runtime inputs
+    positions: Dict[str, Any] = field(default_factory=dict)
+    contexts: Dict[str, Any] = field(default_factory=dict)
+
+    # Risk + execution toggles
+    risk_cfg: Dict[str, Any] = field(default_factory=dict)
     dry: bool = False
 
-    # set at runtime (can be passed, but defaulted)
-    now: object = None
+    def __post_init__(self) -> None:
+        # Normalize timeframe/tf
+        if self.timeframe and not self.tf:
+            self.tf = self.timeframe
+        if not self.timeframe:
+            self.timeframe = self.tf
 
-    # derived
-    strats: list = field(default_factory=list, init=False)
-    symbols: list = field(default_factory=list, init=False)
-
-    def __post_init__(self):
-        self.strats = [s.strip() for s in (self.strats_raw or "").split(",") if s.strip()]
-        self.symbols = [s.strip() for s in (self.symbols_raw or "").split(",") if s.strip()]
-        if self.contexts is None:
-            self.contexts = {}
-
-    def get(self, key: str, default=None):
+    def get(self, key: str, default: Any = None) -> Any:
         """Dict-like access used by older code paths."""
-        if hasattr(self, key):
-            return getattr(self, key)
-        return self.contexts.get(key, default)
+        if key in ("tf", "timeframe"):
+            return self.tf or self.timeframe or default
+        return getattr(self, key, default)
 
-    def set(self, key: str, value):
-        """Store extra runtime config values."""
-        if hasattr(self, key):
-            setattr(self, key, value)
-        else:
-            self.contexts[key] = value
-
-
+@dataclass
 class SchedulerResult:
     """
     Result of a single scheduler pass.
