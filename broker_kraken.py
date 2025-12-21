@@ -119,6 +119,9 @@ _ASSET_CODE_OVERRIDES = {
     "USDC": "USDC",
 }
 
+# Balance cache (seconds) to prevent repeated private Balance calls within a single tick
+_BAL_CACHE: Dict[str, Any] = {"ts": 0.0, "bal": {}}
+
 def _asset_code_candidates(ui_asset: str) -> list:
     a = (ui_asset or "").upper().strip()
     cands = []
@@ -146,11 +149,31 @@ def _get_balance_float(bal: dict, ui_asset: str) -> float:
     return 0.0
 
 def _fetch_balances() -> dict:
-    # Kraken private Balance endpoint
-    resp = _priv("Balance", {})  # use module-level private call
-    if not resp.get("ok"):
-        raise RuntimeError(f"Kraken private call failed: Balance errors={resp.get('errors')}")
-    return resp.get("result", {}) or {}
+    """Fetch Kraken balances (private Balance), with a short TTL cache.
+
+    Kraken returns HTTP 200 even on logical failures; our _priv() helper raises
+    on payload errors. This function therefore returns the *result dict*
+    directly (e.g., {"ZUSD":"123.45","XXBT":"0.01",...}).
+    """
+    # Cache to avoid spamming Balance across a single scheduler tick.
+    ttl = float(os.getenv("KRAKEN_BALANCE_TTL_SEC", "3.0") or 3.0)
+    now = time.time()
+    try:
+        ts = float(_BAL_CACHE.get("ts") or 0.0)
+    except Exception:
+        ts = 0.0
+
+    if ttl > 0 and (now - ts) < ttl and isinstance(_BAL_CACHE.get("bal"), dict):
+        return _BAL_CACHE["bal"]  # type: ignore[return-value]
+
+    bal = _priv("Balance", {}) or {}
+    if not isinstance(bal, dict):
+        bal = {}
+
+    _BAL_CACHE["ts"] = now
+    _BAL_CACHE["bal"] = bal
+    return bal
+
 # ---------------------------------------------------------------------------
 # Order cooldown latch (authoritative gateway)
 # ---------------------------------------------------------------------------
@@ -580,8 +603,8 @@ def market_notional(
         except Exception as e:
             return {"ok": False, "error": f"market_notional failed: balance fetch failed: {e}"}
 
-        base = base_ccy  # derived earlier from pair, e.g. 'BTC' for 'BTC/USD'
-        avail = float(bal.get(base, 0.0) or 0.0)
+        base = (ui.split('/', 1)[0] if '/' in ui else ui).strip().upper()
+        avail = float(_get_balance_float(bal, base) or 0.0)
         # If we don't have the asset, nothing to sell.
         if avail <= 0:
             return {"ok": False, "error": f"market_notional failed: insufficient {base} balance (avail={avail})"}
