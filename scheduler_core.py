@@ -11,47 +11,47 @@ from risk_engine import RiskEngine
 
 
 @dataclass
-@dataclass
 class SchedulerConfig:
-    """Runtime scheduler configuration.
+    # NOTE: dataclasses require all non-default fields to come before default fields.
+    # We keep everything defaulted for backwards compatibility with older call sites.
 
-    Compatibility notes:
-    - Supports both `timeframe` and `tf` (alias property) for time frame naming.
-    - Provides dict-like `.get()` access used across the codebase.
-    """
-
-    # Primary settings
-    timeframe: str = "5Min"
-    strats_raw: str = "c1"
-    symbols_raw: str = "BTC/USD"
+    tf: str = "5Min"
+    strats_raw: str = ""
+    symbols_raw: str = ""
     limit: int = 300
-    notional: float = 40.0
-    dry: bool = True
+    notional: float = 0.0
 
-    # Optional runtime state/context
+    # put contexts before dry to avoid dataclass init ordering errors in some merges
     contexts: dict = field(default_factory=dict)
-    positions: list = field(default_factory=list)
-    now: object = None
-    risk_cfg: dict = field(default_factory=dict)
+    dry: bool = False
 
-    # Derived lists (populated in __post_init__)
+    # set at runtime (can be passed, but defaulted)
+    now: object = None
+
+    # derived
     strats: list = field(default_factory=list, init=False)
     symbols: list = field(default_factory=list, init=False)
 
     def __post_init__(self):
         self.strats = [s.strip() for s in (self.strats_raw or "").split(",") if s.strip()]
         self.symbols = [s.strip() for s in (self.symbols_raw or "").split(",") if s.strip()]
+        if self.contexts is None:
+            self.contexts = {}
 
-    @property
-    def tf(self) -> str:
-        return self.timeframe
+    def get(self, key: str, default=None):
+        """Dict-like access used by older code paths."""
+        if hasattr(self, key):
+            return getattr(self, key)
+        return self.contexts.get(key, default)
 
-    def get(self, key, default=None):
-        # dict-style access used by some modules
-        if key == "tf":
-            return self.timeframe
-        return getattr(self, key, default)
-@dataclass
+    def set(self, key: str, value):
+        """Store extra runtime config values."""
+        if hasattr(self, key):
+            setattr(self, key, value)
+        else:
+            self.contexts[key] = value
+
+
 class SchedulerResult:
     """
     Result of a single scheduler pass.
