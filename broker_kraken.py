@@ -174,6 +174,80 @@ def _fetch_balances() -> dict:
     _BAL_CACHE["bal"] = bal
     return bal
 
+
+# ---------------------------------------------------------------------------
+# Pair metadata (ordermin / lot_decimals) for minimum-volume + precision guards
+# ---------------------------------------------------------------------------
+_PAIR_META_LOCK = threading.Lock()
+_PAIR_META_CACHE: Dict[str, Dict[str, Any]] = {}  # pair -> {"ts": float, "ordermin": float, "lot_decimals": int}
+
+def _pair_meta(pair: str) -> Dict[str, Any]:
+    """Return Kraken pair metadata for order sizing guards.
+
+    Uses public AssetPairs and caches results. Values:
+      - ordermin: minimum base volume for orders
+      - lot_decimals: max decimals allowed for volume
+    """
+    key = str(pair or "").strip().upper()
+    if not key:
+        return {"ordermin": 0.0, "lot_decimals": 8}
+
+    ttl = float(os.getenv("KRAKEN_PAIR_META_TTL_SEC", "3600") or 3600)
+    now = time.time()
+
+    with _PAIR_META_LOCK:
+        cached = _PAIR_META_CACHE.get(key)
+        if cached and ttl > 0:
+            try:
+                if (now - float(cached.get("ts") or 0.0)) < ttl:
+                    return {"ordermin": float(cached.get("ordermin") or 0.0),
+                            "lot_decimals": int(cached.get("lot_decimals") or 8)}
+            except Exception:
+                pass
+
+    try:
+        res = _pub("AssetPairs", {"pair": key}) or {}
+    except Exception:
+        res = {}
+
+    ordermin = 0.0
+    lot_decimals = 8
+    if isinstance(res, dict) and res:
+        try:
+            v = next(iter(res.values()))
+            if isinstance(v, dict):
+                ordermin = float(v.get("ordermin") or 0.0)
+                lot_decimals = int(v.get("lot_decimals") or 8)
+        except Exception:
+            pass
+
+    meta = {"ts": now, "ordermin": float(ordermin), "lot_decimals": int(lot_decimals)}
+    with _PAIR_META_LOCK:
+        _PAIR_META_CACHE[key] = meta
+
+    return {"ordermin": meta["ordermin"], "lot_decimals": meta["lot_decimals"]}
+
+def _truncate_to_decimals(x: float, decimals: int) -> float:
+    """Truncate (not round) to a fixed number of decimals."""
+    try:
+        d = max(0, int(decimals))
+    except Exception:
+        d = 0
+    if not math.isfinite(float(x)):
+        return 0.0
+    if d <= 0:
+        return float(int(x))
+    factor = 10 ** d
+    return math.floor(float(x) * factor) / factor
+
+def _format_volume(x: float, decimals: int) -> str:
+    try:
+        d = max(0, int(decimals))
+    except Exception:
+        d = 8
+    return f"{float(x):.{d}f}"
+
+
 # ---------------------------------------------------------------------------
 # Order cooldown latch (authoritative gateway)
 # ---------------------------------------------------------------------------
@@ -591,8 +665,8 @@ def market_notional(
         px = float(price)
     else:
         px = _ensure_price(ui)
-
-    volume = _round_qty(float(notional) / px)
+    # Compute base volume from USD notional.
+    volume = float(notional) / px
 
     # Spot-safe preflight: cap sell volume to available base balance so we don't hit
     # EOrder:Insufficient funds when our paper position size differs from exchange.
@@ -615,11 +689,25 @@ def market_notional(
         if float(volume) <= 0:
             return {"ok": False, "error": f"market_notional failed: sell volume <= 0 after balance cap (avail={avail})"}
 
+    # Enforce Kraken per-pair minimum volume + precision (prevents AddOrder volume minimum errors).
+    meta = _pair_meta(pair)
+    ordermin = float(meta.get("ordermin") or 0.0)
+    lot_decimals = int(meta.get("lot_decimals") or 8)
+
+    # Truncate to allowed decimals (Kraken rejects or rounds unexpectedly otherwise).
+    volume = _truncate_to_decimals(float(volume), lot_decimals)
+
+    if volume <= 0.0:
+        return {"ok": False, "error": "market_notional failed: volume <= 0 after precision truncation"}
+
+    if ordermin > 0.0 and float(volume) < ordermin:
+        return {"ok": False, "error": f"market_notional failed: below_min_volume:{volume}<{ordermin} (pair={pair})"}
+
     payload = {
         "pair": pair,
         "type": "buy" if side == "buy" else "sell",
         "ordertype": "market",
-        "volume": f"{volume:.8f}",
+        "volume": _format_volume(volume, lot_decimals),
         "userref": str(
             _userref_for_strategy(strategy)
             if strategy is not None
