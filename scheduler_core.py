@@ -12,64 +12,52 @@ from risk_engine import RiskEngine
 
 @dataclass
 class SchedulerConfig:
+    """Lightweight config holder used by scheduler_v2.
+
+    This project has historically treated config as a dict *and* as an object.
+    To keep backwards compatibility (and to avoid fragile refactors), this class:
+      - accepts **kwargs (including both tf and timeframe)
+      - exposes .tf as an alias for .timeframe
+      - implements .get(key, default) like a dict
     """
-    Minimal config for a single scheduler pass.
-    """
-    now: dt.datetime
-    timeframe: str
-    limit: int
-    symbols: List[str]
-    strats: List[str]
-    notional: float
-    positions: Mapping[Tuple[str, str], PMPosition]  # keyed by (symbol, strategy)
-    contexts: Dict[str, Dict[str, Any]]
-    risk_cfg: Dict[str, Any] = field(default_factory=dict)
 
-    # Compatibility: some legacy code paths treat scheduler config like a dict
-    # and call `.get()`. SchedulerConfig is a dataclass, so provide a safe
-    # adapter that falls back to dataclass attributes or risk_cfg.
+    def __init__(self, **kwargs):
+        # Common fields (use conservative defaults)
+        self.now = kwargs.pop("now", None)
 
-# Back-compat: older code paths expect cfg.tf (timeframe)
-@property
-def tf(self) -> str:
-    return getattr(self, "timeframe", "")
+        # Timeframe can come in as 'timeframe' or legacy 'tf'
+        tf = kwargs.pop("timeframe", None)
+        if tf is None:
+            tf = kwargs.pop("tf", None)
+        self.timeframe = tf or "5Min"
 
-    def get(self, key: str, default: Any = None) -> Any:
-        # 1) Direct attribute
-        if hasattr(self, key):
-            return getattr(self, key)
+        self.limit = kwargs.pop("limit", 300)
+        self.notional = kwargs.pop("notional", kwargs.pop("notional_usd", 40.0))
+        self.dry = kwargs.pop("dry", False)
 
-        # 2) Allow common uppercase env-style keys to map to fields
-        k = key.lower()
-        if hasattr(self, k):
-            return getattr(self, k)
+        # Strategy + universe
+        self.strats = kwargs.pop("strats", kwargs.pop("strategies", []))
+        self.symbols = kwargs.pop("symbols", kwargs.pop("universe", []))
 
-        # 3) Finally, check risk_cfg (often used as a dict of extra flags)
-        if isinstance(self.risk_cfg, dict):
-            return self.risk_cfg.get(key, self.risk_cfg.get(k, default))
+        # Config blobs
+        self.risk_cfg = kwargs.pop("risk_cfg", kwargs.pop("risk", {}))
+        self.guard_cfg = kwargs.pop("guard_cfg", kwargs.pop("guard", {}))
+        self.cap_cfg = kwargs.pop("cap_cfg", kwargs.pop("cap", {}))
 
-        return default
+        # State containers
+        self.intents = kwargs.pop("intents", [])
+        self.telemetry = kwargs.pop("telemetry", [])
 
+        # Stash any remaining keys as attributes for flexibility
+        for k, v in kwargs.items():
+            setattr(self, k, v)
 
-@dataclass
-class SchedulerResult:
-    """
-    Result of a single scheduler pass.
+    @property
+    def tf(self):
+        return self.timeframe
 
-    intents:
-      - high-level OrderIntent objects (entries / exits / TP / SL)
-        AFTER applying per-strategy exits AND global risk exits
-        (daily flatten, profit-lock, stop-loss, ATR floor).
-    telemetry:
-      - human/debug-focused logs about why each intent was produced
-    """
-    intents: List[OrderIntent] = field(default_factory=list)
-    telemetry: List[Dict[str, Any]] = field(default_factory=list)
-
-
-# ----------------------------------------------------------------------
-# Internal helpers
-# ----------------------------------------------------------------------
+    def get(self, key, default=None):
+        return getattr(self, key, default)
 
 def _make_position_snapshot_map(
     positions: Mapping[Tuple[str, str], PMPosition],
