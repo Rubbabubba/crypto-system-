@@ -146,8 +146,17 @@ def _get_balance_float(bal: dict, ui_asset: str) -> float:
     return 0.0
 
 def _fetch_balances() -> dict:
-    # Kraken private Balance endpoint
-    resp = _KRAKEN_API.private("Balance", {})
+    """Return Kraken balances (asset_code -> string amount).
+
+    Do NOT depend on a global client (e.g. _KRAKEN_API). That pattern is fragile
+    across refactors/import order and is exactly what caused
+    `name '_KRAKEN_API' is not defined`.
+
+    This uses the module's signed-request helper (`_priv`) which pulls
+    credentials from env on demand.
+    """
+    resp = _priv("Balance", {})
+    # _priv returns a dict like: {"ok": True/False, "result": {...}, "errors": [...]}
     if not resp.get("ok"):
         raise RuntimeError(f"Kraken private call failed: Balance errors={resp.get('errors')}")
     return resp.get("result", {}) or {}
