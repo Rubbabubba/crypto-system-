@@ -572,36 +572,26 @@ def market_notional(
 
     volume = _round_qty(float(notional) / px)
 
-# Spot-safe preflight: cap order size to available balances so exits don't try to "short"
-try:
-    bal = _fetch_balances()
-except Exception as e:
-    return {"ok": False, "error": f"market_notional failed: {e}"}
+    # Spot-safe preflight: cap sell volume to available base balance so we don't hit
+    # EOrder:Insufficient funds when our paper position size differs from exchange.
+    # Note: we only cap SELL on spot. For BUY (spending quote), we leave as-is for now.
+    if side.lower() == "sell":
+        try:
+            bal = _fetch_balances()
+        except Exception as e:
+            return {"ok": False, "error": f"market_notional failed: balance fetch failed: {e}"}
 
-base_ui = symbol.split("/")[0].upper()
-quote_ui = symbol.split("/")[1].upper() if "/" in symbol else "USD"
+        base = base_ccy  # derived earlier from pair, e.g. 'BTC' for 'BTC/USD'
+        avail = float(bal.get(base, 0.0) or 0.0)
+        # If we don't have the asset, nothing to sell.
+        if avail <= 0:
+            return {"ok": False, "error": f"market_notional failed: insufficient {base} balance (avail={avail})"}
 
-if side.lower() == "sell":
-    avail_base = _get_balance_float(bal, base_ui)
-    # tiny buffer to avoid dust / fee rounding issues
-    max_base = max(0.0, avail_base * 0.999)
-    if max_base <= 0:
-        return {"ok": False, "error": f"market_notional failed: no {base_ui} balance to sell (avail={avail_base})"}
-    if float(volume) > max_base:
-        volume = _round_qty(max_base)
-else:
-    avail_quote = _get_balance_float(bal, quote_ui)
-    max_quote = max(0.0, avail_quote * 0.999)
-    if max_quote <= 0:
-        return {"ok": False, "error": f"market_notional failed: no {quote_ui} balance to buy with (avail={avail_quote})"}
-    if float(notional) > max_quote:
-        notional = max_quote
-        volume = _round_qty(float(notional) / px)
-
-if float(volume) <= 0:
-    return {"ok": False, "error": "market_notional failed: volume rounded to 0 after balance cap"}
-    if volume <= 0:
-        raise ValueError("computed volume <= 0")
+        # volume is in BASE units for Kraken spot orders
+        volume = min(volume, avail)
+        # If the cap reduces volume to ~0, bail.
+        if float(volume) <= 0:
+            return {"ok": False, "error": f"market_notional failed: sell volume <= 0 after balance cap (avail={avail})"}
 
     payload = {
         "pair": pair,
