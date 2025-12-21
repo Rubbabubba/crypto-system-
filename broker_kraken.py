@@ -163,9 +163,6 @@ def _cooldown_seconds(name: str, default: int = 0) -> int:
     except Exception:
         return default
 
-# If set to '1', broker enforces same-side/flip cooldowns. Default off (scheduler already enforces).
-BROKER_COOLDOWN_ENABLED = os.getenv('KRAKEN_BROKER_COOLDOWN', '0') == '1'
-
 def _cooldown_check_and_latch(strategy: str, kraken_pair: str, side: str) -> None:
     """Raise if an order should be blocked by cooldown/min-hold; otherwise latch immediately."""
     same_side = _cooldown_seconds('SCHED_COOLDOWN_SAME_SIDE_SECONDS', 0)
@@ -565,8 +562,7 @@ def market_notional(
         raise ValueError('missing strategy tag for order (strategy is required)')
 
     # Authoritative cooldown/min-hold gateway (keyed on KRAKEN pair)
-    if BROKER_COOLDOWN_ENABLED:
-        _cooldown_check_and_latch(strat_tag, pair, side)
+    _cooldown_check_and_latch(strat_tag, pair, side)
 
     # Use caller-supplied price if valid; otherwise fall back to last_price.
     if isinstance(price, (int, float)) and math.isfinite(float(price)) and float(price) > 0:
