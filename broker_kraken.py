@@ -261,7 +261,7 @@ def _priv(path: str, data: Dict[str, Any], timeout: float = 30.0) -> Dict[str, A
     This helper logs the endpoint + errors and raises if errors are present.
     """
     urlpath = f"/0/private/{path}"
-    url = _KRAKEN_API + urlpath
+    url = API_BASE + urlpath
 
     # Kraken requires an always-increasing nonce (int). Milliseconds since epoch is fine.
     data = dict(data or {})
