@@ -4,53 +4,54 @@ import datetime as dt
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Mapping, Optional, Tuple, Callable
 
+from book import StrategyBook, ScanRequest, ScanResult
+from strategy_api import OrderIntent, PositionSnapshot, RiskContext
+from position_manager import Position as PMPosition
+from risk_engine import RiskEngine
 
 
+@dataclass
 @dataclass
 class SchedulerConfig:
+    """Runtime scheduler configuration.
+
+    Compatibility notes:
+    - Supports both `timeframe` and `tf` (alias property) for time frame naming.
+    - Provides dict-like `.get()` access used across the codebase.
     """
-    Minimal config for a single scheduler pass.
-    """
-    now: dt.datetime
-    timeframe: str
-    limit: int
-    symbols: List[str]
-    strats: List[str]
-    notional: float
-    positions: Mapping[Tuple[str, str], PMPosition]  # keyed by (symbol, strategy)
-    contexts: Dict[str, Dict[str, Any]]
-    risk_cfg: Dict[str, Any] = field(default_factory=dict)
 
-    # Compatibility: some legacy code paths treat scheduler config like a dict
-    # and call `.get()`. SchedulerConfig is a dataclass, so provide a safe
-    # adapter that falls back to dataclass attributes or risk_cfg.
-    def get(self, key: str, default: Any = None) -> Any:
-        # 1) Direct attribute
-        if hasattr(self, key):
-            return getattr(self, key)
+    # Primary settings
+    timeframe: str = "5Min"
+    strats_raw: str = "c1"
+    symbols_raw: str = "BTC/USD"
+    limit: int = 300
+    notional: float = 40.0
+    dry: bool = True
 
-        # 2) Allow common uppercase env-style keys to map to fields
-        k = key.lower()
-        if hasattr(self, k):
-            return getattr(self, k)
+    # Optional runtime state/context
+    contexts: dict = field(default_factory=dict)
+    positions: list = field(default_factory=list)
+    now: object = None
+    risk_cfg: dict = field(default_factory=dict)
 
-        # 3) Finally, check risk_cfg (often used as a dict of extra flags)
-        if isinstance(self.risk_cfg, dict):
-            return self.risk_cfg.get(key, self.risk_cfg.get(k, default))
+    # Derived lists (populated in __post_init__)
+    strats: list = field(default_factory=list, init=False)
+    symbols: list = field(default_factory=list, init=False)
 
-        return default
+    def __post_init__(self):
+        self.strats = [s.strip() for s in (self.strats_raw or "").split(",") if s.strip()]
+        self.symbols = [s.strip() for s in (self.symbols_raw or "").split(",") if s.strip()]
 
-
-@dataclass
     @property
     def tf(self) -> str:
-        # Back-compat: some code expects cfg.tf instead of cfg.timeframe
-        return getattr(self, 'timeframe', None) or getattr(self, 'tf_raw', None) or ''
+        return self.timeframe
 
-    @tf.setter
-    def tf(self, value: str) -> None:
-        self.timeframe = value
-
+    def get(self, key, default=None):
+        # dict-style access used by some modules
+        if key == "tf":
+            return self.timeframe
+        return getattr(self, key, default)
+@dataclass
 class SchedulerResult:
     """
     Result of a single scheduler pass.
@@ -69,12 +70,6 @@ class SchedulerResult:
 # ----------------------------------------------------------------------
 # Internal helpers
 # ----------------------------------------------------------------------
-
-
-from book import StrategyBook, ScanRequest, ScanResult
-from strategy_api import OrderIntent, PositionSnapshot, RiskContext
-from position_manager import Position as PMPosition
-from risk_engine import RiskEngine
 
 def _make_position_snapshot_map(
     positions: Mapping[Tuple[str, str], PMPosition],
