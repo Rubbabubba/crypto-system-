@@ -6215,94 +6215,80 @@ def _pnl__agg(group_fields: List[str], start: Optional[str], end: Optional[str],
         rows = [dict(r) for r in con.execute(sql, params).fetchall()]
         return {"ok": True, "table": table, "start": s, "end": e, "realized_only": realized_only, "count": len(rows), "rows": rows}
 
-def _load_open_positions_from_trades(use_strategy_col: bool = False) -> Dict[Tuple[str, str], Position]:
-    """
-    Load net positions from the trades/journal table, using the same DB the PnL uses.
-    For positions, we treat the 'trades' table as the single source of truth
-    whenever it exists, because that's where TradesHistory imports write.
+def _load_open_positions_from_trades(use_strategy_col: bool = True) -> List[Position]:
+    """Compute open (net) positions from the local `trades` table.
 
-    Returns a dict keyed by (symbol, strategy).
+    This is a lightweight, deterministic view that does *not* depend on Kraken positions.
+    It is used by /debug/positions and any journal sanity checks.
+
+    Notes:
+    - Long-only: buys add, sells reduce. If sells exceed current qty we zero the position.
+    - Average price is maintained as a weighted average of *buys* for the remaining qty.
     """
-    con = _db()
+    import sqlite3
+
+    if not DB_PATH:
+        return []
+
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
     try:
-        table = "trades"
-        try:
-            cur = con.execute("SELECT name FROM sqlite_master WHERE type='table'")
-            names = {r[0] for r in cur.fetchall()}
-            if "trades" not in names:
-                # Fall back to the generic detector if no 'trades' table
-                table = _pnl__detect_table(con)
-        except Exception:
-            table = _pnl__detect_table(con)
+        # Ensure table exists
+        names = set(r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall())
+        if "trades" not in names:
+            return []
 
-        return load_net_positions(con, table=table, use_strategy_col=use_strategy_col)
-    finally:
-        con.close()
+        rows = conn.execute(
+            """
+            SELECT ts, symbol, side, price, volume, COALESCE(strategy, '') AS strategy
+            FROM trades
+            ORDER BY ts ASC
+            """
+        ).fetchall()
 
-def _position_for(sym, strat, positions):
-    positions = _normalize_positions(positions)
-    key = f"{sym}|{strat}"
-    return positions.get(key)
-    
-import json
-
-def _normalize_positions(positions):
-    """
-    Ensure positions is a dict mapping 'SYMBOL|STRAT' -> position dict.
-    Accepts dict, JSON string, list, or None and normalizes.
-    """
-    if isinstance(positions, dict):
-        return positions
-
-    if positions is None:
-        return {}
-
-    # If it's JSON text
-    if isinstance(positions, str):
-        positions = positions.strip()
-        if not positions:
-            return {}
-        try:
-            loaded = json.loads(positions)
-        except Exception:
-            return {}  # bad JSON; treat as no positions
-
-        # If the JSON is already a mapping
-        if isinstance(loaded, dict):
-            return loaded
-
-        # If it's a list of position objects, build a mapping
-        if isinstance(loaded, list):
-            mapping = {}
-            for p in loaded:
-                try:
-                    sym = p.get("symbol")
-                    strat = p.get("strategy") or p.get("strategy_id")
-                    if sym and strat:
-                        key = f"{sym}|{strat}"
-                        mapping[key] = p
-                except Exception:
-                    continue
-            return mapping
-
-        return {}
-
-    # If it’s some other weird type, just fail-safe
-    if isinstance(positions, list):
-        mapping = {}
-        for p in positions:
-            try:
-                sym = p.get("symbol")
-                strat = p.get("strategy") or p.get("strategy_id")
-                if sym and strat:
-                    key = f"{sym}|{strat}"
-                    mapping[key] = p
-            except Exception:
+        state: Dict[Tuple[str, str], Dict[str, float]] = {}
+        for r in rows:
+            sym = (r["symbol"] or "").strip()
+            if not sym:
                 continue
-        return mapping
+            strat = (r["strategy"] or "").strip() if use_strategy_col else "misc"
+            side = (r["side"] or "").strip().lower()
+            price = float(r["price"] or 0.0)
+            vol = float(r["volume"] or 0.0)
+            if vol <= 0:
+                continue
 
-    return {}
+            k = (strat or "misc", sym)
+            st = state.setdefault(k, {"qty": 0.0, "avg": 0.0})
 
+            qty = st["qty"]
+            avg = st["avg"]
+
+            if side == "buy":
+                new_qty = qty + vol
+                if new_qty > 0 and price > 0:
+                    st["avg"] = ((avg * qty) + (price * vol)) / new_qty
+                st["qty"] = new_qty
+            elif side == "sell":
+                # Reduce position; if we oversell, flatten.
+                if vol >= qty:
+                    st["qty"] = 0.0
+                    st["avg"] = 0.0
+                else:
+                    st["qty"] = qty - vol
+            else:
+                # Unknown side; ignore.
+                continue
+
+        out: List[Position] = []
+        for (strat, sym), st in state.items():
+            if st["qty"] and st["qty"] > 0:
+                out.append(Position(symbol=sym, strategy=strat, qty=st["qty"], avg_price=st["avg"]))
+
+        out.sort(key=lambda p: (p.strategy or "", p.symbol or ""))
+        return out
+    finally:
+        conn.close()
 @app.get("/pnl/by_strategy")
 def pnl_by_strategy(start: Optional[str] = None, end: Optional[str] = None,
                     realized_only: Optional[str] = "true", tz: Optional[str] = "UTC"):
