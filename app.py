@@ -75,8 +75,6 @@ import requests
 import uuid
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
-from dataclasses import dataclass
-import traceback
 from symbol_map import KRAKEN_PAIR_MAP, to_kraken
 from position_engine import PositionEngine, Fill
 from position_manager import load_net_positions, Position
@@ -2702,7 +2700,7 @@ def debug_strategy_scan(payload: Dict[str, Any] = Body(default=None)):
     notional = float(payload.get("notional", float(os.getenv("SCHED_NOTIONAL", "25") or 25.0)))
 
     # Load positions + risk config
-    positions = _load_open_positions_from_trades(use_strategy_col=True)
+    positions = _load_open_positions_from_trades(include_strategy=include_strategy, include_legacy=include_legacy)
     risk_cfg = load_risk_config() or {}
 
     # Preload bars using the same format as the main scheduler
@@ -3704,30 +3702,63 @@ def debug_global_policy():
     
 
 @app.get("/debug/positions")
-def debug_positions():
+def debug_positions(include_strategy: bool = True, include_legacy: bool = False):
     """
-    Returns the system's notion of open positions derived from the local journal/trades tables.
-    This route is intentionally defensive: it should never crash the whole app with a 500 that hides the root cause.
+    Show current open positions as seen by the system, including:
+
+    - qty / avg_price from trades table
+    - last_price (via _last_price_safe)
+    - unrealized_pct (via RiskEngine.compute_unrealized_pct)
+    - per-symbol caps from risk.json (max_notional / max_units)
+
+    This is the single source of truth for exposures + unrealized P&L.
     """
-    try:
-        # This uses our trade-derived position calculator (see _calc_net_positions_from_trades).
-        out = _load_open_positions_from_trades(use_strategy_col=True)
-        # serialize Positions to JSON-friendly dicts
-        positions = []
-        for k, p in out.items():
-            positions.append({
-                "symbol": getattr(p, "symbol", k[0]),
-                "strategy": getattr(p, "strategy", k[1]),
-                "qty": float(getattr(p, "qty", 0.0)),
-                "side": getattr(p, "side", "long"),
-                "avg_price": float(getattr(p, "avg_price", 0.0)) if getattr(p, "avg_price", None) is not None else 0.0
-            })
-        return {"ok": True, "count": len(positions), "positions": positions}
-    except Exception as e:
-        return JSONResponse(
-            status_code=500,
-            content={"ok": False, "error": f"{type(e).__name__}: {e}", "trace": traceback.format_exc()},
+    positions = _load_open_positions_from_trades(include_strategy=include_strategy, include_legacy=include_legacy)
+    risk_cfg = load_risk_config() or {}
+    risk_engine = RiskEngine(risk_cfg)
+
+    out = []
+
+    for (symbol, strategy), pm_pos in positions.items():
+        snap = PositionSnapshot(
+            symbol=symbol,
+            strategy=strategy,
+            qty=float(getattr(pm_pos, "qty", 0.0) or 0.0),
+            avg_price=getattr(pm_pos, "avg_price", None),
+            unrealized_pct=None,
         )
+
+        last_px = _last_price_safe(symbol)
+        try:
+            unrealized_pct = risk_engine.compute_unrealized_pct(
+                snap,
+                last_price_fn=_last_price_safe,
+            )
+        except Exception:
+            unrealized_pct = None
+
+        snap.unrealized_pct = unrealized_pct
+
+        # symbol caps (already time-of-day adjusted)
+        max_notional, max_units = risk_engine.symbol_caps(symbol)
+
+        out.append(
+            {
+                "symbol": symbol,
+                "strategy": strategy,
+                "qty": snap.qty,
+                "avg_price": snap.avg_price,
+                "last_price": last_px,
+                "unrealized_pct": unrealized_pct,
+                "max_notional_cap": max_notional,
+                "max_units_cap": max_units,
+            }
+        )
+
+    return {
+        "positions": out,
+    }
+
 @app.get("/debug/trades_sample")
 def debug_trades_sample(
     symbol: str = Query(None, description="Optional symbol filter, e.g. ADA/USD"),
@@ -6182,96 +6213,30 @@ def _pnl__agg(group_fields: List[str], start: Optional[str], end: Optional[str],
         where, params = _pnl__where(s, e)
         sql = _pnl__build_sql(table, group_fields, have, realized_only).replace("{WHERE}", where)
         rows = [dict(r) for r in con.execute(sql, params).fetchall()]
-@dataclass
-class _PosState:
-    qty: float = 0.0
-    cost_basis: float = 0.0  # tracked using a moving-average cost basis
-    avg_price: float = 0.0
-
-def _calc_net_positions_from_trades(con: sqlite3.Connection, use_strategy_col: bool = False) -> Dict[Tuple[str, str], Position]:
-    """
-    Compute open long positions from the local `trades` table.
-
-    Why this exists:
-    - Some Kraken spot trade payloads/rows can be interpreted incorrectly (side sign),
-      which creates "phantom positions" in the journal.
-    - We compute positions locally from trades with a clear rule:
-        buy  => +volume (increase base qty)
-        sell => -volume (decrease base qty)
-      and maintain a moving-average cost basis for remaining qty.
-    """
-    # Ensure rows are accessible by name even if connection wasn't configured that way.
-    con.row_factory = sqlite3.Row
-    cur = con.cursor()
-
-    # If the DB doesn't have a strategy column (older DBs), we'll default to "misc".
-    cols = {r["name"] for r in cur.execute("PRAGMA table_info(trades)").fetchall()}
-    has_strategy = "strategy" in cols
-
-    q = "SELECT ts, symbol, side, volume, cost, price{strategy_col} FROM trades ORDER BY ts ASC"
-    strategy_col = ", strategy" if (use_strategy_col and has_strategy) else ""
-    q = q.format(strategy_col=strategy_col)
-
-    states: Dict[Tuple[str, str], _PosState] = {}
-
-    for row in cur.execute(q).fetchall():
-        sym = row["symbol"]
-        strat = row["strategy"] if (use_strategy_col and has_strategy) else "misc"
-
-        side = (row["side"] or "").lower().strip()
-        vol = float(row["volume"] or 0.0)
-        cost = float(row["cost"] or 0.0)
-
-        key = (sym, strat)
-        st = states.get(key) or _PosState()
-
-        if vol <= 0:
-            states[key] = st
-            continue
-
-        if side == "buy":
-            st.qty += vol
-            st.cost_basis += cost
-            st.avg_price = (st.cost_basis / st.qty) if st.qty > 0 else 0.0
-
-        elif side == "sell":
-            # Reduce quantity; apply the current avg cost basis proportionally.
-            qty_sold = min(vol, st.qty) if st.qty > 0 else vol
-            st.cost_basis -= st.avg_price * qty_sold
-            st.qty -= qty_sold
-
-            # Clamp tiny negatives from float math
-            if abs(st.qty) < 1e-10:
-                st.qty = 0.0
-                st.cost_basis = 0.0
-                st.avg_price = 0.0
-            else:
-                st.avg_price = (st.cost_basis / st.qty) if st.qty > 0 else 0.0
-
-        else:
-            # Unknown side: ignore
-            pass
-
-        states[key] = st
-
-    # Convert to Position objects, dropping zeros.
-    out: Dict[Tuple[str, str], Position] = {}
-    for (sym, strat), st in states.items():
-        if abs(st.qty) < 1e-10:
-            continue
-        out[(sym, strat)] = Position(symbol=sym, strategy=strat, qty=st.qty, side="long", avg_price=st.avg_price)
-
-    return out
+        return {"ok": True, "table": table, "start": s, "end": e, "realized_only": realized_only, "count": len(rows), "rows": rows}
 
 def _load_open_positions_from_trades(use_strategy_col: bool = False) -> Dict[Tuple[str, str], Position]:
     """
-    Wrapper used across routes. Uses our local trade-based position calc to avoid phantom positions.
+    Load net positions from the trades/journal table, using the same DB the PnL uses.
+    For positions, we treat the 'trades' table as the single source of truth
+    whenever it exists, because that's where TradesHistory imports write.
+
+    Returns a dict keyed by (symbol, strategy).
     """
     con = _db()
     try:
-        return _calc_net_positions_from_trades(con, use_strategy_col=use_strategy_col)
+        table = "trades"
+        try:
+            cur = con.execute("SELECT name FROM sqlite_master WHERE type='table'")
+            names = {r[0] for r in cur.fetchall()}
+            if "trades" not in names:
+                # Fall back to the generic detector if no 'trades' table
+                table = _pnl__detect_table(con)
+        except Exception:
+            table = _pnl__detect_table(con)
+
+        return load_net_positions(con, table=table, use_strategy_col=use_strategy_col)
     finally:
-        con.close()
         con.close()
 
 def _position_for(sym, strat, positions):
