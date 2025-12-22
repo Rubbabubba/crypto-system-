@@ -2674,7 +2674,11 @@ def debug_db():
     return info
 
 @app.post("/debug/strategy_scan")
-def debug_strategy_scan(payload: Dict[str, Any] = Body(default=None)):
+def debug_strategy_scan(
+    payload: Dict[str, Any] = Body(default=None),
+    include_strategy: bool = True,
+    include_legacy: bool = False,
+):
     """
     Explain why a given strategy did or did not want to trade a symbol
     on the most recent bar.
@@ -3713,6 +3717,8 @@ def debug_positions(include_strategy: bool = True, include_legacy: bool = False)
 
     This is the single source of truth for exposures + unrealized P&L.
     """
+    # Back-compat: /debug/positions historically accepted include_strategy/include_legacy.
+    # The position loader accepts these as aliases and returns a dict keyed by (symbol, strategy).
     positions = _load_open_positions_from_trades(include_strategy=include_strategy, include_legacy=include_legacy)
     risk_cfg = load_risk_config() or {}
     risk_engine = RiskEngine(risk_cfg)
@@ -6215,20 +6221,32 @@ def _pnl__agg(group_fields: List[str], start: Optional[str], end: Optional[str],
         rows = [dict(r) for r in con.execute(sql, params).fetchall()]
         return {"ok": True, "table": table, "start": s, "end": e, "realized_only": realized_only, "count": len(rows), "rows": rows}
 
-def _load_open_positions_from_trades(use_strategy_col: bool = True) -> List[Position]:
+def _load_open_positions_from_trades(
+    use_strategy_col: bool = True,
+    # Back-compat aliases used by older debug endpoints / clients
+    include_strategy: Optional[bool] = None,
+    include_legacy: bool = False,
+) -> Dict[Tuple[str, str], Position]:
     """Compute open (net) positions from the local `trades` table.
 
-    This is a lightweight, deterministic view that does *not* depend on Kraken positions.
-    It is used by /debug/positions and any journal sanity checks.
+    Returns a dict keyed by (symbol, strategy).
+
+    Design goals:
+    - Deterministic, trade-driven (does NOT depend on Kraken balances/positions).
+    - Long-only: buys add, sells reduce. If sells exceed current qty we flatten at zero.
+    - Avg price is a weighted average of remaining buys.
 
     Notes:
-    - Long-only: buys add, sells reduce. If sells exceed current qty we zero the position.
-    - Average price is maintained as a weighted average of *buys* for the remaining qty.
+    - include_strategy is an alias for use_strategy_col.
+    - include_legacy is currently ignored (kept only to avoid breaking callers).
     """
     import sqlite3
 
+    if include_strategy is not None:
+        use_strategy_col = bool(include_strategy)
+
     if not DB_PATH:
-        return []
+        return {}
 
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
@@ -6236,7 +6254,7 @@ def _load_open_positions_from_trades(use_strategy_col: bool = True) -> List[Posi
         # Ensure table exists
         names = set(r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall())
         if "trades" not in names:
-            return []
+            return {}
 
         rows = conn.execute(
             """
@@ -6246,6 +6264,7 @@ def _load_open_positions_from_trades(use_strategy_col: bool = True) -> List[Posi
             """
         ).fetchall()
 
+        # state keyed by (symbol, strategy)
         state: Dict[Tuple[str, str], Dict[str, float]] = {}
         for r in rows:
             sym = (r["symbol"] or "").strip()
@@ -6258,7 +6277,7 @@ def _load_open_positions_from_trades(use_strategy_col: bool = True) -> List[Posi
             if vol <= 0:
                 continue
 
-            k = (strat or "misc", sym)
+            k = (sym, (strat or "misc"))
             st = state.setdefault(k, {"qty": 0.0, "avg": 0.0})
 
             qty = st["qty"]
@@ -6280,12 +6299,12 @@ def _load_open_positions_from_trades(use_strategy_col: bool = True) -> List[Posi
                 # Unknown side; ignore.
                 continue
 
-        out: List[Position] = []
-        for (strat, sym), st in state.items():
+        out: Dict[Tuple[str, str], Position] = {}
+        for (sym, strat), st in state.items():
             if st["qty"] and st["qty"] > 0:
-                out.append(Position(symbol=sym, strategy=strat, qty=st["qty"], avg_price=st["avg"]))
+                out[(sym, strat)] = Position(symbol=sym, strategy=strat, qty=st["qty"], avg_price=st["avg"])
 
-        out.sort(key=lambda p: (p.strategy or "", p.symbol or ""))
+        # NOTE: callers may iterate; stable ordering is handled at presentation layer.
         return out
     finally:
         conn.close()
