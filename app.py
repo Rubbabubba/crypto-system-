@@ -3524,127 +3524,85 @@ def debug_env():
     return {"ok": True, "env": env}
     
 @app.get("/debug/kraken/positions")
-def debug_kraken_positions(
-    use_strategy: bool = True,
-    include_legacy: bool = False,
-):
-    """
-    Cross-check live Kraken balances vs journal-derived positions.
+def debug_kraken_positions(use_strategy: bool = True, include_legacy: bool = False):
+    """Compare Kraken balances vs journal-implied positions (by asset).
 
-    - Kraken side: broker_kraken.positions() -> [{"asset": "AVAX", "qty": 1.23}, ...]
-    - Journal side: load_net_positions(...) from trades table.
-      * use_strategy=True  -> uses (symbol,strategy), then aggregates per asset
-      * include_legacy=False -> ignores strategy='legacy' (old history after reset)
-
-    Returns:
-      {
-        "ok": true,
-        "kraken": [...],
-        "journal_by_asset": [...],
-        "diff": [...]
-      }
+    Kraken spot balances are authoritative. Journal positions are reconstructed from the local
+    trades table by default (to avoid ledgers-only artifacts / phantom positions).
     """
     try:
-        # --- Kraken side: live balances -----------------------------------
+        bal = kraken_balances()  # dict asset->qty
+        kraken_list = [{"asset": a, "qty": float(q)} for a, q in sorted(bal.items())]
+
+        con = sqlite3.connect("journal.db")
         try:
-            kraken_raw = broker_kraken.positions()  # [{"asset": "AVAX","qty": 1.23}, ...] or [{"error": "..."}]
-        except Exception as e:
-            kraken_raw = [{"error": f"positions_error:{e}"}]
+            journal_positions = []
+            if db_has_table(con, "trades"):
+                try:
+                    journal_positions = _compute_net_positions_from_trades(con, table="trades")
+                except Exception:
+                    journal_positions = []
 
-        kraken_map = {}
-        kraken_list = []
-        for row in kraken_raw:
-            asset = str(row.get("asset", "")).upper()
-            if not asset:
-                # pass through errors or unknown shapes
-                kraken_list.append(row)
-                continue
-            try:
-                qty = float(row.get("qty", 0.0) or 0.0)
-            except Exception:
-                qty = 0.0
-            if qty == 0.0:
-                continue
-            kraken_map[asset] = kraken_map.get(asset, 0.0) + qty
-            kraken_list.append({"asset": asset, "qty": qty})
-
-        # --- Journal side: load positions from trades ---------------------
-        con = _db()
-        try:
-            # PnL helper detects the correct table; fallback to "trades"
-            try:
-                table = _pnl__detect_table(con)
-            except Exception:
-                table = "trades"
-
-            pos_dict = load_net_positions(
-                con,
-                table=table,
-                use_strategy_col=bool(use_strategy),
-            )
+            if not journal_positions:
+                table = "ledgers_trade" if db_has_table(con, "ledgers_trade") else "trades"
+                try:
+                    journal_positions = load_net_positions(con, table=table, use_strategy=use_strategy)
+                except Exception:
+                    journal_positions = []
         finally:
-            con.close()
+            try:
+                con.close()
+            except Exception:
+                pass
 
-        journal_agg: Dict[str, float] = {}
-        journal_details: Dict[str, list] = {}
-
-        for (symbol, strategy), pos in pos_dict.items():
-            if not include_legacy and str(strategy).strip().lower() == "legacy":
-                # Ignore legacy history when include_legacy=False
+        by_asset = {}
+        for p in journal_positions:
+            sym = p.get("symbol") if isinstance(p, dict) else getattr(p, "symbol", None)
+            strat = p.get("strategy") if isinstance(p, dict) else getattr(p, "strategy", None)
+            qty = p.get("qty") if isinstance(p, dict) else getattr(p, "qty", None)
+            if sym is None or qty is None:
                 continue
-
-            sym = str(symbol or "").upper()
-            if "/" in sym:
-                asset = sym.split("/", 1)[0].strip()
-            else:
-                # Fallback: treat full symbol as asset (e.g. "AVAXUSD" -> "AVAXUSD")
-                asset = sym
-
-            qty = float(pos.qty or 0.0)
+            try:
+                qty = float(qty)
+            except Exception:
+                continue
             if abs(qty) < 1e-12:
                 continue
-
-            journal_agg[asset] = journal_agg.get(asset, 0.0) + qty
-            journal_details.setdefault(asset, []).append({
+            base = sym.split("/")[0] if "/" in sym else sym
+            by_asset.setdefault(base, {"asset": base, "qty": 0.0, "positions": []})
+            by_asset[base]["qty"] += qty
+            by_asset[base]["positions"].append({
                 "symbol": sym,
-                "strategy": strategy,
+                "strategy": strat or "misc",
                 "qty": qty,
-                "side": "long" if qty > 0 else ("short" if qty < 0 else "flat"),
+                "side": "long" if qty > 0 else "short",
             })
 
-        journal_list = []
-        for asset, total_qty in journal_agg.items():
-            journal_list.append({
-                "asset": asset,
-                "qty": total_qty,
-                "positions": journal_details.get(asset, []),
-            })
+        journal_by_asset = [by_asset[k] for k in sorted(by_asset.keys())]
 
-        # --- Diff: kraken_qty - journal_qty --------------------------------
-        all_assets = set(kraken_map.keys()) | set(journal_agg.keys())
-        diff_list = []
-        for asset in sorted(all_assets):
-            kqty = float(kraken_map.get(asset, 0.0))
-            jq = float(journal_agg.get(asset, 0.0))
-            diff_list.append({
-                "asset": asset,
-                "kraken_qty": kqty,
-                "journal_qty": jq,
-                "delta": kqty - jq,
-            })
+        assets = sorted(set(list(bal.keys()) + list(by_asset.keys())))
+        diff = []
+        for a in assets:
+            kq = float(bal.get(a, 0.0) or 0.0)
+            jq = float(by_asset.get(a, {}).get("qty", 0.0) if a in by_asset else 0.0)
+            diff.append({"asset": a, "kraken_qty": kq, "journal_qty": jq, "delta": kq - jq})
 
         return {
             "ok": True,
-            "use_strategy": bool(use_strategy),
-            "include_legacy": bool(include_legacy),
+            "use_strategy": use_strategy,
+            "include_legacy": include_legacy,
             "kraken": kraken_list,
-            "journal_by_asset": sorted(journal_list, key=lambda x: x["asset"]),
-            "diff": diff_list,
+            "journal_by_asset": journal_by_asset,
+            "diff": diff,
+        }
+    except Exception as e:
+        return {
+            "ok": False,
+            "error": f"{type(e).__name__}: {e}",
+            "trace": traceback.format_exc().splitlines()[-30:],
         }
 
-    except Exception as e:
-        return {"ok": False, "error": str(e)}
-    
+
 @app.get("/debug/global_policy")
 def debug_global_policy():
     """
@@ -3703,61 +3661,57 @@ def debug_global_policy():
 
 @app.get("/debug/positions")
 def debug_positions():
+    """Debug helper: show open positions computed from journal trades with last price and P&L.
+
+    This endpoint should not throw 500s — if something fails, it returns ok=false with details.
     """
-    Show current open positions as seen by the system, including:
+    try:
+        open_positions = _load_open_positions_from_trades(path="journal.db")
 
-    - qty / avg_price from trades table
-    - last_price (via _last_price_safe)
-    - unrealized_pct (via RiskEngine.compute_unrealized_pct)
-    - per-symbol caps from risk.json (max_notional / max_units)
+        risk_cfg = load_risk_config() or {}
+        symbol_caps = (risk_cfg.get("symbol_caps") or {}) if isinstance(risk_cfg, dict) else {}
 
-    This is the single source of truth for exposures + unrealized P&L.
-    """
-    positions = _load_open_positions_from_trades(use_strategy_col=True)
-    risk_cfg = load_risk_config() or {}
-    risk_engine = RiskEngine(risk_cfg)
+        rows = []
+        for snap in open_positions:
+            try:
+                last_px = float(_last_price_safe(snap.symbol) or 0.0)
+                avg = snap.avg_price
 
-    out = []
+                if avg is None:
+                    unreal_pct = None
+                else:
+                    try:
+                        avg_f = float(avg)
+                        unreal_pct = None if avg_f <= 0 else ((last_px - avg_f) / avg_f) * 100.0
+                    except Exception:
+                        unreal_pct = None
 
-    for (symbol, strategy), pm_pos in positions.items():
-        snap = PositionSnapshot(
-            symbol=symbol,
-            strategy=strategy,
-            qty=float(getattr(pm_pos, "qty", 0.0) or 0.0),
-            avg_price=getattr(pm_pos, "avg_price", None),
-            unrealized_pct=None,
-        )
+                rows.append({
+                    "symbol": snap.symbol,
+                    "strategy": snap.strategy,
+                    "qty": snap.qty,
+                    "avg_price": snap.avg_price,
+                    "last_price": last_px,
+                    "unrealized_pct": unreal_pct,
+                    "cap": symbol_caps.get(snap.symbol),
+                })
+            except Exception as e:
+                rows.append({
+                    "symbol": getattr(snap, "symbol", None),
+                    "strategy": getattr(snap, "strategy", None),
+                    "qty": getattr(snap, "qty", None),
+                    "avg_price": getattr(snap, "avg_price", None),
+                    "error": f"row_error:{type(e).__name__}:{e}",
+                })
 
-        last_px = _last_price_safe(symbol)
-        try:
-            unrealized_pct = risk_engine.compute_unrealized_pct(
-                snap,
-                last_price_fn=_last_price_safe,
-            )
-        except Exception:
-            unrealized_pct = None
+        return {"ok": True, "count": len(rows), "positions": rows}
+    except Exception as e:
+        return {
+            "ok": False,
+            "error": f"{type(e).__name__}: {e}",
+            "trace": traceback.format_exc().splitlines()[-30:],
+        }
 
-        snap.unrealized_pct = unrealized_pct
-
-        # symbol caps (already time-of-day adjusted)
-        max_notional, max_units = risk_engine.symbol_caps(symbol)
-
-        out.append(
-            {
-                "symbol": symbol,
-                "strategy": strategy,
-                "qty": snap.qty,
-                "avg_price": snap.avg_price,
-                "last_price": last_px,
-                "unrealized_pct": unrealized_pct,
-                "max_notional_cap": max_notional,
-                "max_units_cap": max_units,
-            }
-        )
-
-    return {
-        "positions": out,
-    }
 
 @app.get("/debug/trades_sample")
 def debug_trades_sample(
@@ -6215,30 +6169,136 @@ def _pnl__agg(group_fields: List[str], start: Optional[str], end: Optional[str],
         rows = [dict(r) for r in con.execute(sql, params).fetchall()]
         return {"ok": True, "table": table, "start": s, "end": e, "realized_only": realized_only, "count": len(rows), "rows": rows}
 
-def _load_open_positions_from_trades(use_strategy_col: bool = False) -> Dict[Tuple[str, str], Position]:
-    """
-    Load net positions from the trades/journal table, using the same DB the PnL uses.
-    For positions, we treat the 'trades' table as the single source of truth
-    whenever it exists, because that's where TradesHistory imports write.
+def _compute_net_positions_from_trades(con, table: str = "trades"):
+    """Compute open positions from a trades-like table (symbol, side, volume, price, strategy, ts).
 
-    Returns a dict keyed by (symbol, strategy).
+    Defensive fallback used when higher-level helpers (e.g. load_net_positions) fail.
+    Uses a simple average-cost model (not FIFO).
+    Returns list[dict]: {symbol, strategy, qty, avg_price}
     """
-    con = _db()
+    cur = con.cursor()
+
+    cols = set()
     try:
-        table = "trades"
+        cur.execute(f"PRAGMA table_info({table})")
+        cols = {r[1] for r in cur.fetchall()}
+    except Exception:
+        cols = set()
+
+    need = {"symbol", "side"}
+    if cols and not need.issubset(cols):
+        raise RuntimeError(f"{table} missing required columns: {sorted(need - cols)}")
+
+    volume_col = "volume" if (not cols or "volume" in cols) else ("qty" if "qty" in cols else None)
+    price_col  = "price"  if (not cols or "price"  in cols) else ("px" if "px" in cols else None)
+    strat_col  = "strategy" if (not cols or "strategy" in cols) else None
+    ts_col     = "ts" if (not cols or "ts" in cols) else None
+
+    if volume_col is None:
+        raise RuntimeError(f"{table} missing volume/qty column")
+
+    select_cols = ["symbol"]
+    if strat_col:
+        select_cols.append(f"COALESCE({strat_col}, 'misc') AS strategy")
+    else:
+        select_cols.append("'misc' AS strategy")
+    select_cols.append("LOWER(side) AS side")
+    select_cols.append(f"{volume_col} AS volume")
+    if price_col:
+        select_cols.append(f"{price_col} AS price")
+    else:
+        select_cols.append("NULL AS price")
+
+    order_by = "ORDER BY ts ASC" if ts_col else ""
+    q = f"SELECT {', '.join(select_cols)} FROM {table} WHERE symbol IS NOT NULL {order_by}"
+    cur.execute(q)
+    rows = cur.fetchall()
+
+    state = {}  # (symbol,strategy) -> [qty, cost]
+    for sym, strat, side, vol, px in rows:
         try:
-            cur = con.execute("SELECT name FROM sqlite_master WHERE type='table'")
-            names = {r[0] for r in cur.fetchall()}
-            if "trades" not in names:
-                # Fall back to the generic detector if no 'trades' table
-                table = _pnl__detect_table(con)
+            vol = float(vol or 0.0)
         except Exception:
-            table = _pnl__detect_table(con)
+            vol = 0.0
+        if vol == 0.0:
+            continue
+        try:
+            px = float(px) if px is not None else None
+        except Exception:
+            px = None
 
-        return load_net_positions(con, table=table, use_strategy_col=use_strategy_col)
+        key = (sym, strat)
+        if key not in state:
+            state[key] = [0.0, 0.0]
+
+        qty, cost = state[key]
+        if side == "buy":
+            qty += vol
+            if px is not None:
+                cost += vol * px
+        elif side == "sell":
+            if qty > 0:
+                reduce_qty = min(vol, qty)
+                if qty != 0:
+                    cost -= cost * (reduce_qty / qty)
+                qty -= reduce_qty
+        state[key] = [qty, cost]
+
+    out = []
+    for (sym, strat), (qty, cost) in state.items():
+        if abs(qty) < 1e-12:
+            continue
+        avg = (cost / qty) if (qty and cost and qty > 0) else None
+        out.append({"symbol": sym, "strategy": strat, "qty": qty, "avg_price": avg})
+    return out
+
+
+def _load_open_positions_from_trades(path="journal.db") -> list[PositionSnapshot]:
+    """Load open positions for debugging.
+
+    Primary path: use load_net_positions (if it works for your schema).
+    Fallback: compute from the trades table using a simple average-cost model.
+    """
+    con = sqlite3.connect(path)
+    try:
+        # Prefer trades if it exists; ledgers_trade can include ledger-only artifacts.
+        table = "trades" if db_has_table(con, "trades") else ("ledgers_trade" if db_has_table(con, "ledgers_trade") else "trades")
+
+        try:
+            positions = load_net_positions(con, table=table, use_strategy=True)
+        except Exception:
+            raw = _compute_net_positions_from_trades(con, table=table)
+            positions = []
+            for r in raw:
+                positions.append({
+                    "symbol": r["symbol"],
+                    "strategy": r["strategy"],
+                    "qty": r["qty"],
+                    "avg_price": r.get("avg_price"),
+                })
+
+        snaps: list[PositionSnapshot] = []
+        for p in positions:
+            try:
+                sym = p.get("symbol") if isinstance(p, dict) else getattr(p, "symbol", None)
+                strat = p.get("strategy") if isinstance(p, dict) else getattr(p, "strategy", "misc")
+                qty = p.get("qty") if isinstance(p, dict) else getattr(p, "qty", 0.0)
+                avg = p.get("avg_price") if isinstance(p, dict) else getattr(p, "avg_price", None)
+
+                qty = float(qty or 0.0)
+                avg = float(avg) if avg is not None else None
+                if not sym or abs(qty) < 1e-12:
+                    continue
+
+                snaps.append(PositionSnapshot(symbol=sym, strategy=strat or "misc", qty=qty, avg_price=avg))
+            except Exception:
+                continue
+        return snaps
     finally:
-        con.close()
-
+        try:
+            con.close()
+        except Exception:
+            pass
 def _position_for(sym, strat, positions):
     positions = _normalize_positions(positions)
     key = f"{sym}|{strat}"
