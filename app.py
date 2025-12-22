@@ -851,7 +851,10 @@ def _next_kraken_nonce() -> int:
 # initialize nonce state on import
 _load_kraken_nonce_state()
 
-def kraken_private(method: str, data: Dict[str, Any], key: str, secret_b64: str) -> Dict[str, Any]:
+def kraken_private(method: str, data: Dict[str, Any], key: Optional[str] = None, secret_b64: Optional[str] = None) -> Dict[str, Any]:
+    # Backwards-compatible: if key/secret not passed, pull from env.
+    if key is None or secret_b64 is None:
+        key, secret_b64, _ = _kraken_creds()
     """Kraken private API call with nonce serialization + retry on Invalid nonce."""
     path = f"/0/private/{method}"
     url = f"{KRAKEN_API_BASE}{path}"
@@ -3524,41 +3527,127 @@ def debug_env():
     return {"ok": True, "env": env}
     
 @app.get("/debug/kraken/positions")
-def debug_kraken_positions():
+def debug_kraken_positions(
+    use_strategy: bool = True,
+    include_legacy: bool = False,
+):
     """
-    Safe diagnostic endpoint: returns Kraken 'Balance' (wallet balances) without crashing.
-    This endpoint should NEVER 500; if Kraken call fails, it returns ok=false with error details.
+    Cross-check live Kraken balances vs journal-derived positions.
+
+    - Kraken side: broker_kraken.positions() -> [{"asset": "AVAX", "qty": 1.23}, ...]
+    - Journal side: load_net_positions(...) from trades table.
+      * use_strategy=True  -> uses (symbol,strategy), then aggregates per asset
+      * include_legacy=False -> ignores strategy='legacy' (old history after reset)
+
+    Returns:
+      {
+        "ok": true,
+        "kraken": [...],
+        "journal_by_asset": [...],
+        "diff": [...]
+      }
     """
     try:
-        # Reuse existing helpers if present
-        creds_present = bool(os.getenv("KRAKEN_API_KEY")) and bool(os.getenv("KRAKEN_API_SECRET"))
-        if not creds_present:
-            return {"ok": True, "creds_present": False, "balances": [], "raw": None}
+        # --- Kraken side: live balances -----------------------------------
+        try:
+            kraken_raw = broker_kraken.positions()  # [{"asset": "AVAX","qty": 1.23}, ...] or [{"error": "..."}]
+        except Exception as e:
+            kraken_raw = [{"error": f"positions_error:{e}"}]
 
-        # kraken_private is defined earlier in this file (in your codebase).
-        raw = kraken_private("Balance", {})
-        # Kraken replies usually look like {"error": [...], "result": {...}}
-        err = raw.get("error") if isinstance(raw, dict) else None
-        if err:
-            return {"ok": False, "creds_present": True, "error": err, "raw": raw}
-
-        result = raw.get("result", {}) if isinstance(raw, dict) else {}
-        balances = []
-        for asset, qty_str in result.items():
-            try:
-                qty = float(qty_str)
-            except Exception:
+        kraken_map = {}
+        kraken_list = []
+        for row in kraken_raw:
+            asset = str(row.get("asset", "")).upper()
+            if not asset:
+                # pass through errors or unknown shapes
+                kraken_list.append(row)
                 continue
-            if abs(qty) > 0:
-                balances.append({"asset": asset, "qty": qty})
+            try:
+                qty = float(row.get("qty", 0.0) or 0.0)
+            except Exception:
+                qty = 0.0
+            if qty == 0.0:
+                continue
+            kraken_map[asset] = kraken_map.get(asset, 0.0) + qty
+            kraken_list.append({"asset": asset, "qty": qty})
 
-        # Sort for readability (largest qty first)
-        balances.sort(key=lambda x: abs(x["qty"]), reverse=True)
-        return {"ok": True, "creds_present": True, "balances": balances, "raw": raw}
+        # --- Journal side: load positions from trades ---------------------
+        con = _db()
+        try:
+            # PnL helper detects the correct table; fallback to "trades"
+            try:
+                table = _pnl__detect_table(con)
+            except Exception:
+                table = "trades"
+
+            pos_dict = load_net_positions(
+                con,
+                table=table,
+                use_strategy_col=bool(use_strategy),
+            )
+        finally:
+            con.close()
+
+        journal_agg: Dict[str, float] = {}
+        journal_details: Dict[str, list] = {}
+
+        for (symbol, strategy), pos in pos_dict.items():
+            if not include_legacy and str(strategy).strip().lower() == "legacy":
+                # Ignore legacy history when include_legacy=False
+                continue
+
+            sym = str(symbol or "").upper()
+            if "/" in sym:
+                asset = sym.split("/", 1)[0].strip()
+            else:
+                # Fallback: treat full symbol as asset (e.g. "AVAXUSD" -> "AVAXUSD")
+                asset = sym
+
+            qty = float(pos.qty or 0.0)
+            if abs(qty) < 1e-12:
+                continue
+
+            journal_agg[asset] = journal_agg.get(asset, 0.0) + qty
+            journal_details.setdefault(asset, []).append({
+                "symbol": sym,
+                "strategy": strategy,
+                "qty": qty,
+                "side": "long" if qty > 0 else ("short" if qty < 0 else "flat"),
+            })
+
+        journal_list = []
+        for asset, total_qty in journal_agg.items():
+            journal_list.append({
+                "asset": asset,
+                "qty": total_qty,
+                "positions": journal_details.get(asset, []),
+            })
+
+        # --- Diff: kraken_qty - journal_qty --------------------------------
+        all_assets = set(kraken_map.keys()) | set(journal_agg.keys())
+        diff_list = []
+        for asset in sorted(all_assets):
+            kqty = float(kraken_map.get(asset, 0.0))
+            jq = float(journal_agg.get(asset, 0.0))
+            diff_list.append({
+                "asset": asset,
+                "kraken_qty": kqty,
+                "journal_qty": jq,
+                "delta": kqty - jq,
+            })
+
+        return {
+            "ok": True,
+            "use_strategy": bool(use_strategy),
+            "include_legacy": bool(include_legacy),
+            "kraken": kraken_list,
+            "journal_by_asset": sorted(journal_list, key=lambda x: x["asset"]),
+            "diff": diff_list,
+        }
+
     except Exception as e:
-        return {"ok": False, "creds_present": bool(os.getenv("KRAKEN_API_KEY")), "error": f"{type(e).__name__}: {e}"}
-
-
+        return {"ok": False, "error": str(e)}
+    
 @app.get("/debug/global_policy")
 def debug_global_policy():
     """
@@ -3618,97 +3707,60 @@ def debug_global_policy():
 @app.get("/debug/positions")
 def debug_positions():
     """
-    Safe reconciliation endpoint:
-    - Kraken wallet balances (Balance)
-    - Journal balances by asset (sum of ledger amounts)
-    - Optional: journal positions table breakdown (if present)
-    Always returns JSON; never throws 500.
+    Show current open positions as seen by the system, including:
+
+    - qty / avg_price from trades table
+    - last_price (via _last_price_safe)
+    - unrealized_pct (via RiskEngine.compute_unrealized_pct)
+    - per-symbol caps from risk.json (max_notional / max_units)
+
+    This is the single source of truth for exposures + unrealized P&L.
     """
-    import sqlite3
-    try:
-        # 1) Kraken balances
-        kraken_out = debug_kraken_positions()
-        kraken_list = []
-        if isinstance(kraken_out, dict) and kraken_out.get("ok") and kraken_out.get("creds_present"):
-            # Kraken 'balances' assets are Kraken's asset codes; keep them as-is.
-            kraken_list = [{"asset": b["asset"], "qty": float(b["qty"])} for b in kraken_out.get("balances", [])]
+    positions = _load_open_positions_from_trades(use_strategy_col=True)
+    risk_cfg = load_risk_config() or {}
+    risk_engine = RiskEngine(risk_cfg)
 
-        # Normalize for diff map
-        kraken_map = {x["asset"]: float(x["qty"]) for x in kraken_list}
+    out = []
 
-        # 2) Journal balances by asset from ledgers table
-        journal_by_asset = []
-        journal_map = {}
+    for (symbol, strategy), pm_pos in positions.items():
+        snap = PositionSnapshot(
+            symbol=symbol,
+            strategy=strategy,
+            qty=float(getattr(pm_pos, "qty", 0.0) or 0.0),
+            avg_price=getattr(pm_pos, "avg_price", None),
+            unrealized_pct=None,
+        )
 
-        db_path = globals().get("DB_PATH") or os.getenv("DB_PATH") or "/var/data/journal.db"
-        conn = sqlite3.connect(db_path)
-        conn.row_factory = sqlite3.Row
-        cur = conn.cursor()
-
-        # ledgers table: expect columns asset TEXT, amount REAL (or similar)
-        # If your schema uses 'asset'/'amount', this works. If not, return a helpful error.
+        last_px = _last_price_safe(symbol)
         try:
-            cur.execute("SELECT asset, SUM(amount) AS qty FROM ledgers GROUP BY asset")
-            rows = cur.fetchall()
-            for r in rows:
-                asset = r["asset"]
-                qty = float(r["qty"] or 0.0)
-                if abs(qty) > 0:
-                    journal_map[asset] = qty
-                    journal_by_asset.append({"asset": asset, "qty": qty})
-        except Exception as e:
-            # Fall back: try common alternative column name 'qty'
-            cur.execute("SELECT asset, SUM(qty) AS qty FROM ledgers GROUP BY asset")
-            rows = cur.fetchall()
-            for r in rows:
-                asset = r["asset"]
-                qty = float(r["qty"] or 0.0)
-                if abs(qty) > 0:
-                    journal_map[asset] = qty
-                    journal_by_asset.append({"asset": asset, "qty": qty})
-
-        # 3) Optional: per-position breakdown if a 'positions' table exists
-        positions = []
-        try:
-            cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='positions'")
-            if cur.fetchone():
-                cur.execute("SELECT symbol, strategy, qty, side FROM positions")
-                for r in cur.fetchall():
-                    positions.append({"symbol": r["symbol"], "strategy": r["strategy"], "qty": float(r["qty"]), "side": r["side"]})
+            unrealized_pct = risk_engine.compute_unrealized_pct(
+                snap,
+                last_price_fn=_last_price_safe,
+            )
         except Exception:
-            pass
+            unrealized_pct = None
 
-        conn.close()
+        snap.unrealized_pct = unrealized_pct
 
-        # 4) Diff
-        all_assets = sorted(set(kraken_map.keys()) | set(journal_map.keys()))
-        diff = []
-        for a in all_assets:
-            k = float(kraken_map.get(a, 0.0))
-            j = float(journal_map.get(a, 0.0))
-            delta = k - j
-            # keep even if 0? only if meaningful
-            if abs(delta) > 0:
-                diff.append({"asset": a, "kraken_qty": k, "journal_qty": j, "delta": delta})
+        # symbol caps (already time-of-day adjusted)
+        max_notional, max_units = risk_engine.symbol_caps(symbol)
 
-        # Sort diffs by absolute delta
-        diff.sort(key=lambda x: abs(x["delta"]), reverse=True)
+        out.append(
+            {
+                "symbol": symbol,
+                "strategy": strategy,
+                "qty": snap.qty,
+                "avg_price": snap.avg_price,
+                "last_price": last_px,
+                "unrealized_pct": unrealized_pct,
+                "max_notional_cap": max_notional,
+                "max_units_cap": max_units,
+            }
+        )
 
-        return {
-            "ok": True,
-            "use_strategy": True,
-            "include_legacy": False,
-            "db_path": db_path,
-            "kraken": kraken_list,
-            "journal_by_asset": [{"asset": a, "qty": q, "positions": []} for a,q in sorted(journal_map.items(), key=lambda kv: abs(kv[1]), reverse=True)],
-            "positions_table": positions,
-            "diff": diff,
-            "kraken_raw_ok": bool(isinstance(kraken_out, dict) and kraken_out.get("ok")),
-            "kraken_raw": kraken_out if (isinstance(kraken_out, dict) and not kraken_out.get("ok")) else None,
-        }
-    except Exception as e:
-        return {"ok": False, "error": f"{type(e).__name__}: {e}"}
-
+    return {
+        "positions": out,
+    }
 
 @app.get("/debug/trades_sample")
 def debug_trades_sample(
