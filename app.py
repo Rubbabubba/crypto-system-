@@ -70,6 +70,12 @@ import sqlite3
 import sys
 import time
 import threading
+
+# Global cache of most recently preloaded bar contexts (symbol -> {'one':..., 'five':...}).
+# Used by /debug/positions and RiskEngine when not running inside a scheduler context.
+_LAST_CONTEXTS: dict = {}
+_LAST_CONTEXTS_LOCK = threading.Lock()
+
 import broker_kraken
 import requests
 import uuid
@@ -2674,11 +2680,7 @@ def debug_db():
     return info
 
 @app.post("/debug/strategy_scan")
-def debug_strategy_scan(
-    payload: Dict[str, Any] = Body(default=None),
-    include_strategy: bool = True,
-    include_legacy: bool = False,
-):
+def debug_strategy_scan(payload: Dict[str, Any] = Body(default=None)):
     """
     Explain why a given strategy did or did not want to trade a symbol
     on the most recent bar.
@@ -3717,8 +3719,6 @@ def debug_positions(include_strategy: bool = True, include_legacy: bool = False)
 
     This is the single source of truth for exposures + unrealized P&L.
     """
-    # Back-compat: /debug/positions historically accepted include_strategy/include_legacy.
-    # The position loader accepts these as aliases and returns a dict keyed by (symbol, strategy).
     positions = _load_open_positions_from_trades(include_strategy=include_strategy, include_legacy=include_legacy)
     risk_cfg = load_risk_config() or {}
     risk_engine = RiskEngine(risk_cfg)
@@ -4206,27 +4206,38 @@ def _startup():
 # Last-price helper for risk calculation + exits
 # ------------------------------------------------------------------
 def _last_price_safe(symbol: str) -> float:
-    # 1) Try cached 5m bars
-    ctx = contexts.get(symbol)
-    if ctx:
-        five = ctx.get("five") or {}
-        closes = five.get("close") or []
-        if closes:
-            try:
-                return float(closes[-1])
-            except Exception:
-                pass
+    """Best-effort last price for risk/debug.
 
-    # 2) Fallback: ask broker router for a last price (prevents exit blocks)
+    Order of precedence:
+      1) Most recently preloaded bar contexts from scheduler_v2/strategy_scan (cached globally)
+      2) Broker router helpers (get_last_price / get_ticker)
+      3) 0.0 (unknown)
+
+    NOTE: This must never raise, because it's called from debug endpoints.
+    """
+    # 1) Try cached 5m bars from last scheduler preload
+    try:
+        with _LAST_CONTEXTS_LOCK:
+            ctx = (_LAST_CONTEXTS or {}).get(symbol)
+        if ctx:
+            five = ctx.get("five") or {}
+            closes = five.get("close") or []
+            if closes:
+                try:
+                    return float(closes[-1])
+                except Exception:
+                    pass
+    except Exception:
+        pass
+
+    # 2) Fallback: ask broker router for a last price
     try:
         if br is not None:
-            # Prefer a dedicated helper if you have it
             if hasattr(br, "get_last_price"):
                 px = br.get_last_price(symbol)
-                if px:
+                if px is not None:
                     return float(px)
 
-            # Otherwise try ticker-like helpers if present
             if hasattr(br, "get_ticker"):
                 t = br.get_ticker(symbol)
                 if isinstance(t, dict):
@@ -5116,7 +5127,16 @@ def scheduler_run_v2(payload: Dict[str, Any] = Body(default=None)):
     
 
 
-    # ------------------------------------------------------------------
+    
+    # Cache contexts globally for debug/risk helpers (e.g., /debug/positions)
+    try:
+        with _LAST_CONTEXTS_LOCK:
+            _LAST_CONTEXTS.clear()
+            _LAST_CONTEXTS.update({k: v for k, v in contexts.items() if v})
+    except Exception:
+        pass
+
+# ------------------------------------------------------------------
     # Last-price helper for risk calculation + exits
     # ------------------------------------------------------------------
     def _last_price_safe(symbol: str) -> float:
@@ -6221,32 +6241,20 @@ def _pnl__agg(group_fields: List[str], start: Optional[str], end: Optional[str],
         rows = [dict(r) for r in con.execute(sql, params).fetchall()]
         return {"ok": True, "table": table, "start": s, "end": e, "realized_only": realized_only, "count": len(rows), "rows": rows}
 
-def _load_open_positions_from_trades(
-    use_strategy_col: bool = True,
-    # Back-compat aliases used by older debug endpoints / clients
-    include_strategy: Optional[bool] = None,
-    include_legacy: bool = False,
-) -> Dict[Tuple[str, str], Position]:
+def _load_open_positions_from_trades(use_strategy_col: bool = True) -> List[Position]:
     """Compute open (net) positions from the local `trades` table.
 
-    Returns a dict keyed by (symbol, strategy).
-
-    Design goals:
-    - Deterministic, trade-driven (does NOT depend on Kraken balances/positions).
-    - Long-only: buys add, sells reduce. If sells exceed current qty we flatten at zero.
-    - Avg price is a weighted average of remaining buys.
+    This is a lightweight, deterministic view that does *not* depend on Kraken positions.
+    It is used by /debug/positions and any journal sanity checks.
 
     Notes:
-    - include_strategy is an alias for use_strategy_col.
-    - include_legacy is currently ignored (kept only to avoid breaking callers).
+    - Long-only: buys add, sells reduce. If sells exceed current qty we zero the position.
+    - Average price is maintained as a weighted average of *buys* for the remaining qty.
     """
     import sqlite3
 
-    if include_strategy is not None:
-        use_strategy_col = bool(include_strategy)
-
     if not DB_PATH:
-        return {}
+        return []
 
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
@@ -6254,7 +6262,7 @@ def _load_open_positions_from_trades(
         # Ensure table exists
         names = set(r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall())
         if "trades" not in names:
-            return {}
+            return []
 
         rows = conn.execute(
             """
@@ -6264,7 +6272,6 @@ def _load_open_positions_from_trades(
             """
         ).fetchall()
 
-        # state keyed by (symbol, strategy)
         state: Dict[Tuple[str, str], Dict[str, float]] = {}
         for r in rows:
             sym = (r["symbol"] or "").strip()
@@ -6277,7 +6284,7 @@ def _load_open_positions_from_trades(
             if vol <= 0:
                 continue
 
-            k = (sym, (strat or "misc"))
+            k = (strat or "misc", sym)
             st = state.setdefault(k, {"qty": 0.0, "avg": 0.0})
 
             qty = st["qty"]
@@ -6299,12 +6306,12 @@ def _load_open_positions_from_trades(
                 # Unknown side; ignore.
                 continue
 
-        out: Dict[Tuple[str, str], Position] = {}
-        for (sym, strat), st in state.items():
+        out: List[Position] = []
+        for (strat, sym), st in state.items():
             if st["qty"] and st["qty"] > 0:
-                out[(sym, strat)] = Position(symbol=sym, strategy=strat, qty=st["qty"], avg_price=st["avg"])
+                out.append(Position(symbol=sym, strategy=strat, qty=st["qty"], avg_price=st["avg"]))
 
-        # NOTE: callers may iterate; stable ordering is handled at presentation layer.
+        out.sort(key=lambda p: (p.strategy or "", p.symbol or ""))
         return out
     finally:
         conn.close()
