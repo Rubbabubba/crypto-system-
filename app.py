@@ -175,6 +175,12 @@ log = logging.getLogger("crypto-system-api")
 _LAST_ACTION_LATCH = {}  # (symbol, strategy) -> {ts, side, kind}
 _LAST_ACTION_LATCH_LOCK = threading.Lock()
 
+# ------------------------------------------------------------------------------
+# Cached bar contexts for debug endpoints (populated by /scheduler/v2/run)
+# ------------------------------------------------------------------------------
+_LAST_CONTEXTS: Dict[str, Any] = {}
+_LAST_CONTEXTS_LOCK = threading.Lock()
+
 # --------------------------------------------------------------------------------------
 # Risk config loader (policy_config/risk.json)
 # --------------------------------------------------------------------------------------
@@ -2699,21 +2705,22 @@ def debug_strategy_scan(payload: Dict[str, Any] = Body(default=None)):
     limit = int(payload.get("limit", int(os.getenv("SCHED_LIMIT", "300") or 300)))
     notional = float(payload.get("notional", float(os.getenv("SCHED_NOTIONAL", "25") or 25.0)))
 
-    # debug flags (default to strategy-aware positions; no legacy unless requested)
-    def _parse_bool(v, default: bool) -> bool:
+    def _coerce_bool(v, default: bool=False) -> bool:
         if v is None:
             return default
         if isinstance(v, bool):
             return v
+        if isinstance(v, (int, float)):
+            return bool(v)
         s = str(v).strip().lower()
-        if s in ("1", "true", "yes", "y", "on"):
+        if s in ("1", "true", "t", "yes", "y", "on"):
             return True
-        if s in ("0", "false", "no", "n", "off"):
+        if s in ("0", "false", "f", "no", "n", "off"):
             return False
         return default
 
-    include_strategy = _parse_bool(payload.get("include_strategy"), True)
-    include_legacy = _parse_bool(payload.get("include_legacy"), False)
+    include_strategy = _coerce_bool(payload.get("include_strategy"), default=True)
+    include_legacy = _coerce_bool(payload.get("include_legacy"), default=False)
 
     # Load positions + risk config
     positions = _load_open_positions_from_trades(include_strategy=include_strategy, include_legacy=include_legacy)
@@ -3903,187 +3910,13 @@ def scheduler_last():
 @app.post("/scheduler/core_debug")
 def scheduler_core_debug(payload: Dict[str, Any] = Body(default=None)):
     """
-    Run scheduler_core.run_scheduler_once with the current config,
-    but DO NOT route anything to the broker.
+    Disabled debug endpoint.
 
-    Returns:
-      - config (resolved from payload + env)
-      - positions
-      - raw intents from scheduler_core (before caps/guard/loss-zone)
-      - scheduler_core telemetry
+    This endpoint previously contained pseudocode placeholders that could
+    break deploys. If you need it, we can re-introduce a fully implemented
+    version later.
     """
-    payload = payload or {}
-
-    def _env_bool(key: str, default: bool) -> bool:
-        v = os.getenv(key)
-        if v is None:
-            return default
-        return str(v).lower() in ("1", "true", "yes", "on")
-
-    tf = str(payload.get("tf", os.getenv("SCHED_TIMEFRAME", "5Min")))
-    strats_csv = str(payload.get("strats", os.getenv("SCHED_STRATS", "c1,c2,c3,c4,c5,c6")))
-    strats = [s.strip().lower() for s in strats_csv.split(",") if s.strip()]
-
-    symbols_csv = str(payload.get("symbols", os.getenv("SYMBOLS", "BTC/USD,ETH/USD")))
-    syms = [s.strip().upper() for s in symbols_csv.split(",") if s.strip()]
-
-    limit = int(payload.get("limit", int(os.getenv("SCHED_LIMIT", "300") or 300)))
-    notional = float(payload.get("notional", float(os.getenv("SCHED_NOTIONAL", "25") or 25.0)))
-
-    config_snapshot = {
-        "tf": tf,
-        "strats_raw": strats_csv,
-        "strats": strats,
-        "symbols_raw": symbols_csv,
-        "symbols": syms,
-        "limit": limit,
-        "notional": notional,
-    }
-
-    # positions + risk_cfg
-    positions = _load_open_positions_from_trades(use_strategy_col=True)
-    # Normalize positions for scheduler_core: it expects a dict keyed by (symbol, strategy)
-    # _load_open_positions_from_trades returns a List[Position] for debug friendliness.
-    if isinstance(positions, list):
-        _pos_map: Dict[Tuple[str, str], Position] = {}
-        for p in positions:
-            try:
-                sym = (getattr(p, "symbol", "") or "").strip()
-                strat = (getattr(p, "strategy", "") or "").strip()
-                if not sym:
-                    continue
-                _pos_map[(sym, strat)] = p
-            except Exception:
-                continue
-        positions = _pos_map
-    elif not isinstance(positions, dict):
-        positions = {}
-    risk_cfg = load_risk_config() or {}
-    risk_engine = RiskEngine(risk_cfg)
-
-    # preload bars (same as v2)
-    try:
-        import br_router as br  # type: ignore[import]
-    except Exception as e:
-        return {
-            "ok": False,
-            "error": f"failed to import br_router: {e}",
-            "config": config_snapshot,
-        }
-
-    contexts: Dict[str, Any] = {}
-    telemetry: List[Dict[str, Any]] = []
-
-    def _safe_series(bars, key: str):
-        vals = []
-        if isinstance(bars, list):
-            for row in bars:
-                if isinstance(row, dict) and key in row:
-                    vals.append(row[key])
-        return vals
-
-
-
-
-    for sym in syms:
-        try:
-            one = br.get_bars(sym, timeframe="1Min", limit=limit)
-            multi = br.get_bars(sym, timeframe=tf, limit=limit)
-
-            if not one or not multi:
-                contexts[sym] = None
-                telemetry.append(
-                    {
-                        "symbol": sym,
-                        "stage": "preload_bars",
-                        "ok": False,
-                        "reason": "no_bars",
-                    }
-                )
-                continue
-
-            contexts[sym] = {
-                "one": {
-                    "open": _safe_series(one, "open"),
-                    "high": _safe_series(one, "high"),
-                    "low": _safe_series(one, "low"),
-                    "close": _safe_series(one, "close"),
-                    "volume": _safe_series(one, "volume"),
-                    "ts": _safe_series(one, "ts"),
-                },
-                "five": {
-                    "open": _safe_series(multi, "open"),
-                    "high": _safe_series(multi, "high"),
-                    "low": _safe_series(multi, "low"),
-                    "close": _safe_series(multi, "close"),
-                    "volume": _safe_series(multi, "volume"),
-                    "ts": _safe_series(multi, "ts"),
-                },
-            }
-        except Exception as e:
-            contexts[sym] = None
-            telemetry.append(
-                {
-                    "symbol": sym,
-                    "stage": "preload_bars",
-                    "ok": False,
-                    "error": f"{e.__class__.__name__}: {e}",
-                }
-            )
-
-    now = dt.datetime.utcnow()
-    # Defensive: scheduler_core requires dict positions
-    if not isinstance(positions, dict):
-        raise TypeError(f"scheduler_run_v2 positions must be dict, got {type(positions)}")
-
-    cfg = SchedulerConfig(
-        now=now,
-        timeframe=tf,
-        limit=limit,
-        symbols=syms,
-        strats=strats,
-        notional=notional,
-        positions=positions,
-        contexts=contexts,
-        risk_cfg=risk_cfg,
-    )
-
-    result: SchedulerResult = run_scheduler_once(cfg, last_price_fn=_last_price_safe)
-
-    telemetry.extend(result.telemetry)
-
-    intents_out = []
-    for it in result.intents:
-        intents_out.append(
-            {
-                "strategy": it.strategy,
-                "symbol": it.symbol,
-                "kind": it.kind,
-                "side": it.side,
-                "notional": it.notional,
-                "reason": it.reason,
-                "meta": it.meta,
-            }
-        )
-
-    pos_out = []
-    for (sym, strat), pm_pos in positions.items():
-        pos_out.append(
-            {
-                "symbol": sym,
-                "strategy": strat,
-                "qty": float(getattr(pm_pos, "qty", 0.0) or 0.0),
-                "avg_price": getattr(pm_pos, "avg_price", None),
-            }
-        )
-
-    return {
-        "ok": True,
-        "config": config_snapshot,
-        "positions": pos_out,
-        "intents": intents_out,
-        "telemetry": telemetry,
-    }
+    return {"ok": False, "error": "disabled", "note": "use /scheduler/v2/run with dry=true"}
 
 @app.get("/scheduler/risk_debug")
 def scheduler_risk_debug(
@@ -4099,22 +3932,6 @@ def scheduler_risk_debug(
     - global exit decision (if any)
     """
     positions = _load_open_positions_from_trades(use_strategy_col=True)
-    # Normalize positions for scheduler_core: it expects a dict keyed by (symbol, strategy)
-    # _load_open_positions_from_trades returns a List[Position] for debug friendliness.
-    if isinstance(positions, list):
-        _pos_map: Dict[Tuple[str, str], Position] = {}
-        for p in positions:
-            try:
-                sym = (getattr(p, "symbol", "") or "").strip()
-                strat = (getattr(p, "strategy", "") or "").strip()
-                if not sym:
-                    continue
-                _pos_map[(sym, strat)] = p
-            except Exception:
-                continue
-        positions = _pos_map
-    elif not isinstance(positions, dict):
-        positions = {}
     risk_cfg = load_risk_config() or {}
     risk_engine = RiskEngine(risk_cfg)
 
@@ -4257,7 +4074,8 @@ def _startup():
 # ------------------------------------------------------------------
 def _last_price_safe(symbol: str) -> float:
     # 1) Try cached 5m bars
-    ctx = contexts.get(symbol)
+    with _LAST_CONTEXTS_LOCK:
+            ctx = _LAST_CONTEXTS.get(symbol)
     if ctx:
         five = ctx.get("five") or {}
         closes = five.get("close") or []
@@ -4375,22 +4193,6 @@ def scheduler_run(payload: Dict[str, Any] = Body(default=None)):
 
         # Load open positions keyed by (symbol, strategy).
         positions = _load_open_positions_from_trades(use_strategy_col=True)
-    # Normalize positions for scheduler_core: it expects a dict keyed by (symbol, strategy)
-    # _load_open_positions_from_trades returns a List[Position] for debug friendliness.
-    if isinstance(positions, list):
-        _pos_map: Dict[Tuple[str, str], Position] = {}
-        for p in positions:
-            try:
-                sym = (getattr(p, "symbol", "") or "").strip()
-                strat = (getattr(p, "strategy", "") or "").strip()
-                if not sym:
-                    continue
-                _pos_map[(sym, strat)] = p
-            except Exception:
-                continue
-        positions = _pos_map
-    elif not isinstance(positions, dict):
-        positions = {}
 
         # --- risk config ----------------------------------------------------
         # Load global risk policy config
@@ -5140,8 +4942,6 @@ def scheduler_run_v2(payload: Dict[str, Any] = Body(default=None)):
             except Exception:
                 continue
         positions = _pos_map
-    elif not isinstance(positions, dict):
-        positions = {}
     risk_cfg = load_risk_config() or {}
     risk_engine = RiskEngine(risk_cfg)
 
@@ -5202,7 +5002,8 @@ def scheduler_run_v2(payload: Dict[str, Any] = Body(default=None)):
     # Last-price helper for risk calculation + exits
     # ------------------------------------------------------------------
     def _last_price_safe(symbol: str) -> float:
-        ctx = contexts.get(symbol)
+        with _LAST_CONTEXTS_LOCK:
+            ctx = _LAST_CONTEXTS.get(symbol)
         if not ctx:
             return 0.0
         five = ctx.get("five") or {}
@@ -5217,6 +5018,15 @@ def scheduler_run_v2(payload: Dict[str, Any] = Body(default=None)):
     # ------------------------------------------------------------------
     # Build SchedulerConfig and run scheduler_core once
     # ------------------------------------------------------------------
+
+    # Update global context cache for /debug/positions pricing helper
+    try:
+        with _LAST_CONTEXTS_LOCK:
+            _LAST_CONTEXTS.clear()
+            _LAST_CONTEXTS.update(contexts or {})
+    except Exception:
+        pass
+
     now = dt.datetime.utcnow()
     # Defensive: scheduler_core requires dict positions
     if not isinstance(positions, dict):
@@ -5937,78 +5747,6 @@ def scheduler_run_v2(payload: Dict[str, Any] = Body(default=None)):
 
 # ---- New core debug endpoint) ------------------------------------------------------------        
         
-@app.post("/scheduler/core_debug")
-def scheduler_core_debug(payload: Dict[str, Any] = Body(default=None)):
-    """
-    Runs the new scheduler_core once and returns the raw OrderIntents,
-    WITHOUT sending any orders to the broker. Safe for inspection.
-    """
-    # Reuse the same config parsing you already do in scheduler_run:
-    # - resolve timeframe, symbols, strats, limit, notional, dry from
-    #   env + payload
-    # - load positions via _load_open_positions_from_trades(use_strategy_col=True)
-    # - load risk_cfg via load_risk_config()
-    # - preload contexts dict exactly like scheduler_run does
-
-    # Pseudocode sketch (you’ll adapt from your existing scheduler_run):
-    now = dt.datetime.utcnow()
-    positions = _load_open_positions_from_trades(use_strategy_col=True)
-    # Normalize positions for scheduler_core: it expects a dict keyed by (symbol, strategy)
-    # _load_open_positions_from_trades returns a List[Position] for debug friendliness.
-    if isinstance(positions, list):
-        _pos_map: Dict[Tuple[str, str], Position] = {}
-        for p in positions:
-            try:
-                sym = (getattr(p, "symbol", "") or "").strip()
-                strat = (getattr(p, "strategy", "") or "").strip()
-                if not sym:
-                    continue
-                _pos_map[(sym, strat)] = p
-            except Exception:
-                continue
-        positions = _pos_map
-    elif not isinstance(positions, dict):
-        positions = {}
-    risk_cfg = load_risk_config() or {}
-    contexts = { ... }  # the same structure you currently pass to StrategyBook
-
-    # Defensive: scheduler_core requires dict positions
-    if not isinstance(positions, dict):
-        raise TypeError(f"scheduler_run_v2 positions must be dict, got {type(positions)}")
-
-    cfg = SchedulerConfig(
-        now=now,
-        timeframe=tf,
-        limit=limit,
-        symbols=symbols,
-        strats=strats,
-        notional=notional,
-        positions=positions,
-        contexts=contexts,
-        risk_cfg=risk_cfg,
-    )
-
-    result = run_scheduler_once(cfg)
-
-    # Convert OrderIntents to plain dicts for JSON
-    intents_as_dicts = [
-        {
-            "strategy": i.strategy,
-            "symbol": i.symbol,
-            "side": i.side,
-            "kind": i.kind,
-            "notional": i.notional,
-            "reason": i.reason,
-            "meta": i.meta,
-        }
-        for i in result.intents
-    ]
-
-    return {
-        "intents": intents_as_dicts,
-        "telemetry": result.telemetry,
-    }
-    
 @app.post("/scheduler/core_debug_risk")
 def scheduler_core_debug_risk(payload: Dict[str, Any] = Body(default=None)):
     """
@@ -6049,8 +5787,6 @@ def scheduler_core_debug_risk(payload: Dict[str, Any] = Body(default=None)):
             except Exception:
                 continue
         positions = _pos_map
-    elif not isinstance(positions, dict):
-        positions = {}
     risk_cfg = load_risk_config() or {}
 
     # 3) Build contexts exactly like scheduler_run (reuse your existing code)
@@ -6347,7 +6083,7 @@ def _pnl__agg(group_fields: List[str], start: Optional[str], end: Optional[str],
         rows = [dict(r) for r in con.execute(sql, params).fetchall()]
         return {"ok": True, "table": table, "start": s, "end": e, "realized_only": realized_only, "count": len(rows), "rows": rows}
 
-def _load_open_positions_from_trades(use_strategy_col: bool = True) -> List[Position]:
+def _load_open_positions_from_trades(include_strategy: bool = True, include_legacy: bool = False, use_strategy_col: bool = True) -> Dict[Tuple[str, str], Position]:
     """Compute open (net) positions from the local `trades` table.
 
     This is a lightweight, deterministic view that does *not* depend on Kraken positions.
@@ -6360,7 +6096,7 @@ def _load_open_positions_from_trades(use_strategy_col: bool = True) -> List[Posi
     import sqlite3
 
     if not DB_PATH:
-        return []
+        return {}
 
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
@@ -6368,7 +6104,7 @@ def _load_open_positions_from_trades(use_strategy_col: bool = True) -> List[Posi
         # Ensure table exists
         names = set(r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall())
         if "trades" not in names:
-            return []
+            return {}
 
         rows = conn.execute(
             """
@@ -6383,7 +6119,7 @@ def _load_open_positions_from_trades(use_strategy_col: bool = True) -> List[Posi
             sym = (r["symbol"] or "").strip()
             if not sym:
                 continue
-            strat = (r["strategy"] or "").strip() if use_strategy_col else "misc"
+            strat = (r["strategy"] or "").strip() if (use_strategy_col and include_strategy) else ""
             side = (r["side"] or "").strip().lower()
             price = float(r["price"] or 0.0)
             vol = float(r["volume"] or 0.0)
@@ -6412,13 +6148,24 @@ def _load_open_positions_from_trades(use_strategy_col: bool = True) -> List[Posi
                 # Unknown side; ignore.
                 continue
 
-        out: List[Position] = []
+        out_list: List[Position] = []
         for (strat, sym), st in state.items():
             if st["qty"] and st["qty"] > 0:
-                out.append(Position(symbol=sym, strategy=strat, qty=st["qty"], avg_price=st["avg"]))
+                out_list.append(Position(symbol=sym, strategy=strat, qty=st["qty"], avg_price=st["avg"]))
 
-        out.sort(key=lambda p: (p.strategy or "", p.symbol or ""))
-        return out
+        out_list.sort(key=lambda p: (p.strategy or "", p.symbol or ""))
+
+        out_map: Dict[Tuple[str, str], Position] = {}
+        for p in out_list:
+            sym = (getattr(p, "symbol", "") or "").strip()
+            strat = (getattr(p, "strategy", "") or "").strip() if include_strategy else ""
+            if not sym:
+                continue
+            out_map[(sym, strat)] = p
+            if include_legacy and strat:
+                out_map[(sym, "")] = p
+
+        return out_map
     finally:
         conn.close()
 @app.get("/pnl/by_strategy")
