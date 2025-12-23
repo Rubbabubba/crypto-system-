@@ -70,12 +70,6 @@ import sqlite3
 import sys
 import time
 import threading
-
-# Global cache of most recently preloaded bar contexts (symbol -> {'one':..., 'five':...}).
-# Used by /debug/positions and RiskEngine when not running inside a scheduler context.
-_LAST_CONTEXTS: dict = {}
-_LAST_CONTEXTS_LOCK = threading.Lock()
-
 import broker_kraken
 import requests
 import uuid
@@ -2772,6 +2766,10 @@ def debug_strategy_scan(payload: Dict[str, Any] = Body(default=None)):
         )
 
     # Build a minimal SchedulerConfig (we only care about this one symbol/strat)
+    # Defensive: scheduler_core requires dict positions
+    if not isinstance(positions, dict):
+        raise TypeError(f"scheduler_run_v2 positions must be dict, got {type(positions)}")
+
     cfg = SchedulerConfig(
         now=dt.datetime.utcnow(),
         timeframe=tf,
@@ -3928,6 +3926,22 @@ def scheduler_core_debug(payload: Dict[str, Any] = Body(default=None)):
 
     # positions + risk_cfg
     positions = _load_open_positions_from_trades(use_strategy_col=True)
+    # Normalize positions for scheduler_core: it expects a dict keyed by (symbol, strategy)
+    # _load_open_positions_from_trades returns a List[Position] for debug friendliness.
+    if isinstance(positions, list):
+        _pos_map: Dict[Tuple[str, str], Position] = {}
+        for p in positions:
+            try:
+                sym = (getattr(p, "symbol", "") or "").strip()
+                strat = (getattr(p, "strategy", "") or "").strip()
+                if not sym:
+                    continue
+                _pos_map[(sym, strat)] = p
+            except Exception:
+                continue
+        positions = _pos_map
+    elif not isinstance(positions, dict):
+        positions = {}
     risk_cfg = load_risk_config() or {}
     risk_engine = RiskEngine(risk_cfg)
 
@@ -4002,6 +4016,10 @@ def scheduler_core_debug(payload: Dict[str, Any] = Body(default=None)):
             )
 
     now = dt.datetime.utcnow()
+    # Defensive: scheduler_core requires dict positions
+    if not isinstance(positions, dict):
+        raise TypeError(f"scheduler_run_v2 positions must be dict, got {type(positions)}")
+
     cfg = SchedulerConfig(
         now=now,
         timeframe=tf,
@@ -4065,6 +4083,22 @@ def scheduler_risk_debug(
     - global exit decision (if any)
     """
     positions = _load_open_positions_from_trades(use_strategy_col=True)
+    # Normalize positions for scheduler_core: it expects a dict keyed by (symbol, strategy)
+    # _load_open_positions_from_trades returns a List[Position] for debug friendliness.
+    if isinstance(positions, list):
+        _pos_map: Dict[Tuple[str, str], Position] = {}
+        for p in positions:
+            try:
+                sym = (getattr(p, "symbol", "") or "").strip()
+                strat = (getattr(p, "strategy", "") or "").strip()
+                if not sym:
+                    continue
+                _pos_map[(sym, strat)] = p
+            except Exception:
+                continue
+        positions = _pos_map
+    elif not isinstance(positions, dict):
+        positions = {}
     risk_cfg = load_risk_config() or {}
     risk_engine = RiskEngine(risk_cfg)
 
@@ -4206,38 +4240,27 @@ def _startup():
 # Last-price helper for risk calculation + exits
 # ------------------------------------------------------------------
 def _last_price_safe(symbol: str) -> float:
-    """Best-effort last price for risk/debug.
+    # 1) Try cached 5m bars
+    ctx = contexts.get(symbol)
+    if ctx:
+        five = ctx.get("five") or {}
+        closes = five.get("close") or []
+        if closes:
+            try:
+                return float(closes[-1])
+            except Exception:
+                pass
 
-    Order of precedence:
-      1) Most recently preloaded bar contexts from scheduler_v2/strategy_scan (cached globally)
-      2) Broker router helpers (get_last_price / get_ticker)
-      3) 0.0 (unknown)
-
-    NOTE: This must never raise, because it's called from debug endpoints.
-    """
-    # 1) Try cached 5m bars from last scheduler preload
-    try:
-        with _LAST_CONTEXTS_LOCK:
-            ctx = (_LAST_CONTEXTS or {}).get(symbol)
-        if ctx:
-            five = ctx.get("five") or {}
-            closes = five.get("close") or []
-            if closes:
-                try:
-                    return float(closes[-1])
-                except Exception:
-                    pass
-    except Exception:
-        pass
-
-    # 2) Fallback: ask broker router for a last price
+    # 2) Fallback: ask broker router for a last price (prevents exit blocks)
     try:
         if br is not None:
+            # Prefer a dedicated helper if you have it
             if hasattr(br, "get_last_price"):
                 px = br.get_last_price(symbol)
-                if px is not None:
+                if px:
                     return float(px)
 
+            # Otherwise try ticker-like helpers if present
             if hasattr(br, "get_ticker"):
                 t = br.get_ticker(symbol)
                 if isinstance(t, dict):
@@ -4336,6 +4359,22 @@ def scheduler_run(payload: Dict[str, Any] = Body(default=None)):
 
         # Load open positions keyed by (symbol, strategy).
         positions = _load_open_positions_from_trades(use_strategy_col=True)
+    # Normalize positions for scheduler_core: it expects a dict keyed by (symbol, strategy)
+    # _load_open_positions_from_trades returns a List[Position] for debug friendliness.
+    if isinstance(positions, list):
+        _pos_map: Dict[Tuple[str, str], Position] = {}
+        for p in positions:
+            try:
+                sym = (getattr(p, "symbol", "") or "").strip()
+                strat = (getattr(p, "strategy", "") or "").strip()
+                if not sym:
+                    continue
+                _pos_map[(sym, strat)] = p
+            except Exception:
+                continue
+        positions = _pos_map
+    elif not isinstance(positions, dict):
+        positions = {}
 
         # --- risk config ----------------------------------------------------
         # Load global risk policy config
@@ -5071,6 +5110,22 @@ def scheduler_run_v2(payload: Dict[str, Any] = Body(default=None)):
     # Load positions & risk config
     # ------------------------------------------------------------------
     positions = _load_open_positions_from_trades(use_strategy_col=True)
+    # Normalize positions for scheduler_core: it expects a dict keyed by (symbol, strategy)
+    # _load_open_positions_from_trades returns a List[Position] for debug friendliness.
+    if isinstance(positions, list):
+        _pos_map: Dict[Tuple[str, str], Position] = {}
+        for p in positions:
+            try:
+                sym = (getattr(p, "symbol", "") or "").strip()
+                strat = (getattr(p, "strategy", "") or "").strip()
+                if not sym:
+                    continue
+                _pos_map[(sym, strat)] = p
+            except Exception:
+                continue
+        positions = _pos_map
+    elif not isinstance(positions, dict):
+        positions = {}
     risk_cfg = load_risk_config() or {}
     risk_engine = RiskEngine(risk_cfg)
 
@@ -5127,16 +5182,7 @@ def scheduler_run_v2(payload: Dict[str, Any] = Body(default=None)):
     
 
 
-    
-    # Cache contexts globally for debug/risk helpers (e.g., /debug/positions)
-    try:
-        with _LAST_CONTEXTS_LOCK:
-            _LAST_CONTEXTS.clear()
-            _LAST_CONTEXTS.update({k: v for k, v in contexts.items() if v})
-    except Exception:
-        pass
-
-# ------------------------------------------------------------------
+    # ------------------------------------------------------------------
     # Last-price helper for risk calculation + exits
     # ------------------------------------------------------------------
     def _last_price_safe(symbol: str) -> float:
@@ -5156,6 +5202,10 @@ def scheduler_run_v2(payload: Dict[str, Any] = Body(default=None)):
     # Build SchedulerConfig and run scheduler_core once
     # ------------------------------------------------------------------
     now = dt.datetime.utcnow()
+    # Defensive: scheduler_core requires dict positions
+    if not isinstance(positions, dict):
+        raise TypeError(f"scheduler_run_v2 positions must be dict, got {type(positions)}")
+
     cfg = SchedulerConfig(
         now=now,
         timeframe=tf,
@@ -5887,8 +5937,28 @@ def scheduler_core_debug(payload: Dict[str, Any] = Body(default=None)):
     # Pseudocode sketch (you’ll adapt from your existing scheduler_run):
     now = dt.datetime.utcnow()
     positions = _load_open_positions_from_trades(use_strategy_col=True)
+    # Normalize positions for scheduler_core: it expects a dict keyed by (symbol, strategy)
+    # _load_open_positions_from_trades returns a List[Position] for debug friendliness.
+    if isinstance(positions, list):
+        _pos_map: Dict[Tuple[str, str], Position] = {}
+        for p in positions:
+            try:
+                sym = (getattr(p, "symbol", "") or "").strip()
+                strat = (getattr(p, "strategy", "") or "").strip()
+                if not sym:
+                    continue
+                _pos_map[(sym, strat)] = p
+            except Exception:
+                continue
+        positions = _pos_map
+    elif not isinstance(positions, dict):
+        positions = {}
     risk_cfg = load_risk_config() or {}
     contexts = { ... }  # the same structure you currently pass to StrategyBook
+
+    # Defensive: scheduler_core requires dict positions
+    if not isinstance(positions, dict):
+        raise TypeError(f"scheduler_run_v2 positions must be dict, got {type(positions)}")
 
     cfg = SchedulerConfig(
         now=now,
@@ -5949,6 +6019,22 @@ def scheduler_core_debug_risk(payload: Dict[str, Any] = Body(default=None)):
 
     # 2) Load positions & risk_cfg exactly as scheduler_run does
     positions = _load_open_positions_from_trades(use_strategy_col=True)
+    # Normalize positions for scheduler_core: it expects a dict keyed by (symbol, strategy)
+    # _load_open_positions_from_trades returns a List[Position] for debug friendliness.
+    if isinstance(positions, list):
+        _pos_map: Dict[Tuple[str, str], Position] = {}
+        for p in positions:
+            try:
+                sym = (getattr(p, "symbol", "") or "").strip()
+                strat = (getattr(p, "strategy", "") or "").strip()
+                if not sym:
+                    continue
+                _pos_map[(sym, strat)] = p
+            except Exception:
+                continue
+        positions = _pos_map
+    elif not isinstance(positions, dict):
+        positions = {}
     risk_cfg = load_risk_config() or {}
 
     # 3) Build contexts exactly like scheduler_run (reuse your existing code)
@@ -5957,6 +6043,10 @@ def scheduler_core_debug_risk(payload: Dict[str, Any] = Body(default=None)):
     #   logic that's currently inside scheduler_run before StrategyBook.scan.
 
     now = dt.datetime.utcnow()
+    # Defensive: scheduler_core requires dict positions
+    if not isinstance(positions, dict):
+        raise TypeError(f"scheduler_run_v2 positions must be dict, got {type(positions)}")
+
     cfg = SchedulerConfig(
         now=now,
         timeframe=tf,
