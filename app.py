@@ -2700,7 +2700,7 @@ def debug_strategy_scan(payload: Dict[str, Any] = Body(default=None)):
     notional = float(payload.get("notional", float(os.getenv("SCHED_NOTIONAL", "25") or 25.0)))
 
     # Load positions + risk config
-    positions = _load_open_positions_from_trades(include_strategy=include_strategy, include_legacy=include_legacy)
+    positions = _load_open_positions_from_trades()
     risk_cfg = load_risk_config() or {}
 
     # Preload bars using the same format as the main scheduler
@@ -4362,19 +4362,19 @@ def scheduler_run(payload: Dict[str, Any] = Body(default=None)):
         # Normalize positions for scheduler_core: it expects a dict keyed by (symbol, strategy)
         # _load_open_positions_from_trades returns a List[Position] for debug friendliness.
         if isinstance(positions, list):
-        _pos_map: Dict[Tuple[str, str], Position] = {}
-        for p in positions:
-            try:
-                sym = (getattr(p, "symbol", "") or "").strip()
-                strat = (getattr(p, "strategy", "") or "").strip()
-                if not sym:
+            _pos_map: Dict[Tuple[str, str], Position] = {}
+            for p in positions:
+                try:
+                    sym = (getattr(p, "symbol", "") or "").strip()
+                    strat = (getattr(p, "strategy", "") or "").strip()
+                    if not sym:
+                        continue
+                    _pos_map[(sym, strat)] = p
+                except Exception:
                     continue
-                _pos_map[(sym, strat)] = p
-            except Exception:
-                continue
-        positions = _pos_map
-    elif not isinstance(positions, dict):
-        positions = {}
+            positions = _pos_map
+        elif not isinstance(positions, dict):
+            positions = {}
 
         # --- risk config ----------------------------------------------------
         # Load global risk policy config
