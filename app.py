@@ -69,6 +69,7 @@ import os
 import sqlite3
 import sys
 import time
+import traceback
 import threading
 import broker_kraken
 import requests
@@ -2684,208 +2685,194 @@ def debug_strategy_scan(payload: Dict[str, Any] = Body(default=None)):
       - raw scan fields (action, reason, score, atr_pct, notional, selected)
       - entry gating flags (is_flat, scan_selected, etc.)
     """
+    payload = payload or {}
+
+    strat = str(payload.get("strategy") or "").strip().lower()
+    symbol = str(payload.get("symbol") or "").strip().upper()
+
+    if not strat or not symbol:
+        return {
+            "ok": False,
+            "error": "Both 'strategy' and 'symbol' are required, e.g. c3 / ADA/USD",
+        }
+
+    tf = str(payload.get("tf") or os.getenv("TF", "5Min"))
+    limit = int(payload.get("limit", int(os.getenv("SCHED_LIMIT", "300") or 300)))
+    notional = float(payload.get("notional", float(os.getenv("SCHED_NOTIONAL", "25") or 25.0)))
+
+    # Load positions + risk config
+    # Be compatible with older versions of _load_open_positions_from_trades()
+    # (some builds don't accept include_strategy / include_legacy kwargs).
     try:
-        payload = payload or {}
-        def _as_bool(v, default=False):
-            if v is None:
-                return default
-            if isinstance(v, bool):
-                return v
-            if isinstance(v, (int, float)):
-                return bool(v)
-            if isinstance(v, str):
-                return v.strip().lower() in ("1", "true", "t", "yes", "y", "on")
-            return default
-
-        include_strategy = _as_bool(payload.get("include_strategy"), True)
-        include_legacy = _as_bool(payload.get("include_legacy"), False)
-
-
-        strat = str(payload.get("strategy") or "").strip().lower()
-        symbol = str(payload.get("symbol") or "").strip().upper()
-
-        if not strat or not symbol:
-            return {
-                "ok": False,
-                "error": "Both 'strategy' and 'symbol' are required, e.g. c3 / ADA/USD",
-            }
-
-        tf = str(payload.get("tf") or os.getenv("TF", "5Min"))
-        limit = int(payload.get("limit", int(os.getenv("SCHED_LIMIT", "300") or 300)))
-        notional = float(payload.get("notional", float(os.getenv("SCHED_NOTIONAL", "25") or 25.0)))
-
-        # Load positions + risk config
         positions = _load_open_positions_from_trades(include_strategy=include_strategy, include_legacy=include_legacy)
-        risk_cfg = load_risk_config() or {}
-
-        # Preload bars using the same format as the main scheduler
+    except TypeError:
         try:
-            import br_router as br  # type: ignore[import]
-        except Exception as e:
-            return {
-                "ok": False,
-                "error": f"failed to import br_router: {e}",
-            }
+            positions = _load_open_positions_from_trades(include_legacy=include_legacy)
+        except TypeError:
+            positions = _load_open_positions_from_trades()
+    risk_cfg = load_risk_config() or {}
 
-        def _safe_series(bars, key: str):
-            vals = []
-            if isinstance(bars, list):
-                for row in bars:
-                    if isinstance(row, dict) and key in row:
-                        vals.append(row[key])
-            return vals
+    # Preload bars using the same format as the main scheduler
+    try:
+        import br_router as br  # type: ignore[import]
+    except Exception as e:
+        return {
+            "ok": False,
+            "error": f"failed to import br_router: {e}",
+        }
 
-        contexts: Dict[str, Any] = {}
-        telemetry: List[Dict[str, Any]] = []
+    def _safe_series(bars, key: str):
+        vals = []
+        if isinstance(bars, list):
+            for row in bars:
+                if isinstance(row, dict) and key in row:
+                    vals.append(row[key])
+        return vals
 
-        try:
-            one = br.get_bars(symbol, timeframe="1Min", limit=limit)
-            five = br.get_bars(symbol, timeframe=tf, limit=limit)
+    contexts: Dict[str, Any] = {}
+    telemetry: List[Dict[str, Any]] = []
 
-            if not one or not five:
-                contexts[symbol] = None
-                telemetry.append(
-                    {
-                        "symbol": symbol,
-                        "stage": "preload_bars",
-                        "ok": False,
-                        "reason": "no_bars",
-                    }
-                )
-            else:
-                # IMPORTANT: match the real scheduler preload:
-                # broker returns keys like "c","h","l" (close, high, low)
-                contexts[symbol] = {
-                    "one": {
-                        "close": _safe_series(one, "c"),
-                        "high":  _safe_series(one, "h"),
-                        "low":   _safe_series(one, "l"),
-                        "volume": _safe_series(one, "v"),
-                    },
-                    "five": {
-                        "close": _safe_series(five, "c"),
-                        "high":  _safe_series(five, "h"),
-                        "low":   _safe_series(five, "l"),
-                        "volume": _safe_series(five, "v"),
-                    },
-                }
-        except Exception as e:
+    try:
+        one = br.get_bars(symbol, timeframe="1Min", limit=limit)
+        five = br.get_bars(symbol, timeframe=tf, limit=limit)
+
+        if not one or not five:
             contexts[symbol] = None
             telemetry.append(
                 {
                     "symbol": symbol,
                     "stage": "preload_bars",
                     "ok": False,
-                    "error": f"{e.__class__.__name__}: {e}",
+                    "reason": "no_bars",
                 }
             )
-
-        # Build a minimal SchedulerConfig (we only care about this one symbol/strat)
-        # Defensive: scheduler_core requires dict positions
-        if not isinstance(positions, dict):
-            raise TypeError(f"scheduler_run_v2 positions must be dict, got {type(positions)}")
-
-        cfg = SchedulerConfig(
-            now=dt.datetime.utcnow(),
-            timeframe=tf,
-            limit=limit,
-            symbols=[symbol],
-            strats=[strat],
-            notional=notional,
-            positions=positions,
-            contexts=contexts,
-            risk_cfg=risk_cfg,
-        )
-
-        # Run the book's scan for this strategy
-        book = StrategyBook()
-        sreq = ScanRequest(
-            strat=strat,
-            timeframe=tf,
-            limit=limit,
-            topk=book.topk,
-            min_score=book.min_score,
-            notional=notional,
-        )
-
-        scans: List[ScanResult] = book.scan(sreq, cfg.contexts) or []
-
-        # Get the scan result for this symbol (if any)
-        scan = None
-        for r in scans:
-            if isinstance(r, ScanResult) and getattr(r, "symbol", None) == symbol:
-                scan = r
-                break
-
-        # Position snapshot for this strategy/symbol
-        pos_obj = positions.get((symbol, strat))
-        qty = float(getattr(pos_obj, "qty", 0.0) or 0.0) if pos_obj is not None else 0.0
-        avg_price = getattr(pos_obj, "avg_price", None) if pos_obj is not None else None
-
-        out: Dict[str, Any] = {
-            "ok": True,
-            "strategy": strat,
-            "symbol": symbol,
-            "tf": tf,
-            "limit": limit,
-            "notional": notional,
-            "position": {
-                "qty": qty,
-                "avg_price": avg_price,
-            },
-            "telemetry": telemetry,
-        }
-
-        if scan is None:
-            out["scan"] = {"reason": "no_scan_result"}
-            out["entry_gate"] = {
-                "is_flat": abs(qty) < 1e-10,
-                "scan_selected": None,
-                "scan_action": None,
-                "scan_notional_positive": None,
-                "would_emit_entry": False,
+        else:
+            # IMPORTANT: match the real scheduler preload:
+            # broker returns keys like "c","h","l" (close, high, low)
+            contexts[symbol] = {
+                "one": {
+                    "close": _safe_series(one, "c"),
+                    "high":  _safe_series(one, "h"),
+                    "low":   _safe_series(one, "l"),
+                    "volume": _safe_series(one, "v"),
+                },
+                "five": {
+                    "close": _safe_series(five, "c"),
+                    "high":  _safe_series(five, "h"),
+                    "low":   _safe_series(five, "l"),
+                    "volume": _safe_series(five, "v"),
+                },
             }
-            return out
-
-        # Raw scan fields
-        out["scan"] = {
-            "action": scan.action,
-            "reason": scan.reason,
-            "score": float(getattr(scan, "score", 0.0) or 0.0),
-            "atr_pct": float(getattr(scan, "atr_pct", 0.0) or 0.0),
-            "notional": float(getattr(scan, "notional", 0.0) or 0.0),
-            "selected": bool(getattr(scan, "selected", False)),
-        }
-
-        # Entry gating logic (mirrors entry_signal checks, but simplified)
-        is_flat = abs(qty) < 1e-10
-        scan_selected = bool(getattr(scan, "selected", False))
-        scan_action = getattr(scan, "action", None)
-        scan_notional_positive = float(getattr(scan, "notional", 0.0) or 0.0) > 0.0
-
-        would_emit_entry = (
-            is_flat
-            and scan_selected
-            and scan_action in ("buy", "sell")
-            and scan_notional_positive
+    except Exception as e:
+        contexts[symbol] = None
+        telemetry.append(
+            {
+                "symbol": symbol,
+                "stage": "preload_bars",
+                "ok": False,
+                "error": f"{e.__class__.__name__}: {e}",
+            }
         )
 
-        out["entry_gate"] = {
-            "is_flat": is_flat,
-            "scan_selected": scan_selected,
-            "scan_action": scan_action,
-            "scan_notional_positive": scan_notional_positive,
-            "would_emit_entry": would_emit_entry,
-        }
+    # Build a minimal SchedulerConfig (we only care about this one symbol/strat)
+    # Defensive: scheduler_core requires dict positions
+    if not isinstance(positions, dict):
+        raise TypeError(f"scheduler_run_v2 positions must be dict, got {type(positions)}")
 
+    cfg = SchedulerConfig(
+        now=dt.datetime.utcnow(),
+        timeframe=tf,
+        limit=limit,
+        symbols=[symbol],
+        strats=[strat],
+        notional=notional,
+        positions=positions,
+        contexts=contexts,
+        risk_cfg=risk_cfg,
+    )
+
+    # Run the book's scan for this strategy
+    book = StrategyBook()
+    sreq = ScanRequest(
+        strat=strat,
+        timeframe=tf,
+        limit=limit,
+        topk=book.topk,
+        min_score=book.min_score,
+        notional=notional,
+    )
+
+    scans: List[ScanResult] = book.scan(sreq, cfg.contexts) or []
+
+    # Get the scan result for this symbol (if any)
+    scan = None
+    for r in scans:
+        if isinstance(r, ScanResult) and getattr(r, "symbol", None) == symbol:
+            scan = r
+            break
+
+    # Position snapshot for this strategy/symbol
+    pos_obj = positions.get((symbol, strat))
+    qty = float(getattr(pos_obj, "qty", 0.0) or 0.0) if pos_obj is not None else 0.0
+    avg_price = getattr(pos_obj, "avg_price", None) if pos_obj is not None else None
+
+    out: Dict[str, Any] = {
+        "ok": True,
+        "strategy": strat,
+        "symbol": symbol,
+        "tf": tf,
+        "limit": limit,
+        "notional": notional,
+        "position": {
+            "qty": qty,
+            "avg_price": avg_price,
+        },
+        "telemetry": telemetry,
+    }
+
+    if scan is None:
+        out["scan"] = {"reason": "no_scan_result"}
+        out["entry_gate"] = {
+            "is_flat": abs(qty) < 1e-10,
+            "scan_selected": None,
+            "scan_action": None,
+            "scan_notional_positive": None,
+            "would_emit_entry": False,
+        }
         return out
 
-    except Exception as e:
-        return {
-            "ok": False,
-            "error": str(e),
-            "trace": traceback.format_exc().splitlines()[-30:],
-        }
+    # Raw scan fields
+    out["scan"] = {
+        "action": scan.action,
+        "reason": scan.reason,
+        "score": float(getattr(scan, "score", 0.0) or 0.0),
+        "atr_pct": float(getattr(scan, "atr_pct", 0.0) or 0.0),
+        "notional": float(getattr(scan, "notional", 0.0) or 0.0),
+        "selected": bool(getattr(scan, "selected", False)),
+    }
+
+    # Entry gating logic (mirrors entry_signal checks, but simplified)
+    is_flat = abs(qty) < 1e-10
+    scan_selected = bool(getattr(scan, "selected", False))
+    scan_action = getattr(scan, "action", None)
+    scan_notional_positive = float(getattr(scan, "notional", 0.0) or 0.0) > 0.0
+
+    would_emit_entry = (
+        is_flat
+        and scan_selected
+        and scan_action in ("buy", "sell")
+        and scan_notional_positive
+    )
+
+    out["entry_gate"] = {
+        "is_flat": is_flat,
+        "scan_selected": scan_selected,
+        "scan_action": scan_action,
+        "scan_notional_positive": scan_notional_positive,
+        "would_emit_entry": would_emit_entry,
+    }
+
+    return out
 
 @app.get("/debug/kraken/trades")
 def debug_kraken_trades(since_hours: int = 720, limit: int = 50000):
