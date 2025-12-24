@@ -4359,22 +4359,22 @@ def scheduler_run(payload: Dict[str, Any] = Body(default=None)):
 
         # Load open positions keyed by (symbol, strategy).
         positions = _load_open_positions_from_trades(use_strategy_col=True)
-    # Normalize positions for scheduler_core: it expects a dict keyed by (symbol, strategy)
-    # _load_open_positions_from_trades returns a List[Position] for debug friendliness.
-    if isinstance(positions, list):
-        _pos_map: Dict[Tuple[str, str], Position] = {}
-        for p in positions:
-            try:
-                sym = (getattr(p, "symbol", "") or "").strip()
-                strat = (getattr(p, "strategy", "") or "").strip()
-                if not sym:
+        # Normalize positions for scheduler_core: it expects a dict keyed by (symbol, strategy)
+        # _load_open_positions_from_trades returns a List[Position] for debug friendliness.
+        if isinstance(positions, list):
+            _pos_map: Dict[Tuple[str, str], Position] = {}
+            for p in positions:
+                try:
+                    sym = (getattr(p, "symbol", "") or "").strip()
+                    strat = (getattr(p, "strategy", "") or "").strip()
+                    if not sym:
+                        continue
+                    _pos_map[(sym, strat)] = p
+                except Exception:
                     continue
-                _pos_map[(sym, strat)] = p
-            except Exception:
-                continue
-        positions = _pos_map
-    elif not isinstance(positions, dict):
-        positions = {}
+            positions = _pos_map
+        elif not isinstance(positions, dict):
+            positions = {}
 
         # --- risk config ----------------------------------------------------
         # Load global risk policy config
@@ -5126,96 +5126,6 @@ def scheduler_run_v2(payload: Dict[str, Any] = Body(default=None)):
         positions = _pos_map
     elif not isinstance(positions, dict):
         positions = {}
-
-# ------------------------------------------------------------------
-# Reconcile journal-derived positions against broker truth (Kraken).
-# Goal: exits + risk should never depend on phantom journal state.
-#
-# Policy:
-# - Broker balances are authoritative for *tradeable* qty.
-# - Effective qty = min(journal_qty, broker_qty) per base asset.
-# - If broker_qty == 0 -> drop phantom position from scheduler input.
-# - Keep journal_qty attached on the Position object for debugging.
-# ------------------------------------------------------------------
-try:
-    broker_asset_qty: Dict[str, float] = {}
-    try:
-        kraken_rows = broker_kraken.positions() or []
-    except Exception:
-        kraken_rows = []
-    if isinstance(kraken_rows, list):
-        for row in kraken_rows:
-            if not isinstance(row, dict):
-                continue
-            asset = (str(row.get("asset") or "")).strip().upper()
-            if not asset:
-                continue
-            try:
-                q = float(row.get("qty", 0.0) or 0.0)
-            except Exception:
-                q = 0.0
-            if q == 0.0:
-                continue
-            broker_asset_qty[asset] = broker_asset_qty.get(asset, 0.0) + q
-
-    if isinstance(positions, dict) and broker_asset_qty:
-        reconciled: Dict[Tuple[str, str], Position] = {}
-        phantom_count = 0
-        clipped_count = 0
-
-        for (sym_k, strat_k), p in list(positions.items()):
-            try:
-                sym_s = (str(sym_k or "")).strip()
-                if not sym_s:
-                    continue
-                base_asset = sym_s.split("/", 1)[0].strip().upper()
-                broker_q = float(broker_asset_qty.get(base_asset, 0.0) or 0.0)
-
-                # Journal qty (what the ledger reconstruction thinks)
-                try:
-                    journal_q = float(getattr(p, "qty", 0.0) or 0.0)
-                except Exception:
-                    journal_q = 0.0
-
-                # Attach for debug visibility (won't break if Position is frozen=False)
-                try:
-                    setattr(p, "journal_qty", journal_q)
-                    setattr(p, "broker_qty", broker_q)
-                except Exception:
-                    pass
-
-                eff_q = min(journal_q, broker_q)
-
-                if broker_q <= 0.0 or eff_q <= 0.0:
-                    phantom_count += 1
-                    continue  # drop phantom for scheduler/risk
-
-                if eff_q < journal_q:
-                    clipped_count += 1
-
-                try:
-                    setattr(p, "qty", eff_q)
-                except Exception:
-                    pass
-
-                reconciled[(sym_k, strat_k)] = p
-            except Exception:
-                # If anything weird, keep the original position to avoid crashing
-                reconciled[(sym_k, strat_k)] = p
-
-        positions = reconciled
-        telemetry.append(
-            {
-                "stage": "positions_reconcile",
-                "source": "kraken",
-                "journal_count": len(reconciled) + phantom_count,
-                "kept_count": len(reconciled),
-                "phantom_dropped": phantom_count,
-                "qty_clipped": clipped_count,
-            }
-        )
-except Exception as e:
-    telemetry.append({"stage": "positions_reconcile", "ok": False, "error": str(e)})
     risk_cfg = load_risk_config() or {}
     risk_engine = RiskEngine(risk_cfg)
 
