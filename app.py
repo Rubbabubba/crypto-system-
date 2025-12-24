@@ -2700,7 +2700,7 @@ def debug_strategy_scan(payload: Dict[str, Any] = Body(default=None)):
     notional = float(payload.get("notional", float(os.getenv("SCHED_NOTIONAL", "25") or 25.0)))
 
     # Load positions + risk config
-    positions = _load_open_positions_from_trades()
+    positions = _load_open_positions_from_trades(include_strategy=include_strategy, include_legacy=include_legacy)
     risk_cfg = load_risk_config() or {}
 
     # Preload bars using the same format as the main scheduler
@@ -3717,7 +3717,7 @@ def debug_positions(include_strategy: bool = True, include_legacy: bool = False)
 
     This is the single source of truth for exposures + unrealized P&L.
     """
-    positions = _load_open_positions_from_trades()
+    positions = _load_open_positions_from_trades(include_strategy=include_strategy, include_legacy=include_legacy)
     risk_cfg = load_risk_config() or {}
     risk_engine = RiskEngine(risk_cfg)
 
@@ -4359,9 +4359,9 @@ def scheduler_run(payload: Dict[str, Any] = Body(default=None)):
 
         # Load open positions keyed by (symbol, strategy).
         positions = _load_open_positions_from_trades(use_strategy_col=True)
-    # Normalize positions for scheduler_core: it expects a dict keyed by (symbol, strategy)
-    # _load_open_positions_from_trades returns a List[Position] for debug friendliness.
-    if isinstance(positions, list):
+        # Normalize positions for scheduler_core: it expects a dict keyed by (symbol, strategy)
+        # _load_open_positions_from_trades returns a List[Position] for debug friendliness.
+        if isinstance(positions, list):
         _pos_map: Dict[Tuple[str, str], Position] = {}
         for p in positions:
             try:
