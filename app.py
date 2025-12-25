@@ -4243,7 +4243,13 @@ def _startup():
 # ------------------------------------------------------------------
 def _last_price_safe(symbol: str) -> float:
     # 1) Try cached 5m bars
-    ctx = contexts.get(symbol)
+    ctx = None
+    try:
+        ctxs = globals().get("contexts")
+        if isinstance(ctxs, dict):
+            ctx = ctxs.get(symbol)
+    except Exception:
+        ctx = None
     if ctx:
         five = ctx.get("five") or {}
         closes = five.get("close") or []
@@ -5188,7 +5194,13 @@ def scheduler_run_v2(payload: Dict[str, Any] = Body(default=None)):
     # Last-price helper for risk calculation + exits
     # ------------------------------------------------------------------
     def _last_price_safe(symbol: str) -> float:
-        ctx = contexts.get(symbol)
+        ctx = None
+    try:
+        ctxs = globals().get("contexts")
+        if isinstance(ctxs, dict):
+            ctx = ctxs.get(symbol)
+    except Exception:
+        ctx = None
         if not ctx:
             return 0.0
         five = ctx.get("five") or {}
