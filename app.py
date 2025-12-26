@@ -2475,6 +2475,47 @@ def journal_counts():
         per_strategy.append({"strategy": row[0], "count": row[1]})
     conn.close()
     return {"ok": True, "total": total, "labeled": labeled, "unlabeled": unlabeled, "per_strategy": per_strategy}
+
+@app.post("/journal/reset_open_positions")
+def journal_reset_open_positions(payload: Dict[str, Any] = Body(default=None)):
+    """
+    Hard reset for open positions derived from the trades table.
+
+    This is intended for "Day 0" resets:
+    - Marks all existing trades as strategy='legacy'
+    - Future open-position calculations will ignore these rows
+    - New trades will use real strategies (c1, c2, etc.)
+    """
+    payload = payload or {}
+    confirm = str(payload.get("confirm", "")).strip().upper()
+    if confirm not in ("YES_RESET", "YES_RESET_OPEN_POSITIONS"):
+        return {
+            "ok": False,
+            "error": "confirmation_required",
+            "hint": "Set confirm='YES_RESET_OPEN_POSITIONS' (or 'YES_RESET') in the JSON body to proceed.",
+        }
+
+    conn = _db()
+    cur = conn.cursor()
+    try:
+        total = cur.execute("SELECT COUNT(*) FROM trades").fetchone()[0]
+        to_mark = cur.execute(
+            "SELECT COUNT(*) FROM trades WHERE LOWER(COALESCE(strategy, '')) != 'legacy'"
+        ).fetchone()[0]
+        cur.execute(
+            "UPDATE trades SET strategy='legacy' WHERE LOWER(COALESCE(strategy, '')) != 'legacy'"
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    return {
+        "ok": True,
+        "marked_legacy": int(to_mark),
+        "total_rows": int(total),
+        "note": "All existing trades are now tagged as strategy='legacy' and will be ignored by open-position loaders.",
+    }
+
     
 @app.get("/journal/v2/review")
 def journal_v2_review(
@@ -6491,6 +6532,7 @@ def _load_open_positions_from_trades(use_strategy_col: bool = True) -> List[Posi
             """
             SELECT ts, symbol, side, price, volume, COALESCE(strategy, '') AS strategy
             FROM trades
+            WHERE LOWER(COALESCE(strategy, '')) != 'legacy'
             ORDER BY ts ASC
             """
         ).fetchall()
