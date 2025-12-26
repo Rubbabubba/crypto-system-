@@ -5474,6 +5474,41 @@ def scheduler_run_v2(payload: Dict[str, Any] = Body(default=None)):
     # Apply guard + per-symbol caps + loss-zone no-rebuy; then route
     # Also: stop-the-bleed duplicate action latch (1 action per (sym,strat) per run)
     # ------------------------------------------------------------------
+    # Snapshot broker balances once per run for exit guardrail
+    broker_asset_balances: Dict[str, float] = {}
+    try:
+        raw_positions = broker_kraken.positions()
+        if isinstance(raw_positions, list):
+            for p in raw_positions:
+                try:
+                    asset = str(p.get("asset", "") or "").upper()
+                    qty = float(p.get("qty", 0.0) or 0.0)
+                except Exception:
+                    continue
+                if not asset:
+                    continue
+                if qty == 0.0:
+                    continue
+                broker_asset_balances[asset] = broker_asset_balances.get(asset, 0.0) + qty
+    except Exception as e:
+        try:
+            log.warning("scheduler_v2: failed to load broker positions for exit guard: %s", e)
+        except Exception:
+            pass
+
+    def _asset_from_symbol(sym: str) -> str:
+        s = str(sym or "").upper()
+        if "/" in s:
+            return s.split("/", 1)[0].strip()
+        return s.strip()
+
+    def _broker_qty_for_symbol(sym: str) -> float:
+        try:
+            asset = _asset_from_symbol(sym)
+            return float(broker_asset_balances.get(asset, 0.0) or 0.0)
+        except Exception:
+            return 0.0
+
     sent_keys: set = set()
 
     for intent in final_intents:
@@ -5645,8 +5680,33 @@ def scheduler_run_v2(payload: Dict[str, Any] = Body(default=None)):
                 )
                 continue
 
+            # Broker-aware exit sizing: never sell more than broker reports
+            qty_for_exit = abs(qty_here)
+            broker_qty = 0.0
+            if side == "sell":
+                try:
+                    broker_qty = _broker_qty_for_symbol(intent.symbol)
+                except Exception:
+                    broker_qty = 0.0
+
+                if broker_qty <= 0.0:
+                    telemetry.append(
+                        {
+                            "symbol": intent.symbol,
+                            "strategy": intent.strategy,
+                            "kind": getattr(intent, "kind", None),
+                            "side": side,
+                            "reason": "exit_skipped_no_broker_balance",
+                            "source": "scheduler_v2",
+                        }
+                    )
+                    continue
+
+                # Effective qty to exit is bounded by what the broker says we hold
+                qty_for_exit = min(qty_for_exit, broker_qty)
+
             # If broker side is SELL, we must have something to sell
-            if side == "sell" and qty_here <= 0.0:
+            if side == "sell" and qty_for_exit <= 0.0:
                 telemetry.append(
                     {
                         "symbol": intent.symbol,
@@ -5663,11 +5723,11 @@ def scheduler_run_v2(payload: Dict[str, Any] = Body(default=None)):
             if getattr(intent, "notional", None) is not None and float(getattr(intent, "notional", 0.0) or 0.0) > 0.0:
                 final_notional = float(getattr(intent, "notional", 0.0))
             else:
-                final_notional = abs(qty_here) * px  # flatten full position
+                final_notional = qty_for_exit * px  # flatten full position
 
             # Cap SELL exits so we never try to sell more than position value
             if side == "sell":
-                max_notional = abs(qty_here) * px * 0.995  # buffer for fees/rounding
+                max_notional = qty_for_exit * px * 0.995  # buffer for fees/rounding
                 final_notional = min(final_notional, max_notional)
 
         # Valid final_notional?
