@@ -65,7 +65,6 @@ import hashlib
 import hmac
 import json
 import logging
-import traceback
 import os
 import sqlite3
 import sys
@@ -75,7 +74,7 @@ import broker_kraken
 import requests
 import uuid
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Tuple
 from symbol_map import KRAKEN_PAIR_MAP, to_kraken
 from position_engine import PositionEngine, Fill
 from position_manager import load_net_positions, Position
@@ -2701,8 +2700,7 @@ def debug_strategy_scan(payload: Dict[str, Any] = Body(default=None)):
     notional = float(payload.get("notional", float(os.getenv("SCHED_NOTIONAL", "25") or 25.0)))
 
     # Load positions + risk config
-    include_legacy = bool(payload.get("include_legacy", False))
-    positions = _load_open_positions_from_trades(include_legacy=include_legacy, by_key=True)
+    positions = _load_open_positions_from_trades()
     risk_cfg = load_risk_config() or {}
 
     # Preload bars using the same format as the main scheduler
@@ -3719,7 +3717,7 @@ def debug_positions(include_strategy: bool = True, include_legacy: bool = False)
 
     This is the single source of truth for exposures + unrealized P&L.
     """
-    positions = _load_open_positions_from_trades(include_legacy=include_legacy, by_key=True)
+    positions = _load_open_positions_from_trades(use_strategy_col=include_strategy, include_legacy=include_legacy)
     risk_cfg = load_risk_config() or {}
     risk_engine = RiskEngine(risk_cfg)
 
@@ -3942,8 +3940,8 @@ def scheduler_core_debug(payload: Dict[str, Any] = Body(default=None)):
             except Exception:
                 continue
         positions = _pos_map
-        if not isinstance(positions, dict):
-            positions = {}
+    elif not isinstance(positions, dict):
+        positions = {}
     risk_cfg = load_risk_config() or {}
     risk_engine = RiskEngine(risk_cfg)
 
@@ -4099,8 +4097,8 @@ def scheduler_risk_debug(
             except Exception:
                 continue
         positions = _pos_map
-        if not isinstance(positions, dict):
-            positions = {}
+    elif not isinstance(positions, dict):
+        positions = {}
     risk_cfg = load_risk_config() or {}
     risk_engine = RiskEngine(risk_cfg)
 
@@ -4243,13 +4241,7 @@ def _startup():
 # ------------------------------------------------------------------
 def _last_price_safe(symbol: str) -> float:
     # 1) Try cached 5m bars
-    ctx = None
-    try:
-        ctxs = globals().get("contexts")
-        if isinstance(ctxs, dict):
-            ctx = ctxs.get(symbol)
-    except Exception:
-        ctx = None
+    ctx = contexts.get(symbol)
     if ctx:
         five = ctx.get("five") or {}
         closes = five.get("close") or []
@@ -4373,15 +4365,15 @@ def scheduler_run(payload: Dict[str, Any] = Body(default=None)):
             _pos_map: Dict[Tuple[str, str], Position] = {}
             for p in positions:
                 try:
-                    sym = (getattr(p, "symbol", "") or "").strip()
-                    strat = (getattr(p, "strategy", "") or "").strip()
-                    if not sym:
+                    sym = getattr(p, 'symbol', None) or getattr(p, 'sym', None)
+                    strat = getattr(p, 'strategy', None) or getattr(p, 'strat', None)
+                    if not sym or not strat:
                         continue
                     _pos_map[(sym, strat)] = p
                 except Exception:
                     continue
             positions = _pos_map
-        if not isinstance(positions, dict):
+        elif not isinstance(positions, dict):
             positions = {}
 
         # --- risk config ----------------------------------------------------
@@ -5132,8 +5124,8 @@ def scheduler_run_v2(payload: Dict[str, Any] = Body(default=None)):
             except Exception:
                 continue
         positions = _pos_map
-        if not isinstance(positions, dict):
-            positions = {}
+    elif not isinstance(positions, dict):
+        positions = {}
     risk_cfg = load_risk_config() or {}
     risk_engine = RiskEngine(risk_cfg)
 
@@ -5194,13 +5186,7 @@ def scheduler_run_v2(payload: Dict[str, Any] = Body(default=None)):
     # Last-price helper for risk calculation + exits
     # ------------------------------------------------------------------
     def _last_price_safe(symbol: str) -> float:
-        ctx = None
-    try:
-        ctxs = globals().get("contexts")
-        if isinstance(ctxs, dict):
-            ctx = ctxs.get(symbol)
-    except Exception:
-        ctx = None
+        ctx = contexts.get(symbol)
         if not ctx:
             return 0.0
         five = ctx.get("five") or {}
@@ -5965,8 +5951,8 @@ def scheduler_core_debug(payload: Dict[str, Any] = Body(default=None)):
             except Exception:
                 continue
         positions = _pos_map
-        if not isinstance(positions, dict):
-            positions = {}
+    elif not isinstance(positions, dict):
+        positions = {}
     risk_cfg = load_risk_config() or {}
     contexts = { ... }  # the same structure you currently pass to StrategyBook
 
@@ -6047,8 +6033,8 @@ def scheduler_core_debug_risk(payload: Dict[str, Any] = Body(default=None)):
             except Exception:
                 continue
         positions = _pos_map
-        if not isinstance(positions, dict):
-            positions = {}
+    elif not isinstance(positions, dict):
+        positions = {}
     risk_cfg = load_risk_config() or {}
 
     # 3) Build contexts exactly like scheduler_run (reuse your existing code)
@@ -6345,7 +6331,7 @@ def _pnl__agg(group_fields: List[str], start: Optional[str], end: Optional[str],
         rows = [dict(r) for r in con.execute(sql, params).fetchall()]
         return {"ok": True, "table": table, "start": s, "end": e, "realized_only": realized_only, "count": len(rows), "rows": rows}
 
-def _load_open_positions_from_trades(include_legacy: bool = False, by_key: bool = False, use_strategy_col: bool = True) -> Union[List[Position], Dict[Tuple[str, str], Position]]:
+def _load_open_positions_from_trades(use_strategy_col: bool = True) -> List[Position]:
     """Compute open (net) positions from the local `trades` table.
 
     This is a lightweight, deterministic view that does *not* depend on Kraken positions.
@@ -6416,12 +6402,6 @@ def _load_open_positions_from_trades(include_legacy: bool = False, by_key: bool 
                 out.append(Position(symbol=sym, strategy=strat, qty=st["qty"], avg_price=st["avg"]))
 
         out.sort(key=lambda p: (p.strategy or "", p.symbol or ""))
-        if by_key:
-            pos_map: Dict[Tuple[str, str], Position] = {}
-            for snap in out:
-                key = (snap.symbol or "", snap.strategy or "")
-                pos_map[key] = snap
-            return pos_map
         return out
     finally:
         conn.close()
