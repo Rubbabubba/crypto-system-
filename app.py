@@ -6072,8 +6072,26 @@ def scheduler_run_v2(payload: Dict[str, Any] = Body(default=None)):
         universe.append(u)
 
     # ------------------------------------------------------------------
-    # FINAL RETURN — log telemetry, then respond
+    # FINAL RETURN — optional journal sync, log telemetry, then respond
     # ------------------------------------------------------------------
+    journal_sync_result = None
+    if (not dry) and _env_bool("SCHED_JOURNAL_SYNC_AFTER_RUN", False):
+        try:
+            jr_payload = {
+                "since_hours": int(os.getenv("SCHED_JOURNAL_SYNC_SINCE_HOURS", "24") or 24),
+                "limit": int(os.getenv("SCHED_JOURNAL_SYNC_LIMIT", "5000") or 5000),
+                "mode": "cursor",
+                "advance_cursor": True,
+                "dry_run": False,
+            }
+            journal_sync_result = journal_sync(jr_payload)
+        except Exception as e:
+            journal_sync_result = {"ok": False, "error": str(e)}
+            try:
+                log.warning("scheduler_v2: journal_sync after run failed: %s", e)
+            except Exception:
+                pass
+
     try:
         # Log telemetry for offline Advisor v2 analysis.
         # We log regardless of dry/live, but the rows themselves include any
@@ -6090,6 +6108,7 @@ def scheduler_run_v2(payload: Dict[str, Any] = Body(default=None)):
         "actions": actions,
         "telemetry": telemetry,
         "universe": universe,
+        "journal_sync": journal_sync_result,
     }
 
 
