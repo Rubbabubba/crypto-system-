@@ -2673,6 +2673,33 @@ def debug_db():
         info["error"] = str(e)
     return info
 
+
+
+@app.get("/debug/strategy_scan")
+def debug_strategy_scan_get(
+    strategy: str,
+    symbol: str,
+    tf: str = "5Min",
+    dry: bool = False,
+    limit: int = 300,
+    notional: float = 25.0,
+):
+    """
+    Convenience GET wrapper for /debug/strategy_scan.
+
+    Accepts query parameters and forwards to the POST-based debug_strategy_scan
+    using the same payload format.
+    """
+    payload: Dict[str, Any] = {
+        "strategy": strategy,
+        "symbol": symbol,
+        "tf": tf,
+        "dry": dry,
+        "limit": limit,
+        "notional": notional,
+    }
+    return debug_strategy_scan(payload=payload)
+
 @app.post("/debug/strategy_scan")
 def debug_strategy_scan(payload: Dict[str, Any] = Body(default=None)):
     """
@@ -3706,7 +3733,7 @@ def debug_global_policy():
     
 
 @app.get("/debug/positions")
-def debug_positions(include_strategy: bool = True, include_legacy: bool = False):
+def debug_positions(include_strategy: bool = True):
     """
     Show current open positions as seen by the system, including:
 
@@ -3717,7 +3744,7 @@ def debug_positions(include_strategy: bool = True, include_legacy: bool = False)
 
     This is the single source of truth for exposures + unrealized P&L.
     """
-    positions = _load_open_positions_from_trades(use_strategy_col=include_strategy, include_legacy=include_legacy)
+    positions = _load_open_positions_from_trades(use_strategy_col=include_strategy)
     risk_cfg = load_risk_config() or {}
     risk_engine = RiskEngine(risk_cfg)
 
