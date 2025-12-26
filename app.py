@@ -2728,6 +2728,23 @@ def debug_strategy_scan(payload: Dict[str, Any] = Body(default=None)):
 
     # Load positions + risk config
     positions = _load_open_positions_from_trades()
+    # Normalize positions for scheduler_core: it expects a dict keyed by (symbol, strategy)
+    # _load_open_positions_from_trades returns a List[Position] for debug friendliness.
+    if isinstance(positions, list):
+        _pos_map: Dict[Tuple[str, str], Position] = {}
+        for p in positions:
+            try:
+                sym = (getattr(p, "symbol", "") or "").strip()
+                strat = (getattr(p, "strategy", "") or "").strip()
+                if not sym:
+                    continue
+                _pos_map[(sym, strat)] = p
+            except Exception:
+                continue
+        positions = _pos_map
+    elif not isinstance(positions, dict):
+        positions = {}
+
     risk_cfg = load_risk_config() or {}
 
     # Preload bars using the same format as the main scheduler
@@ -3750,41 +3767,58 @@ def debug_positions(include_strategy: bool = True):
 
     out = []
 
-    for (symbol, strategy), pm_pos in positions.items():
-        snap = PositionSnapshot(
-            symbol=symbol,
-            strategy=strategy,
-            qty=float(getattr(pm_pos, "qty", 0.0) or 0.0),
-            avg_price=getattr(pm_pos, "avg_price", None),
-            unrealized_pct=None,
-        )
-
-        last_px = _last_price_safe(symbol)
+    # _load_open_positions_from_trades now returns a List[Position].
+    # We normalize that into a debug-friendly list of dicts.
+    for pm_pos in positions:
         try:
-            unrealized_pct = risk_engine.compute_unrealized_pct(
-                snap,
-                last_price_fn=_last_price_safe,
+            symbol = (getattr(pm_pos, "symbol", "") or "").strip()
+            strategy = (getattr(pm_pos, "strategy", "") or "").strip() if include_strategy else ""
+            if not symbol:
+                continue
+
+            snap = PositionSnapshot(
+                symbol=symbol,
+                strategy=strategy,
+                qty=float(getattr(pm_pos, "qty", 0.0) or 0.0),
+                avg_price=getattr(pm_pos, "avg_price", None),
+                unrealized_pct=None,
             )
-        except Exception:
-            unrealized_pct = None
 
-        snap.unrealized_pct = unrealized_pct
+            last_px = _last_price_safe(symbol)
+            try:
+                unrealized_pct = risk_engine.compute_unrealized_pct(
+                    snap,
+                    last_price_fn=_last_price_safe,
+                )
+            except Exception:
+                unrealized_pct = None
 
-        # symbol caps (already time-of-day adjusted)
-        max_notional, max_units = risk_engine.symbol_caps(symbol)
+            snap.unrealized_pct = unrealized_pct
 
-        out.append(
-            {
-                "symbol": symbol,
-                "strategy": strategy,
-                "qty": snap.qty,
-                "avg_price": snap.avg_price,
-                "last_price": last_px,
-                "unrealized_pct": unrealized_pct,
-                "max_notional_cap": max_notional,
-                "max_units_cap": max_units,
-            }
-        )
+            # symbol caps (already time-of-day adjusted)
+            max_notional, max_units = risk_engine.symbol_caps(symbol)
+
+            out.append(
+                {
+                    "symbol": symbol,
+                    "strategy": strategy,
+                    "qty": snap.qty,
+                    "avg_price": snap.avg_price,
+                    "last_price": last_px,
+                    "unrealized_pct": unrealized_pct,
+                    "max_notional_cap": max_notional,
+                    "max_units_cap": max_units,
+                }
+            )
+        except Exception as e:
+            # Do not let a single bad record crash the endpoint.
+            out.append(
+                {
+                    "symbol": symbol if 'symbol' in locals() else None,
+                    "strategy": strategy if 'strategy' in locals() else None,
+                    "error": f"failed to build snapshot: {e.__class__.__name__}: {e}",
+                }
+            )
 
     return {
         "positions": out,
@@ -4266,16 +4300,33 @@ def _startup():
 # ------------------------------------------------------------------
 # Last-price helper for risk calculation + exits
 # ------------------------------------------------------------------
+_LAST_PRICE_CONTEXTS: Dict[str, Any] = {}
+
 def _last_price_safe(symbol: str) -> float:
-    # 1) Try cached 5m bars
-    ctx = contexts.get(symbol)
-    if ctx:
+    """
+    Best-effort last price helper used by exits + debug endpoints.
+
+    Priority:
+    1) Use cached 5m bars from the most recent scheduler run (if available).
+    2) Ask the broker router for a last price / ticker.
+    3) Fall back to 0.0 if everything fails (never raises, never returns None).
+    """
+    ctx = None
+    try:
+        # _LAST_PRICE_CONTEXTS is refreshed on each scheduler_run_v2 call.
+        if isinstance(_LAST_PRICE_CONTEXTS, dict):
+            ctx = _LAST_PRICE_CONTEXTS.get(symbol)
+    except Exception:
+        ctx = None
+
+    if isinstance(ctx, dict):
         five = ctx.get("five") or {}
         closes = five.get("close") or []
         if closes:
             try:
                 return float(closes[-1])
             except Exception:
+                # fall through to broker fallback
                 pass
 
     # 2) Fallback: ask broker router for a last price (prevents exit blocks)
@@ -4295,9 +4346,12 @@ def _last_price_safe(symbol: str) -> float:
                         if k in t and t[k] is not None:
                             return float(t[k])
     except Exception:
+        # We never let a bad broker response crash the scheduler.
         pass
 
+    # Final fallback: 0.0 means "unknown / unusable", callers must treat as no-op.
     return 0.0
+
 
 
 # --------------------------------------------------------------------------------------
@@ -5216,6 +5270,14 @@ def scheduler_run_v2(payload: Dict[str, Any] = Body(default=None)):
     # Defensive: scheduler_core requires dict positions
     if not isinstance(positions, dict):
         raise TypeError(f"scheduler_run_v2 positions must be dict, got {type(positions)}")
+
+    
+    # Snapshot contexts globally for helpers like _last_price_safe
+    global _LAST_PRICE_CONTEXTS
+    try:
+        _LAST_PRICE_CONTEXTS = contexts or {}
+    except Exception:
+        _LAST_PRICE_CONTEXTS = {}
 
     cfg = SchedulerConfig(
         now=now,
