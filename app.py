@@ -5183,22 +5183,6 @@ def scheduler_run_v2(payload: Dict[str, Any] = Body(default=None)):
 
 
     # ------------------------------------------------------------------
-    # Last-price helper for risk calculation + exits
-    # ------------------------------------------------------------------
-    def _last_price_safe(symbol: str) -> float:
-        ctx = contexts.get(symbol)
-        if not ctx:
-            return 0.0
-        five = ctx.get("five") or {}
-        closes = five.get("close") or []
-        if not closes:
-            return 0.0
-        try:
-            return float(closes[-1])
-        except Exception:
-            return 0.0
-
-    # ------------------------------------------------------------------
     # Build SchedulerConfig and run scheduler_core once
     # ------------------------------------------------------------------
     now = dt.datetime.utcnow()
@@ -5559,7 +5543,7 @@ def scheduler_run_v2(payload: Dict[str, Any] = Body(default=None)):
         else:
             qty_here = float(getattr(pm_pos, "qty", 0.0) or 0.0)
             px = _last_price_safe(intent.symbol)
-            if px <= 0.0:
+            if px is None or px <= 0.0:
                 telemetry.append(
                     {
                         "symbol": intent.symbol,
