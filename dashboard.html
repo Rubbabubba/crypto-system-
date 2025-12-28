@@ -1339,13 +1339,22 @@
     }
 
     // ===== Advisor =====
+
+// ===== Advisor =====
     async function runAdvisor() {
       try {
-        const data = await fetchJSON("/advisor/daily");
+        const [daily, summary, suggestions] = await Promise.all([
+          fetchJSON("/advisor/daily"),
+          fetchJSON("/advisor/v2/summary?hours=24"),
+          fetchJSON("/advisor/v2/suggestions?hours=24")
+        ]);
+
+        const data = daily || {};
         $id("advisor_date").textContent = data.date || "—";
         $id("advisor_notes").textContent = data.notes || "No notes.";
         const ul = $id("advisor_recs");
         ul.innerHTML = "";
+
         const recs = data.recommendations || [];
         if (!recs.length) {
           const li = document.createElement("li");
@@ -1358,12 +1367,35 @@
             ul.appendChild(li);
           });
         }
-        log("Advisor loaded", { count: (data.recommendations || []).length });
+
+        // Append Advisor v2 suggestions (per-strategy top pairs)
+        if (suggestions && suggestions.ok && Array.isArray(suggestions.per_strategy)) {
+          suggestions.per_strategy.forEach(entry => {
+            const strat = (entry.strategy || "").toUpperCase();
+            (entry.pairs || []).forEach(p => {
+              const li = document.createElement("li");
+              const sym = p.symbol || "?";
+              const pnl = p.realized_pnl || 0;
+              const wr = (p.win_rate != null)
+                ? (p.win_rate * 100).toFixed(1) + "%"
+                : "—";
+              const score = (p.score != null)
+                ? Number(p.score).toFixed(2)
+                : "";
+              li.textContent = `[v2] ${strat} / ${sym} — pnl=${money(pnl)} win_rate=${wr}` + (score ? " score=" + score : "");
+              ul.appendChild(li);
+            });
+          });
+        }
+
+        log("Advisor loaded", {
+          daily_count: (data.recommendations || []).length,
+          v2_pairs: (suggestions && suggestions.overall_top_pairs && suggestions.overall_top_pairs.length) || 0
+        });
       } catch (e) {
         log("runAdvisor failed", String(e));
       }
     }
-
     async function applyAdvisor(dryRun) {
       try {
         const payload = {

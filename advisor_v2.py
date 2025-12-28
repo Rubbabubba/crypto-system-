@@ -732,5 +732,137 @@ def summarize_v2(limit: int = 1000) -> Dict[str, Any]:
     }
 
 # Backwards-compatible alias (app.py imports advisor_summary)
-def advisor_summary(limit: int = 1000):
-    return summarize_v2(limit=limit)
+
+def advisor_summary(hours: int = 24, days: Optional[int] = None, limit: int = 1000) -> Dict[str, Any]:
+    """High-level Advisor v2 summary over recent history.
+
+    This is a lightweight view on top of :func:`generate_report`, intended for the
+    /advisor/v2/summary API endpoint. It aggregates:
+
+    - Window metadata (since/until, hours/days)
+    - High-level counts (journal/telemetry/trades)
+    - Top strategies / pairs / symbols by realized PnL
+
+    It is strictly read-only and never places orders.
+    """
+    try:
+        rep = generate_report(hours=hours, days=days, bucket_hours=4, write_file=False, out_name="advisor_v2_report_live.json")
+    except Exception as exc:
+        return {
+            "ok": False,
+            "error": "advisor_report_failed",
+            "detail": str(exc),
+        }
+
+    if not rep.get("ok"):
+        # propagate underlying error structure
+        return rep
+
+    window = rep.get("window", {}) or {}
+    counts = rep.get("counts", {}) or {}
+
+    per_strategy_list = rep.get("per_strategy_list") or []
+    per_pair_list = rep.get("per_pair_list") or []
+    per_symbol_list = rep.get("per_symbol_list") or []
+
+    # Trimmed leaderboards, sorted by realized PnL desc
+    top_n = max(1, min(limit, 50))
+    def _sort_key(row):
+        return _safe_float(row.get("realized_pnl"), 0.0)
+
+    top_strategies = sorted(per_strategy_list, key=_sort_key, reverse=True)[:top_n]
+    top_pairs = sorted(per_pair_list, key=_sort_key, reverse=True)[:top_n]
+    top_symbols = sorted(per_symbol_list, key=_sort_key, reverse=True)[:top_n]
+
+    return {
+        "ok": True,
+        "window": window,
+        "counts": counts,
+        "top_strategies": top_strategies,
+        "top_pairs": top_pairs,
+        "top_symbols": top_symbols,
+    }
+
+
+def advisor_suggestions(
+    hours: int = 24,
+    days: Optional[int] = None,
+    top_n: int = 5,
+    min_closed: int = 3,
+) -> Dict[str, Any]:
+    """Advisor v2 suggestions for strategy/symbol pairs.
+
+    Uses the full Advisor v2 report (trades + journal_v2 + telemetry_v2) to
+    identify the best-performing (strategy, symbol) combinations over the given
+    lookback window. For now, this only surfaces pairs that *actually traded*
+    in the window (status="already_trading").
+
+    Returns a per-strategy list of suggested pairs ranked by a simple score
+    (currently realized PnL), plus an overall top list for convenience.
+    """
+    try:
+        rep = generate_report(hours=hours, days=days, bucket_hours=4, write_file=False, out_name="advisor_v2_report_live.json")
+    except Exception as exc:
+        return {
+            "ok": False,
+            "error": "advisor_report_failed",
+            "detail": str(exc),
+        }
+
+    if not rep.get("ok"):
+        return rep
+
+    per_pair_list = rep.get("per_pair_list") or []
+    window = rep.get("window", {}) or {}
+
+    # Group by strategy
+    per_strategy: Dict[str, list] = {}
+    all_pairs: list = []
+
+    for row in per_pair_list:
+        strat = _safe_str(row.get("strategy")).lower() or "unknown"
+        sym = _safe_str(row.get("symbol")) or "unknown"
+
+        closed = int(row.get("closed_chunks") or 0)
+        fills = int(row.get("fills") or 0)
+        pnl = _safe_float(row.get("realized_pnl"), 0.0)
+        win_rate = row.get("win_rate")
+
+        if closed < min_closed:
+            continue
+
+        score = pnl  # simple score for now; can evolve later
+        item = {
+            "strategy": strat,
+            "symbol": sym,
+            "realized_pnl": pnl,
+            "win_rate": win_rate,
+            "fills": fills,
+            "closed_chunks": closed,
+            "max_drawdown": _safe_float(row.get("max_drawdown"), 0.0),
+            "score": score,
+            "status": "already_trading",
+        }
+        per_strategy.setdefault(strat, []).append(item)
+        all_pairs.append(item)
+
+    # Sort each strategy's list by score
+    per_strategy_out: List[Dict[str, Any]] = []
+    for strat, rows in per_strategy.items():
+        rows_sorted = sorted(rows, key=lambda r: _safe_float(r.get("score"), 0.0), reverse=True)
+        per_strategy_out.append({
+            "strategy": strat,
+            "pairs": rows_sorted[: max(1, min(top_n, 50))],
+        })
+
+    # Overall top list
+    overall_top = sorted(all_pairs, key=lambda r: _safe_float(r.get("score"), 0.0), reverse=True)[
+        : max(1, min(top_n, 50))
+    ]
+
+    return {
+        "ok": True,
+        "window": window,
+        "per_strategy": per_strategy_out,
+        "overall_top_pairs": overall_top,
+    }

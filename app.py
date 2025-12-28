@@ -2419,14 +2419,19 @@ def advisor_apply(payload: Dict[str, Any] = Body(default=None)):
         json.dump(data, fh, indent=2)
     return {"ok": True, "saved": True, **data}
     
+
 @app.get("/advisor/v2/summary")
-def advisor_v2_summary(limit: int = Query(1000, ge=1, le=10000)):
-    """
-    High-level Advisor summary over recent journal_v2 entries.
-    This does NOT place orders; it's read-only analytics.
+def advisor_v2_summary(
+    hours: int = Query(24, ge=1, le=24*30),
+    days: Optional[int] = Query(None, ge=1, le=365),
+    limit: int = Query(1000, ge=1, le=10000),
+):
+    """High-level Advisor v2 summary over recent history.
+
+    This is a read-only analytics endpoint. It never places orders.
     """
     try:
-        payload = advisor_summary(limit=limit)
+        payload = advisor_summary(hours=hours, days=days, limit=limit)
         return payload
     except Exception as exc:
         return {
@@ -2434,8 +2439,6 @@ def advisor_v2_summary(limit: int = Query(1000, ge=1, le=10000)):
             "error": "advisor_v2_failed",
             "detail": str(exc),
         }
-
-
 @app.get("/advisor/v2/report")
 def advisor_v2_report(
     hours: int = Query(24, ge=1, le=24*30),
@@ -2463,6 +2466,30 @@ def advisor_v2_report(
     except Exception as exc:
         return {"ok": False, "error": "advisor_v2_report_failed", "detail": str(exc)}
 
+
+
+@app.get("/advisor/v2/suggestions")
+def advisor_v2_suggestions(
+    hours: int = Query(24, ge=1, le=24*30),
+    days: Optional[int] = Query(None, ge=1, le=365),
+    top_n: int = Query(5, ge=1, le=50),
+    min_closed: int = Query(3, ge=1, le=100),
+):
+    """Advisor v2 suggestions for strategy/symbol pairs.
+
+    Uses realized performance over the lookback window to highlight the
+    strongest (strategy, symbol) combinations. This is read-only analytics.
+    """
+    try:
+        from advisor_v2 import advisor_suggestions as _adv_suggestions
+        payload = _adv_suggestions(hours=hours, days=days, top_n=top_n, min_closed=min_closed)
+        return payload
+    except Exception as exc:
+        return {
+            "ok": False,
+            "error": "advisor_v2_suggestions_failed",
+            "detail": str(exc),
+        }
 @app.get("/journal/counts")
 def journal_counts():
     conn = _db()
@@ -2517,155 +2544,6 @@ def journal_reset_open_positions(payload: Dict[str, Any] = Body(default=None)):
     }
 
     
-
-@app.post("/journal/cleanup_broker_mismatch")
-def journal_cleanup_broker_mismatch(payload: Dict[str, Any] = Body(default=None)) -> Dict[str, Any]:
-    """
-    One-time cleanup for journal-only open positions that have no backing balance
-    at the broker.
-
-    - Loads open positions from trades (non-legacy only)
-    - Aggregates by asset (using symbol -> asset mapping)
-    - Loads broker balances (broker_kraken.positions)
-    - For any asset where broker_qty ~ 0 but journal_qty != 0,
-      marks all trades for those symbols as strategy='legacy'.
-
-    This is designed for "flatten & reset" scenarios where manual broker
-    actions closed positions that the journal still thinks are open.
-    """
-    payload = payload or {}
-    confirm = str(payload.get("confirm", "")).strip().upper()
-    if confirm not in ("YES_CLEAN_BROKER_MISMATCH", "YES_CLEAN"):
-        return {
-            "ok": False,
-            "error": "confirmation_required",
-            "hint": "Set confirm='YES_CLEAN_BROKER_MISMATCH' (or 'YES_CLEAN') in the JSON body to proceed.",
-        }
-
-    # 1) Load open positions from trades (non-legacy)
-    try:
-        positions = _load_open_positions_from_trades(use_strategy_col=True)
-    except TypeError:
-        # Backward-compatible: older signature without kwargs
-        positions = _load_open_positions_from_trades()
-
-    journal_by_asset: Dict[str, float] = {}
-    for p in positions or []:
-        try:
-            sym = (getattr(p, "symbol", None) or getattr(p, "Symbol", None) or "").strip()
-            qty = float(getattr(p, "qty", 0.0) or 0.0)
-            if not sym or abs(qty) <= 0.0:
-                continue
-            asset = sym.upper().split("/", 1)[0].strip()
-            if not asset:
-                continue
-            journal_by_asset[asset] = journal_by_asset.get(asset, 0.0) + qty
-        except Exception:
-            continue
-
-    # 2) Load broker balances
-    broker_asset_balances: Dict[str, float] = {}
-    try:
-        raw_positions = broker_kraken.positions()
-        if isinstance(raw_positions, list):
-            for row in raw_positions:
-                try:
-                    asset = str(row.get("asset", "") or "").upper()
-                    qty = float(row.get("qty", 0.0) or 0.0)
-                    if not asset:
-                        continue
-                    broker_asset_balances[asset] = broker_asset_balances.get(asset, 0.0) + qty
-                except Exception:
-                    continue
-    except Exception as e:
-        return {
-            "ok": False,
-            "error": f"failed_to_load_broker_positions: {e}",
-            "journal_by_asset": journal_by_asset,
-        }
-
-    # 3) Determine which assets need cleanup
-    MIN_JOURNAL_QTY = 1e-9
-    MIN_BROKER_QTY = 1e-9
-
-    candidates: List[Dict[str, Any]] = []
-    for asset, jqty in journal_by_asset.items():
-        bqty = float(broker_asset_balances.get(asset, 0.0) or 0.0)
-        if abs(jqty) > MIN_JOURNAL_QTY and abs(bqty) <= MIN_BROKER_QTY:
-            candidates.append({"asset": asset, "journal_qty": jqty, "broker_qty": bqty})
-
-    if not candidates:
-        return {
-            "ok": True,
-            "note": "No broker-mismatch assets found (journal and broker are aligned).",
-            "journal_by_asset": journal_by_asset,
-            "broker_asset_balances": broker_asset_balances,
-            "cleaned": [],
-        }
-
-    # 4) Mark trades for those assets as legacy
-    conn = _db()
-    cur = conn.cursor()
-    cleaned: list[dict] = []
-    try:
-        total_before = cur.execute("SELECT COUNT(*) FROM trades").fetchone()[0]
-
-        for c in candidates:
-            asset = c["asset"]
-            pattern = f"{asset}/%"
-            count_before = cur.execute(
-                """
-                SELECT COUNT(*)
-                FROM trades
-                WHERE LOWER(COALESCE(strategy, '')) != 'legacy'
-                  AND UPPER(COALESCE(symbol, '')) LIKE ?
-                """,
-                (pattern,),
-            ).fetchone()[0]
-
-            cur.execute(
-                """
-                UPDATE trades
-                SET strategy='legacy'
-                WHERE LOWER(COALESCE(strategy, '')) != 'legacy'
-                  AND UPPER(COALESCE(symbol, '')) LIKE ?
-                """,
-                (pattern,),
-            )
-            conn.commit()
-
-            count_after = cur.execute(
-                """
-                SELECT COUNT(*)
-                FROM trades
-                WHERE LOWER(COALESCE(strategy, '')) != 'legacy'
-                  AND UPPER(COALESCE(symbol, '')) LIKE ?
-                """,
-                (pattern,),
-            ).fetchone()[0]
-
-            cleaned.append(
-                {
-                    "asset": asset,
-                    "journal_qty_before": c["journal_qty"],
-                    "broker_qty": c["broker_qty"],
-                    "rows_marked_legacy": int(count_before - count_after),
-                }
-            )
-
-        total_after = cur.execute("SELECT COUNT(*) FROM trades").fetchone()[0]
-    finally:
-        conn.close()
-
-    return {
-        "ok": True,
-        "journal_by_asset_before": journal_by_asset,
-        "broker_asset_balances": broker_asset_balances,
-        "cleaned": cleaned,
-        "total_rows": int(total_after),
-    }
-
-
 @app.get("/journal/v2/review")
 def journal_v2_review(
     limit: int = Query(2000, ge=1, le=100000),
