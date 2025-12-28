@@ -2419,19 +2419,14 @@ def advisor_apply(payload: Dict[str, Any] = Body(default=None)):
         json.dump(data, fh, indent=2)
     return {"ok": True, "saved": True, **data}
     
-
 @app.get("/advisor/v2/summary")
-def advisor_v2_summary(
-    hours: int = Query(24, ge=1, le=24*30),
-    days: Optional[int] = Query(None, ge=1, le=365),
-    limit: int = Query(1000, ge=1, le=10000),
-):
-    """High-level Advisor v2 summary over recent history.
-
-    This is a read-only analytics endpoint. It never places orders.
+def advisor_v2_summary(limit: int = Query(1000, ge=1, le=10000)):
+    """
+    High-level Advisor summary over recent journal_v2 entries.
+    This does NOT place orders; it's read-only analytics.
     """
     try:
-        payload = advisor_summary(hours=hours, days=days, limit=limit)
+        payload = advisor_summary(limit=limit)
         return payload
     except Exception as exc:
         return {
@@ -2439,6 +2434,8 @@ def advisor_v2_summary(
             "error": "advisor_v2_failed",
             "detail": str(exc),
         }
+
+
 @app.get("/advisor/v2/report")
 def advisor_v2_report(
     hours: int = Query(24, ge=1, le=24*30),
@@ -2466,30 +2463,6 @@ def advisor_v2_report(
     except Exception as exc:
         return {"ok": False, "error": "advisor_v2_report_failed", "detail": str(exc)}
 
-
-
-@app.get("/advisor/v2/suggestions")
-def advisor_v2_suggestions(
-    hours: int = Query(24, ge=1, le=24*30),
-    days: Optional[int] = Query(None, ge=1, le=365),
-    top_n: int = Query(5, ge=1, le=50),
-    min_closed: int = Query(3, ge=1, le=100),
-):
-    """Advisor v2 suggestions for strategy/symbol pairs.
-
-    Uses realized performance over the lookback window to highlight the
-    strongest (strategy, symbol) combinations. This is read-only analytics.
-    """
-    try:
-        from advisor_v2 import advisor_suggestions as _adv_suggestions
-        payload = _adv_suggestions(hours=hours, days=days, top_n=top_n, min_closed=min_closed)
-        return payload
-    except Exception as exc:
-        return {
-            "ok": False,
-            "error": "advisor_v2_suggestions_failed",
-            "detail": str(exc),
-        }
 @app.get("/journal/counts")
 def journal_counts():
     conn = _db()
@@ -2502,47 +2475,6 @@ def journal_counts():
         per_strategy.append({"strategy": row[0], "count": row[1]})
     conn.close()
     return {"ok": True, "total": total, "labeled": labeled, "unlabeled": unlabeled, "per_strategy": per_strategy}
-
-@app.post("/journal/reset_open_positions")
-def journal_reset_open_positions(payload: Dict[str, Any] = Body(default=None)):
-    """
-    Hard reset for open positions derived from the trades table.
-
-    This is intended for "Day 0" resets:
-    - Marks all existing trades as strategy='legacy'
-    - Future open-position calculations will ignore these rows
-    - New trades will use real strategies (c1, c2, etc.)
-    """
-    payload = payload or {}
-    confirm = str(payload.get("confirm", "")).strip().upper()
-    if confirm not in ("YES_RESET", "YES_RESET_OPEN_POSITIONS"):
-        return {
-            "ok": False,
-            "error": "confirmation_required",
-            "hint": "Set confirm='YES_RESET_OPEN_POSITIONS' (or 'YES_RESET') in the JSON body to proceed.",
-        }
-
-    conn = _db()
-    cur = conn.cursor()
-    try:
-        total = cur.execute("SELECT COUNT(*) FROM trades").fetchone()[0]
-        to_mark = cur.execute(
-            "SELECT COUNT(*) FROM trades WHERE LOWER(COALESCE(strategy, '')) != 'legacy'"
-        ).fetchone()[0]
-        cur.execute(
-            "UPDATE trades SET strategy='legacy' WHERE LOWER(COALESCE(strategy, '')) != 'legacy'"
-        )
-        conn.commit()
-    finally:
-        conn.close()
-
-    return {
-        "ok": True,
-        "marked_legacy": int(to_mark),
-        "total_rows": int(total),
-        "note": "All existing trades are now tagged as strategy='legacy' and will be ignored by open-position loaders.",
-    }
-
     
 @app.get("/journal/v2/review")
 def journal_v2_review(
@@ -2741,33 +2673,6 @@ def debug_db():
         info["error"] = str(e)
     return info
 
-
-
-@app.get("/debug/strategy_scan")
-def debug_strategy_scan_get(
-    strategy: str,
-    symbol: str,
-    tf: str = "5Min",
-    dry: bool = False,
-    limit: int = 300,
-    notional: float = 25.0,
-):
-    """
-    Convenience GET wrapper for /debug/strategy_scan.
-
-    Accepts query parameters and forwards to the POST-based debug_strategy_scan
-    using the same payload format.
-    """
-    payload: Dict[str, Any] = {
-        "strategy": strategy,
-        "symbol": symbol,
-        "tf": tf,
-        "dry": dry,
-        "limit": limit,
-        "notional": notional,
-    }
-    return debug_strategy_scan(payload=payload)
-
 @app.post("/debug/strategy_scan")
 def debug_strategy_scan(payload: Dict[str, Any] = Body(default=None)):
     """
@@ -2796,23 +2701,6 @@ def debug_strategy_scan(payload: Dict[str, Any] = Body(default=None)):
 
     # Load positions + risk config
     positions = _load_open_positions_from_trades()
-    # Normalize positions for scheduler_core: it expects a dict keyed by (symbol, strategy)
-    # _load_open_positions_from_trades returns a List[Position] for debug friendliness.
-    if isinstance(positions, list):
-        _pos_map: Dict[Tuple[str, str], Position] = {}
-        for p in positions:
-            try:
-                sym = (getattr(p, "symbol", "") or "").strip()
-                strat = (getattr(p, "strategy", "") or "").strip()
-                if not sym:
-                    continue
-                _pos_map[(sym, strat)] = p
-            except Exception:
-                continue
-        positions = _pos_map
-    elif not isinstance(positions, dict):
-        positions = {}
-
     risk_cfg = load_risk_config() or {}
 
     # Preload bars using the same format as the main scheduler
@@ -3818,7 +3706,7 @@ def debug_global_policy():
     
 
 @app.get("/debug/positions")
-def debug_positions(include_strategy: bool = True):
+def debug_positions(include_strategy: bool = True, include_legacy: bool = False):
     """
     Show current open positions as seen by the system, including:
 
@@ -3829,64 +3717,47 @@ def debug_positions(include_strategy: bool = True):
 
     This is the single source of truth for exposures + unrealized P&L.
     """
-    positions = _load_open_positions_from_trades(use_strategy_col=include_strategy)
+    positions = _load_open_positions_from_trades(use_strategy_col=include_strategy, include_legacy=include_legacy)
     risk_cfg = load_risk_config() or {}
     risk_engine = RiskEngine(risk_cfg)
 
     out = []
 
-    # _load_open_positions_from_trades now returns a List[Position].
-    # We normalize that into a debug-friendly list of dicts.
-    for pm_pos in positions:
+    for (symbol, strategy), pm_pos in positions.items():
+        snap = PositionSnapshot(
+            symbol=symbol,
+            strategy=strategy,
+            qty=float(getattr(pm_pos, "qty", 0.0) or 0.0),
+            avg_price=getattr(pm_pos, "avg_price", None),
+            unrealized_pct=None,
+        )
+
+        last_px = _last_price_safe(symbol)
         try:
-            symbol = (getattr(pm_pos, "symbol", "") or "").strip()
-            strategy = (getattr(pm_pos, "strategy", "") or "").strip() if include_strategy else ""
-            if not symbol:
-                continue
-
-            snap = PositionSnapshot(
-                symbol=symbol,
-                strategy=strategy,
-                qty=float(getattr(pm_pos, "qty", 0.0) or 0.0),
-                avg_price=getattr(pm_pos, "avg_price", None),
-                unrealized_pct=None,
+            unrealized_pct = risk_engine.compute_unrealized_pct(
+                snap,
+                last_price_fn=_last_price_safe,
             )
+        except Exception:
+            unrealized_pct = None
 
-            last_px = _last_price_safe(symbol)
-            try:
-                unrealized_pct = risk_engine.compute_unrealized_pct(
-                    snap,
-                    last_price_fn=_last_price_safe,
-                )
-            except Exception:
-                unrealized_pct = None
+        snap.unrealized_pct = unrealized_pct
 
-            snap.unrealized_pct = unrealized_pct
+        # symbol caps (already time-of-day adjusted)
+        max_notional, max_units = risk_engine.symbol_caps(symbol)
 
-            # symbol caps (already time-of-day adjusted)
-            max_notional, max_units = risk_engine.symbol_caps(symbol)
-
-            out.append(
-                {
-                    "symbol": symbol,
-                    "strategy": strategy,
-                    "qty": snap.qty,
-                    "avg_price": snap.avg_price,
-                    "last_price": last_px,
-                    "unrealized_pct": unrealized_pct,
-                    "max_notional_cap": max_notional,
-                    "max_units_cap": max_units,
-                }
-            )
-        except Exception as e:
-            # Do not let a single bad record crash the endpoint.
-            out.append(
-                {
-                    "symbol": symbol if 'symbol' in locals() else None,
-                    "strategy": strategy if 'strategy' in locals() else None,
-                    "error": f"failed to build snapshot: {e.__class__.__name__}: {e}",
-                }
-            )
+        out.append(
+            {
+                "symbol": symbol,
+                "strategy": strategy,
+                "qty": snap.qty,
+                "avg_price": snap.avg_price,
+                "last_price": last_px,
+                "unrealized_pct": unrealized_pct,
+                "max_notional_cap": max_notional,
+                "max_units_cap": max_units,
+            }
+        )
 
     return {
         "positions": out,
@@ -4368,33 +4239,16 @@ def _startup():
 # ------------------------------------------------------------------
 # Last-price helper for risk calculation + exits
 # ------------------------------------------------------------------
-_LAST_PRICE_CONTEXTS: Dict[str, Any] = {}
-
 def _last_price_safe(symbol: str) -> float:
-    """
-    Best-effort last price helper used by exits + debug endpoints.
-
-    Priority:
-    1) Use cached 5m bars from the most recent scheduler run (if available).
-    2) Ask the broker router for a last price / ticker.
-    3) Fall back to 0.0 if everything fails (never raises, never returns None).
-    """
-    ctx = None
-    try:
-        # _LAST_PRICE_CONTEXTS is refreshed on each scheduler_run_v2 call.
-        if isinstance(_LAST_PRICE_CONTEXTS, dict):
-            ctx = _LAST_PRICE_CONTEXTS.get(symbol)
-    except Exception:
-        ctx = None
-
-    if isinstance(ctx, dict):
+    # 1) Try cached 5m bars
+    ctx = contexts.get(symbol)
+    if ctx:
         five = ctx.get("five") or {}
         closes = five.get("close") or []
         if closes:
             try:
                 return float(closes[-1])
             except Exception:
-                # fall through to broker fallback
                 pass
 
     # 2) Fallback: ask broker router for a last price (prevents exit blocks)
@@ -4414,12 +4268,9 @@ def _last_price_safe(symbol: str) -> float:
                         if k in t and t[k] is not None:
                             return float(t[k])
     except Exception:
-        # We never let a bad broker response crash the scheduler.
         pass
 
-    # Final fallback: 0.0 means "unknown / unusable", callers must treat as no-op.
     return 0.0
-
 
 
 # --------------------------------------------------------------------------------------
@@ -5332,20 +5183,28 @@ def scheduler_run_v2(payload: Dict[str, Any] = Body(default=None)):
 
 
     # ------------------------------------------------------------------
+    # Last-price helper for risk calculation + exits
+    # ------------------------------------------------------------------
+    def _last_price_safe(symbol: str) -> float:
+        ctx = contexts.get(symbol)
+        if not ctx:
+            return 0.0
+        five = ctx.get("five") or {}
+        closes = five.get("close") or []
+        if not closes:
+            return 0.0
+        try:
+            return float(closes[-1])
+        except Exception:
+            return 0.0
+
+    # ------------------------------------------------------------------
     # Build SchedulerConfig and run scheduler_core once
     # ------------------------------------------------------------------
     now = dt.datetime.utcnow()
     # Defensive: scheduler_core requires dict positions
     if not isinstance(positions, dict):
         raise TypeError(f"scheduler_run_v2 positions must be dict, got {type(positions)}")
-
-    
-    # Snapshot contexts globally for helpers like _last_price_safe
-    global _LAST_PRICE_CONTEXTS
-    try:
-        _LAST_PRICE_CONTEXTS = contexts or {}
-    except Exception:
-        _LAST_PRICE_CONTEXTS = {}
 
     cfg = SchedulerConfig(
         now=now,
@@ -5542,41 +5401,6 @@ def scheduler_run_v2(payload: Dict[str, Any] = Body(default=None)):
     # Apply guard + per-symbol caps + loss-zone no-rebuy; then route
     # Also: stop-the-bleed duplicate action latch (1 action per (sym,strat) per run)
     # ------------------------------------------------------------------
-    # Snapshot broker balances once per run for exit guardrail
-    broker_asset_balances: Dict[str, float] = {}
-    try:
-        raw_positions = broker_kraken.positions()
-        if isinstance(raw_positions, list):
-            for p in raw_positions:
-                try:
-                    asset = str(p.get("asset", "") or "").upper()
-                    qty = float(p.get("qty", 0.0) or 0.0)
-                except Exception:
-                    continue
-                if not asset:
-                    continue
-                if qty == 0.0:
-                    continue
-                broker_asset_balances[asset] = broker_asset_balances.get(asset, 0.0) + qty
-    except Exception as e:
-        try:
-            log.warning("scheduler_v2: failed to load broker positions for exit guard: %s", e)
-        except Exception:
-            pass
-
-    def _asset_from_symbol(sym: str) -> str:
-        s = str(sym or "").upper()
-        if "/" in s:
-            return s.split("/", 1)[0].strip()
-        return s.strip()
-
-    def _broker_qty_for_symbol(sym: str) -> float:
-        try:
-            asset = _asset_from_symbol(sym)
-            return float(broker_asset_balances.get(asset, 0.0) or 0.0)
-        except Exception:
-            return 0.0
-
     sent_keys: set = set()
 
     for intent in final_intents:
@@ -5735,7 +5559,7 @@ def scheduler_run_v2(payload: Dict[str, Any] = Body(default=None)):
         else:
             qty_here = float(getattr(pm_pos, "qty", 0.0) or 0.0)
             px = _last_price_safe(intent.symbol)
-            if px is None or px <= 0.0:
+            if px <= 0.0:
                 telemetry.append(
                     {
                         "symbol": intent.symbol,
@@ -5748,33 +5572,8 @@ def scheduler_run_v2(payload: Dict[str, Any] = Body(default=None)):
                 )
                 continue
 
-            # Broker-aware exit sizing: never sell more than broker reports
-            qty_for_exit = abs(qty_here)
-            broker_qty = 0.0
-            if side == "sell":
-                try:
-                    broker_qty = _broker_qty_for_symbol(intent.symbol)
-                except Exception:
-                    broker_qty = 0.0
-
-                if broker_qty <= 0.0:
-                    telemetry.append(
-                        {
-                            "symbol": intent.symbol,
-                            "strategy": intent.strategy,
-                            "kind": getattr(intent, "kind", None),
-                            "side": side,
-                            "reason": "exit_skipped_no_broker_balance",
-                            "source": "scheduler_v2",
-                        }
-                    )
-                    continue
-
-                # Effective qty to exit is bounded by what the broker says we hold
-                qty_for_exit = min(qty_for_exit, broker_qty)
-
             # If broker side is SELL, we must have something to sell
-            if side == "sell" and qty_for_exit <= 0.0:
+            if side == "sell" and qty_here <= 0.0:
                 telemetry.append(
                     {
                         "symbol": intent.symbol,
@@ -5791,11 +5590,11 @@ def scheduler_run_v2(payload: Dict[str, Any] = Body(default=None)):
             if getattr(intent, "notional", None) is not None and float(getattr(intent, "notional", 0.0) or 0.0) > 0.0:
                 final_notional = float(getattr(intent, "notional", 0.0))
             else:
-                final_notional = qty_for_exit * px  # flatten full position
+                final_notional = abs(qty_here) * px  # flatten full position
 
             # Cap SELL exits so we never try to sell more than position value
             if side == "sell":
-                max_notional = qty_for_exit * px * 0.995  # buffer for fees/rounding
+                max_notional = abs(qty_here) * px * 0.995  # buffer for fees/rounding
                 final_notional = min(final_notional, max_notional)
 
         # Valid final_notional?
@@ -5813,7 +5612,7 @@ def scheduler_run_v2(payload: Dict[str, Any] = Body(default=None)):
             continue
 
         # Ignore dust for entries + TP/SL; still allow generic exits (e.g. daily_flatten)
-        if final_notional < MIN_NOTIONAL_USD and getattr(intent, "kind", "") in {"entry", "scale", "take_profit", "stop_loss"}:
+        if final_notional < MIN_NOTIONAL_USD and getattr(intent, "kind", "") in {"entry", "scale"}:
             telemetry.append(
                 {
                     "symbol": intent.symbol,
@@ -6099,26 +5898,8 @@ def scheduler_run_v2(payload: Dict[str, Any] = Body(default=None)):
         universe.append(u)
 
     # ------------------------------------------------------------------
-    # FINAL RETURN — optional journal sync, log telemetry, then respond
+    # FINAL RETURN — log telemetry, then respond
     # ------------------------------------------------------------------
-    journal_sync_result = None
-    if (not dry) and _env_bool("SCHED_JOURNAL_SYNC_AFTER_RUN", False):
-        try:
-            jr_payload = {
-                "since_hours": int(os.getenv("SCHED_JOURNAL_SYNC_SINCE_HOURS", "24") or 24),
-                "limit": int(os.getenv("SCHED_JOURNAL_SYNC_LIMIT", "5000") or 5000),
-                "mode": "cursor",
-                "advance_cursor": True,
-                "dry_run": False,
-            }
-            journal_sync_result = journal_sync(jr_payload)
-        except Exception as e:
-            journal_sync_result = {"ok": False, "error": str(e)}
-            try:
-                log.warning("scheduler_v2: journal_sync after run failed: %s", e)
-            except Exception:
-                pass
-
     try:
         # Log telemetry for offline Advisor v2 analysis.
         # We log regardless of dry/live, but the rows themselves include any
@@ -6135,7 +5916,6 @@ def scheduler_run_v2(payload: Dict[str, Any] = Body(default=None)):
         "actions": actions,
         "telemetry": telemetry,
         "universe": universe,
-        "journal_sync": journal_sync_result,
     }
 
 
@@ -6578,7 +6358,6 @@ def _load_open_positions_from_trades(use_strategy_col: bool = True) -> List[Posi
             """
             SELECT ts, symbol, side, price, volume, COALESCE(strategy, '') AS strategy
             FROM trades
-            WHERE LOWER(COALESCE(strategy, '')) != 'legacy'
             ORDER BY ts ASC
             """
         ).fetchall()
