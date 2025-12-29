@@ -2873,7 +2873,6 @@ def debug_strategy_scan(payload: Dict[str, Any] = Body(default=None)):
     }
 
     return out
-
 @app.get("/debug/kraken/trades")
 def debug_kraken_trades(since_hours: int = 720, limit: int = 50000):
     """
@@ -3762,7 +3761,7 @@ def debug_positions(include_strategy: bool = True, include_legacy: bool = False)
     risk_cfg = load_risk_config() or {}
     risk_engine = RiskEngine(risk_cfg)
 
-    out: List[Dict[str, Any]] = []
+    out = []
     for (symbol, strategy), pm_pos in positions.items():
         snap = PositionSnapshot(
             symbol=symbol,
@@ -3802,7 +3801,6 @@ def debug_positions(include_strategy: bool = True, include_legacy: bool = False)
     return {
         "positions": out,
     }
-
 @app.get("/debug/trades_sample")
 def debug_trades_sample(
     symbol: str = Query(None, description="Optional symbol filter, e.g. ADA/USD"),
@@ -4280,43 +4278,80 @@ def _startup():
 # Last-price helper for risk calculation + exits
 # ------------------------------------------------------------------
 def _last_price_safe(symbol: str) -> float:
-    # 1) Try cached 5m bars
-    ctx = contexts.get(symbol)
-    if ctx:
-        five = ctx.get("five") or {}
-        closes = five.get("close") or []
-        if closes:
-            try:
-                return float(closes[-1])
-            except Exception:
-                pass
+    """
+    Best-effort last price lookup used by debug and risk endpoints.
 
-    # 2) Fallback: ask broker router for a last price (prevents exit blocks)
+    Tries, in order:
+      1) Global `contexts` (if present) 5m closes
+      2) br_router helpers (get_last_price, get_ticker)
+      3) br_router.get_bars("5Min")
+
+    On any failure, returns 0.0 instead of raising, so that callers like
+    /debug/positions and /scheduler/core_debug_risk never crash purely due
+    to price lookup issues.
+    """
+    # 1) Try cached 5m bars from global contexts, if available
     try:
-        if br is not None:
-            # Prefer a dedicated helper if you have it
+        ctxs = globals().get("contexts") or {}
+        if isinstance(ctxs, dict):
+            ctx = ctxs.get(symbol)
+        else:
+            ctx = None
+        if ctx:
+            five = ctx.get("five") or {}
+            closes = five.get("close") or []
+            if closes:
+                return float(closes[-1])
+    except Exception:
+        # contexts missing or malformed; fall through to broker lookups
+        pass
+
+    # 2) Fallback: ask broker router for a last price
+    br = None
+    try:
+        import br_router as br_mod  # type: ignore[import]
+        br = br_mod
+    except Exception:
+        br = None
+
+    if br is not None:
+        # Prefer a dedicated helper if you have it
+        try:
             if hasattr(br, "get_last_price"):
                 px = br.get_last_price(symbol)
-                if px:
+                if px is not None:
                     return float(px)
+        except Exception:
+            pass
 
-            # Otherwise try ticker-like helpers if present
+        # Otherwise try ticker-like helpers if present
+        try:
             if hasattr(br, "get_ticker"):
                 t = br.get_ticker(symbol)
                 if isinstance(t, dict):
                     for k in ("last", "price", "c", "close"):
-                        if k in t and t[k] is not None:
-                            return float(t[k])
-    except Exception:
-        pass
+                        v = t.get(k)
+                        if v is not None:
+                            return float(v)
+        except Exception:
+            pass
 
+        # Finally, try OHLC bars as a last resort
+        try:
+            if hasattr(br, "get_bars"):
+                bars = br.get_bars(symbol, timeframe="5Min", limit=1)
+                if isinstance(bars, list) and bars:
+                    row = bars[-1]
+                    if isinstance(row, dict):
+                        for k in ("c", "close", "price", "last"):
+                            v = row.get(k)
+                            if v is not None:
+                                return float(v)
+        except Exception:
+            pass
+
+    # Absolute fallback: unknown price
     return 0.0
-
-
-# --------------------------------------------------------------------------------------
-# Scheduler run (manual + background)
-# --------------------------------------------------------------------------------------
-
 @app.post("/scheduler/run")
 def scheduler_run(payload: Dict[str, Any] = Body(default=None)):
     """
@@ -6371,10 +6406,7 @@ def _pnl__agg(group_fields: List[str], start: Optional[str], end: Optional[str],
         rows = [dict(r) for r in con.execute(sql, params).fetchall()]
         return {"ok": True, "table": table, "start": s, "end": e, "realized_only": realized_only, "count": len(rows), "rows": rows}
 
-def _load_open_positions_from_trades(
-    use_strategy_col: bool = True,
-    include_legacy: bool = False,
-) -> List[Position]:
+def _load_open_positions_from_trades(use_strategy_col: bool = True, include_legacy: bool = False) -> List[Position]:
     """Compute open (net) positions from the local `trades` table.
 
     This is a lightweight, deterministic view that does *not* depend on Kraken positions.
