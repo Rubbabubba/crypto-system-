@@ -6069,6 +6069,83 @@ def scheduler_core_debug(payload: Dict[str, Any] = Body(default=None)):
     }
     
 @app.post("/scheduler/core_debug_risk")
+
+def _preload_contexts(tf: str, symbols: List[str], limit: int) -> Dict[str, Any]:
+    """
+    Helper for /scheduler/core_debug_risk:
+    Preload bar contexts (1Min + tf) for each symbol into a dictionary
+    matching the shape expected by SchedulerConfig/StrategyBook.
+
+    This is a read-only helper for debug/risk surfaces and does not send orders.
+    """
+    ctxs: Dict[str, Any] = {}
+    try:
+        import br_router as br  # type: ignore[import]
+    except Exception:
+        # If bar router is unavailable, return an empty context map.
+        return ctxs
+
+    def _safe_series(bars, key: str):
+        vals = []
+        if isinstance(bars, list):
+            for row in bars:
+                if isinstance(row, dict) and key in row:
+                    vals.append(row[key])
+        return vals
+
+    def _normalize_symbol_for_bars(sym: str) -> str:
+        s = str(sym or "")
+        if "/" in s:
+            base, quote = s.split("/", 1)
+            return f"{base}{quote}"
+        return s
+
+    def _canon_symbol(sym: str) -> str:
+        s = str(sym or "").upper()
+
+        # Prefer router-level normalizer if present
+        try:
+            if hasattr(br, "normalize_symbol"):
+                return str(br.normalize_symbol(s))
+        except Exception:
+            pass
+
+        # Minimal Kraken-style altnames -> canonical spot symbols
+        if s == "XBT/USD":
+            return "BTC/USD"
+        if s == "XLTCZ/USD":
+            return "LTC/USD"
+        if s == "XXRPZ/USD":
+            return "XRP/USD"
+        return s
+
+    for sym in symbols or []:
+        sym_can = _canon_symbol(sym)
+        try:
+            bars_sym = _normalize_symbol_for_bars(sym)
+            one = br.get_bars(bars_sym, timeframe="1Min", limit=limit)
+            five = br.get_bars(bars_sym, timeframe=tf, limit=limit)
+
+            if not one or not five:
+                ctxs[sym_can] = None
+            else:
+                ctxs[sym_can] = {
+                    "one": {
+                        "close": _safe_series(one, "c"),
+                        "high": _safe_series(one, "h"),
+                        "low": _safe_series(one, "l"),
+                    },
+                    "five": {
+                        "close": _safe_series(five, "c"),
+                        "high": _safe_series(five, "h"),
+                        "low": _safe_series(five, "l"),
+                    },
+                }
+        except Exception:
+            ctxs[sym_can] = None
+
+    return ctxs
+
 def scheduler_core_debug_risk(payload: Dict[str, Any] = Body(default=None)):
     """
     Debug-only: run scheduler_core + RiskEngine, but DO NOT send orders.
