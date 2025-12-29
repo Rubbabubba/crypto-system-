@@ -2699,9 +2699,34 @@ def debug_strategy_scan(payload: Dict[str, Any] = Body(default=None)):
     limit = int(payload.get("limit", int(os.getenv("SCHED_LIMIT", "300") or 300)))
     notional = float(payload.get("notional", float(os.getenv("SCHED_NOTIONAL", "25") or 25.0)))
 
-    # Load positions + risk config
-    positions = _load_open_positions_from_trades()
+    # Load positions + risk config, then normalize positions to dict[(symbol,strat)] -> Position
+    raw_positions = _load_open_positions_from_trades(use_strategy_col=True)
     risk_cfg = load_risk_config() or {}
+
+    positions: Dict[Tuple[str, str], Position] = {}
+    if isinstance(raw_positions, dict):
+        positions = raw_positions
+    elif isinstance(raw_positions, list):
+        _pos_map: Dict[Tuple[str, str], Position] = {}
+        for p in raw_positions:
+            try:
+                sym = (getattr(p, "symbol", "") or "").strip()
+                sname = (getattr(p, "strategy", "") or "").strip().lower()
+                if not sym:
+                    continue
+                key = (sym, sname or "default")
+                qty = float(getattr(p, "qty", 0.0) or 0.0)
+                if abs(qty) > 1e-12:
+                    _pos_map[key] = p
+                elif key in _pos_map:
+                    _pos_map.pop(key, None)
+            except Exception:
+                continue
+        positions = _pos_map
+
+    # Defensive: scheduler_core requires dict positions
+    if not isinstance(positions, dict):
+        raise TypeError(f"debug_strategy_scan positions must be dict, got {type(positions)}")
 
     # Preload bars using the same format as the main scheduler
     try:
@@ -2739,19 +2764,16 @@ def debug_strategy_scan(payload: Dict[str, Any] = Body(default=None)):
             )
         else:
             # IMPORTANT: match the real scheduler preload:
-            # broker returns keys like "c","h","l" (close, high, low)
             contexts[symbol] = {
                 "one": {
                     "close": _safe_series(one, "c"),
-                    "high":  _safe_series(one, "h"),
-                    "low":   _safe_series(one, "l"),
-                    "volume": _safe_series(one, "v"),
+                    "high": _safe_series(one, "h"),
+                    "low": _safe_series(one, "l"),
                 },
                 "five": {
                     "close": _safe_series(five, "c"),
-                    "high":  _safe_series(five, "h"),
-                    "low":   _safe_series(five, "l"),
-                    "volume": _safe_series(five, "v"),
+                    "high": _safe_series(five, "h"),
+                    "low": _safe_series(five, "l"),
                 },
             }
     except Exception as e:
@@ -2766,10 +2788,6 @@ def debug_strategy_scan(payload: Dict[str, Any] = Body(default=None)):
         )
 
     # Build a minimal SchedulerConfig (we only care about this one symbol/strat)
-    # Defensive: scheduler_core requires dict positions
-    if not isinstance(positions, dict):
-        raise TypeError(f"scheduler_run_v2 positions must be dict, got {type(positions)}")
-
     cfg = SchedulerConfig(
         now=dt.datetime.utcnow(),
         timeframe=tf,
@@ -2821,32 +2839,23 @@ def debug_strategy_scan(payload: Dict[str, Any] = Body(default=None)):
         "telemetry": telemetry,
     }
 
-    if scan is None:
-        out["scan"] = {"reason": "no_scan_result"}
-        out["entry_gate"] = {
-            "is_flat": abs(qty) < 1e-10,
-            "scan_selected": None,
-            "scan_action": None,
-            "scan_notional_positive": None,
-            "would_emit_entry": False,
+    if scan is not None:
+        out["scan"] = {
+            "action": getattr(scan, "action", None),
+            "reason": getattr(scan, "reason", None),
+            "score": getattr(scan, "score", None),
+            "atr_pct": getattr(scan, "atr_pct", None),
+            "notional": getattr(scan, "notional", None),
+            "selected": getattr(scan, "selected", None),
         }
-        return out
+    else:
+        out["scan"] = None
 
-    # Raw scan fields
-    out["scan"] = {
-        "action": scan.action,
-        "reason": scan.reason,
-        "score": float(getattr(scan, "score", 0.0) or 0.0),
-        "atr_pct": float(getattr(scan, "atr_pct", 0.0) or 0.0),
-        "notional": float(getattr(scan, "notional", 0.0) or 0.0),
-        "selected": bool(getattr(scan, "selected", False)),
-    }
-
-    # Entry gating logic (mirrors entry_signal checks, but simplified)
-    is_flat = abs(qty) < 1e-10
-    scan_selected = bool(getattr(scan, "selected", False))
-    scan_action = getattr(scan, "action", None)
-    scan_notional_positive = float(getattr(scan, "notional", 0.0) or 0.0) > 0.0
+    # Derive some entry-gating flags similar to scheduler_v2
+    is_flat = abs(qty) < 1e-12
+    scan_selected = bool(out["scan"] and out["scan"]["selected"])
+    scan_action = out["scan"]["action"] if out["scan"] else None
+    scan_notional_positive = (out["scan"]["notional"] or 0.0) > 0.0 if out["scan"] else False
 
     would_emit_entry = (
         is_flat
@@ -3717,12 +3726,43 @@ def debug_positions(include_strategy: bool = True, include_legacy: bool = False)
 
     This is the single source of truth for exposures + unrealized P&L.
     """
-    positions = _load_open_positions_from_trades(use_strategy_col=include_strategy, include_legacy=include_legacy)
+    raw_positions = _load_open_positions_from_trades(
+        use_strategy_col=include_strategy,
+        include_legacy=include_legacy,
+    )
+
+    # Normalize to the dict shape expected everywhere else:
+    #   (symbol, strategy) -> Position
+    positions: Dict[Tuple[str, str], Position] = {}
+
+    if isinstance(raw_positions, dict):
+        positions = raw_positions
+    elif isinstance(raw_positions, list):
+        _pos_map: Dict[Tuple[str, str], Position] = {}
+        for p in raw_positions:
+            try:
+                sym = (getattr(p, "symbol", "") or "").strip()
+                strat = (getattr(p, "strategy", "") or "").strip().lower()
+                if not sym:
+                    continue
+                # Fallback labels when strategy col is empty or we’re not
+                # including per-strategy splits.
+                if not strat:
+                    strat = "default" if include_strategy else "misc"
+                key = (sym, strat)
+                qty = float(getattr(p, "qty", 0.0) or 0.0)
+                if abs(qty) > 1e-12:
+                    _pos_map[key] = p
+                elif key in _pos_map:
+                    _pos_map.pop(key, None)
+            except Exception:
+                continue
+        positions = _pos_map
+
     risk_cfg = load_risk_config() or {}
     risk_engine = RiskEngine(risk_cfg)
 
-    out = []
-
+    out: List[Dict[str, Any]] = []
     for (symbol, strategy), pm_pos in positions.items():
         snap = PositionSnapshot(
             symbol=symbol,
@@ -6331,7 +6371,10 @@ def _pnl__agg(group_fields: List[str], start: Optional[str], end: Optional[str],
         rows = [dict(r) for r in con.execute(sql, params).fetchall()]
         return {"ok": True, "table": table, "start": s, "end": e, "realized_only": realized_only, "count": len(rows), "rows": rows}
 
-def _load_open_positions_from_trades(use_strategy_col: bool = True) -> List[Position]:
+def _load_open_positions_from_trades(
+    use_strategy_col: bool = True,
+    include_legacy: bool = False,
+) -> List[Position]:
     """Compute open (net) positions from the local `trades` table.
 
     This is a lightweight, deterministic view that does *not* depend on Kraken positions.
