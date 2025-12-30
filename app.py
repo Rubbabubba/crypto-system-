@@ -2463,6 +2463,40 @@ def advisor_v2_report(
     except Exception as exc:
         return {"ok": False, "error": "advisor_v2_report_failed", "detail": str(exc)}
 
+@app.get("/advisor/v2/suggestions")
+def advisor_v2_suggestions(
+    hours: int = Query(24, ge=1, le=24*30),
+    days: Optional[int] = Query(None, ge=1, le=365),
+    top_n: int = Query(10, ge=1, le=50),
+    min_trades: int = Query(3, ge=0, le=100),
+    min_closed: int = Query(3, ge=0, le=100),
+):
+    """
+    Advisor v2 suggestions endpoint used by the dashboard.
+
+    This is a thin wrapper around advisor_v2.advisor_suggestions and
+    never places orders. It only reads journal/telemetry/trades and
+    returns ranked (strategy, symbol) pairs.
+    """
+    try:
+        from advisor_v2 import advisor_suggestions
+        payload = advisor_suggestions(
+            hours=hours,
+            days=days,
+            top_n=top_n,
+            min_trades=min_trades,
+            min_closed=min_closed,
+        )
+        return payload
+    except Exception as exc:
+        return {
+            "ok": False,
+            "error": "advisor_v2_suggestions_failed",
+            "detail": str(exc),
+        }
+
+
+
 @app.get("/journal/counts")
 def journal_counts():
     conn = _db()
