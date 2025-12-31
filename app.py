@@ -2468,7 +2468,6 @@ def advisor_v2_suggestions(
     hours: int = Query(24, ge=1, le=24*30),
     days: Optional[int] = Query(None, ge=1, le=365),
     top_n: int = Query(10, ge=1, le=50),
-    min_trades: int = Query(3, ge=0, le=100),
     min_closed: int = Query(3, ge=0, le=100),
 ):
     """
@@ -2484,7 +2483,6 @@ def advisor_v2_suggestions(
             hours=hours,
             days=days,
             top_n=top_n,
-            min_trades=min_trades,
             min_closed=min_closed,
         )
         return payload
