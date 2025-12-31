@@ -189,15 +189,17 @@
     @media (min-width: 1024px) {
       .main-grid {
         grid-template-columns: minmax(0,1.5fr) minmax(0,1.2fr);
-        grid-template-rows: auto auto auto;
+        grid-template-rows: auto auto auto auto;
         grid-template-areas:
           "perf risk"
-          "calendar side"
+          "calendar risk"
+          "trades side"
           "ops ops";
       }
       #card-perf { grid-area: perf; }
       #card-risk { grid-area: risk; }
       #card-calendar { grid-area: calendar; }
+      #card-trades { grid-area: trades; }
       #side-column { grid-area: side; display: flex; flex-direction: column; gap: 14px; }
       #card-ops { grid-area: ops; }
     }
@@ -539,7 +541,6 @@
         <span class="badge">UI <strong>v2.0.0</strong></span>
         <span class="badge"><span>Symbols:</span> <strong id="hdr_symbols">—</strong></span>
         <span class="badge"><span>Strategies:</span> <strong id="hdr_strats">—</strong></span>
-        <span class="badge" id="hdr_scheduler_badge">Scheduler: <strong id="hdr_scheduler">—</strong></span>
       </div>
     </header>
 
@@ -565,10 +566,10 @@
         <div class="kpi-value" id="kpi_exposure_value">$0.00</div>
         <div class="kpi-sub" id="kpi_exposure_sub">vs caps</div>
       </div>
-      <div class="kpi-card" id="kpi-kraken-value">
-        <div class="kpi-label">Kraken Value (Live)</div>
-        <div class="kpi-value" id="kpi_kraken_value">$0.00</div>
-        <div class="kpi-sub" id="kpi_kraken_sub">Kraken account value</div>
+      <div class="kpi-card" id="kpi-scheduler">
+        <div class="kpi-label">Scheduler</div>
+        <div class="kpi-value" id="kpi_sched_value">—</div>
+        <div class="kpi-sub" id="kpi_sched_sub">status &amp; last run</div>
       </div>
     </div>
 
@@ -684,7 +685,9 @@
       </section>
 
       <!-- Right column (strategies, recent trades, advisor) -->
-      <div id="side-column">
+      
+
+<div id="side-column">
         <!-- Strategies & Symbols -->
         <section class="card" id="card-strats">
           <div class="card-header">
@@ -1018,9 +1021,8 @@
         log("updateTopKpis failed", String(e));
       }
 
-      // Scheduler, Kraken value, and risk handled in their own functions
+      // Scheduler + risk handled in their own functions
       await updateSchedulerKpi();
-      await updateKrakenKpi();
       await updateRiskCard();
     }
 
@@ -1030,38 +1032,16 @@
         const last = await fetchJSON("/scheduler/last").catch(() => null);
         const running = !!status.enabled;
         const label = running ? "RUNNING" : "STOPPED";
-        const badge = document.getElementById("hdr_scheduler_badge");
-        const strong = document.getElementById("hdr_scheduler");
-        if (strong) {
-          strong.textContent = label;
+        $id("kpi_sched_value").textContent = label;
+        $id("kpi_sched_value").classList.remove("kpi-good","kpi-bad");
+        $id("kpi_sched_value").classList.add(running ? "kpi-good" : "kpi-bad");
+        let sub = "enabled=" + String(status.enabled) + ", ticks=" + String(status.ticks || status.tick || 0);
+        if (last && last.last_ts) {
+          sub += " • last " + String(last.last_ts);
         }
-        if (badge) {
-          let sub = "enabled=" + String(status.enabled) + ", ticks=" + String(status.ticks || status.tick || 0);
-          if (last && last.last_ts) {
-            sub += " • last " + String(last.last_ts);
-          }
-          badge.title = sub;
-        }
+        $id("kpi_sched_sub").textContent = sub;
       } catch (e) {
         log("updateSchedulerKpi failed", String(e));
-      }
-    }
-
-    async function updateKrakenKpi() {
-      try {
-        const res = await fetchJSON("/debug/kraken/value");
-        const valueEl = document.getElementById("kpi_kraken_value");
-        const subEl = document.getElementById("kpi_kraken_sub");
-        if (!res || !valueEl || !subEl) return;
-        const total = Number(res.total_value || 0);
-        valueEl.textContent = money(total);
-        let sub = "Kraken account value";
-        if (res.note) {
-          sub = res.note;
-        }
-        subEl.textContent = sub;
-      } catch (e) {
-        log("updateKrakenKpi failed", String(e));
       }
     }
 
