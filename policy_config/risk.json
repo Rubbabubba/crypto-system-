@@ -48,19 +48,19 @@
   },
   "risk_caps": {
     "max_notional_per_symbol": {
-      "ADAUSD": 80.0,
-      "AVAXUSD": 120.0,
-      "BCHUSD": 80.0,
+      "ADAUSD": 50.0,
+      "AVAXUSD": 0.0,
+      "BCHUSD": 50.0,
       "BTCUSD": 150.0,
-      "DOTUSD": 100.0,
-      "ETHUSD": 150.0,
+      "DOTUSD": 60.0,
+      "ETHUSD": 30.0,
       "LINKUSD": 100.0,
       "LTCUSD": 80.0,
       "NEARUSD": 80.0,
       "SOLUSD": 120.0,
-      "SUIUSD": 80.0,
-      "XRPUSD": 80.0,
-      "default": 80.0
+      "SUIUSD": 60.0,
+      "XRPUSD": 20.0,
+      "default": 40.0
     },
     "max_units_per_symbol": {
       "default": null
