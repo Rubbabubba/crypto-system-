@@ -634,9 +634,13 @@ def generate_report(
             "trades_fills": len(trades),
             "closed_chunks": len(closes),
         },
+        # Canonical lists and backwards-compatible aliases
         "per_strategy": per_strategy_list,
         "per_symbol": per_symbol_list,
         "per_pair": per_pair_list,
+        "per_strategy_list": per_strategy_list,
+        "per_symbol_list": per_symbol_list,
+        "per_pair_list": per_pair_list,
         "per_filter": {k: v for k, v in sorted(filter_counts.items(), key=lambda kv: kv[1].get("count", 0), reverse=True)},
         "per_strategy_filter": strat_filter_counts,
         "per_symbol_filter": sym_filter_counts,
@@ -761,9 +765,10 @@ def advisor_summary(hours: int = 24, days: Optional[int] = None, limit: int = 10
     window = rep.get("window", {}) or {}
     counts = rep.get("counts", {}) or {}
 
-    per_strategy_list = rep.get("per_strategy_list") or []
-    per_pair_list = rep.get("per_pair_list") or []
-    per_symbol_list = rep.get("per_symbol_list") or []
+    # Prefer explicit *_list keys, fall back to legacy fields if needed
+    per_strategy_list = rep.get("per_strategy_list") or rep.get("per_strategy") or []
+    per_pair_list = rep.get("per_pair_list") or rep.get("per_pair") or []
+    per_symbol_list = rep.get("per_symbol_list") or rep.get("per_symbol") or []
 
     # Trimmed leaderboards, sorted by realized PnL desc
     top_n = max(1, min(limit, 50))
@@ -812,8 +817,10 @@ def advisor_suggestions(
     if not rep.get("ok"):
         return rep
 
-    per_pair_list = rep.get("per_pair_list") or []
+    # Use new *_list keys when present, fall back to legacy fields otherwise
+    per_pair_list = rep.get("per_pair_list") or rep.get("per_pair") or []
     window = rep.get("window", {}) or {}
+    counts = rep.get("counts", {}) or {}
 
     # Group by strategy
     per_strategy: Dict[str, list] = {}
@@ -860,9 +867,22 @@ def advisor_suggestions(
         : max(1, min(top_n, 50))
     ]
 
+    # If we have no qualifying pairs, surface a structured reason and counts
+    if not per_strategy_out:
+        return {
+            "ok": True,
+            "window": window,
+            "per_strategy": [],
+            "overall_top_pairs": [],
+            "counts": counts,
+            "reason": "no_pairs_with_min_closed",
+            "min_closed": min_closed,
+        }
+
     return {
         "ok": True,
         "window": window,
         "per_strategy": per_strategy_out,
         "overall_top_pairs": overall_top,
+        "counts": counts,
     }
