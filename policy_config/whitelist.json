@@ -1,14 +1,12 @@
 {
   "c1": [
-    "SOL/USD",
-    "AVAX/USD"
+    "SOL/USD"
   ],
   "c2": [
     "BTC/USD",
     "ETH/USD",
     "XRP/USD",
-    "SUI/USD",
-    "AVAX/USD"
+    "SUI/USD"
   ],
   "c3": [
     "ADA/USD",
