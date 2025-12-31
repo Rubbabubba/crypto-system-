@@ -2661,6 +2661,89 @@ def debug_kraken():
     else:
         out["private"] = {"ok": False, "error": "no_creds_in_env"}
     return out
+@app.get("/debug/kraken/value")
+def debug_kraken_value():
+    """
+    Lightweight helper to approximate live Kraken account value in USD.
+
+    It uses the private Balance endpoint plus public Ticker prices via our
+    existing price_ticker helper. This is intentionally best-effort and
+    only used for the dashboard KPI.
+    """
+    key, sec, *_ = _kraken_creds()
+    if not (key and sec):
+        return {"ok": False, "error": "no_creds_in_env"}
+
+    try:
+        raw = kraken_private("Balance", {}, key, sec) or {}
+        balances = (raw.get("result") or {}) if isinstance(raw, dict) else {}
+    except Exception as e:
+        log.warning("/debug/kraken/value balance err: %s", e)
+        return {"ok": False, "error": str(e)}
+
+    def _clean_asset(a: str) -> str:
+        a = (a or "").upper().strip()
+        if not a:
+            return ""
+        # Strip common leading wrappers: XXBT -> XBT, XETH -> ETH, ZUSD -> USD, etc.
+        while len(a) >= 4 and a[0] in "XZ" and a[1] in "XZ":
+            a = a[1:]
+        if len(a) >= 4 and a[0] in "XZ":
+            a = a[1:]
+        # Drop trailing Z wrapper if present.
+        if len(a) >= 4 and a.endswith("Z"):
+            a = a[:-1]
+        if a == "XBT":
+            a = "BTC"
+        return a
+
+    prices: Dict[str, float] = {}
+    rows = []
+    total = 0.0
+
+    for raw_code, amt_s in balances.items():
+        try:
+            amt = float(amt_s or 0.0)
+        except Exception:
+            continue
+        if amt <= 0:
+            continue
+
+        base = _clean_asset(raw_code)
+        if not base:
+            continue
+
+        # Treat dollar-like assets as already USD.
+        if base in ("USD", "USDT", "USDC"):
+            px = 1.0
+        else:
+            if base not in prices:
+                info = price_ticker(base, "USD")
+                px = float((info or {}).get("price") or 0.0)
+                prices[base] = px
+            else:
+                px = prices[base]
+
+        usd_value = amt * px
+        total += usd_value
+        rows.append(
+            {
+                "asset_raw": raw_code,
+                "asset": base,
+                "amount": amt,
+                "price": px,
+                "usd_value": usd_value,
+            }
+        )
+
+    return {
+        "ok": True,
+        "total_value": total,
+        "assets": rows,
+        "note": "Approximate live Kraken value from Balance + Ticker",
+    }
+
+
 
 @app.get("/debug/db")
 def debug_db():
