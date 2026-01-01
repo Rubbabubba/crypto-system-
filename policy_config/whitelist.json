@@ -1,6 +1,7 @@
 {
   "c1": [
-    "SOL/USD"
+    "BTC/USD",
+    "ETH/USD"
   ],
   "c2": [
     "BTC/USD",
@@ -10,9 +11,7 @@
   ],
   "c3": [
     "ADA/USD",
-    "XRP/USD",
-    "DOT/USD",
-    "SOL/USD"
+    "XRP/USD"
   ],
   "c4": [
     "LTC/USD",
@@ -21,7 +20,6 @@
   ],
   "c5": [
     "LINK/USD",
-    "DOT/USD",
     "NEAR/USD"
   ],
   "c6": [
