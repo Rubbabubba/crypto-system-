@@ -2661,89 +2661,6 @@ def debug_kraken():
     else:
         out["private"] = {"ok": False, "error": "no_creds_in_env"}
     return out
-@app.get("/debug/kraken/value")
-def debug_kraken_value():
-    """
-    Lightweight helper to approximate live Kraken account value in USD.
-
-    It uses the private Balance endpoint plus public Ticker prices via our
-    existing price_ticker helper. This is intentionally best-effort and
-    only used for the dashboard KPI.
-    """
-    key, sec, *_ = _kraken_creds()
-    if not (key and sec):
-        return {"ok": False, "error": "no_creds_in_env"}
-
-    try:
-        raw = kraken_private("Balance", {}, key, sec) or {}
-        balances = (raw.get("result") or {}) if isinstance(raw, dict) else {}
-    except Exception as e:
-        log.warning("/debug/kraken/value balance err: %s", e)
-        return {"ok": False, "error": str(e)}
-
-    def _clean_asset(a: str) -> str:
-        a = (a or "").upper().strip()
-        if not a:
-            return ""
-        # Strip common leading wrappers: XXBT -> XBT, XETH -> ETH, ZUSD -> USD, etc.
-        while len(a) >= 4 and a[0] in "XZ" and a[1] in "XZ":
-            a = a[1:]
-        if len(a) >= 4 and a[0] in "XZ":
-            a = a[1:]
-        # Drop trailing Z wrapper if present.
-        if len(a) >= 4 and a.endswith("Z"):
-            a = a[:-1]
-        if a == "XBT":
-            a = "BTC"
-        return a
-
-    prices: Dict[str, float] = {}
-    rows = []
-    total = 0.0
-
-    for raw_code, amt_s in balances.items():
-        try:
-            amt = float(amt_s or 0.0)
-        except Exception:
-            continue
-        if amt <= 0:
-            continue
-
-        base = _clean_asset(raw_code)
-        if not base:
-            continue
-
-        # Treat dollar-like assets as already USD.
-        if base in ("USD", "USDT", "USDC"):
-            px = 1.0
-        else:
-            if base not in prices:
-                info = price_ticker(base, "USD")
-                px = float((info or {}).get("price") or 0.0)
-                prices[base] = px
-            else:
-                px = prices[base]
-
-        usd_value = amt * px
-        total += usd_value
-        rows.append(
-            {
-                "asset_raw": raw_code,
-                "asset": base,
-                "amount": amt,
-                "price": px,
-                "usd_value": usd_value,
-            }
-        )
-
-    return {
-        "ok": True,
-        "total_value": total,
-        "assets": rows,
-        "note": "Approximate live Kraken value from Balance + Ticker",
-    }
-
-
 
 @app.get("/debug/db")
 def debug_db():
@@ -4064,6 +3981,52 @@ def scheduler_core_debug(payload: Dict[str, Any] = Body(default=None)):
     symbols_csv = str(payload.get("symbols", os.getenv("SYMBOLS", "BTC/USD,ETH/USD")))
     syms = [s.strip().upper() for s in symbols_csv.split(",") if s.strip()]
 
+    # ------------------------------------------------------------------
+    # Policy-aligned universe: restrict scheduler symbols to whitelist + risk policy
+    # (prevents scanning/trading paused pairs even if SYMBOLS env includes them).
+    # ------------------------------------------------------------------
+    try:
+        wl_map = load_whitelist_config() or {}
+        rk_cfg = load_risk_config() or {}
+        # Union of whitelisted symbols for selected strategies
+        wl_union = set()
+        for st in strats:
+            for sym in (wl_map.get(st) or []):
+                wl_union.add(str(sym).strip().upper())
+
+        # Risk policy guards
+        avoid_pairs = set(str(x).strip().upper() for x in (rk_cfg.get("avoid_pairs") or []) if str(x).strip())
+        caps_map = (((rk_cfg.get("risk_caps") or {}).get("max_notional_per_symbol")) or {}) if isinstance(rk_cfg, dict) else {}
+        default_cap = float((((rk_cfg.get("risk_caps") or {}).get("default")) or 0.0)) if isinstance(rk_cfg, dict) else 0.0
+
+        def _pair_key(s: str) -> str:
+            return str(s).strip().upper().replace("/", "")
+
+        def _cap_for(sym: str) -> float:
+            k = _pair_key(sym)
+            v = caps_map.get(k)
+            try:
+                return float(v) if v is not None else float(default_cap or 0.0)
+            except Exception:
+                return float(default_cap or 0.0)
+
+        filtered = []
+        for sym in syms:
+            k = _pair_key(sym)
+            if wl_union and sym not in wl_union:
+                continue
+            if k in avoid_pairs:
+                continue
+            cap = _cap_for(sym)
+            if cap <= 0:
+                continue
+            filtered.append(sym)
+
+        if filtered:
+            syms = filtered
+    except Exception:
+        pass
+
     limit = int(payload.get("limit", int(os.getenv("SCHED_LIMIT", "300") or 300)))
     notional = float(payload.get("notional", float(os.getenv("SCHED_NOTIONAL", "25") or 25.0)))
 
@@ -4523,6 +4486,52 @@ def scheduler_run(payload: Dict[str, Any] = Body(default=None)):
         ]
         symbols_csv = str(payload.get("symbols", os.getenv("SYMBOLS", "BTC/USD,ETH/USD")))
         syms = [s.strip().upper() for s in symbols_csv.split(",") if s.strip()]
+
+    # ------------------------------------------------------------------
+    # Policy-aligned universe: restrict scheduler symbols to whitelist + risk policy
+    # (prevents scanning/trading paused pairs even if SYMBOLS env includes them).
+    # ------------------------------------------------------------------
+    try:
+        wl_map = load_whitelist_config() or {}
+        rk_cfg = load_risk_config() or {}
+        # Union of whitelisted symbols for selected strategies
+        wl_union = set()
+        for st in strats:
+            for sym in (wl_map.get(st) or []):
+                wl_union.add(str(sym).strip().upper())
+
+        # Risk policy guards
+        avoid_pairs = set(str(x).strip().upper() for x in (rk_cfg.get("avoid_pairs") or []) if str(x).strip())
+        caps_map = (((rk_cfg.get("risk_caps") or {}).get("max_notional_per_symbol")) or {}) if isinstance(rk_cfg, dict) else {}
+        default_cap = float((((rk_cfg.get("risk_caps") or {}).get("default")) or 0.0)) if isinstance(rk_cfg, dict) else 0.0
+
+        def _pair_key(s: str) -> str:
+            return str(s).strip().upper().replace("/", "")
+
+        def _cap_for(sym: str) -> float:
+            k = _pair_key(sym)
+            v = caps_map.get(k)
+            try:
+                return float(v) if v is not None else float(default_cap or 0.0)
+            except Exception:
+                return float(default_cap or 0.0)
+
+        filtered = []
+        for sym in syms:
+            k = _pair_key(sym)
+            if wl_union and sym not in wl_union:
+                continue
+            if k in avoid_pairs:
+                continue
+            cap = _cap_for(sym)
+            if cap <= 0:
+                continue
+            filtered.append(sym)
+
+        if filtered:
+            syms = filtered
+    except Exception:
+        pass
         limit = int(payload.get("limit", int(os.getenv("SCHED_LIMIT", "300") or 300)))
         notional = float(payload.get("notional", float(os.getenv("SCHED_NOTIONAL", "25") or 25)))
 
@@ -5256,6 +5265,52 @@ def scheduler_run_v2(payload: Dict[str, Any] = Body(default=None)):
     symbols_csv = str(payload.get("symbols", os.getenv("SYMBOLS", "BTC/USD,ETH/USD")))
     syms = [s.strip().upper() for s in symbols_csv.split(",") if s.strip()]
 
+    # ------------------------------------------------------------------
+    # Policy-aligned universe: restrict scheduler symbols to whitelist + risk policy
+    # (prevents scanning/trading paused pairs even if SYMBOLS env includes them).
+    # ------------------------------------------------------------------
+    try:
+        wl_map = load_whitelist_config() or {}
+        rk_cfg = load_risk_config() or {}
+        # Union of whitelisted symbols for selected strategies
+        wl_union = set()
+        for st in strats:
+            for sym in (wl_map.get(st) or []):
+                wl_union.add(str(sym).strip().upper())
+
+        # Risk policy guards
+        avoid_pairs = set(str(x).strip().upper() for x in (rk_cfg.get("avoid_pairs") or []) if str(x).strip())
+        caps_map = (((rk_cfg.get("risk_caps") or {}).get("max_notional_per_symbol")) or {}) if isinstance(rk_cfg, dict) else {}
+        default_cap = float((((rk_cfg.get("risk_caps") or {}).get("default")) or 0.0)) if isinstance(rk_cfg, dict) else 0.0
+
+        def _pair_key(s: str) -> str:
+            return str(s).strip().upper().replace("/", "")
+
+        def _cap_for(sym: str) -> float:
+            k = _pair_key(sym)
+            v = caps_map.get(k)
+            try:
+                return float(v) if v is not None else float(default_cap or 0.0)
+            except Exception:
+                return float(default_cap or 0.0)
+
+        filtered = []
+        for sym in syms:
+            k = _pair_key(sym)
+            if wl_union and sym not in wl_union:
+                continue
+            if k in avoid_pairs:
+                continue
+            cap = _cap_for(sym)
+            if cap <= 0:
+                continue
+            filtered.append(sym)
+
+        if filtered:
+            syms = filtered
+    except Exception:
+        pass
+
     limit = int(payload.get("limit", int(os.getenv("SCHED_LIMIT", "300") or 300)))
     notional = float(payload.get("notional", float(os.getenv("SCHED_NOTIONAL", "25") or 25.0)))
 
@@ -5881,11 +5936,11 @@ def scheduler_run_v2(payload: Dict[str, Any] = Body(default=None)):
         try:
             cooldown_same = int(os.getenv("SCHED_COOLDOWN_SAME_SIDE_SECONDS", "0") or 0)
             cooldown_flip = int(os.getenv("SCHED_COOLDOWN_FLIP_SECONDS", "0") or 0)
-            min_hold_exit = int(os.getenv("SCHED_MIN_HOLD_SECONDS", "0") or 0)
+            min_hold_seconds = int(os.getenv("SCHED_MIN_HOLD_SECONDS", "0") or 0)
             kind_l = str(getattr(intent, "kind", "") or "").strip().lower()
 
             # Stop-loss bypasses cooldown/min-hold (safety first)
-            if kind_l != "stop_loss" and (cooldown_same > 0 or cooldown_flip > 0 or (min_hold_exit > 0 and kind_l in ("exit", "take_profit"))):
+            if kind_l != "stop_loss" and (cooldown_same > 0 or cooldown_flip > 0 or (min_hold_seconds > 0 and kind_l in ("entry", "scale", "scale_in", "add"))):
                 key = (intent.symbol, intent.strategy)
                 now = time.time()
                 with _LAST_ACTION_LATCH_LOCK:
@@ -5912,9 +5967,9 @@ def scheduler_run_v2(payload: Dict[str, Any] = Body(default=None)):
                         actions.append(action_record)
                         continue
 
-                    if min_hold_exit > 0 and kind_l in ("exit", "take_profit") and age < min_hold_exit:
+                    if min_hold_seconds > 0 and kind_l in ("entry", "scale", "scale_in", "add") and age < min_hold_seconds:
                         action_record["status"] = "skipped_min_hold"
-                        action_record["error"] = f"min_hold:{age:.1f}s<{min_hold_exit}s"
+                        action_record["error"] = f"min_hold:{age:.1f}s<{min_hold_seconds}s"
                         try: log.info("scheduler_v2: %s %s %s blocked (%s)", intent.strategy, intent.symbol, side, action_record["error"])
                         except Exception: pass
                         actions.append(action_record)
