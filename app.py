@@ -4487,51 +4487,61 @@ def scheduler_run(payload: Dict[str, Any] = Body(default=None)):
         symbols_csv = str(payload.get("symbols", os.getenv("SYMBOLS", "BTC/USD,ETH/USD")))
         syms = [s.strip().upper() for s in symbols_csv.split(",") if s.strip()]
 
-    # ------------------------------------------------------------------
-    # Policy-aligned universe: restrict scheduler symbols to whitelist + risk policy
-    # (prevents scanning/trading paused pairs even if SYMBOLS env includes them).
-    # ------------------------------------------------------------------
-    try:
-        wl_map = load_whitelist_config() or {}
-        rk_cfg = load_risk_config() or {}
-        # Union of whitelisted symbols for selected strategies
-        wl_union = set()
-        for st in strats:
-            for sym in (wl_map.get(st) or []):
-                wl_union.add(str(sym).strip().upper())
+        # ------------------------------------------------------------------
+        # Policy-aligned universe: restrict scheduler symbols to whitelist + risk policy
+        # (prevents scanning/trading paused pairs even if SYMBOLS env includes them).
+        # ------------------------------------------------------------------
+        try:
+            wl_map = load_whitelist_config() or {}
+            rk_cfg = load_risk_config() or {}
 
-        # Risk policy guards
-        avoid_pairs = set(str(x).strip().upper() for x in (rk_cfg.get("avoid_pairs") or []) if str(x).strip())
-        caps_map = (((rk_cfg.get("risk_caps") or {}).get("max_notional_per_symbol")) or {}) if isinstance(rk_cfg, dict) else {}
-        default_cap = float((((rk_cfg.get("risk_caps") or {}).get("default")) or 0.0)) if isinstance(rk_cfg, dict) else 0.0
+            # Union of whitelisted symbols for selected strategies (if configured)
+            wl_union: set[str] = set()
+            for st in strats:
+                for sym in (wl_map.get(st) or []):
+                    s = str(sym).strip().upper()
+                    if s:
+                        wl_union.add(s)
 
-        def _pair_key(s: str) -> str:
-            return str(s).strip().upper().replace("/", "")
+            # Risk policy guards
+            avoid_pairs = set(
+                str(x).strip().upper()
+                for x in ((rk_cfg.get("avoid_pairs") or []) if isinstance(rk_cfg, dict) else [])
+                if str(x).strip()
+            )
 
-        def _cap_for(sym: str) -> float:
-            k = _pair_key(sym)
-            v = caps_map.get(k)
-            try:
-                return float(v) if v is not None else float(default_cap or 0.0)
-            except Exception:
-                return float(default_cap or 0.0)
+            risk_caps = (rk_cfg.get("risk_caps") or {}) if isinstance(rk_cfg, dict) else {}
+            caps_map = (risk_caps.get("max_notional_per_symbol") or {}) if isinstance(risk_caps, dict) else {}
+            default_cap = float(risk_caps.get("default") or 0.0) if isinstance(risk_caps, dict) else 0.0
 
-        filtered = []
-        for sym in syms:
-            k = _pair_key(sym)
-            if wl_union and sym not in wl_union:
-                continue
-            if k in avoid_pairs:
-                continue
-            cap = _cap_for(sym)
-            if cap <= 0:
-                continue
-            filtered.append(sym)
+            def _pair_key(s: str) -> str:
+                return str(s).strip().upper().replace("/", "")
 
-        if filtered:
-            syms = filtered
-    except Exception:
-        pass
+            def _cap_for(sym: str) -> float:
+                k = _pair_key(sym)
+                v = caps_map.get(k) if isinstance(caps_map, dict) else None
+                try:
+                    return float(v) if v is not None else float(default_cap or 0.0)
+                except Exception:
+                    return float(default_cap or 0.0)
+
+            filtered: List[str] = []
+            for sym in syms:
+                su = str(sym).strip().upper()
+                if not su:
+                    continue
+                if wl_union and su not in wl_union:
+                    continue
+                if su in avoid_pairs or _pair_key(su) in avoid_pairs:
+                    continue
+                if _cap_for(su) <= 0:
+                    continue
+                filtered.append(su)
+
+            if filtered:
+                syms = filtered
+        except Exception:
+            pass
         limit = int(payload.get("limit", int(os.getenv("SCHED_LIMIT", "300") or 300)))
         notional = float(payload.get("notional", float(os.getenv("SCHED_NOTIONAL", "25") or 25)))
 
