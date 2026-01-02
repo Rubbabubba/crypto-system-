@@ -23,14 +23,13 @@
       "symbol": "BCH/USD",
       "until": "2025-12-14T21:02:40Z"
     },
-    "DOTUSD",
-    "SOLUSD"
+    "LTCUSD"
   ],
   "cooldown_minutes_after_exit_for_mr": 30,
   "daily_flatten": {
     "enabled": true,
     "flatten_hour_local": 23,
-    "flatten_minute_local": 0
+    "flatten_minute_local": 55
   },
   "edge_multiple_vs_fee": 3.0,
   "exit_for_strategies": [
@@ -46,7 +45,7 @@
     "c1"
   ],
   "profit_lock": {
-    "take_profit_pct": 1.5
+    "take_profit_pct": 2.0
   },
   "risk_caps": {
     "max_notional_per_symbol": {
@@ -54,15 +53,15 @@
       "AVAXUSD": 0.0,
       "BCHUSD": 50.0,
       "BTCUSD": 150.0,
-      "DOTUSD": 0.0,
+      "DOTUSD": 60.0,
       "ETHUSD": 30.0,
-      "LINKUSD": 40.0,
-      "LTCUSD": 80.0,
+      "LINKUSD": 100.0,
+      "LTCUSD": 0.0,
       "NEARUSD": 80.0,
-      "SOLUSD": 0.0,
+      "SOLUSD": 120.0,
       "SUIUSD": 60.0,
       "XRPUSD": 20.0,
-      "default": 40.0
+      "default": 50.0
     },
     "max_units_per_symbol": {
       "default": null
@@ -72,13 +71,15 @@
   "tiers": {
     "tier1": [
       "BTCUSD",
-      "ETHUSD"
+      "ETHUSD",
+      "SOLUSD"
     ],
     "tier2": [
       "ADAUSD",
       "AVAXUSD",
       "BCHUSD",
       "DOGEUSD",
+      "DOTUSD",
       "LTCUSD",
       "LINKUSD",
       "NEARUSD",
