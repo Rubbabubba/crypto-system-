@@ -158,7 +158,7 @@ from pydantic import BaseModel
 # Version / Logging
 # --------------------------------------------------------------------------------------
 
-APP_VERSION = "2.0.0-hotfix.3"
+APP_VERSION = "2.0.0-hotfix.3+schedv2rebind"
 
 logging.basicConfig(
     level=logging.INFO,
@@ -5199,10 +5199,6 @@ def scheduler_run_v2(payload: Dict[str, Any] = Body(default=None)):
     actions: List[Dict[str, Any]] = []
     telemetry: List[Dict[str, Any]] = []
 
-    # --- request correlation id (helps debug 'null' responses) ---
-    _req_id = uuid.uuid4().hex[:10]
-    log.info("scheduler_v2_run start req_id=%s payload_keys=%s", _req_id, list((payload or {}).keys()))
-
     # small helpers for super-safe config access
     def _cfg_get(d: Any, key: str, default: Any = None) -> Any:
         return d.get(key, default) if isinstance(d, dict) else default
@@ -6250,8 +6246,7 @@ def _reconcile_positions_with_kraken(pos_list: Any) -> Any:
         # Never let telemetry logging break the API
         log.warning("scheduler_v2: failed to log telemetry: %s", e)
 
-    out = {
-        "req_id": _req_id,
+    return {
         "ok": True,
         "dry": bool(dry),
         "config": config_snapshot,
@@ -6259,9 +6254,41 @@ def _reconcile_positions_with_kraken(pos_list: Any) -> Any:
         "telemetry": telemetry,
         "universe": universe,
     }
-    # Always return an explicit JSON response (defensive against accidental None)
-    log.info("scheduler_v2_run end req_id=%s actions=%s", _req_id, len(out.get("actions") or []))
-    return JSONResponse(content=out)
+
+
+
+# --------------------------------------------------------------------------------------
+# HOTFIX: Force /scheduler/v2/run to bind to the real scheduler_run_v2 handler.
+# If an earlier stub route got registered (causing 200 null), we remove it and re-add.
+# --------------------------------------------------------------------------------------
+try:
+    from fastapi.routing import APIRoute
+
+    def _rebind_scheduler_v2_run():
+        try:
+            before = len(getattr(app.router, "routes", []) or [])
+            new_routes = []
+            removed = 0
+            for r in getattr(app.router, "routes", []) or []:
+                if isinstance(r, APIRoute) and getattr(r, "path", None) == "/scheduler/v2/run" and "POST" in (getattr(r, "methods", set()) or set()):
+                    removed += 1
+                    continue
+                new_routes.append(r)
+            if removed:
+                app.router.routes = new_routes  # type: ignore
+                log.warning("Rebinding /scheduler/v2/run: removed %s old route(s)", removed)
+
+            # Re-add the correct handler explicitly
+            app.add_api_route("/scheduler/v2/run", scheduler_run_v2, methods=["POST"])
+            after = len(getattr(app.router, "routes", []) or [])
+            log.info("Rebinding /scheduler/v2/run complete (routes before=%s after=%s)", before, after)
+        except Exception as _e:
+            log.exception("Failed to rebind /scheduler/v2/run: %s", _e)
+
+    _rebind_scheduler_v2_run()
+except Exception:
+    # If APIRoute isn't available for some reason, skip rebinding.
+    pass
 
 
 # ---- New core debug endpoint) ------------------------------------------------------------        
