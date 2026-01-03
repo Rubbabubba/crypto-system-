@@ -668,6 +668,8 @@ def market_notional(
     # Compute base volume from USD notional.
     volume = float(notional) / px
 
+    avail_for_sell: Optional[float] = None  # only set for spot SELL preflight
+
     # Spot-safe preflight: cap sell volume to available base balance so we don't hit
     # EOrder:Insufficient funds when our paper position size differs from exchange.
     # Note: we only cap SELL on spot. For BUY (spending quote), we leave as-is for now.
@@ -679,6 +681,7 @@ def market_notional(
 
         base = (ui.split('/', 1)[0] if '/' in ui else ui).strip().upper()
         avail = float(_get_balance_float(bal, base) or 0.0)
+        avail_for_sell = avail
         # If we don't have the asset, nothing to sell.
         if avail <= 0:
             return {"ok": False, "error": f"market_notional failed: insufficient {base} balance (avail={avail})"}
@@ -701,20 +704,14 @@ def market_notional(
         return {"ok": False, "error": "market_notional failed: volume <= 0 after precision truncation"}
 
     if ordermin > 0.0 and float(volume) < ordermin:
-        # For SELL exits: if we have enough available to meet the minimum, bump to ordermin
-        # (otherwise we'd spam failed exits when we're just barely under the threshold due to
-        # price movement / truncation). For BUY or when avail < ordermin, keep failing.
-        if side.lower() == "sell":
-            try:
-                bal = _fetch_balances()
-                base_ui = (ui.split('/', 1)[0] if '/' in ui else ui).strip().upper()
-                avail2 = float(_get_balance_float(bal, base_ui) or 0.0)
-            except Exception:
-                avail2 = 0.0
-            if avail2 >= ordermin:
-                volume = ordermin
+        # SELL handling:
+        # - If we *do* have enough available base to meet Kraken minimum, bump to minimum.
+        # - If we *do not* have enough (true dust), return a distinct error for callers to quarantine.
+        if side.lower() == "sell" and avail_for_sell is not None:
+            if float(avail_for_sell) >= ordermin:
+                volume = _truncate_to_decimals(float(ordermin), lot_decimals)
             else:
-                return {"ok": False, "error": f"market_notional failed: below_min_volume:{volume}<{ordermin} (pair={pair})"}
+                return {"ok": False, "error": f"market_notional failed: dust_below_min_volume:{volume}<{ordermin} (pair={pair}) (avail={avail_for_sell})"}
         else:
             return {"ok": False, "error": f"market_notional failed: below_min_volume:{volume}<{ordermin} (pair={pair})"}
 

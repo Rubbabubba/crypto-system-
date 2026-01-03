@@ -175,6 +175,14 @@ log = logging.getLogger("crypto-system-api")
 _LAST_ACTION_LATCH = {}  # (symbol, strategy) -> {ts, side, kind}
 _LAST_ACTION_LATCH_LOCK = threading.Lock()
 
+# ------------------------------------------------------------------------------
+# Dust/min-volume latch (in-memory): prevent repeated sell attempts that Kraken will reject
+# Keyed by Kraken pair and side.
+# ------------------------------------------------------------------------------
+_DUST_LATCH = {}  # (pair, side) -> {ts, until, avail, ordermin, reason}
+_DUST_LATCH_LOCK = threading.Lock()
+
+
 # --------------------------------------------------------------------------------------
 # Risk config loader (policy_config/risk.json)
 # --------------------------------------------------------------------------------------
@@ -2732,7 +2740,7 @@ def debug_strategy_scan(payload: Dict[str, Any] = Body(default=None)):
     notional = float(payload.get("notional", float(os.getenv("SCHED_NOTIONAL", "25") or 25.0)))
 
     # Load positions + risk config, then normalize positions to dict[(symbol,strat)] -> Position
-    raw_positions = _load_reconciled_positions(use_strategy_col=True, include_legacy=False)
+    raw_positions = _load_open_positions_from_trades(use_strategy_col=True)
     risk_cfg = load_risk_config() or {}
 
     positions: Dict[Tuple[str, str], Position] = {}
@@ -3689,41 +3697,6 @@ def debug_kraken_positions(
     except Exception as e:
         return {"ok": False, "error": str(e)}
     
-@app.get("/debug/kraken/value")
-def debug_kraken_value():
-    """Approximate live Kraken portfolio value using Balance + last prices.
-
-    - Uses broker_kraken.positions() for balances (already normalized).
-    - Prices via _last_price_safe(symbol).
-    - Returns USD cash + sum(asset_qty * last_price(asset/USD)).
-
-    Note: This is a best-effort mark-to-market; it does not include margin,
-    staking rewards not in Balance, or unrealized PnL on derivatives.
-    """
-    try:
-        import broker_kraken
-        bals = broker_kraken.positions() or []
-        total = 0.0
-        breakdown = []
-        for row in bals:
-            asset = str(row.get("asset") or "").upper().strip()
-            qty = float(row.get("qty") or 0.0)
-            if qty <= 0:
-                continue
-            if asset == "USD":
-                total += qty
-                breakdown.append({"asset": "USD", "qty": qty, "px": 1.0, "value": qty})
-                continue
-            sym = f"{asset}/USD"
-            px = float(_last_price_safe(sym) or 0.0)
-            val = qty * px
-            total += val
-            breakdown.append({"asset": asset, "qty": qty, "px": px, "value": val})
-        breakdown.sort(key=lambda x: float(x.get("value") or 0.0), reverse=True)
-        return {"ok": True, "total_usd": total, "breakdown": breakdown}
-    except Exception as e:
-        return {"ok": False, "error": str(e)}
-
 @app.get("/debug/global_policy")
 def debug_global_policy():
     """
@@ -4076,7 +4049,7 @@ def scheduler_core_debug(payload: Dict[str, Any] = Body(default=None)):
     }
 
     # positions + risk_cfg
-    positions = _load_reconciled_positions(use_strategy_col=True, include_legacy=False)
+    positions = _load_open_positions_from_trades(use_strategy_col=True)
     # Normalize positions for scheduler_core: it expects a dict keyed by (symbol, strategy)
     # _load_open_positions_from_trades returns a List[Position] for debug friendliness.
     if isinstance(positions, list):
@@ -4233,7 +4206,7 @@ def scheduler_risk_debug(
     - symbol caps
     - global exit decision (if any)
     """
-    positions = _load_reconciled_positions(use_strategy_col=True, include_legacy=False)
+    positions = _load_open_positions_from_trades(use_strategy_col=True)
     # Normalize positions for scheduler_core: it expects a dict keyed by (symbol, strategy)
     # _load_open_positions_from_trades returns a List[Position] for debug friendliness.
     if isinstance(positions, list):
@@ -4602,7 +4575,7 @@ def scheduler_run(payload: Dict[str, Any] = Body(default=None)):
         log.info(msg)
 
         # Load open positions keyed by (symbol, strategy).
-        positions = _load_reconciled_positions(use_strategy_col=True, include_legacy=False)
+        positions = _load_open_positions_from_trades(use_strategy_col=True)
         # Normalize positions for scheduler_core: it expects a dict keyed by (symbol, strategy)
         # _load_open_positions_from_trades returns a List[Position] for debug friendliness.
         if isinstance(positions, list):
@@ -5399,7 +5372,7 @@ def scheduler_run_v2(payload: Dict[str, Any] = Body(default=None)):
     # ------------------------------------------------------------------
     # Load positions & risk config
     # ------------------------------------------------------------------
-    positions = _load_reconciled_positions(use_strategy_col=True, include_legacy=False)
+    positions = _load_open_positions_from_trades(use_strategy_col=True)
     # Normalize positions for scheduler_core: it expects a dict keyed by (symbol, strategy)
     # _load_open_positions_from_trades returns a List[Position] for debug friendliness.
     if isinstance(positions, list):
@@ -6039,6 +6012,36 @@ def scheduler_run_v2(payload: Dict[str, Any] = Body(default=None)):
                         telemetry.append({"t": "skip_open_order", "symbol": intent.symbol, "pair": kpair, "strat": intent.strat})
                         continue
 
+            # Dust/min-volume latch: skip repeated sell attempts that Kraken will reject
+            try:
+                if side == 'sell':
+                    try:
+                        kpair = to_kraken(intent.symbol)
+                    except Exception:
+                        kpair = None
+                    if kpair:
+                        with _DUST_LATCH_LOCK:
+                            d = _DUST_LATCH.get((kpair, side))
+                        if d and float(time.time()) < float(d.get('until') or 0):
+                            action_record['status'] = 'skipped_dust_latched'
+                            action_record['error'] = f"dust_latched (pair={kpair})"
+                            telemetry.append({
+                                't': 'dust_latched_skip',
+                                'symbol': intent.symbol,
+                                'pair': kpair,
+                                'strategy': intent.strategy,
+                                'kind': str(getattr(intent, 'kind', None) or ''),
+                                'side': side,
+                                'until': d.get('until'),
+                                'avail': d.get('avail'),
+                                'ordermin': d.get('ordermin'),
+                                'reason': d.get('reason'),
+                            })
+                            actions.append(action_record)
+                            continue
+            except Exception:
+                pass
+
             resp = br.market_notional(
                 symbol=intent.symbol,
                 side=side,
@@ -6047,23 +6050,55 @@ def scheduler_run_v2(payload: Dict[str, Any] = Body(default=None)):
             )
             action_record["status"] = "sent"
             action_record["response"] = resp
-
-
-            # Update anti-churn latch immediately on send
+            
+            # If broker returned a min-volume/dust error, latch it to avoid repeated failures
             try:
-                with _LAST_ACTION_LATCH_LOCK:
-                    _LAST_ACTION_LATCH[(intent.symbol, intent.strategy)] = {
-                        "ts": time.time(),
-                        "side": side,
-                        "kind": str(getattr(intent, "kind", None) or ""),
-                    }
+                if isinstance(resp, dict) and not bool(resp.get('ok', True)):
+                    err = str(resp.get('error') or '')
+                    if 'dust_below_min_volume' in err or 'below_min_volume' in err:
+                        try:
+                            kpair = to_kraken(intent.symbol)
+                        except Exception:
+                            kpair = None
+                        if kpair:
+                            ttl = float(os.getenv('DUST_TTL_SECONDS', '86400') or 86400)
+                            until = float(time.time()) + ttl
+                            # Best-effort parse avail and ordermin from error string
+                            m_av = re.search(r'\(avail=([0-9\.eE\-\+]+)\)', err)
+                            m_om = re.search(r'<([0-9\.eE\-\+]+)', err)
+                            avail_v = float(m_av.group(1)) if m_av else None
+                            ordermin_v = float(m_om.group(1)) if m_om else None
+                            with _DUST_LATCH_LOCK:
+                                _DUST_LATCH[(kpair, side)] = {
+                                    'ts': float(time.time()),
+                                    'until': until,
+                                    'avail': avail_v,
+                                    'ordermin': ordermin_v,
+                                    'reason': err,
+                                }
+                            action_record['status'] = 'dust' if 'dust_below_min_volume' in err else 'below_min_volume'
             except Exception:
                 pass
+            
+
             otx, ur = _extract_ordertxid_userref(resp)
             if otx:
                 action_record["ordertxid"] = otx
             if ur:
                 action_record["userref"] = ur
+            
+            # Update anti-churn latch only if order was actually accepted (has txid)
+            try:
+                if action_record.get('ordertxid') and action_record.get('status') == 'sent':
+                    with _LAST_ACTION_LATCH_LOCK:
+                        _LAST_ACTION_LATCH[(intent.symbol, intent.strategy)] = {
+                            'ts': time.time(),
+                            'side': side,
+                            'kind': str(getattr(intent, 'kind', None) or ''),
+                        }
+            except Exception:
+                pass
+            
 
         except Exception as e:
             log.error("scheduler_v2: broker error for %s %s: %s", intent.symbol, side, e)
@@ -6226,7 +6261,7 @@ def scheduler_core_debug(payload: Dict[str, Any] = Body(default=None)):
 
     # Pseudocode sketch (you’ll adapt from your existing scheduler_run):
     now = dt.datetime.utcnow()
-    positions = _load_reconciled_positions(use_strategy_col=True, include_legacy=False)
+    positions = _load_open_positions_from_trades(use_strategy_col=True)
     # Normalize positions for scheduler_core: it expects a dict keyed by (symbol, strategy)
     # _load_open_positions_from_trades returns a List[Position] for debug friendliness.
     if isinstance(positions, list):
@@ -6385,7 +6420,7 @@ def scheduler_core_debug_risk(payload: Dict[str, Any] = Body(default=None)):
         symbols = [str(s).strip().upper() for s in symbols_csv or []]
 
     # 2) Load positions & risk_cfg exactly as scheduler_run does
-    positions = _load_reconciled_positions(use_strategy_col=True, include_legacy=False)
+    positions = _load_open_positions_from_trades(use_strategy_col=True)
     # Normalize positions for scheduler_core: it expects a dict keyed by (symbol, strategy)
     # _load_open_positions_from_trades returns a List[Position] for debug friendliness.
     if isinstance(positions, list):
@@ -6772,87 +6807,6 @@ def _load_open_positions_from_trades(use_strategy_col: bool = True, include_lega
         return out
     finally:
         conn.close()
-
-def _load_reconciled_positions(
-    use_strategy_col: bool = True,
-    include_legacy: bool = False,
-) -> Dict[Tuple[str, str], Position]:
-    """Reconcile local journal-derived positions with live Kraken balances.
-
-    Rule:
-      - Kraken balances are the SELL authority (spot reality).
-      - Journal positions provide avg_price + per-strategy attribution *only*.
-      - If Kraken has 0 for an asset, that position is excluded from the returned map
-        (prevents phantom exits / incorrect exposure).
-
-    Strategy attribution:
-      - If journal has multiple strategies for an asset, distribute Kraken qty
-        proportionally to journal qty.
-      - If no journal attribution exists, label strategy='unattributed'.
-    """
-    # --- Journal (local) ---
-    journal_list = _load_open_positions_from_trades(use_strategy_col=bool(use_strategy_col), include_legacy=include_legacy)
-    journal_map: Dict[Tuple[str, str], Position] = {}
-    if isinstance(journal_list, list):
-        for p in journal_list:
-            try:
-                sym = (getattr(p, "symbol", "") or "").strip().upper()
-                strat = (getattr(p, "strategy", "") or "").strip().lower() or ("misc" if not use_strategy_col else "default")
-                qty = float(getattr(p, "qty", 0.0) or 0.0)
-                if sym and abs(qty) > 1e-12:
-                    journal_map[(sym, strat)] = p
-            except Exception:
-                continue
-
-    # Aggregate journal by base asset
-    journal_by_asset: Dict[str, float] = {}
-    journal_details: Dict[str, List[Tuple[str, str, float, Optional[float]]]] = {}
-    for (sym, strat), p in journal_map.items():
-        base = sym.split("/", 1)[0].strip().upper() if "/" in sym else sym.strip().upper()
-        qty = float(getattr(p, "qty", 0.0) or 0.0)
-        journal_by_asset[base] = journal_by_asset.get(base, 0.0) + qty
-        journal_details.setdefault(base, []).append((sym, strat, qty, getattr(p, "avg_price", None)))
-
-    # --- Kraken (live balances) ---
-    kraken_bal: Dict[str, float] = {}
-    try:
-        import broker_kraken
-        for row in broker_kraken.positions() or []:
-            a = str(row.get("asset") or "").strip().upper()
-            q = float(row.get("qty") or 0.0)
-            if a:
-                kraken_bal[a] = kraken_bal.get(a, 0.0) + q
-    except Exception:
-        kraken_bal = {}
-
-    # Build reconciled positions map
-    out: Dict[Tuple[str, str], Position] = {}
-    for asset, kqty in kraken_bal.items():
-        if asset == "USD":
-            continue
-        if kqty <= 0:
-            continue
-
-        sym = f"{asset}/USD"
-
-        # If the system doesn't trade this symbol, still expose it as 'unattributed'
-        # so exits can flatten it safely (global exit/risk).
-        if asset in journal_details and journal_by_asset.get(asset, 0.0) > 0 and use_strategy_col:
-            total = float(journal_by_asset[asset])
-            for (jsym, jstrat, jqty, javg) in journal_details[asset]:
-                ratio = (float(jqty) / total) if total > 0 else 0.0
-                alloc = float(kqty) * ratio
-                if alloc <= 1e-12:
-                    continue
-                # prefer journal symbol if it matches the asset
-                osym = (jsym or sym).strip().upper()
-                out[(osym, jstrat)] = Position(symbol=osym, strategy=jstrat, qty=alloc, avg_price=javg)
-        else:
-            out[(sym, "unattributed")] = Position(symbol=sym, strategy="unattributed", qty=float(kqty), avg_price=None)
-
-    return out
-
-
 @app.get("/pnl/by_strategy")
 def pnl_by_strategy(start: Optional[str] = None, end: Optional[str] = None,
                     realized_only: Optional[str] = "true", tz: Optional[str] = "UTC"):
