@@ -701,7 +701,22 @@ def market_notional(
         return {"ok": False, "error": "market_notional failed: volume <= 0 after precision truncation"}
 
     if ordermin > 0.0 and float(volume) < ordermin:
-        return {"ok": False, "error": f"market_notional failed: below_min_volume:{volume}<{ordermin} (pair={pair})"}
+        # For SELL exits: if we have enough available to meet the minimum, bump to ordermin
+        # (otherwise we'd spam failed exits when we're just barely under the threshold due to
+        # price movement / truncation). For BUY or when avail < ordermin, keep failing.
+        if side.lower() == "sell":
+            try:
+                bal = _fetch_balances()
+                base_ui = (ui.split('/', 1)[0] if '/' in ui else ui).strip().upper()
+                avail2 = float(_get_balance_float(bal, base_ui) or 0.0)
+            except Exception:
+                avail2 = 0.0
+            if avail2 >= ordermin:
+                volume = ordermin
+            else:
+                return {"ok": False, "error": f"market_notional failed: below_min_volume:{volume}<{ordermin} (pair={pair})"}
+        else:
+            return {"ok": False, "error": f"market_notional failed: below_min_volume:{volume}<{ordermin} (pair={pair})"}
 
     payload = {
         "pair": pair,
