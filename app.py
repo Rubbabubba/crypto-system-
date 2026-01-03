@@ -158,7 +158,7 @@ from pydantic import BaseModel
 # Version / Logging
 # --------------------------------------------------------------------------------------
 
-APP_VERSION = "2.0.0-hotfix.3+schedv2rebind"
+APP_VERSION = "2.0.0-hotfix.3"
 
 logging.basicConfig(
     level=logging.INFO,
@@ -5415,34 +5415,34 @@ def _reconcile_positions_with_kraken(pos_list: Any) -> Any:
         except Exception:
             continue
 
-    by_asset: Dict[str, List[Any]] = {}
-    for p in pos_list:
-        sym = (getattr(p, "symbol", "") or "").strip()
-        asset = sym.split("/")[0].upper().strip() if "/" in sym else sym.upper().strip()[:4]
-        by_asset.setdefault(asset, []).append(p)
+        by_asset: Dict[str, List[Any]] = {}
+        for p in pos_list:
+            sym = (getattr(p, "symbol", "") or "").strip()
+            asset = sym.split("/")[0].upper().strip() if "/" in sym else sym.upper().strip()[:4]
+            by_asset.setdefault(asset, []).append(p)
 
-    out: List[Any] = []
-    for asset, plist in by_asset.items():
-        kqty = float(kr_map.get(asset, 0) or 0)
-        if kqty <= 0:
-            # Kraken doesn't hold it -> no exits should be generated for it
-            continue
-        jtot = 0.0
-        for p in plist:
-            try:
-                jtot += float(getattr(p, "qty", 0) or 0)
-            except Exception:
-                pass
-        if jtot <= 0:
-            continue
-        scale = kqty / jtot
-        for p in plist:
-            try:
-                p.qty = float(getattr(p, "qty", 0) or 0) * scale
-            except Exception:
-                pass
-            out.append(p)
-    return out
+        out: List[Any] = []
+        for asset, plist in by_asset.items():
+            kqty = float(kr_map.get(asset, 0) or 0)
+            if kqty <= 0:
+                # Kraken doesn't hold it -> no exits should be generated for it
+                continue
+            jtot = 0.0
+            for p in plist:
+                try:
+                    jtot += float(getattr(p, "qty", 0) or 0)
+                except Exception:
+                    pass
+            if jtot <= 0:
+                continue
+            scale = kqty / jtot
+            for p in plist:
+                try:
+                    p.qty = float(getattr(p, "qty", 0) or 0) * scale
+                except Exception:
+                    pass
+                out.append(p)
+        return out
 
     # Load positions & risk config
     # ------------------------------------------------------------------
@@ -6256,39 +6256,6 @@ def _reconcile_positions_with_kraken(pos_list: Any) -> Any:
     }
 
 
-
-# --------------------------------------------------------------------------------------
-# HOTFIX: Force /scheduler/v2/run to bind to the real scheduler_run_v2 handler.
-# If an earlier stub route got registered (causing 200 null), we remove it and re-add.
-# --------------------------------------------------------------------------------------
-try:
-    from fastapi.routing import APIRoute
-
-    def _rebind_scheduler_v2_run():
-        try:
-            before = len(getattr(app.router, "routes", []) or [])
-            new_routes = []
-            removed = 0
-            for r in getattr(app.router, "routes", []) or []:
-                if isinstance(r, APIRoute) and getattr(r, "path", None) == "/scheduler/v2/run" and "POST" in (getattr(r, "methods", set()) or set()):
-                    removed += 1
-                    continue
-                new_routes.append(r)
-            if removed:
-                app.router.routes = new_routes  # type: ignore
-                log.warning("Rebinding /scheduler/v2/run: removed %s old route(s)", removed)
-
-            # Re-add the correct handler explicitly
-            app.add_api_route("/scheduler/v2/run", scheduler_run_v2, methods=["POST"])
-            after = len(getattr(app.router, "routes", []) or [])
-            log.info("Rebinding /scheduler/v2/run complete (routes before=%s after=%s)", before, after)
-        except Exception as _e:
-            log.exception("Failed to rebind /scheduler/v2/run: %s", _e)
-
-    _rebind_scheduler_v2_run()
-except Exception:
-    # If APIRoute isn't available for some reason, skip rebinding.
-    pass
 
 
 # ---- New core debug endpoint) ------------------------------------------------------------        
