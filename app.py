@@ -158,7 +158,7 @@ from pydantic import BaseModel
 # Version / Logging
 # --------------------------------------------------------------------------------------
 
-APP_VERSION = "2.0.0-hotfix.3"
+APP_VERSION = "2.0.0-hotfix.4-schedv2nullfix"
 
 logging.basicConfig(
     level=logging.INFO,
@@ -6246,14 +6246,23 @@ def _reconcile_positions_with_kraken(pos_list: Any) -> Any:
         # Never let telemetry logging break the API
         log.warning("scheduler_v2: failed to log telemetry: %s", e)
 
-    return {
+
+    out = {
         "ok": True,
         "dry": bool(dry),
         "config": config_snapshot,
         "actions": actions,
         "telemetry": telemetry,
         "universe": universe,
+        # deploy marker / smoke-test
+        "scheduler_v2_run_marker": "v5.0.10",
+        "server_time_utc": datetime.datetime.utcnow().replace(microsecond=0).isoformat() + "Z",
     }
+    # Hard guard: never allow FastAPI to serialize a bare None (which becomes JSON null).
+    if out is None:
+        out = {"ok": False, "error": "scheduler_v2_run produced None unexpectedly"}
+    return JSONResponse(content=out)
+
 
 
 
