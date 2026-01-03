@@ -175,14 +175,6 @@ log = logging.getLogger("crypto-system-api")
 _LAST_ACTION_LATCH = {}  # (symbol, strategy) -> {ts, side, kind}
 _LAST_ACTION_LATCH_LOCK = threading.Lock()
 
-# ------------------------------------------------------------------------------
-# Dust/min-volume latch (in-memory): prevent repeated sell attempts that Kraken will reject
-# Keyed by Kraken pair and side.
-# ------------------------------------------------------------------------------
-_DUST_LATCH = {}  # (pair, side) -> {ts, until, avail, ordermin, reason}
-_DUST_LATCH_LOCK = threading.Lock()
-
-
 # --------------------------------------------------------------------------------------
 # Risk config loader (policy_config/risk.json)
 # --------------------------------------------------------------------------------------
@@ -3575,6 +3567,39 @@ def debug_env():
     env = {k: os.getenv(k) for k in keys}
     return {"ok": True, "env": env}
     
+
+@app.get("/debug/kraken/value")
+def debug_kraken_value():
+    """Live Kraken portfolio value (best-effort)."""
+    try:
+        try:
+            bals = broker_kraken.positions()  # [{"asset":..,"qty":..}, ...]
+        except Exception as e:
+            return {"ok": False, "error": f"positions_error:{e}"}
+
+        breakdown = []
+        total = 0.0
+        for row in bals:
+            asset = str(row.get("asset","")).upper()
+            if not asset:
+                continue
+            qty = float(row.get("qty", 0) or 0)
+            if qty == 0:
+                continue
+            px = 1.0
+            if asset != "USD":
+                try:
+                    px = float(broker_kraken.last_price(f"{asset}USD") or 0) or 0.0
+                except Exception:
+                    px = 0.0
+            val = qty * px
+            breakdown.append({"asset": asset, "qty": qty, "px": px, "value": val})
+            total += val
+        breakdown.sort(key=lambda r: (0 if r["asset"]=="USD" else 1, r["asset"]))
+        return {"ok": True, "total_usd": total, "breakdown": breakdown}
+    except Exception as e:
+        return {"ok": False, "error": f"debug_kraken_value_error:{e}"}
+
 @app.get("/debug/kraken/positions")
 def debug_kraken_positions(
     use_strategy: bool = True,
@@ -4050,6 +4075,7 @@ def scheduler_core_debug(payload: Dict[str, Any] = Body(default=None)):
 
     # positions + risk_cfg
     positions = _load_open_positions_from_trades(use_strategy_col=True)
+    positions = _reconcile_positions_with_kraken(positions)
     # Normalize positions for scheduler_core: it expects a dict keyed by (symbol, strategy)
     # _load_open_positions_from_trades returns a List[Position] for debug friendliness.
     if isinstance(positions, list):
@@ -5370,6 +5396,54 @@ def scheduler_run_v2(payload: Dict[str, Any] = Body(default=None)):
         guard_allows = None  # optional; strategies already use guard internally
 
     # ------------------------------------------------------------------
+
+def _reconcile_positions_with_kraken(pos_list: Any) -> Any:
+    """Return journal positions filtered/scaled to live Kraken balances."""
+    if not isinstance(pos_list, list):
+        return pos_list
+    try:
+        kr_raw = broker_kraken.positions() or []
+    except Exception:
+        kr_raw = []
+    kr_map: Dict[str, float] = {}
+    for r in kr_raw:
+        try:
+            a = str(r.get("asset","")).upper().strip()
+            if not a:
+                continue
+            kr_map[a] = float(r.get("qty",0) or 0)
+        except Exception:
+            continue
+
+    by_asset: Dict[str, List[Any]] = {}
+    for p in pos_list:
+        sym = (getattr(p, "symbol", "") or "").strip()
+        asset = sym.split("/")[0].upper().strip() if "/" in sym else sym.upper().strip()[:4]
+        by_asset.setdefault(asset, []).append(p)
+
+    out: List[Any] = []
+    for asset, plist in by_asset.items():
+        kqty = float(kr_map.get(asset, 0) or 0)
+        if kqty <= 0:
+            # Kraken doesn't hold it -> no exits should be generated for it
+            continue
+        jtot = 0.0
+        for p in plist:
+            try:
+                jtot += float(getattr(p, "qty", 0) or 0)
+            except Exception:
+                pass
+        if jtot <= 0:
+            continue
+        scale = kqty / jtot
+        for p in plist:
+            try:
+                p.qty = float(getattr(p, "qty", 0) or 0) * scale
+            except Exception:
+                pass
+            out.append(p)
+    return out
+
     # Load positions & risk config
     # ------------------------------------------------------------------
     positions = _load_open_positions_from_trades(use_strategy_col=True)
@@ -6012,36 +6086,6 @@ def scheduler_run_v2(payload: Dict[str, Any] = Body(default=None)):
                         telemetry.append({"t": "skip_open_order", "symbol": intent.symbol, "pair": kpair, "strat": intent.strat})
                         continue
 
-            # Dust/min-volume latch: skip repeated sell attempts that Kraken will reject
-            try:
-                if side == 'sell':
-                    try:
-                        kpair = to_kraken(intent.symbol)
-                    except Exception:
-                        kpair = None
-                    if kpair:
-                        with _DUST_LATCH_LOCK:
-                            d = _DUST_LATCH.get((kpair, side))
-                        if d and float(time.time()) < float(d.get('until') or 0):
-                            action_record['status'] = 'skipped_dust_latched'
-                            action_record['error'] = f"dust_latched (pair={kpair})"
-                            telemetry.append({
-                                't': 'dust_latched_skip',
-                                'symbol': intent.symbol,
-                                'pair': kpair,
-                                'strategy': intent.strategy,
-                                'kind': str(getattr(intent, 'kind', None) or ''),
-                                'side': side,
-                                'until': d.get('until'),
-                                'avail': d.get('avail'),
-                                'ordermin': d.get('ordermin'),
-                                'reason': d.get('reason'),
-                            })
-                            actions.append(action_record)
-                            continue
-            except Exception:
-                pass
-
             resp = br.market_notional(
                 symbol=intent.symbol,
                 side=side,
@@ -6050,55 +6094,23 @@ def scheduler_run_v2(payload: Dict[str, Any] = Body(default=None)):
             )
             action_record["status"] = "sent"
             action_record["response"] = resp
-            
-            # If broker returned a min-volume/dust error, latch it to avoid repeated failures
+
+
+            # Update anti-churn latch immediately on send
             try:
-                if isinstance(resp, dict) and not bool(resp.get('ok', True)):
-                    err = str(resp.get('error') or '')
-                    if 'dust_below_min_volume' in err or 'below_min_volume' in err:
-                        try:
-                            kpair = to_kraken(intent.symbol)
-                        except Exception:
-                            kpair = None
-                        if kpair:
-                            ttl = float(os.getenv('DUST_TTL_SECONDS', '86400') or 86400)
-                            until = float(time.time()) + ttl
-                            # Best-effort parse avail and ordermin from error string
-                            m_av = re.search(r'\(avail=([0-9\.eE\-\+]+)\)', err)
-                            m_om = re.search(r'<([0-9\.eE\-\+]+)', err)
-                            avail_v = float(m_av.group(1)) if m_av else None
-                            ordermin_v = float(m_om.group(1)) if m_om else None
-                            with _DUST_LATCH_LOCK:
-                                _DUST_LATCH[(kpair, side)] = {
-                                    'ts': float(time.time()),
-                                    'until': until,
-                                    'avail': avail_v,
-                                    'ordermin': ordermin_v,
-                                    'reason': err,
-                                }
-                            action_record['status'] = 'dust' if 'dust_below_min_volume' in err else 'below_min_volume'
+                with _LAST_ACTION_LATCH_LOCK:
+                    _LAST_ACTION_LATCH[(intent.symbol, intent.strategy)] = {
+                        "ts": time.time(),
+                        "side": side,
+                        "kind": str(getattr(intent, "kind", None) or ""),
+                    }
             except Exception:
                 pass
-            
-
             otx, ur = _extract_ordertxid_userref(resp)
             if otx:
                 action_record["ordertxid"] = otx
             if ur:
                 action_record["userref"] = ur
-            
-            # Update anti-churn latch only if order was actually accepted (has txid)
-            try:
-                if action_record.get('ordertxid') and action_record.get('status') == 'sent':
-                    with _LAST_ACTION_LATCH_LOCK:
-                        _LAST_ACTION_LATCH[(intent.symbol, intent.strategy)] = {
-                            'ts': time.time(),
-                            'side': side,
-                            'kind': str(getattr(intent, 'kind', None) or ''),
-                        }
-            except Exception:
-                pass
-            
 
         except Exception as e:
             log.error("scheduler_v2: broker error for %s %s: %s", intent.symbol, side, e)
