@@ -83,7 +83,7 @@ from strategy_api import PositionSnapshot
 from strategy_api import PositionSnapshot
 from scheduler_core import SchedulerConfig, SchedulerResult, StrategyBook, ScanRequest, ScanResult,run_scheduler_once
 from risk_engine import RiskEngine
-from fastapi import Body, FastAPI, HTTPException, Query
+from fastapi import Body, FastAPI, HTTPException, Query, Request
 from advisor_v2 import advisor_summary
 
 
@@ -5184,7 +5184,7 @@ def scheduler_run(payload: Dict[str, Any] = Body(default=None)):
 # --------------------------------------------------------------------------------------
 
 @app.post("/scheduler/v2/run")
-def scheduler_run_v2(payload: Dict[str, Any] = Body(default=None)):
+def scheduler_run_v2(request: Request, payload: Dict[str, Any] = Body(default=None)):
     """
     Scheduler v2:
 
@@ -5196,8 +5196,6 @@ def scheduler_run_v2(payload: Dict[str, Any] = Body(default=None)):
     This does NOT remove the legacy /scheduler/run endpoint. Use this side-by-side
     for testing until you're happy to flip over.
     """
-    payload = payload or {}
-    # DEPLOY_MARKER: scheduler_v2_run_no_null v5.0.11
     actions: List[Dict[str, Any]] = []
     telemetry: List[Dict[str, Any]] = []
 
@@ -5215,6 +5213,16 @@ def scheduler_run_v2(payload: Dict[str, Any] = Body(default=None)):
         return str(v).lower() in ("1", "true", "yes", "on")
 
     payload = payload or {}
+
+    # Accept `?dry=true|false` as well as JSON body {"dry": ...}.
+    # Some clients (SoapUI/Apache HttpClient) send POST /scheduler/v2/run?dry=false with an empty body.
+    try:
+        if "dry" not in payload:
+            qdry = request.query_params.get("dry")
+            if qdry is not None:
+                payload["dry"] = str(qdry).lower() in ("1", "true", "yes", "on")
+    except Exception:
+        pass
     
     # ---------------------------------------------------------------
     # Helpers: intent_id + broker response extraction (attribution)
@@ -5389,7 +5397,7 @@ def scheduler_run_v2(payload: Dict[str, Any] = Body(default=None)):
     except Exception as e:
         log.error("scheduler_v2: failed to import br_router: %s", e)
         if not dry:
-            return JSONResponse(content={
+            return {"ok": False, "error": f"failed to import br_router: {e}", "config": config_snapshot}
         br = None  # dry mode can still show intents
 
     try:
@@ -6169,7 +6177,7 @@ def _reconcile_positions_with_kraken(pos_list: Any) -> Any:
                 "actions_sent": 0,
                 "actions_dry": 0,
                 "reasons": [],
-            })
+            }
         return universe_map[key]
 
     # Prime universe with all (strat, symbol) pairs from config
@@ -6248,20 +6256,20 @@ def _reconcile_positions_with_kraken(pos_list: Any) -> Any:
         # Never let telemetry logging break the API
         log.warning("scheduler_v2: failed to log telemetry: %s", e)
 
-    return JSONResponse(content={
+    resp = {
         "ok": True,
         "dry": bool(dry),
         "config": config_snapshot,
         "actions": actions,
         "telemetry": telemetry,
         "universe": universe,
-    })
+    }
+    # Absolute safety: never emit JSON null.
+    return resp if resp is not None else {"ok": False, "message": "scheduler_v2_returned_none"}
 
 
 # ---- New core debug endpoint) ------------------------------------------------------------        
         
-    # If we ever reach here, something went wrong; never return None.
-    return JSONResponse(content={"ok": False, "error": "scheduler_v2_run_fell_through", "marker": "v5.0.11"})
 @app.post("/scheduler/core_debug")
 def scheduler_core_debug(payload: Dict[str, Any] = Body(default=None)):
     """
