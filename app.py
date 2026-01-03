@@ -1,5 +1,5 @@
 """
-crypto-system-api (app.py) — v2.4.2
+crypto-system-api (app.py) — v3.0.0
 ------------------------------------
 Full drop-in FastAPI app.
 
@@ -83,7 +83,7 @@ from strategy_api import PositionSnapshot
 from strategy_api import PositionSnapshot
 from scheduler_core import SchedulerConfig, SchedulerResult, StrategyBook, ScanRequest, ScanResult,run_scheduler_once
 from risk_engine import RiskEngine
-from fastapi import Body, FastAPI, HTTPException, Query, Request
+from fastapi import Body, FastAPI, HTTPException, Query
 from advisor_v2 import advisor_summary
 
 
@@ -145,7 +145,7 @@ logging.basicConfig(
 log = logging.getLogger("crypto-system")
 logger = log  # alias for older patches
 log.info("Logging initialized at level %s", LOG_LEVEL)
-__version__ = '2.3.4'
+__version__ = '2.0.0'
 
 
 
@@ -158,7 +158,7 @@ from pydantic import BaseModel
 # Version / Logging
 # --------------------------------------------------------------------------------------
 
-APP_VERSION = "2.0.0-hotfix.3"
+APP_VERSION = "3.0.0"
 
 logging.basicConfig(
     level=logging.INFO,
@@ -2732,7 +2732,7 @@ def debug_strategy_scan(payload: Dict[str, Any] = Body(default=None)):
     notional = float(payload.get("notional", float(os.getenv("SCHED_NOTIONAL", "25") or 25.0)))
 
     # Load positions + risk config, then normalize positions to dict[(symbol,strat)] -> Position
-    raw_positions = _load_open_positions_from_trades(use_strategy_col=True)
+    raw_positions = _load_reconciled_positions(use_strategy_col=True, include_legacy=False)
     risk_cfg = load_risk_config() or {}
 
     positions: Dict[Tuple[str, str], Position] = {}
@@ -3567,7 +3567,6 @@ def debug_env():
     env = {k: os.getenv(k) for k in keys}
     return {"ok": True, "env": env}
     
-
 @app.get("/debug/kraken/value")
 def debug_kraken_value():
     """Live Kraken portfolio value (best-effort)."""
@@ -3599,7 +3598,7 @@ def debug_kraken_value():
         return {"ok": True, "total_usd": total, "breakdown": breakdown}
     except Exception as e:
         return {"ok": False, "error": f"debug_kraken_value_error:{e}"}
-
+    
 @app.get("/debug/kraken/positions")
 def debug_kraken_positions(
     use_strategy: bool = True,
@@ -3722,6 +3721,41 @@ def debug_kraken_positions(
     except Exception as e:
         return {"ok": False, "error": str(e)}
     
+@app.get("/debug/kraken/value")
+def debug_kraken_value():
+    """Approximate live Kraken portfolio value using Balance + last prices.
+
+    - Uses broker_kraken.positions() for balances (already normalized).
+    - Prices via _last_price_safe(symbol).
+    - Returns USD cash + sum(asset_qty * last_price(asset/USD)).
+
+    Note: This is a best-effort mark-to-market; it does not include margin,
+    staking rewards not in Balance, or unrealized PnL on derivatives.
+    """
+    try:
+        import broker_kraken
+        bals = broker_kraken.positions() or []
+        total = 0.0
+        breakdown = []
+        for row in bals:
+            asset = str(row.get("asset") or "").upper().strip()
+            qty = float(row.get("qty") or 0.0)
+            if qty <= 0:
+                continue
+            if asset == "USD":
+                total += qty
+                breakdown.append({"asset": "USD", "qty": qty, "px": 1.0, "value": qty})
+                continue
+            sym = f"{asset}/USD"
+            px = float(_last_price_safe(sym) or 0.0)
+            val = qty * px
+            total += val
+            breakdown.append({"asset": asset, "qty": qty, "px": px, "value": val})
+        breakdown.sort(key=lambda x: float(x.get("value") or 0.0), reverse=True)
+        return {"ok": True, "total_usd": total, "breakdown": breakdown}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
 @app.get("/debug/global_policy")
 def debug_global_policy():
     """
@@ -4074,8 +4108,7 @@ def scheduler_core_debug(payload: Dict[str, Any] = Body(default=None)):
     }
 
     # positions + risk_cfg
-    positions = _load_open_positions_from_trades(use_strategy_col=True)
-    positions = _reconcile_positions_with_kraken(positions)
+    positions = _load_reconciled_positions(use_strategy_col=True, include_legacy=False)
     # Normalize positions for scheduler_core: it expects a dict keyed by (symbol, strategy)
     # _load_open_positions_from_trades returns a List[Position] for debug friendliness.
     if isinstance(positions, list):
@@ -4232,7 +4265,7 @@ def scheduler_risk_debug(
     - symbol caps
     - global exit decision (if any)
     """
-    positions = _load_open_positions_from_trades(use_strategy_col=True)
+    positions = _load_reconciled_positions(use_strategy_col=True, include_legacy=False)
     # Normalize positions for scheduler_core: it expects a dict keyed by (symbol, strategy)
     # _load_open_positions_from_trades returns a List[Position] for debug friendliness.
     if isinstance(positions, list):
@@ -4601,7 +4634,7 @@ def scheduler_run(payload: Dict[str, Any] = Body(default=None)):
         log.info(msg)
 
         # Load open positions keyed by (symbol, strategy).
-        positions = _load_open_positions_from_trades(use_strategy_col=True)
+        positions = _load_reconciled_positions(use_strategy_col=True, include_legacy=False)
         # Normalize positions for scheduler_core: it expects a dict keyed by (symbol, strategy)
         # _load_open_positions_from_trades returns a List[Position] for debug friendliness.
         if isinstance(positions, list):
@@ -5184,7 +5217,7 @@ def scheduler_run(payload: Dict[str, Any] = Body(default=None)):
 # --------------------------------------------------------------------------------------
 
 @app.post("/scheduler/v2/run")
-def scheduler_run_v2(request: Request, payload: Dict[str, Any] = Body(default=None)):
+def scheduler_run_v2(payload: Dict[str, Any] = Body(default=None)):
     """
     Scheduler v2:
 
@@ -5213,16 +5246,6 @@ def scheduler_run_v2(request: Request, payload: Dict[str, Any] = Body(default=No
         return str(v).lower() in ("1", "true", "yes", "on")
 
     payload = payload or {}
-
-    # Accept `?dry=true|false` as well as JSON body {"dry": ...}.
-    # Some clients (SoapUI/Apache HttpClient) send POST /scheduler/v2/run?dry=false with an empty body.
-    try:
-        if "dry" not in payload:
-            qdry = request.query_params.get("dry")
-            if qdry is not None:
-                payload["dry"] = str(qdry).lower() in ("1", "true", "yes", "on")
-    except Exception:
-        pass
     
     # ---------------------------------------------------------------
     # Helpers: intent_id + broker response extraction (attribution)
@@ -5406,57 +5429,9 @@ def scheduler_run_v2(request: Request, payload: Dict[str, Any] = Body(default=No
         guard_allows = None  # optional; strategies already use guard internally
 
     # ------------------------------------------------------------------
-
-def _reconcile_positions_with_kraken(pos_list: Any) -> Any:
-    """Return journal positions filtered/scaled to live Kraken balances."""
-    if not isinstance(pos_list, list):
-        return pos_list
-    try:
-        kr_raw = broker_kraken.positions() or []
-    except Exception:
-        kr_raw = []
-    kr_map: Dict[str, float] = {}
-    for r in kr_raw:
-        try:
-            a = str(r.get("asset","")).upper().strip()
-            if not a:
-                continue
-            kr_map[a] = float(r.get("qty",0) or 0)
-        except Exception:
-            continue
-
-    by_asset: Dict[str, List[Any]] = {}
-    for p in pos_list:
-        sym = (getattr(p, "symbol", "") or "").strip()
-        asset = sym.split("/")[0].upper().strip() if "/" in sym else sym.upper().strip()[:4]
-        by_asset.setdefault(asset, []).append(p)
-
-    out: List[Any] = []
-    for asset, plist in by_asset.items():
-        kqty = float(kr_map.get(asset, 0) or 0)
-        if kqty <= 0:
-            # Kraken doesn't hold it -> no exits should be generated for it
-            continue
-        jtot = 0.0
-        for p in plist:
-            try:
-                jtot += float(getattr(p, "qty", 0) or 0)
-            except Exception:
-                pass
-        if jtot <= 0:
-            continue
-        scale = kqty / jtot
-        for p in plist:
-            try:
-                p.qty = float(getattr(p, "qty", 0) or 0) * scale
-            except Exception:
-                pass
-            out.append(p)
-    return out
-
     # Load positions & risk config
     # ------------------------------------------------------------------
-    positions = _load_open_positions_from_trades(use_strategy_col=True)
+    positions = _load_reconciled_positions(use_strategy_col=True, include_legacy=False)
     # Normalize positions for scheduler_core: it expects a dict keyed by (symbol, strategy)
     # _load_open_positions_from_trades returns a List[Position] for debug friendliness.
     if isinstance(positions, list):
@@ -6256,7 +6231,7 @@ def _reconcile_positions_with_kraken(pos_list: Any) -> Any:
         # Never let telemetry logging break the API
         log.warning("scheduler_v2: failed to log telemetry: %s", e)
 
-    resp = {
+    return {
         "ok": True,
         "dry": bool(dry),
         "config": config_snapshot,
@@ -6264,8 +6239,6 @@ def _reconcile_positions_with_kraken(pos_list: Any) -> Any:
         "telemetry": telemetry,
         "universe": universe,
     }
-    # Absolute safety: never emit JSON null.
-    return resp if resp is not None else {"ok": False, "message": "scheduler_v2_returned_none"}
 
 
 # ---- New core debug endpoint) ------------------------------------------------------------        
@@ -6285,7 +6258,7 @@ def scheduler_core_debug(payload: Dict[str, Any] = Body(default=None)):
 
     # Pseudocode sketch (you’ll adapt from your existing scheduler_run):
     now = dt.datetime.utcnow()
-    positions = _load_open_positions_from_trades(use_strategy_col=True)
+    positions = _load_reconciled_positions(use_strategy_col=True, include_legacy=False)
     # Normalize positions for scheduler_core: it expects a dict keyed by (symbol, strategy)
     # _load_open_positions_from_trades returns a List[Position] for debug friendliness.
     if isinstance(positions, list):
@@ -6444,7 +6417,7 @@ def scheduler_core_debug_risk(payload: Dict[str, Any] = Body(default=None)):
         symbols = [str(s).strip().upper() for s in symbols_csv or []]
 
     # 2) Load positions & risk_cfg exactly as scheduler_run does
-    positions = _load_open_positions_from_trades(use_strategy_col=True)
+    positions = _load_reconciled_positions(use_strategy_col=True, include_legacy=False)
     # Normalize positions for scheduler_core: it expects a dict keyed by (symbol, strategy)
     # _load_open_positions_from_trades returns a List[Position] for debug friendliness.
     if isinstance(positions, list):
@@ -6831,6 +6804,87 @@ def _load_open_positions_from_trades(use_strategy_col: bool = True, include_lega
         return out
     finally:
         conn.close()
+
+def _load_reconciled_positions(
+    use_strategy_col: bool = True,
+    include_legacy: bool = False,
+) -> Dict[Tuple[str, str], Position]:
+    """Reconcile local journal-derived positions with live Kraken balances.
+
+    Rule:
+      - Kraken balances are the SELL authority (spot reality).
+      - Journal positions provide avg_price + per-strategy attribution *only*.
+      - If Kraken has 0 for an asset, that position is excluded from the returned map
+        (prevents phantom exits / incorrect exposure).
+
+    Strategy attribution:
+      - If journal has multiple strategies for an asset, distribute Kraken qty
+        proportionally to journal qty.
+      - If no journal attribution exists, label strategy='unattributed'.
+    """
+    # --- Journal (local) ---
+    journal_list = _load_open_positions_from_trades(use_strategy_col=bool(use_strategy_col), include_legacy=include_legacy)
+    journal_map: Dict[Tuple[str, str], Position] = {}
+    if isinstance(journal_list, list):
+        for p in journal_list:
+            try:
+                sym = (getattr(p, "symbol", "") or "").strip().upper()
+                strat = (getattr(p, "strategy", "") or "").strip().lower() or ("misc" if not use_strategy_col else "default")
+                qty = float(getattr(p, "qty", 0.0) or 0.0)
+                if sym and abs(qty) > 1e-12:
+                    journal_map[(sym, strat)] = p
+            except Exception:
+                continue
+
+    # Aggregate journal by base asset
+    journal_by_asset: Dict[str, float] = {}
+    journal_details: Dict[str, List[Tuple[str, str, float, Optional[float]]]] = {}
+    for (sym, strat), p in journal_map.items():
+        base = sym.split("/", 1)[0].strip().upper() if "/" in sym else sym.strip().upper()
+        qty = float(getattr(p, "qty", 0.0) or 0.0)
+        journal_by_asset[base] = journal_by_asset.get(base, 0.0) + qty
+        journal_details.setdefault(base, []).append((sym, strat, qty, getattr(p, "avg_price", None)))
+
+    # --- Kraken (live balances) ---
+    kraken_bal: Dict[str, float] = {}
+    try:
+        import broker_kraken
+        for row in broker_kraken.positions() or []:
+            a = str(row.get("asset") or "").strip().upper()
+            q = float(row.get("qty") or 0.0)
+            if a:
+                kraken_bal[a] = kraken_bal.get(a, 0.0) + q
+    except Exception:
+        kraken_bal = {}
+
+    # Build reconciled positions map
+    out: Dict[Tuple[str, str], Position] = {}
+    for asset, kqty in kraken_bal.items():
+        if asset == "USD":
+            continue
+        if kqty <= 0:
+            continue
+
+        sym = f"{asset}/USD"
+
+        # If the system doesn't trade this symbol, still expose it as 'unattributed'
+        # so exits can flatten it safely (global exit/risk).
+        if asset in journal_details and journal_by_asset.get(asset, 0.0) > 0 and use_strategy_col:
+            total = float(journal_by_asset[asset])
+            for (jsym, jstrat, jqty, javg) in journal_details[asset]:
+                ratio = (float(jqty) / total) if total > 0 else 0.0
+                alloc = float(kqty) * ratio
+                if alloc <= 1e-12:
+                    continue
+                # prefer journal symbol if it matches the asset
+                osym = (jsym or sym).strip().upper()
+                out[(osym, jstrat)] = Position(symbol=osym, strategy=jstrat, qty=alloc, avg_price=javg)
+        else:
+            out[(sym, "unattributed")] = Position(symbol=sym, strategy="unattributed", qty=float(kqty), avg_price=None)
+
+    return out
+
+
 @app.get("/pnl/by_strategy")
 def pnl_by_strategy(start: Optional[str] = None, end: Optional[str] = None,
                     realized_only: Optional[str] = "true", tz: Optional[str] = "UTC"):
