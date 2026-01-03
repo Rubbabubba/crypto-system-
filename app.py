@@ -5396,54 +5396,6 @@ def scheduler_run_v2(payload: Dict[str, Any] = Body(default=None)):
         guard_allows = None  # optional; strategies already use guard internally
 
     # ------------------------------------------------------------------
-
-def _reconcile_positions_with_kraken(pos_list: Any) -> Any:
-    """Return journal positions filtered/scaled to live Kraken balances."""
-    if not isinstance(pos_list, list):
-        return pos_list
-    try:
-        kr_raw = broker_kraken.positions() or []
-    except Exception:
-        kr_raw = []
-    kr_map: Dict[str, float] = {}
-    for r in kr_raw:
-        try:
-            a = str(r.get("asset","")).upper().strip()
-            if not a:
-                continue
-            kr_map[a] = float(r.get("qty",0) or 0)
-        except Exception:
-            continue
-
-    by_asset: Dict[str, List[Any]] = {}
-    for p in pos_list:
-        sym = (getattr(p, "symbol", "") or "").strip()
-        asset = sym.split("/")[0].upper().strip() if "/" in sym else sym.upper().strip()[:4]
-        by_asset.setdefault(asset, []).append(p)
-
-    out: List[Any] = []
-    for asset, plist in by_asset.items():
-        kqty = float(kr_map.get(asset, 0) or 0)
-        if kqty <= 0:
-            # Kraken doesn't hold it -> no exits should be generated for it
-            continue
-        jtot = 0.0
-        for p in plist:
-            try:
-                jtot += float(getattr(p, "qty", 0) or 0)
-            except Exception:
-                pass
-        if jtot <= 0:
-            continue
-        scale = kqty / jtot
-        for p in plist:
-            try:
-                p.qty = float(getattr(p, "qty", 0) or 0) * scale
-            except Exception:
-                pass
-            out.append(p)
-    return out
-
     # Load positions & risk config
     # ------------------------------------------------------------------
     positions = _load_open_positions_from_trades(use_strategy_col=True)
