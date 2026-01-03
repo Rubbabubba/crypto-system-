@@ -158,7 +158,7 @@ from pydantic import BaseModel
 # Version / Logging
 # --------------------------------------------------------------------------------------
 
-APP_VERSION = "2.0.0-hotfix.4-schedv2nullfix"
+APP_VERSION = "2.0.0-hotfix.3"
 
 logging.basicConfig(
     level=logging.INFO,
@@ -5196,6 +5196,8 @@ def scheduler_run_v2(payload: Dict[str, Any] = Body(default=None)):
     This does NOT remove the legacy /scheduler/run endpoint. Use this side-by-side
     for testing until you're happy to flip over.
     """
+    payload = payload or {}
+    # DEPLOY_MARKER: scheduler_v2_run_no_null v5.0.11
     actions: List[Dict[str, Any]] = []
     telemetry: List[Dict[str, Any]] = []
 
@@ -5387,7 +5389,7 @@ def scheduler_run_v2(payload: Dict[str, Any] = Body(default=None)):
     except Exception as e:
         log.error("scheduler_v2: failed to import br_router: %s", e)
         if not dry:
-            return {"ok": False, "error": f"failed to import br_router: {e}", "config": config_snapshot}
+            return JSONResponse(content={
         br = None  # dry mode can still show intents
 
     try:
@@ -5415,34 +5417,34 @@ def _reconcile_positions_with_kraken(pos_list: Any) -> Any:
         except Exception:
             continue
 
-        by_asset: Dict[str, List[Any]] = {}
-        for p in pos_list:
-            sym = (getattr(p, "symbol", "") or "").strip()
-            asset = sym.split("/")[0].upper().strip() if "/" in sym else sym.upper().strip()[:4]
-            by_asset.setdefault(asset, []).append(p)
+    by_asset: Dict[str, List[Any]] = {}
+    for p in pos_list:
+        sym = (getattr(p, "symbol", "") or "").strip()
+        asset = sym.split("/")[0].upper().strip() if "/" in sym else sym.upper().strip()[:4]
+        by_asset.setdefault(asset, []).append(p)
 
-        out: List[Any] = []
-        for asset, plist in by_asset.items():
-            kqty = float(kr_map.get(asset, 0) or 0)
-            if kqty <= 0:
-                # Kraken doesn't hold it -> no exits should be generated for it
-                continue
-            jtot = 0.0
-            for p in plist:
-                try:
-                    jtot += float(getattr(p, "qty", 0) or 0)
-                except Exception:
-                    pass
-            if jtot <= 0:
-                continue
-            scale = kqty / jtot
-            for p in plist:
-                try:
-                    p.qty = float(getattr(p, "qty", 0) or 0) * scale
-                except Exception:
-                    pass
-                out.append(p)
-        return out
+    out: List[Any] = []
+    for asset, plist in by_asset.items():
+        kqty = float(kr_map.get(asset, 0) or 0)
+        if kqty <= 0:
+            # Kraken doesn't hold it -> no exits should be generated for it
+            continue
+        jtot = 0.0
+        for p in plist:
+            try:
+                jtot += float(getattr(p, "qty", 0) or 0)
+            except Exception:
+                pass
+        if jtot <= 0:
+            continue
+        scale = kqty / jtot
+        for p in plist:
+            try:
+                p.qty = float(getattr(p, "qty", 0) or 0) * scale
+            except Exception:
+                pass
+            out.append(p)
+    return out
 
     # Load positions & risk config
     # ------------------------------------------------------------------
@@ -6167,7 +6169,7 @@ def _reconcile_positions_with_kraken(pos_list: Any) -> Any:
                 "actions_sent": 0,
                 "actions_dry": 0,
                 "reasons": [],
-            }
+            })
         return universe_map[key]
 
     # Prime universe with all (strat, symbol) pairs from config
@@ -6246,29 +6248,20 @@ def _reconcile_positions_with_kraken(pos_list: Any) -> Any:
         # Never let telemetry logging break the API
         log.warning("scheduler_v2: failed to log telemetry: %s", e)
 
-
-    out = {
+    return JSONResponse(content={
         "ok": True,
         "dry": bool(dry),
         "config": config_snapshot,
         "actions": actions,
         "telemetry": telemetry,
         "universe": universe,
-        # deploy marker / smoke-test
-        "scheduler_v2_run_marker": "v5.0.10",
-        "server_time_utc": datetime.datetime.utcnow().replace(microsecond=0).isoformat() + "Z",
-    }
-    # Hard guard: never allow FastAPI to serialize a bare None (which becomes JSON null).
-    if out is None:
-        out = {"ok": False, "error": "scheduler_v2_run produced None unexpectedly"}
-    return JSONResponse(content=out)
-
-
-
+    })
 
 
 # ---- New core debug endpoint) ------------------------------------------------------------        
         
+    # If we ever reach here, something went wrong; never return None.
+    return JSONResponse(content={"ok": False, "error": "scheduler_v2_run_fell_through", "marker": "v5.0.11"})
 @app.post("/scheduler/core_debug")
 def scheduler_core_debug(payload: Dict[str, Any] = Body(default=None)):
     """
