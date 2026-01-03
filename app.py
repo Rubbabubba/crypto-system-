@@ -2733,32 +2733,6 @@ def debug_strategy_scan(payload: Dict[str, Any] = Body(default=None)):
 
     # Load positions + risk config, then normalize positions to dict[(symbol,strat)] -> Position
     raw_positions = _load_open_positions_from_trades(use_strategy_col=True)
-
-    # Live Kraken balances map (base asset -> available qty). Used to prevent phantom SELL exits.
-    try:
-        _kr_pos_raw = broker_kraken.positions() or []
-    except Exception:
-        _kr_pos_raw = []
-    _live_bal: Dict[str, float] = {}
-    for _r in _kr_pos_raw:
-        try:
-            _a = str(_r.get("asset", "") or "").upper()
-            _q = _r.get("avail", None)
-            if _q is None:
-                _q = _r.get("qty", 0.0)
-            _qf = float(_q)
-        except Exception:
-            continue
-        if _a in ("XBT", "XXBT"):
-            _a = "BTC"
-        _live_bal[_a] = _live_bal.get(_a, 0.0) + _qf
-
-    def _base_asset_from_symbol(_sym: str) -> str:
-        _s = str(_sym or "")
-        if "/" in _s:
-            return _s.split("/")[0].upper()
-        return _s.upper()
-
     risk_cfg = load_risk_config() or {}
 
     positions: Dict[Tuple[str, str], Position] = {}
@@ -5225,6 +5199,10 @@ def scheduler_run_v2(payload: Dict[str, Any] = Body(default=None)):
     actions: List[Dict[str, Any]] = []
     telemetry: List[Dict[str, Any]] = []
 
+    # --- request correlation id (helps debug 'null' responses) ---
+    _req_id = uuid.uuid4().hex[:10]
+    log.info("scheduler_v2_run start req_id=%s payload_keys=%s", _req_id, list((payload or {}).keys()))
+
     # small helpers for super-safe config access
     def _cfg_get(d: Any, key: str, default: Any = None) -> Any:
         return d.get(key, default) if isinstance(d, dict) else default
@@ -5784,38 +5762,6 @@ def _reconcile_positions_with_kraken(pos_list: Any) -> Any:
         except Exception:
             pass
 
-        # SELL-exit gate: never attempt to sell an asset that Kraken reports as 0 available.
-        # This prevents "avail=0.0" churn when the journal thinks a position exists but Kraken does not.
-        kind = (str(getattr(intent, "kind", "") or "")).strip().lower()
-        if side == "sell" and kind in exit_kinds:
-            base = _base_asset_from_symbol(getattr(intent, "symbol", ""))
-            if float(_live_bal.get(base, 0.0)) <= 0.0:
-                telemetry.append(
-                    {
-                        "symbol": intent.symbol,
-                        "strategy": intent.strategy,
-                        "kind": kind,
-                        "side": side,
-                        "reason": f"no_live_balance:{base}",
-                        "source": "scheduler_v2",
-                    }
-                )
-                actions.append(
-                    {
-                        "symbol": intent.symbol,
-                        "strategy": intent.strategy,
-                        "intent_id": intent_id,
-                        "side": side,
-                        "kind": kind,
-                        "notional": float(getattr(intent, "notional", 0.0) or 0.0),
-                        "reason": getattr(intent, "reason", None),
-                        "dry": bool(dry),
-                        "status": "skipped_no_live_balance",
-                        "error": f"no_live_balance:{base}",
-                    }
-                )
-                continue
-
         # Canonicalize symbol for consistent position/context access
         try:
             intent.symbol = _canon_symbol(str(getattr(intent, "symbol", "") or ""))
@@ -6304,7 +6250,8 @@ def _reconcile_positions_with_kraken(pos_list: Any) -> Any:
         # Never let telemetry logging break the API
         log.warning("scheduler_v2: failed to log telemetry: %s", e)
 
-    return {
+    out = {
+        "req_id": _req_id,
         "ok": True,
         "dry": bool(dry),
         "config": config_snapshot,
@@ -6312,6 +6259,9 @@ def _reconcile_positions_with_kraken(pos_list: Any) -> Any:
         "telemetry": telemetry,
         "universe": universe,
     }
+    # Always return an explicit JSON response (defensive against accidental None)
+    log.info("scheduler_v2_run end req_id=%s actions=%s", _req_id, len(out.get("actions") or []))
+    return JSONResponse(content=out)
 
 
 # ---- New core debug endpoint) ------------------------------------------------------------        
