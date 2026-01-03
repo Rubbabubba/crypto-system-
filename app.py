@@ -2733,6 +2733,32 @@ def debug_strategy_scan(payload: Dict[str, Any] = Body(default=None)):
 
     # Load positions + risk config, then normalize positions to dict[(symbol,strat)] -> Position
     raw_positions = _load_open_positions_from_trades(use_strategy_col=True)
+
+    # Live Kraken balances map (base asset -> available qty). Used to prevent phantom SELL exits.
+    try:
+        _kr_pos_raw = broker_kraken.positions() or []
+    except Exception:
+        _kr_pos_raw = []
+    _live_bal: Dict[str, float] = {}
+    for _r in _kr_pos_raw:
+        try:
+            _a = str(_r.get("asset", "") or "").upper()
+            _q = _r.get("avail", None)
+            if _q is None:
+                _q = _r.get("qty", 0.0)
+            _qf = float(_q)
+        except Exception:
+            continue
+        if _a in ("XBT", "XXBT"):
+            _a = "BTC"
+        _live_bal[_a] = _live_bal.get(_a, 0.0) + _qf
+
+    def _base_asset_from_symbol(_sym: str) -> str:
+        _s = str(_sym or "")
+        if "/" in _s:
+            return _s.split("/")[0].upper()
+        return _s.upper()
+
     risk_cfg = load_risk_config() or {}
 
     positions: Dict[Tuple[str, str], Position] = {}
@@ -5396,6 +5422,54 @@ def scheduler_run_v2(payload: Dict[str, Any] = Body(default=None)):
         guard_allows = None  # optional; strategies already use guard internally
 
     # ------------------------------------------------------------------
+
+def _reconcile_positions_with_kraken(pos_list: Any) -> Any:
+    """Return journal positions filtered/scaled to live Kraken balances."""
+    if not isinstance(pos_list, list):
+        return pos_list
+    try:
+        kr_raw = broker_kraken.positions() or []
+    except Exception:
+        kr_raw = []
+    kr_map: Dict[str, float] = {}
+    for r in kr_raw:
+        try:
+            a = str(r.get("asset","")).upper().strip()
+            if not a:
+                continue
+            kr_map[a] = float(r.get("qty",0) or 0)
+        except Exception:
+            continue
+
+    by_asset: Dict[str, List[Any]] = {}
+    for p in pos_list:
+        sym = (getattr(p, "symbol", "") or "").strip()
+        asset = sym.split("/")[0].upper().strip() if "/" in sym else sym.upper().strip()[:4]
+        by_asset.setdefault(asset, []).append(p)
+
+    out: List[Any] = []
+    for asset, plist in by_asset.items():
+        kqty = float(kr_map.get(asset, 0) or 0)
+        if kqty <= 0:
+            # Kraken doesn't hold it -> no exits should be generated for it
+            continue
+        jtot = 0.0
+        for p in plist:
+            try:
+                jtot += float(getattr(p, "qty", 0) or 0)
+            except Exception:
+                pass
+        if jtot <= 0:
+            continue
+        scale = kqty / jtot
+        for p in plist:
+            try:
+                p.qty = float(getattr(p, "qty", 0) or 0) * scale
+            except Exception:
+                pass
+            out.append(p)
+    return out
+
     # Load positions & risk config
     # ------------------------------------------------------------------
     positions = _load_open_positions_from_trades(use_strategy_col=True)
@@ -5709,6 +5783,38 @@ def scheduler_run_v2(payload: Dict[str, Any] = Body(default=None)):
                 intent.strategy = "global"
         except Exception:
             pass
+
+        # SELL-exit gate: never attempt to sell an asset that Kraken reports as 0 available.
+        # This prevents "avail=0.0" churn when the journal thinks a position exists but Kraken does not.
+        kind = (str(getattr(intent, "kind", "") or "")).strip().lower()
+        if side == "sell" and kind in exit_kinds:
+            base = _base_asset_from_symbol(getattr(intent, "symbol", ""))
+            if float(_live_bal.get(base, 0.0)) <= 0.0:
+                telemetry.append(
+                    {
+                        "symbol": intent.symbol,
+                        "strategy": intent.strategy,
+                        "kind": kind,
+                        "side": side,
+                        "reason": f"no_live_balance:{base}",
+                        "source": "scheduler_v2",
+                    }
+                )
+                actions.append(
+                    {
+                        "symbol": intent.symbol,
+                        "strategy": intent.strategy,
+                        "intent_id": intent_id,
+                        "side": side,
+                        "kind": kind,
+                        "notional": float(getattr(intent, "notional", 0.0) or 0.0),
+                        "reason": getattr(intent, "reason", None),
+                        "dry": bool(dry),
+                        "status": "skipped_no_live_balance",
+                        "error": f"no_live_balance:{base}",
+                    }
+                )
+                continue
 
         # Canonicalize symbol for consistent position/context access
         try:
