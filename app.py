@@ -158,7 +158,7 @@ from pydantic import BaseModel
 # Version / Logging
 # --------------------------------------------------------------------------------------
 
-APP_VERSION = "3.0.0"
+APP_VERSION = "3.0.1"
 
 logging.basicConfig(
     level=logging.INFO,
@@ -5918,6 +5918,38 @@ def scheduler_run_v2(payload: Dict[str, Any] = Body(default=None)):
             if side == "sell":
                 max_notional = abs(qty_here) * px * 0.995  # buffer for fees/rounding
                 final_notional = min(final_notional, max_notional)
+# Additional safety: reconcile against LIVE Kraken balances so we never sell phantom journal positions.
+# If Kraken reports 0 available for the base asset, we skip with a clear error instead of sending an order.
+if side == "sell":
+    try:
+        base_asset = (str(intent.symbol).split("/", 1)[0] if intent.symbol else "").upper().strip()
+    except Exception:
+        base_asset = ""
+    # Lazy-load balances map once per request (only if needed)
+    if "kraken_bal_map" not in locals():
+        kraken_bal_map = None
+    if kraken_bal_map is None:
+        try:
+            kr_rows = broker_kraken.positions()
+            kraken_bal_map = {str(r.get("asset") or "").upper(): float(r.get("qty") or 0.0) for r in (kr_rows or [])}
+        except Exception:
+            kraken_bal_map = {}
+    avail_qty = float((kraken_bal_map or {}).get(base_asset, 0.0) or 0.0)
+    live_max_notional = avail_qty * px * 0.995
+    if live_max_notional <= 0:
+        action_record["status"] = "skipped_insufficient_balance"
+        action_record["error"] = f"insufficient_balance_live:{base_asset}:avail_qty={avail_qty}"
+        actions.append(action_record)
+        continue
+    final_notional = min(final_notional, live_max_notional)
+
+    # Generic dust/min-order handling (Kraken minimum varies by asset; this is a safe global floor)
+    exit_min_usd = float(os.getenv("EXIT_MIN_NOTIONAL_USD", "6") or 6)
+    if final_notional < exit_min_usd:
+        action_record["status"] = "skipped_below_min_exit_notional"
+        action_record["error"] = f"below_min_exit_notional:${final_notional:.4f}<${exit_min_usd:.2f}"
+        actions.append(action_record)
+        continue
 
         # Valid final_notional?
         if final_notional <= 0.0:
@@ -6017,7 +6049,9 @@ def scheduler_run_v2(payload: Dict[str, Any] = Body(default=None)):
             kind_l = str(getattr(intent, "kind", "") or "").strip().lower()
 
             # Stop-loss bypasses cooldown/min-hold (safety first)
-            if kind_l != "stop_loss" and (cooldown_same > 0 or cooldown_flip > 0 or (min_hold_seconds > 0 and kind_l in ("entry", "scale", "scale_in", "add"))):
+            entry_kinds = ("entry", "scale", "scale_in", "add")
+            # Cooldowns/min-hold apply ONLY to entry/scale kinds. Exits must never be blocked.
+            if kind_l in entry_kinds and (cooldown_same > 0 or cooldown_flip > 0 or min_hold_seconds > 0):
                 key = (intent.symbol, intent.strategy)
                 now = time.time()
                 with _LAST_ACTION_LATCH_LOCK:
