@@ -66,6 +66,10 @@ import hmac
 import json
 import logging
 import os
+
+# Dust exit latch (no-spam; persisted in SQLite)
+DUST_EXIT_TTL_MINUTES = int(os.getenv("DUST_EXIT_TTL_MINUTES", "1440"))
+
 import sqlite3
 import sys
 import time
@@ -5311,10 +5315,7 @@ def scheduler_run_v2(payload: Dict[str, Any] = Body(default=None)):
     # ------------------------------------------------------------------
     MIN_NOTIONAL_USD = float(os.getenv("MIN_ORDER_NOTIONAL_USD", "5.0") or 5.0)
 
-    
-# Dust exit latch (no-spam; persisted in SQLite so it works across workers)
-DUST_EXIT_TTL_MINUTES = int(os.getenv("DUST_EXIT_TTL_MINUTES", "1440"))
-# ------------------------------------------------------------------
+    # ------------------------------------------------------------------
     # Resolve basic scheduler config from payload + env
     # ------------------------------------------------------------------
     tf = str(payload.get("tf", os.getenv("SCHED_TIMEFRAME", "5Min")))
@@ -5430,34 +5431,34 @@ def _reconcile_positions_with_kraken(pos_list: Any) -> Any:
         except Exception:
             continue
 
-    by_asset: Dict[str, List[Any]] = {}
-    for p in pos_list:
-        sym = (getattr(p, "symbol", "") or "").strip()
-        asset = sym.split("/")[0].upper().strip() if "/" in sym else sym.upper().strip()[:4]
-        by_asset.setdefault(asset, []).append(p)
+        by_asset: Dict[str, List[Any]] = {}
+        for p in pos_list:
+            sym = (getattr(p, "symbol", "") or "").strip()
+            asset = sym.split("/")[0].upper().strip() if "/" in sym else sym.upper().strip()[:4]
+            by_asset.setdefault(asset, []).append(p)
 
-    out: List[Any] = []
-    for asset, plist in by_asset.items():
-        kqty = float(kr_map.get(asset, 0) or 0)
-        if kqty <= 0:
-            # Kraken doesn't hold it -> no exits should be generated for it
-            continue
-        jtot = 0.0
-        for p in plist:
-            try:
-                jtot += float(getattr(p, "qty", 0) or 0)
-            except Exception:
-                pass
-        if jtot <= 0:
-            continue
-        scale = kqty / jtot
-        for p in plist:
-            try:
-                p.qty = float(getattr(p, "qty", 0) or 0) * scale
-            except Exception:
-                pass
-            out.append(p)
-    return out
+        out: List[Any] = []
+        for asset, plist in by_asset.items():
+            kqty = float(kr_map.get(asset, 0) or 0)
+            if kqty <= 0:
+                # Kraken doesn't hold it -> no exits should be generated for it
+                continue
+            jtot = 0.0
+            for p in plist:
+                try:
+                    jtot += float(getattr(p, "qty", 0) or 0)
+                except Exception:
+                    pass
+            if jtot <= 0:
+                continue
+            scale = kqty / jtot
+            for p in plist:
+                try:
+                    p.qty = float(getattr(p, "qty", 0) or 0) * scale
+                except Exception:
+                    pass
+                out.append(p)
+        return out
 
     # Load positions & risk config
     # ------------------------------------------------------------------
@@ -6003,35 +6004,6 @@ def _reconcile_positions_with_kraken(pos_list: Any) -> Any:
             "reason": getattr(intent, "reason", None),
             "dry": bool(dry),
         }
-        # Dust exit latch (Option A): if an exit is dust, log it once per TTL, then suppress repeats
-        try:
-            kind_k = (getattr(intent, 'kind', None) or '')
-            if kind_k in ('take_profit','exit','stop_loss') and final_notional < MIN_NOTIONAL_USD:
-                now_ts = int(time.time())
-                ttl_s = DUST_EXIT_TTL_MINUTES * 60
-                key = (intent.strategy, intent.symbol, kind_k)
-                conn_l = _db()
-                cur_l = conn_l.cursor()
-                cur_l.execute('SELECT last_ts FROM dust_latch WHERE strategy=? AND symbol=? AND kind=?', key)
-                row = cur_l.fetchone()
-                if row and (now_ts - int(row[0])) < ttl_s:
-                    conn_l.close()
-                    # Suppress repeated dust exits (no spam)
-                    continue
-                # Latch + log once
-                cur_l.execute(
-                    'INSERT OR REPLACE INTO dust_latch(strategy,symbol,kind,last_ts,reason) VALUES (?,?,?,?,?)',
-                    (key[0], key[1], key[2], now_ts, 'below_min_exit_notional')
-                )
-                conn_l.commit()
-                conn_l.close()
-                action_record['status'] = 'skipped_dust'
-                action_record['error'] = f'below_min_exit_notional:${final_notional:.4f}<${MIN_NOTIONAL_USD:.2f}'
-                actions.append(action_record)
-                continue
-        except Exception:
-            # Never let latch failures break scheduler response
-            pass
 
         if dry or br is None:
             action_record["status"] = "skipped_dry_run"
@@ -6298,6 +6270,8 @@ def _reconcile_positions_with_kraken(pos_list: Any) -> Any:
         "telemetry": telemetry,
         "universe": universe,
     }
+
+
 
 
 # ---- New core debug endpoint) ------------------------------------------------------------        
