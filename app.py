@@ -637,6 +637,50 @@ def _extract_ordertxid_userref_from_resp(resp: Any) -> Tuple[Optional[str], Opti
     return (ordertxid, userref)
 
 
+def _log_blocked_events_bulk(actions: List[Dict[str, Any]], source: str = "scheduler_v2") -> None:
+    """
+    Learning Engine Phase 2: persist blocked/skipped scheduler actions.
+    Best-effort only: failures must NEVER affect scheduler response.
+    """
+    try:
+        import time as _t
+        ts = int(_t.time())
+        rows = []
+        for a in actions or []:
+            status = str(a.get("status") or "")
+            if not status.startswith("skipped_"):
+                continue
+            rows.append((
+                ts,
+                a.get("strategy"),
+                a.get("symbol"),
+                a.get("side"),
+                a.get("kind"),
+                status,
+                a.get("reason"),
+                a.get("error") or a.get("detail"),
+                float(a.get("notional") or 0.0),
+                1 if a.get("dry") else 0,
+                source,
+            ))
+        if not rows:
+            return
+        conn = _db()
+        cur = conn.cursor()
+        cur.executemany(
+            """
+            INSERT INTO blocked_events(ts,strategy,symbol,side,kind,status,reason,detail,notional,dry,source)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?)
+            """,
+            rows,
+        )
+        conn.commit()
+        conn.close()
+    except Exception:
+        return
+
+
+
 def _intent_id(intent: Any) -> Optional[str]:
     """Read the stable intent id you set in intent.meta."""
     try:
@@ -964,6 +1008,27 @@ def _db() -> sqlite3.Connection:
             raw JSON
         )
     """)
+    
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS blocked_events (
+            id        INTEGER PRIMARY KEY AUTOINCREMENT,
+            ts        INTEGER NOT NULL,
+            strategy  TEXT,
+            symbol    TEXT,
+            side      TEXT,
+            kind      TEXT,
+            status    TEXT,
+            reason    TEXT,
+            detail    TEXT,
+            notional  REAL,
+            dry       INTEGER DEFAULT 0,
+            source    TEXT
+        );
+    """)
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_blocked_events_ts ON blocked_events(ts);")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_blocked_events_sym ON blocked_events(symbol);")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_blocked_events_strat ON blocked_events(strategy);")
+
     conn.execute("""
         CREATE TABLE IF NOT EXISTS ledgers (
             txid TEXT PRIMARY KEY,
@@ -2434,6 +2499,65 @@ def advisor_v2_summary(limit: int = Query(1000, ge=1, le=10000)):
             "error": "advisor_v2_failed",
             "detail": str(exc),
         }
+
+
+
+@app.get("/advisor/v2/blocked_summary")
+def advisor_v2_blocked_summary(hours: int = Query(24, ge=1, le=24*30), top_n: int = Query(20, ge=1, le=200)):
+    """
+    Learning Engine Phase 2: summarize blocked/skipped scheduler actions captured in blocked_events.
+    """
+    try:
+        import time
+        since_ts = int(time.time()) - int(hours) * 3600
+        conn = _db()
+        cur = conn.cursor()
+
+        rows = cur.execute(
+            """
+            SELECT COALESCE(reason,''), COUNT(*) as n
+            FROM blocked_events
+            WHERE ts >= ?
+            GROUP BY COALESCE(reason,'')
+            ORDER BY n DESC
+            LIMIT ?
+            """,
+            (since_ts, top_n),
+        ).fetchall()
+        by_reason = [{"reason": r[0], "count": int(r[1])} for r in rows]
+
+        rows = cur.execute(
+            """
+            SELECT COALESCE(symbol,''), COUNT(*) as n
+            FROM blocked_events
+            WHERE ts >= ?
+            GROUP BY COALESCE(symbol,'')
+            ORDER BY n DESC
+            LIMIT ?
+            """,
+            (since_ts, top_n),
+        ).fetchall()
+        by_symbol = [{"symbol": r[0], "count": int(r[1])} for r in rows]
+
+        rows = cur.execute(
+            """
+            SELECT COALESCE(strategy,''), COUNT(*) as n
+            FROM blocked_events
+            WHERE ts >= ?
+            GROUP BY COALESCE(strategy,'')
+            ORDER BY n DESC
+            LIMIT ?
+            """,
+            (since_ts, top_n),
+        ).fetchall()
+        by_strategy = [{"strategy": r[0], "count": int(r[1])} for r in rows]
+
+        total = cur.execute("SELECT COUNT(*) FROM blocked_events WHERE ts >= ?", (since_ts,)).fetchone()[0]
+
+        conn.close()
+        return {"ok": True, "hours": hours, "since_ts": since_ts, "total": int(total), "by_reason": by_reason, "by_symbol": by_symbol, "by_strategy": by_strategy}
+    except Exception as exc:
+        return {"ok": False, "error": "blocked_summary_failed", "detail": str(exc)}
 
 
 @app.get("/advisor/v2/report")
