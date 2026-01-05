@@ -1,5 +1,5 @@
 """
-crypto-system-api (app.py) — v2.4.2
+crypto-system-api (app.py) — v3.0.1
 ------------------------------------
 Full drop-in FastAPI app.
 
@@ -145,7 +145,7 @@ logging.basicConfig(
 log = logging.getLogger("crypto-system")
 logger = log  # alias for older patches
 log.info("Logging initialized at level %s", LOG_LEVEL)
-__version__ = '2.3.4'
+__version__ = '2.0.0'
 
 
 
@@ -637,6 +637,50 @@ def _extract_ordertxid_userref_from_resp(resp: Any) -> Tuple[Optional[str], Opti
     return (ordertxid, userref)
 
 
+def _log_blocked_events_bulk(actions: List[Dict[str, Any]], source: str = "scheduler_v2") -> None:
+    """
+    Learning Engine Phase 2: persist blocked/skipped scheduler actions.
+    Best-effort only: failures must NEVER affect scheduler response.
+    """
+    try:
+        import time as _t
+        ts = int(_t.time())
+        rows = []
+        for a in actions or []:
+            status = str(a.get("status") or "")
+            if not status.startswith("skipped_"):
+                continue
+            rows.append((
+                ts,
+                a.get("strategy"),
+                a.get("symbol"),
+                a.get("side"),
+                a.get("kind"),
+                status,
+                a.get("reason"),
+                a.get("error") or a.get("detail"),
+                float(a.get("notional") or 0.0),
+                1 if a.get("dry") else 0,
+                source,
+            ))
+        if not rows:
+            return
+        conn = _db()
+        cur = conn.cursor()
+        cur.executemany(
+            """
+            INSERT INTO blocked_events(ts,strategy,symbol,side,kind,status,reason,detail,notional,dry,source)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?)
+            """,
+            rows,
+        )
+        conn.commit()
+        conn.close()
+    except Exception:
+        return
+
+
+
 def _intent_id(intent: Any) -> Optional[str]:
     """Read the stable intent id you set in intent.meta."""
     try:
@@ -964,6 +1008,27 @@ def _db() -> sqlite3.Connection:
             raw JSON
         )
     """)
+    
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS blocked_events (
+            id        INTEGER PRIMARY KEY AUTOINCREMENT,
+            ts        INTEGER NOT NULL,
+            strategy  TEXT,
+            symbol    TEXT,
+            side      TEXT,
+            kind      TEXT,
+            status    TEXT,
+            reason    TEXT,
+            detail    TEXT,
+            notional  REAL,
+            dry       INTEGER DEFAULT 0,
+            source    TEXT
+        );
+    """)
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_blocked_events_ts ON blocked_events(ts);")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_blocked_events_sym ON blocked_events(symbol);")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_blocked_events_strat ON blocked_events(strategy);")
+
     conn.execute("""
         CREATE TABLE IF NOT EXISTS ledgers (
             txid TEXT PRIMARY KEY,
@@ -1015,28 +1080,6 @@ def _db() -> sqlite3.Connection:
     conn.execute("CREATE INDEX IF NOT EXISTS idx_trades_symbol ON trades(symbol)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_trades_ordertxid ON trades(ordertxid)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_trades_intent_id ON trades(intent_id)")
-    # --- Advisor v2 Learning Engine (Phase 2) -----------------------------------------
-    # Persist "blocked / skipped" events so Advisor can learn from what DIDN'T execute.
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS blocked_events (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            ts REAL,
-            strategy TEXT,
-            symbol TEXT,
-            kind TEXT,
-            side TEXT,
-            status TEXT,
-            reason TEXT,
-            error TEXT,
-            notional REAL,
-            meta_json TEXT
-        )
-    """)
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_blocked_events_ts ON blocked_events(ts)")
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_blocked_events_reason ON blocked_events(reason)")
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_blocked_events_symbol ON blocked_events(symbol)")
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_blocked_events_strategy ON blocked_events(strategy)")
-
     return conn
 
 def insert_trades(rows: List[Dict[str, Any]]) -> int:
@@ -2458,6 +2501,65 @@ def advisor_v2_summary(limit: int = Query(1000, ge=1, le=10000)):
         }
 
 
+
+@app.get("/advisor/v2/blocked_summary")
+def advisor_v2_blocked_summary(hours: int = Query(24, ge=1, le=24*30), top_n: int = Query(20, ge=1, le=200)):
+    """
+    Learning Engine Phase 2: summarize blocked/skipped scheduler actions captured in blocked_events.
+    """
+    try:
+        import time
+        since_ts = int(time.time()) - int(hours) * 3600
+        conn = _db()
+        cur = conn.cursor()
+
+        rows = cur.execute(
+            """
+            SELECT COALESCE(reason,''), COUNT(*) as n
+            FROM blocked_events
+            WHERE ts >= ?
+            GROUP BY COALESCE(reason,'')
+            ORDER BY n DESC
+            LIMIT ?
+            """,
+            (since_ts, top_n),
+        ).fetchall()
+        by_reason = [{"reason": r[0], "count": int(r[1])} for r in rows]
+
+        rows = cur.execute(
+            """
+            SELECT COALESCE(symbol,''), COUNT(*) as n
+            FROM blocked_events
+            WHERE ts >= ?
+            GROUP BY COALESCE(symbol,'')
+            ORDER BY n DESC
+            LIMIT ?
+            """,
+            (since_ts, top_n),
+        ).fetchall()
+        by_symbol = [{"symbol": r[0], "count": int(r[1])} for r in rows]
+
+        rows = cur.execute(
+            """
+            SELECT COALESCE(strategy,''), COUNT(*) as n
+            FROM blocked_events
+            WHERE ts >= ?
+            GROUP BY COALESCE(strategy,'')
+            ORDER BY n DESC
+            LIMIT ?
+            """,
+            (since_ts, top_n),
+        ).fetchall()
+        by_strategy = [{"strategy": r[0], "count": int(r[1])} for r in rows]
+
+        total = cur.execute("SELECT COUNT(*) FROM blocked_events WHERE ts >= ?", (since_ts,)).fetchone()[0]
+
+        conn.close()
+        return {"ok": True, "hours": hours, "since_ts": since_ts, "total": int(total), "by_reason": by_reason, "by_symbol": by_symbol, "by_strategy": by_strategy}
+    except Exception as exc:
+        return {"ok": False, "error": "blocked_summary_failed", "detail": str(exc)}
+
+
 @app.get("/advisor/v2/report")
 def advisor_v2_report(
     hours: int = Query(24, ge=1, le=24*30),
@@ -2517,167 +2619,6 @@ def advisor_v2_suggestions(
 
 
 
-
-# --------------------------------------------------------------------------------------
-# Advisor v2 Learning Engine — Phase 2 (Observer)
-# --------------------------------------------------------------------------------------
-
-def _is_blocked_action(a: Dict[str, Any]) -> bool:
-    """Return True if an action represents a blocked/skipped trade/exit."""
-    status = str(a.get("status") or "").lower()
-    err = str(a.get("error") or "").lower()
-    # Anything explicitly marked skipped/blocked counts.
-    if status.startswith("skipped") or "blocked" in status:
-        return True
-    # Common failure modes also count.
-    if "insufficient" in err or "below_min" in err or "min_notional" in err:
-        return True
-    return False
-
-def _blocked_reason(a: Dict[str, Any]) -> str:
-    """Normalize a reason string for grouping in Advisor reports."""
-    status = str(a.get("status") or "").strip()
-    if status:
-        return status
-    reason = str(a.get("reason") or "").strip()
-    if reason:
-        return reason
-    err = str(a.get("error") or "").strip()
-    return err[:160] if err else "blocked"
-
-def _insert_blocked_events(events: List[Dict[str, Any]]) -> int:
-    if not events:
-        return 0
-    ts = time.time()
-    conn = _journal_db_connect()
-    try:
-        rows = []
-        for e in events:
-            rows.append((
-                float(e.get("ts") or ts),
-                str(e.get("strategy") or ""),
-                str(e.get("symbol") or ""),
-                str(e.get("kind") or ""),
-                str(e.get("side") or ""),
-                str(e.get("status") or ""),
-                str(e.get("reason") or ""),
-                str(e.get("error") or ""),
-                float(e.get("notional") or 0.0),
-                json.dumps(e.get("meta") or {}, ensure_ascii=False),
-            ))
-        conn.executemany(
-            "INSERT INTO blocked_events (ts,strategy,symbol,kind,side,status,reason,error,notional,meta_json) "
-            "VALUES (?,?,?,?,?,?,?,?,?,?)",
-            rows,
-        )
-        conn.commit()
-        return len(rows)
-    finally:
-        try:
-            conn.close()
-        except Exception:
-            pass
-
-@app.post("/advisor/v2/ingest_run")
-def advisor_v2_ingest_run(payload: Dict[str, Any] = Body(default=None)) -> Dict[str, Any]:
-    """
-    Ingest a /scheduler/v2/run response and persist blocked/skipped events.
-
-    This endpoint is intentionally "observer-only": it never trades.
-    """
-    payload = payload or {}
-    actions = payload.get("actions") or []
-    blocked = []
-    for a in actions:
-        if not isinstance(a, dict):
-            continue
-        if _is_blocked_action(a):
-            blocked.append({
-                "ts": time.time(),
-                "strategy": a.get("strategy"),
-                "symbol": a.get("symbol"),
-                "kind": a.get("kind"),
-                "side": a.get("side"),
-                "status": a.get("status"),
-                "reason": _blocked_reason(a),
-                "error": a.get("error"),
-                "notional": a.get("notional"),
-                "meta": {
-                    "intent_id": a.get("intent_id"),
-                    "dry": payload.get("dry"),
-                    "tf": (payload.get("config") or {}).get("tf"),
-                },
-            })
-    n = _insert_blocked_events(blocked)
-    return {"ok": True, "ingested": n, "blocked_found": len(blocked)}
-
-@app.get("/advisor/v2/blocked_summary")
-def advisor_v2_blocked_summary(hours: int = Query(24, ge=1, le=720), top_n: int = Query(25, ge=1, le=200)) -> Dict[str, Any]:
-    """Aggregated view of blocked/skipped events for the last N hours."""
-    since_ts = time.time() - (hours * 3600)
-    conn = _journal_db_connect()
-    try:
-        cur = conn.cursor()
-        by_reason = []
-        for r in cur.execute(
-            "SELECT COALESCE(NULLIF(TRIM(reason),''),'unknown') AS r, COUNT(*) "
-            "FROM blocked_events WHERE ts >= ? GROUP BY r ORDER BY COUNT(*) DESC LIMIT ?",
-            (since_ts, int(top_n)),
-        ).fetchall():
-            by_reason.append({"reason": r[0], "count": int(r[1])})
-        by_symbol = []
-        for r in cur.execute(
-            "SELECT COALESCE(NULLIF(TRIM(symbol),''),'') AS s, COUNT(*) "
-            "FROM blocked_events WHERE ts >= ? GROUP BY s ORDER BY COUNT(*) DESC LIMIT ?",
-            (since_ts, int(top_n)),
-        ).fetchall():
-            by_symbol.append({"symbol": r[0], "count": int(r[1])})
-        by_strategy = []
-        for r in cur.execute(
-            "SELECT COALESCE(NULLIF(TRIM(strategy),''),'') AS s, COUNT(*) "
-            "FROM blocked_events WHERE ts >= ? GROUP BY s ORDER BY COUNT(*) DESC LIMIT ?",
-            (since_ts, int(top_n)),
-        ).fetchall():
-            by_strategy.append({"strategy": r[0], "count": int(r[1])})
-        total = cur.execute("SELECT COUNT(*) FROM blocked_events WHERE ts >= ?", (since_ts,)).fetchone()[0]
-        return {"ok": True, "hours": hours, "total": int(total), "by_reason": by_reason, "by_symbol": by_symbol, "by_strategy": by_strategy}
-    finally:
-        try:
-            conn.close()
-        except Exception:
-            pass
-
-@app.get("/advisor/v2/blocked_detail")
-def advisor_v2_blocked_detail(hours: int = Query(24, ge=1, le=720), limit: int = Query(200, ge=1, le=5000)) -> Dict[str, Any]:
-    """Recent blocked/skipped event rows (for drilling into root causes)."""
-    since_ts = time.time() - (hours * 3600)
-    conn = _journal_db_connect()
-    try:
-        cur = conn.cursor()
-        rows = []
-        for r in cur.execute(
-            "SELECT ts,strategy,symbol,kind,side,status,reason,error,notional,meta_json "
-            "FROM blocked_events WHERE ts >= ? ORDER BY ts DESC LIMIT ?",
-            (since_ts, int(limit)),
-        ).fetchall():
-            rows.append({
-                "ts": float(r[0] or 0),
-                "strategy": r[1],
-                "symbol": r[2],
-                "kind": r[3],
-                "side": r[4],
-                "status": r[5],
-                "reason": r[6],
-                "error": r[7],
-                "notional": float(r[8] or 0.0),
-                "meta": json.loads(r[9] or "{}") if (r[9] or "").strip() else {},
-            })
-        return {"ok": True, "hours": hours, "count": len(rows), "rows": rows}
-    finally:
-        try:
-            conn.close()
-        except Exception:
-            pass
 @app.get("/journal/counts")
 def journal_counts():
     conn = _db()
@@ -2915,33 +2856,7 @@ def debug_strategy_scan(payload: Dict[str, Any] = Body(default=None)):
     notional = float(payload.get("notional", float(os.getenv("SCHED_NOTIONAL", "25") or 25.0)))
 
     # Load positions + risk config, then normalize positions to dict[(symbol,strat)] -> Position
-    raw_positions = _load_open_positions_from_trades(use_strategy_col=True)
-
-    # Live Kraken balances map (base asset -> available qty). Used to prevent phantom SELL exits.
-    try:
-        _kr_pos_raw = broker_kraken.positions() or []
-    except Exception:
-        _kr_pos_raw = []
-    _live_bal: Dict[str, float] = {}
-    for _r in _kr_pos_raw:
-        try:
-            _a = str(_r.get("asset", "") or "").upper()
-            _q = _r.get("avail", None)
-            if _q is None:
-                _q = _r.get("qty", 0.0)
-            _qf = float(_q)
-        except Exception:
-            continue
-        if _a in ("XBT", "XXBT"):
-            _a = "BTC"
-        _live_bal[_a] = _live_bal.get(_a, 0.0) + _qf
-
-    def _base_asset_from_symbol(_sym: str) -> str:
-        _s = str(_sym or "")
-        if "/" in _s:
-            return _s.split("/")[0].upper()
-        return _s.upper()
-
+    raw_positions = _load_reconciled_positions(use_strategy_col=True, include_legacy=False)
     risk_cfg = load_risk_config() or {}
 
     positions: Dict[Tuple[str, str], Position] = {}
@@ -3776,7 +3691,6 @@ def debug_env():
     env = {k: os.getenv(k) for k in keys}
     return {"ok": True, "env": env}
     
-
 @app.get("/debug/kraken/value")
 def debug_kraken_value():
     """Live Kraken portfolio value (best-effort)."""
@@ -3808,7 +3722,7 @@ def debug_kraken_value():
         return {"ok": True, "total_usd": total, "breakdown": breakdown}
     except Exception as e:
         return {"ok": False, "error": f"debug_kraken_value_error:{e}"}
-
+    
 @app.get("/debug/kraken/positions")
 def debug_kraken_positions(
     use_strategy: bool = True,
@@ -3931,6 +3845,41 @@ def debug_kraken_positions(
     except Exception as e:
         return {"ok": False, "error": str(e)}
     
+@app.get("/debug/kraken/value")
+def debug_kraken_value():
+    """Approximate live Kraken portfolio value using Balance + last prices.
+
+    - Uses broker_kraken.positions() for balances (already normalized).
+    - Prices via _last_price_safe(symbol).
+    - Returns USD cash + sum(asset_qty * last_price(asset/USD)).
+
+    Note: This is a best-effort mark-to-market; it does not include margin,
+    staking rewards not in Balance, or unrealized PnL on derivatives.
+    """
+    try:
+        import broker_kraken
+        bals = broker_kraken.positions() or []
+        total = 0.0
+        breakdown = []
+        for row in bals:
+            asset = str(row.get("asset") or "").upper().strip()
+            qty = float(row.get("qty") or 0.0)
+            if qty <= 0:
+                continue
+            if asset == "USD":
+                total += qty
+                breakdown.append({"asset": "USD", "qty": qty, "px": 1.0, "value": qty})
+                continue
+            sym = f"{asset}/USD"
+            px = float(_last_price_safe(sym) or 0.0)
+            val = qty * px
+            total += val
+            breakdown.append({"asset": asset, "qty": qty, "px": px, "value": val})
+        breakdown.sort(key=lambda x: float(x.get("value") or 0.0), reverse=True)
+        return {"ok": True, "total_usd": total, "breakdown": breakdown}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
 @app.get("/debug/global_policy")
 def debug_global_policy():
     """
@@ -4283,8 +4232,7 @@ def scheduler_core_debug(payload: Dict[str, Any] = Body(default=None)):
     }
 
     # positions + risk_cfg
-    positions = _load_open_positions_from_trades(use_strategy_col=True)
-    positions = _reconcile_positions_with_kraken(positions)
+    positions = _load_reconciled_positions(use_strategy_col=True, include_legacy=False)
     # Normalize positions for scheduler_core: it expects a dict keyed by (symbol, strategy)
     # _load_open_positions_from_trades returns a List[Position] for debug friendliness.
     if isinstance(positions, list):
@@ -4441,7 +4389,7 @@ def scheduler_risk_debug(
     - symbol caps
     - global exit decision (if any)
     """
-    positions = _load_open_positions_from_trades(use_strategy_col=True)
+    positions = _load_reconciled_positions(use_strategy_col=True, include_legacy=False)
     # Normalize positions for scheduler_core: it expects a dict keyed by (symbol, strategy)
     # _load_open_positions_from_trades returns a List[Position] for debug friendliness.
     if isinstance(positions, list):
@@ -4810,7 +4758,7 @@ def scheduler_run(payload: Dict[str, Any] = Body(default=None)):
         log.info(msg)
 
         # Load open positions keyed by (symbol, strategy).
-        positions = _load_open_positions_from_trades(use_strategy_col=True)
+        positions = _load_reconciled_positions(use_strategy_col=True, include_legacy=False)
         # Normalize positions for scheduler_core: it expects a dict keyed by (symbol, strategy)
         # _load_open_positions_from_trades returns a List[Position] for debug friendliness.
         if isinstance(positions, list):
@@ -5605,57 +5553,9 @@ def scheduler_run_v2(payload: Dict[str, Any] = Body(default=None)):
         guard_allows = None  # optional; strategies already use guard internally
 
     # ------------------------------------------------------------------
-
-def _reconcile_positions_with_kraken(pos_list: Any) -> Any:
-    """Return journal positions filtered/scaled to live Kraken balances."""
-    if not isinstance(pos_list, list):
-        return pos_list
-    try:
-        kr_raw = broker_kraken.positions() or []
-    except Exception:
-        kr_raw = []
-    kr_map: Dict[str, float] = {}
-    for r in kr_raw:
-        try:
-            a = str(r.get("asset","")).upper().strip()
-            if not a:
-                continue
-            kr_map[a] = float(r.get("qty",0) or 0)
-        except Exception:
-            continue
-
-    by_asset: Dict[str, List[Any]] = {}
-    for p in pos_list:
-        sym = (getattr(p, "symbol", "") or "").strip()
-        asset = sym.split("/")[0].upper().strip() if "/" in sym else sym.upper().strip()[:4]
-        by_asset.setdefault(asset, []).append(p)
-
-    out: List[Any] = []
-    for asset, plist in by_asset.items():
-        kqty = float(kr_map.get(asset, 0) or 0)
-        if kqty <= 0:
-            # Kraken doesn't hold it -> no exits should be generated for it
-            continue
-        jtot = 0.0
-        for p in plist:
-            try:
-                jtot += float(getattr(p, "qty", 0) or 0)
-            except Exception:
-                pass
-        if jtot <= 0:
-            continue
-        scale = kqty / jtot
-        for p in plist:
-            try:
-                p.qty = float(getattr(p, "qty", 0) or 0) * scale
-            except Exception:
-                pass
-            out.append(p)
-    return out
-
     # Load positions & risk config
     # ------------------------------------------------------------------
-    positions = _load_open_positions_from_trades(use_strategy_col=True)
+    positions = _load_reconciled_positions(use_strategy_col=True, include_legacy=False)
     # Normalize positions for scheduler_core: it expects a dict keyed by (symbol, strategy)
     # _load_open_positions_from_trades returns a List[Position] for debug friendliness.
     if isinstance(positions, list):
@@ -5672,6 +5572,15 @@ def _reconcile_positions_with_kraken(pos_list: Any) -> Any:
         positions = _pos_map
     elif not isinstance(positions, dict):
         positions = {}
+    # ------------------------------------------------------------------
+    # Live broker balances (used to prevent phantom SELL exits)
+    # ------------------------------------------------------------------
+    try:
+        _kr_rows = broker_kraken.positions()
+        kraken_bal_map: Dict[str, float] = {str(r.get("asset") or "").upper(): float(r.get("qty") or 0.0) for r in (_kr_rows or [])}
+    except Exception:
+        kraken_bal_map = {}
+
     risk_cfg = load_risk_config() or {}
     risk_engine = RiskEngine(risk_cfg)
 
@@ -5967,38 +5876,6 @@ def _reconcile_positions_with_kraken(pos_list: Any) -> Any:
         except Exception:
             pass
 
-        # SELL-exit gate: never attempt to sell an asset that Kraken reports as 0 available.
-        # This prevents "avail=0.0" churn when the journal thinks a position exists but Kraken does not.
-        kind = (str(getattr(intent, "kind", "") or "")).strip().lower()
-        if side == "sell" and kind in exit_kinds:
-            base = _base_asset_from_symbol(getattr(intent, "symbol", ""))
-            if float(_live_bal.get(base, 0.0)) <= 0.0:
-                telemetry.append(
-                    {
-                        "symbol": intent.symbol,
-                        "strategy": intent.strategy,
-                        "kind": kind,
-                        "side": side,
-                        "reason": f"no_live_balance:{base}",
-                        "source": "scheduler_v2",
-                    }
-                )
-                actions.append(
-                    {
-                        "symbol": intent.symbol,
-                        "strategy": intent.strategy,
-                        "intent_id": intent_id,
-                        "side": side,
-                        "kind": kind,
-                        "notional": float(getattr(intent, "notional", 0.0) or 0.0),
-                        "reason": getattr(intent, "reason", None),
-                        "dry": bool(dry),
-                        "status": "skipped_no_live_balance",
-                        "error": f"no_live_balance:{base}",
-                    }
-                )
-                continue
-
         # Canonicalize symbol for consistent position/context access
         try:
             intent.symbol = _canon_symbol(str(getattr(intent, "symbol", "") or ""))
@@ -6273,7 +6150,7 @@ def _reconcile_positions_with_kraken(pos_list: Any) -> Any:
             kind_l = str(getattr(intent, "kind", "") or "").strip().lower()
 
             # Stop-loss bypasses cooldown/min-hold (safety first)
-            if kind_l != "stop_loss" and (cooldown_same > 0 or cooldown_flip > 0 or (min_hold_seconds > 0 and kind_l in ("entry", "scale", "scale_in", "add"))):
+            if kind_l != "stop_loss" and kind_l in entry_kinds and (cooldown_same > 0 or cooldown_flip > 0):
                 key = (intent.symbol, intent.strategy)
                 now = time.time()
                 with _LAST_ACTION_LATCH_LOCK:
@@ -6326,6 +6203,35 @@ def _reconcile_positions_with_kraken(pos_list: Any) -> Any:
                         log.info("OpenOrders guard: skip %s (pair=%s) because open order exists", intent.symbol, kpair)
                         telemetry.append({"t": "skip_open_order", "symbol": intent.symbol, "pair": kpair, "strat": intent.strat})
                         continue
+
+            # Live balance gate for SELL exits (prevents phantom exits / avail=0.0 spam)
+            if side == "sell" and kind_l not in entry_kinds:
+                base_asset = (intent.symbol.split("/", 1)[0] if "/" in intent.symbol else str(intent.symbol)[:3]).upper()
+                cands = [base_asset]
+                if base_asset == "BTC": cands.append("XBT")
+                if base_asset == "XBT": cands.append("BTC")
+                avail_qty = 0.0
+                for a in cands:
+                    try:
+                        avail_qty = max(avail_qty, float((kraken_bal_map or {}).get(a, 0.0) or 0.0))
+                    except Exception:
+                        pass
+                if avail_qty <= 0.0:
+                    action_record["status"] = "skipped_insufficient_balance_live"
+                    action_record["error"] = f"insufficient_balance_live:{base_asset}:avail_qty={avail_qty}"
+                    actions.append(action_record)
+                    continue
+                # Cap exits so we never attempt to sell more than Kraken actually has
+                live_max_notional = avail_qty * px * 0.995
+                if live_max_notional > 0:
+                    final_notional = min(final_notional, live_max_notional)
+                # Generic dust/min-order handling (safe global floor; exchange mins vary by asset)
+                exit_min_usd = float(os.getenv("EXIT_MIN_NOTIONAL_USD", "6") or 6)
+                if final_notional < exit_min_usd:
+                    action_record["status"] = "skipped_below_min_exit_notional"
+                    action_record["error"] = f"below_min_exit_notional:${final_notional:.4f}<${exit_min_usd:.2f}"
+                    actions.append(action_record)
+                    continue
 
             resp = br.market_notional(
                 symbol=intent.symbol,
@@ -6514,7 +6420,7 @@ def scheduler_core_debug(payload: Dict[str, Any] = Body(default=None)):
 
     # Pseudocode sketch (you’ll adapt from your existing scheduler_run):
     now = dt.datetime.utcnow()
-    positions = _load_open_positions_from_trades(use_strategy_col=True)
+    positions = _load_reconciled_positions(use_strategy_col=True, include_legacy=False)
     # Normalize positions for scheduler_core: it expects a dict keyed by (symbol, strategy)
     # _load_open_positions_from_trades returns a List[Position] for debug friendliness.
     if isinstance(positions, list):
@@ -6673,7 +6579,7 @@ def scheduler_core_debug_risk(payload: Dict[str, Any] = Body(default=None)):
         symbols = [str(s).strip().upper() for s in symbols_csv or []]
 
     # 2) Load positions & risk_cfg exactly as scheduler_run does
-    positions = _load_open_positions_from_trades(use_strategy_col=True)
+    positions = _load_reconciled_positions(use_strategy_col=True, include_legacy=False)
     # Normalize positions for scheduler_core: it expects a dict keyed by (symbol, strategy)
     # _load_open_positions_from_trades returns a List[Position] for debug friendliness.
     if isinstance(positions, list):
@@ -7060,6 +6966,87 @@ def _load_open_positions_from_trades(use_strategy_col: bool = True, include_lega
         return out
     finally:
         conn.close()
+
+def _load_reconciled_positions(
+    use_strategy_col: bool = True,
+    include_legacy: bool = False,
+) -> Dict[Tuple[str, str], Position]:
+    """Reconcile local journal-derived positions with live Kraken balances.
+
+    Rule:
+      - Kraken balances are the SELL authority (spot reality).
+      - Journal positions provide avg_price + per-strategy attribution *only*.
+      - If Kraken has 0 for an asset, that position is excluded from the returned map
+        (prevents phantom exits / incorrect exposure).
+
+    Strategy attribution:
+      - If journal has multiple strategies for an asset, distribute Kraken qty
+        proportionally to journal qty.
+      - If no journal attribution exists, label strategy='unattributed'.
+    """
+    # --- Journal (local) ---
+    journal_list = _load_open_positions_from_trades(use_strategy_col=bool(use_strategy_col), include_legacy=include_legacy)
+    journal_map: Dict[Tuple[str, str], Position] = {}
+    if isinstance(journal_list, list):
+        for p in journal_list:
+            try:
+                sym = (getattr(p, "symbol", "") or "").strip().upper()
+                strat = (getattr(p, "strategy", "") or "").strip().lower() or ("misc" if not use_strategy_col else "default")
+                qty = float(getattr(p, "qty", 0.0) or 0.0)
+                if sym and abs(qty) > 1e-12:
+                    journal_map[(sym, strat)] = p
+            except Exception:
+                continue
+
+    # Aggregate journal by base asset
+    journal_by_asset: Dict[str, float] = {}
+    journal_details: Dict[str, List[Tuple[str, str, float, Optional[float]]]] = {}
+    for (sym, strat), p in journal_map.items():
+        base = sym.split("/", 1)[0].strip().upper() if "/" in sym else sym.strip().upper()
+        qty = float(getattr(p, "qty", 0.0) or 0.0)
+        journal_by_asset[base] = journal_by_asset.get(base, 0.0) + qty
+        journal_details.setdefault(base, []).append((sym, strat, qty, getattr(p, "avg_price", None)))
+
+    # --- Kraken (live balances) ---
+    kraken_bal: Dict[str, float] = {}
+    try:
+        import broker_kraken
+        for row in broker_kraken.positions() or []:
+            a = str(row.get("asset") or "").strip().upper()
+            q = float(row.get("qty") or 0.0)
+            if a:
+                kraken_bal[a] = kraken_bal.get(a, 0.0) + q
+    except Exception:
+        kraken_bal = {}
+
+    # Build reconciled positions map
+    out: Dict[Tuple[str, str], Position] = {}
+    for asset, kqty in kraken_bal.items():
+        if asset == "USD":
+            continue
+        if kqty <= 0:
+            continue
+
+        sym = f"{asset}/USD"
+
+        # If the system doesn't trade this symbol, still expose it as 'unattributed'
+        # so exits can flatten it safely (global exit/risk).
+        if asset in journal_details and journal_by_asset.get(asset, 0.0) > 0 and use_strategy_col:
+            total = float(journal_by_asset[asset])
+            for (jsym, jstrat, jqty, javg) in journal_details[asset]:
+                ratio = (float(jqty) / total) if total > 0 else 0.0
+                alloc = float(kqty) * ratio
+                if alloc <= 1e-12:
+                    continue
+                # prefer journal symbol if it matches the asset
+                osym = (jsym or sym).strip().upper()
+                out[(osym, jstrat)] = Position(symbol=osym, strategy=jstrat, qty=alloc, avg_price=javg)
+        else:
+            out[(sym, "unattributed")] = Position(symbol=sym, strategy="unattributed", qty=float(kqty), avg_price=None)
+
+    return out
+
+
 @app.get("/pnl/by_strategy")
 def pnl_by_strategy(start: Optional[str] = None, end: Optional[str] = None,
                     realized_only: Optional[str] = "true", tz: Optional[str] = "UTC"):
