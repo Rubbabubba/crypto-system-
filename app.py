@@ -5369,6 +5369,46 @@ def scheduler_run_v2(payload: Dict[str, Any] = Body(default=None)):
     actions: List[Dict[str, Any]] = []
     telemetry: List[Dict[str, Any]] = []
 
+
+    # ------------------------------------------------------------------
+    # Phase 1: timing + timeout instrumentation (single-purpose)
+    # ------------------------------------------------------------------
+    _t0 = time.monotonic()
+    _max_ms = int(os.getenv("SCHED_V2_MAX_RUNTIME_MS", "25000"))
+    _slow_call_ms = int(os.getenv("SCHED_V2_SLOW_CALL_MS", "1500"))
+
+    def _elapsed_ms() -> int:
+        try:
+            return int((time.monotonic() - _t0) * 1000)
+        except Exception:
+            return 0
+
+    def _timing(name: str, ms: int, **extra: Any) -> None:
+        row = {"stage": "timing", "name": str(name), "ms": int(ms)}
+        if extra:
+            row.update(extra)
+        telemetry.append(row)
+
+    def _timeout_response(where: str) -> Dict[str, Any]:
+        ems = _elapsed_ms()
+        telemetry.append({"stage": "timeout", "where": where, "elapsed_ms": ems, "max_ms": _max_ms})
+        return {
+            "ok": False,
+            "error": f"scheduler_v2_timeout:{where}:{ems}ms>{_max_ms}ms",
+            "actions": actions,
+            "telemetry": telemetry,
+        }
+
+    def _check_timeout(where: str, dry: bool, config_snapshot: Dict[str, Any]) -> Any:
+        if _max_ms <= 0:
+            return None
+        ems = _elapsed_ms()
+        if ems > _max_ms:
+            out = _timeout_response(where)
+            out.update({"dry": bool(dry), "config": config_snapshot})
+            return out
+        return None
+
     # small helpers for super-safe config access
     def _cfg_get(d: Any, key: str, default: Any = None) -> Any:
         return d.get(key, default) if isinstance(d, dict) else default
@@ -5589,10 +5629,15 @@ def scheduler_run_v2(payload: Dict[str, Any] = Body(default=None)):
     # Live broker balances (used to prevent phantom SELL exits)
     # ------------------------------------------------------------------
     try:
+        _t = time.monotonic()
         _kr_rows = broker_kraken.positions()
         kraken_bal_map: Dict[str, float] = {str(r.get("asset") or "").upper(): float(r.get("qty") or 0.0) for r in (_kr_rows or [])}
-    except Exception:
+        _ms = int((time.monotonic() - _t) * 1000)
+        _timing("kraken_positions", _ms, rows=len(_kr_rows or []))
+    except Exception as e:
+        telemetry.append({"stage": "kraken_positions", "ok": False, "error": f"{e.__class__.__name__}: {e}"})
         kraken_bal_map = {}
+
 
     risk_cfg = load_risk_config() or {}
     risk_engine = RiskEngine(risk_cfg)
@@ -5627,12 +5672,24 @@ def scheduler_run_v2(payload: Dict[str, Any] = Body(default=None)):
     
     
     for sym in syms:
+        _tr = _check_timeout("preload_bars", dry, config_snapshot)
+        if _tr is not None:
+            return _tr
         sym_can = _canon_symbol(sym)
         try:
             bars_sym = _normalize_symbol_for_bars(sym)
             
+            _t_one = time.monotonic()
             one  = br.get_bars(bars_sym, timeframe="1Min", limit=limit)
+            _ms_one = int((time.monotonic() - _t_one) * 1000)
+            if _ms_one >= _slow_call_ms:
+                telemetry.append({"stage": "slow_call", "name": "get_bars", "symbol": sym, "timeframe": "1Min", "ms": _ms_one})
+
+            _t_five = time.monotonic()
             five = br.get_bars(bars_sym, timeframe=tf,     limit=limit)
+            _ms_five = int((time.monotonic() - _t_five) * 1000)
+            if _ms_five >= _slow_call_ms:
+                telemetry.append({"stage": "slow_call", "name": "get_bars", "symbol": sym, "timeframe": tf, "ms": _ms_five})
 
 
             if not one or not five:
@@ -5648,6 +5705,11 @@ def scheduler_run_v2(payload: Dict[str, Any] = Body(default=None)):
             telemetry.append({"symbol": sym, "stage": "preload_bars", "ok": False, "error": f"{e.__class__.__name__}: {e}"})
 
     
+    _timing("preload_bars_total", int((time.monotonic() - _t_preload) * 1000), symbols=len(syms))
+    _tr = _check_timeout("post_preload_bars", dry, config_snapshot)
+    if _tr is not None:
+        return _tr
+
 
 
     # ------------------------------------------------------------------
@@ -6422,6 +6484,8 @@ def scheduler_run_v2(payload: Dict[str, Any] = Body(default=None)):
     except Exception as e:
         # Never let telemetry logging break the API
         log.warning("scheduler_v2: failed to log telemetry: %s", e)
+
+    _timing("total", _elapsed_ms())
 
     return {
         "ok": True,
