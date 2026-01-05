@@ -5381,6 +5381,7 @@ def scheduler_run_v2(payload: Dict[str, Any] = Body(default=None)):
     _bars_timeout_sec = float(os.getenv("BARS_FETCH_TIMEOUT_SEC", "60") or 60)
     _bars_retries = int(os.getenv("BARS_FETCH_RETRIES", "2") or 2)  # retries after first attempt
     _bars_backoff_sec = float(os.getenv("BARS_FETCH_BACKOFF_SEC", "2") or 2)
+    _preload_1min = str(os.getenv("PRELOAD_1MIN_BARS", "false")).strip().lower() in ("1","true","yes","y","on")
 
     def _get_bars_retry(symbol: str, timeframe: str, limit: int) -> Any:
         """Fetch bars with bounded long timeout + retries. Emits telemetry per attempt."""
@@ -5734,11 +5735,14 @@ def scheduler_run_v2(payload: Dict[str, Any] = Body(default=None)):
         try:
             bars_sym = _normalize_symbol_for_bars(sym)
             
-            _t_one = time.monotonic()
-            one  = _get_bars_retry(bars_sym, timeframe="1Min", limit=limit)
-            _ms_one = int((time.monotonic() - _t_one) * 1000)
-            if _ms_one >= _slow_call_ms:
-                telemetry.append({"stage": "slow_call", "name": "get_bars", "symbol": sym, "timeframe": "1Min", "ms": _ms_one})
+            one = []
+            if _preload_1min:
+                _t_one = time.monotonic()
+                one  = _get_bars_retry(bars_sym, timeframe="1Min", limit=limit)
+                _ms_one = int((time.monotonic() - _t_one) * 1000)
+                if _ms_one >= _slow_call_ms:
+                    telemetry.append({"stage": "slow_call", "name": "get_bars", "symbol": sym, "timeframe": "1Min", "ms": _ms_one})
+
 
             _t_five = time.monotonic()
             five = _get_bars_retry(bars_sym, timeframe=tf,     limit=limit)
