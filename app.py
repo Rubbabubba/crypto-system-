@@ -158,7 +158,7 @@ from pydantic import BaseModel
 # Version / Logging
 # --------------------------------------------------------------------------------------
 
-APP_VERSION = "2.0.0-hotfix.3"
+APP_VERSION = "3.0.1"
 
 logging.basicConfig(
     level=logging.INFO,
@@ -964,29 +964,6 @@ def _db() -> sqlite3.Connection:
             raw JSON
         )
     """)
-
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS blocked_events (
-            id        INTEGER PRIMARY KEY AUTOINCREMENT,
-            ts        INTEGER NOT NULL,
-            strategy  TEXT,
-            symbol    TEXT,
-            side      TEXT,
-            kind      TEXT,
-            status    TEXT,
-            reason    TEXT,
-            detail    TEXT,
-            notional  REAL,
-            dry       INTEGER DEFAULT 0,
-            run_ts    TEXT,
-            source    TEXT
-        );
-    """)
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_blocked_events_ts ON blocked_events(ts);")
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_blocked_events_sym ON blocked_events(symbol);")
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_blocked_events_strat ON blocked_events(strategy);")
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_blocked_events_reason ON blocked_events(reason);")
-
     conn.execute("""
         CREATE TABLE IF NOT EXISTS ledgers (
             txid TEXT PRIMARY KEY,
@@ -1038,6 +1015,28 @@ def _db() -> sqlite3.Connection:
     conn.execute("CREATE INDEX IF NOT EXISTS idx_trades_symbol ON trades(symbol)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_trades_ordertxid ON trades(ordertxid)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_trades_intent_id ON trades(intent_id)")
+    # --- Advisor v2 Learning Engine (Phase 2) -----------------------------------------
+    # Persist "blocked / skipped" events so Advisor can learn from what DIDN'T execute.
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS blocked_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            ts REAL,
+            strategy TEXT,
+            symbol TEXT,
+            kind TEXT,
+            side TEXT,
+            status TEXT,
+            reason TEXT,
+            error TEXT,
+            notional REAL,
+            meta_json TEXT
+        )
+    """)
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_blocked_events_ts ON blocked_events(ts)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_blocked_events_reason ON blocked_events(reason)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_blocked_events_symbol ON blocked_events(symbol)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_blocked_events_strategy ON blocked_events(strategy)")
+
     return conn
 
 def insert_trades(rows: List[Dict[str, Any]]) -> int:
@@ -2459,166 +2458,6 @@ def advisor_v2_summary(limit: int = Query(1000, ge=1, le=10000)):
         }
 
 
-
-def _ingest_blocked_actions(run_payload: Dict[str, Any], source: str = "advisor_v2_ingest") -> Dict[str, Any]:
-    """
-    Learning Engine Phase 2 (safe): ingest scheduler output and persist blocked/skipped actions.
-    This function does NOT call the scheduler; it only stores what you provide.
-    """
-    try:
-        import time
-        now_ts = int(time.time())
-        run_ts = str(run_payload.get("ts") or run_payload.get("run_ts") or "")
-        dry = bool((run_payload.get("dry") is True) or (run_payload.get("config") or {}).get("dry") is True)
-        actions = run_payload.get("actions") or []
-        rows = []
-        for a in actions:
-            status = str(a.get("status") or "")
-            if not status.startswith("skipped_"):
-                continue
-            rows.append((
-                now_ts,
-                a.get("strategy"),
-                a.get("symbol"),
-                a.get("side"),
-                a.get("kind"),
-                status,
-                a.get("reason"),
-                a.get("error") or a.get("detail"),
-                float(a.get("notional") or 0.0),
-                1 if dry else 0,
-                run_ts,
-                source,
-            ))
-        if not rows:
-            return {"ok": True, "ingested": 0}
-        conn = _db()
-        cur = conn.cursor()
-        cur.executemany(
-            """
-            INSERT INTO blocked_events(ts,strategy,symbol,side,kind,status,reason,detail,notional,dry,run_ts,source)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
-            """,
-            rows,
-        )
-        conn.commit()
-        conn.close()
-        return {"ok": True, "ingested": len(rows)}
-    except Exception as exc:
-        return {"ok": False, "error": "ingest_failed", "detail": str(exc)}
-
-
-
-@app.post("/advisor/v2/ingest_run")
-def advisor_v2_ingest_run(payload: Dict[str, Any] = Body(default={})):
-    """
-    Phase 2 (safe): Ingest a scheduler/v2/run JSON response and persist any skipped_* actions.
-    This avoids touching the scheduler loop (read-only observer model).
-    """
-    payload = payload or {}
-    return _ingest_blocked_actions(payload, source="advisor_v2_ingest_run")
-
-
-@app.get("/advisor/v2/blocked_summary")
-def advisor_v2_blocked_summary(hours: int = Query(24, ge=1, le=24*30), top_n: int = Query(20, ge=1, le=200)):
-    """
-    Phase 2: summarize blocked/skipped actions ingested from scheduler runs.
-    """
-    try:
-        import time
-        since_ts = int(time.time()) - int(hours) * 3600
-        conn = _db()
-        cur = conn.cursor()
-
-        total = cur.execute("SELECT COUNT(*) FROM blocked_events WHERE ts >= ?", (since_ts,)).fetchone()[0]
-
-        rows = cur.execute(
-            """
-            SELECT COALESCE(reason,''), COUNT(*) as n
-            FROM blocked_events
-            WHERE ts >= ?
-            GROUP BY COALESCE(reason,'')
-            ORDER BY n DESC
-            LIMIT ?
-            """,
-            (since_ts, top_n),
-        ).fetchall()
-        by_reason = [{"reason": r[0], "count": int(r[1])} for r in rows]
-
-        rows = cur.execute(
-            """
-            SELECT COALESCE(symbol,''), COUNT(*) as n
-            FROM blocked_events
-            WHERE ts >= ?
-            GROUP BY COALESCE(symbol,'')
-            ORDER BY n DESC
-            LIMIT ?
-            """,
-            (since_ts, top_n),
-        ).fetchall()
-        by_symbol = [{"symbol": r[0], "count": int(r[1])} for r in rows]
-
-        rows = cur.execute(
-            """
-            SELECT COALESCE(strategy,''), COUNT(*) as n
-            FROM blocked_events
-            WHERE ts >= ?
-            GROUP BY COALESCE(strategy,'')
-            ORDER BY n DESC
-            LIMIT ?
-            """,
-            (since_ts, top_n),
-        ).fetchall()
-        by_strategy = [{"strategy": r[0], "count": int(r[1])} for r in rows]
-
-        conn.close()
-        return {"ok": True, "hours": hours, "since_ts": since_ts, "total": int(total), "by_reason": by_reason, "by_symbol": by_symbol, "by_strategy": by_strategy}
-    except Exception as exc:
-        return {"ok": False, "error": "blocked_summary_failed", "detail": str(exc)}
-
-
-@app.get("/advisor/v2/blocked_detail")
-def advisor_v2_blocked_detail(hours: int = Query(24, ge=1, le=24*30), limit: int = Query(200, ge=1, le=2000)):
-    """
-    Phase 2: return recent blocked/skipped rows for debugging + analysis.
-    """
-    try:
-        import time
-        since_ts = int(time.time()) - int(hours) * 3600
-        conn = _db()
-        cur = conn.cursor()
-        rows = cur.execute(
-            """
-            SELECT ts, strategy, symbol, side, kind, status, reason, detail, notional, dry, run_ts, source
-            FROM blocked_events
-            WHERE ts >= ?
-            ORDER BY ts DESC
-            LIMIT ?
-            """,
-            (since_ts, limit),
-        ).fetchall()
-        conn.close()
-        items = []
-        for r in rows:
-            items.append({
-                "ts": int(r[0]),
-                "strategy": r[1],
-                "symbol": r[2],
-                "side": r[3],
-                "kind": r[4],
-                "status": r[5],
-                "reason": r[6],
-                "detail": r[7],
-                "notional": float(r[8] or 0.0),
-                "dry": bool(r[9]),
-                "run_ts": r[10],
-                "source": r[11],
-            })
-        return {"ok": True, "hours": hours, "since_ts": since_ts, "count": len(items), "items": items}
-    except Exception as exc:
-        return {"ok": False, "error": "blocked_detail_failed", "detail": str(exc)}
-
-
 @app.get("/advisor/v2/report")
 def advisor_v2_report(
     hours: int = Query(24, ge=1, le=24*30),
@@ -2678,6 +2517,167 @@ def advisor_v2_suggestions(
 
 
 
+
+# --------------------------------------------------------------------------------------
+# Advisor v2 Learning Engine — Phase 2 (Observer)
+# --------------------------------------------------------------------------------------
+
+def _is_blocked_action(a: Dict[str, Any]) -> bool:
+    """Return True if an action represents a blocked/skipped trade/exit."""
+    status = str(a.get("status") or "").lower()
+    err = str(a.get("error") or "").lower()
+    # Anything explicitly marked skipped/blocked counts.
+    if status.startswith("skipped") or "blocked" in status:
+        return True
+    # Common failure modes also count.
+    if "insufficient" in err or "below_min" in err or "min_notional" in err:
+        return True
+    return False
+
+def _blocked_reason(a: Dict[str, Any]) -> str:
+    """Normalize a reason string for grouping in Advisor reports."""
+    status = str(a.get("status") or "").strip()
+    if status:
+        return status
+    reason = str(a.get("reason") or "").strip()
+    if reason:
+        return reason
+    err = str(a.get("error") or "").strip()
+    return err[:160] if err else "blocked"
+
+def _insert_blocked_events(events: List[Dict[str, Any]]) -> int:
+    if not events:
+        return 0
+    ts = time.time()
+    conn = _journal_db_connect()
+    try:
+        rows = []
+        for e in events:
+            rows.append((
+                float(e.get("ts") or ts),
+                str(e.get("strategy") or ""),
+                str(e.get("symbol") or ""),
+                str(e.get("kind") or ""),
+                str(e.get("side") or ""),
+                str(e.get("status") or ""),
+                str(e.get("reason") or ""),
+                str(e.get("error") or ""),
+                float(e.get("notional") or 0.0),
+                json.dumps(e.get("meta") or {}, ensure_ascii=False),
+            ))
+        conn.executemany(
+            "INSERT INTO blocked_events (ts,strategy,symbol,kind,side,status,reason,error,notional,meta_json) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?)",
+            rows,
+        )
+        conn.commit()
+        return len(rows)
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+@app.post("/advisor/v2/ingest_run")
+def advisor_v2_ingest_run(payload: Dict[str, Any] = Body(default=None)) -> Dict[str, Any]:
+    """
+    Ingest a /scheduler/v2/run response and persist blocked/skipped events.
+
+    This endpoint is intentionally "observer-only": it never trades.
+    """
+    payload = payload or {}
+    actions = payload.get("actions") or []
+    blocked = []
+    for a in actions:
+        if not isinstance(a, dict):
+            continue
+        if _is_blocked_action(a):
+            blocked.append({
+                "ts": time.time(),
+                "strategy": a.get("strategy"),
+                "symbol": a.get("symbol"),
+                "kind": a.get("kind"),
+                "side": a.get("side"),
+                "status": a.get("status"),
+                "reason": _blocked_reason(a),
+                "error": a.get("error"),
+                "notional": a.get("notional"),
+                "meta": {
+                    "intent_id": a.get("intent_id"),
+                    "dry": payload.get("dry"),
+                    "tf": (payload.get("config") or {}).get("tf"),
+                },
+            })
+    n = _insert_blocked_events(blocked)
+    return {"ok": True, "ingested": n, "blocked_found": len(blocked)}
+
+@app.get("/advisor/v2/blocked_summary")
+def advisor_v2_blocked_summary(hours: int = Query(24, ge=1, le=720), top_n: int = Query(25, ge=1, le=200)) -> Dict[str, Any]:
+    """Aggregated view of blocked/skipped events for the last N hours."""
+    since_ts = time.time() - (hours * 3600)
+    conn = _journal_db_connect()
+    try:
+        cur = conn.cursor()
+        by_reason = []
+        for r in cur.execute(
+            "SELECT COALESCE(NULLIF(TRIM(reason),''),'unknown') AS r, COUNT(*) "
+            "FROM blocked_events WHERE ts >= ? GROUP BY r ORDER BY COUNT(*) DESC LIMIT ?",
+            (since_ts, int(top_n)),
+        ).fetchall():
+            by_reason.append({"reason": r[0], "count": int(r[1])})
+        by_symbol = []
+        for r in cur.execute(
+            "SELECT COALESCE(NULLIF(TRIM(symbol),''),'') AS s, COUNT(*) "
+            "FROM blocked_events WHERE ts >= ? GROUP BY s ORDER BY COUNT(*) DESC LIMIT ?",
+            (since_ts, int(top_n)),
+        ).fetchall():
+            by_symbol.append({"symbol": r[0], "count": int(r[1])})
+        by_strategy = []
+        for r in cur.execute(
+            "SELECT COALESCE(NULLIF(TRIM(strategy),''),'') AS s, COUNT(*) "
+            "FROM blocked_events WHERE ts >= ? GROUP BY s ORDER BY COUNT(*) DESC LIMIT ?",
+            (since_ts, int(top_n)),
+        ).fetchall():
+            by_strategy.append({"strategy": r[0], "count": int(r[1])})
+        total = cur.execute("SELECT COUNT(*) FROM blocked_events WHERE ts >= ?", (since_ts,)).fetchone()[0]
+        return {"ok": True, "hours": hours, "total": int(total), "by_reason": by_reason, "by_symbol": by_symbol, "by_strategy": by_strategy}
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+@app.get("/advisor/v2/blocked_detail")
+def advisor_v2_blocked_detail(hours: int = Query(24, ge=1, le=720), limit: int = Query(200, ge=1, le=5000)) -> Dict[str, Any]:
+    """Recent blocked/skipped event rows (for drilling into root causes)."""
+    since_ts = time.time() - (hours * 3600)
+    conn = _journal_db_connect()
+    try:
+        cur = conn.cursor()
+        rows = []
+        for r in cur.execute(
+            "SELECT ts,strategy,symbol,kind,side,status,reason,error,notional,meta_json "
+            "FROM blocked_events WHERE ts >= ? ORDER BY ts DESC LIMIT ?",
+            (since_ts, int(limit)),
+        ).fetchall():
+            rows.append({
+                "ts": float(r[0] or 0),
+                "strategy": r[1],
+                "symbol": r[2],
+                "kind": r[3],
+                "side": r[4],
+                "status": r[5],
+                "reason": r[6],
+                "error": r[7],
+                "notional": float(r[8] or 0.0),
+                "meta": json.loads(r[9] or "{}") if (r[9] or "").strip() else {},
+            })
+        return {"ok": True, "hours": hours, "count": len(rows), "rows": rows}
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
 @app.get("/journal/counts")
 def journal_counts():
     conn = _db()
@@ -2916,6 +2916,32 @@ def debug_strategy_scan(payload: Dict[str, Any] = Body(default=None)):
 
     # Load positions + risk config, then normalize positions to dict[(symbol,strat)] -> Position
     raw_positions = _load_open_positions_from_trades(use_strategy_col=True)
+
+    # Live Kraken balances map (base asset -> available qty). Used to prevent phantom SELL exits.
+    try:
+        _kr_pos_raw = broker_kraken.positions() or []
+    except Exception:
+        _kr_pos_raw = []
+    _live_bal: Dict[str, float] = {}
+    for _r in _kr_pos_raw:
+        try:
+            _a = str(_r.get("asset", "") or "").upper()
+            _q = _r.get("avail", None)
+            if _q is None:
+                _q = _r.get("qty", 0.0)
+            _qf = float(_q)
+        except Exception:
+            continue
+        if _a in ("XBT", "XXBT"):
+            _a = "BTC"
+        _live_bal[_a] = _live_bal.get(_a, 0.0) + _qf
+
+    def _base_asset_from_symbol(_sym: str) -> str:
+        _s = str(_sym or "")
+        if "/" in _s:
+            return _s.split("/")[0].upper()
+        return _s.upper()
+
     risk_cfg = load_risk_config() or {}
 
     positions: Dict[Tuple[str, str], Position] = {}
@@ -5598,34 +5624,34 @@ def _reconcile_positions_with_kraken(pos_list: Any) -> Any:
         except Exception:
             continue
 
-        by_asset: Dict[str, List[Any]] = {}
-        for p in pos_list:
-            sym = (getattr(p, "symbol", "") or "").strip()
-            asset = sym.split("/")[0].upper().strip() if "/" in sym else sym.upper().strip()[:4]
-            by_asset.setdefault(asset, []).append(p)
+    by_asset: Dict[str, List[Any]] = {}
+    for p in pos_list:
+        sym = (getattr(p, "symbol", "") or "").strip()
+        asset = sym.split("/")[0].upper().strip() if "/" in sym else sym.upper().strip()[:4]
+        by_asset.setdefault(asset, []).append(p)
 
-        out: List[Any] = []
-        for asset, plist in by_asset.items():
-            kqty = float(kr_map.get(asset, 0) or 0)
-            if kqty <= 0:
-                # Kraken doesn't hold it -> no exits should be generated for it
-                continue
-            jtot = 0.0
-            for p in plist:
-                try:
-                    jtot += float(getattr(p, "qty", 0) or 0)
-                except Exception:
-                    pass
-            if jtot <= 0:
-                continue
-            scale = kqty / jtot
-            for p in plist:
-                try:
-                    p.qty = float(getattr(p, "qty", 0) or 0) * scale
-                except Exception:
-                    pass
-                out.append(p)
-        return out
+    out: List[Any] = []
+    for asset, plist in by_asset.items():
+        kqty = float(kr_map.get(asset, 0) or 0)
+        if kqty <= 0:
+            # Kraken doesn't hold it -> no exits should be generated for it
+            continue
+        jtot = 0.0
+        for p in plist:
+            try:
+                jtot += float(getattr(p, "qty", 0) or 0)
+            except Exception:
+                pass
+        if jtot <= 0:
+            continue
+        scale = kqty / jtot
+        for p in plist:
+            try:
+                p.qty = float(getattr(p, "qty", 0) or 0) * scale
+            except Exception:
+                pass
+            out.append(p)
+    return out
 
     # Load positions & risk config
     # ------------------------------------------------------------------
@@ -5940,6 +5966,38 @@ def _reconcile_positions_with_kraken(pos_list: Any) -> Any:
                 intent.strategy = "global"
         except Exception:
             pass
+
+        # SELL-exit gate: never attempt to sell an asset that Kraken reports as 0 available.
+        # This prevents "avail=0.0" churn when the journal thinks a position exists but Kraken does not.
+        kind = (str(getattr(intent, "kind", "") or "")).strip().lower()
+        if side == "sell" and kind in exit_kinds:
+            base = _base_asset_from_symbol(getattr(intent, "symbol", ""))
+            if float(_live_bal.get(base, 0.0)) <= 0.0:
+                telemetry.append(
+                    {
+                        "symbol": intent.symbol,
+                        "strategy": intent.strategy,
+                        "kind": kind,
+                        "side": side,
+                        "reason": f"no_live_balance:{base}",
+                        "source": "scheduler_v2",
+                    }
+                )
+                actions.append(
+                    {
+                        "symbol": intent.symbol,
+                        "strategy": intent.strategy,
+                        "intent_id": intent_id,
+                        "side": side,
+                        "kind": kind,
+                        "notional": float(getattr(intent, "notional", 0.0) or 0.0),
+                        "reason": getattr(intent, "reason", None),
+                        "dry": bool(dry),
+                        "status": "skipped_no_live_balance",
+                        "error": f"no_live_balance:{base}",
+                    }
+                )
+                continue
 
         # Canonicalize symbol for consistent position/context access
         try:
@@ -6437,8 +6495,6 @@ def _reconcile_positions_with_kraken(pos_list: Any) -> Any:
         "telemetry": telemetry,
         "universe": universe,
     }
-
-
 
 
 # ---- New core debug endpoint) ------------------------------------------------------------        
