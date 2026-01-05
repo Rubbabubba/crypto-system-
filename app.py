@@ -5374,8 +5374,61 @@ def scheduler_run_v2(payload: Dict[str, Any] = Body(default=None)):
     # Phase 1: timing + timeout instrumentation (single-purpose)
     # ------------------------------------------------------------------
     _t0 = time.monotonic()
-    _max_ms = int(os.getenv("SCHED_V2_MAX_RUNTIME_MS", "25000"))
+    _max_ms = int(os.getenv("SCHED_V2_MAX_RUNTIME_MS", "180000"))
     _slow_call_ms = int(os.getenv("SCHED_V2_SLOW_CALL_MS", "1500"))
+
+    # Bar fetch robustness (Phase 1): long timeouts + retries (no skipping)
+    _bars_timeout_sec = float(os.getenv("BARS_FETCH_TIMEOUT_SEC", "60") or 60)
+    _bars_retries = int(os.getenv("BARS_FETCH_RETRIES", "2") or 2)  # retries after first attempt
+    _bars_backoff_sec = float(os.getenv("BARS_FETCH_BACKOFF_SEC", "2") or 2)
+
+    def _get_bars_retry(symbol: str, timeframe: str, limit: int) -> Any:
+        """Fetch bars with bounded long timeout + retries. Emits telemetry per attempt."""
+        attempts = max(1, 1 + max(0, _bars_retries))
+        last_exc: Optional[Exception] = None
+        for i in range(attempts):
+            _t_attempt = time.monotonic()
+            try:
+                # Prefer passing a timeout kwarg if br_router supports it.
+                try:
+                    bars = br.get_bars(symbol, timeframe=timeframe, limit=limit, timeout=_bars_timeout_sec)
+                except TypeError:
+                    bars = br.get_bars(symbol, timeframe=timeframe, limit=limit)
+                _ms = int((time.monotonic() - _t_attempt) * 1000)
+                telemetry.append({
+                    "stage": "bars_fetch_attempt",
+                    "ok": True,
+                    "symbol": symbol,
+                    "timeframe": timeframe,
+                    "attempt": i + 1,
+                    "attempts": attempts,
+                    "ms": _ms,
+                    "timeout_sec": _bars_timeout_sec,
+                })
+                return bars
+            except Exception as e:
+                last_exc = e
+                _ms = int((time.monotonic() - _t_attempt) * 1000)
+                telemetry.append({
+                    "stage": "bars_fetch_attempt",
+                    "ok": False,
+                    "symbol": symbol,
+                    "timeframe": timeframe,
+                    "attempt": i + 1,
+                    "attempts": attempts,
+                    "ms": _ms,
+                    "timeout_sec": _bars_timeout_sec,
+                    "error": f"{e.__class__.__name__}: {e}",
+                })
+                if i < attempts - 1:
+                    try:
+                        time.sleep(max(0.0, float(_bars_backoff_sec)))
+                    except Exception:
+                        pass
+        if last_exc:
+            raise last_exc
+        raise RuntimeError("bars_fetch_failed")
+
 
     def _elapsed_ms() -> int:
         try:
@@ -5682,13 +5735,13 @@ def scheduler_run_v2(payload: Dict[str, Any] = Body(default=None)):
             bars_sym = _normalize_symbol_for_bars(sym)
             
             _t_one = time.monotonic()
-            one  = br.get_bars(bars_sym, timeframe="1Min", limit=limit)
+            one  = _get_bars_retry(bars_sym, timeframe="1Min", limit=limit)
             _ms_one = int((time.monotonic() - _t_one) * 1000)
             if _ms_one >= _slow_call_ms:
                 telemetry.append({"stage": "slow_call", "name": "get_bars", "symbol": sym, "timeframe": "1Min", "ms": _ms_one})
 
             _t_five = time.monotonic()
-            five = br.get_bars(bars_sym, timeframe=tf,     limit=limit)
+            five = _get_bars_retry(bars_sym, timeframe=tf,     limit=limit)
             _ms_five = int((time.monotonic() - _t_five) * 1000)
             if _ms_five >= _slow_call_ms:
                 telemetry.append({"stage": "slow_call", "name": "get_bars", "symbol": sym, "timeframe": tf, "ms": _ms_five})
