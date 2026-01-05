@@ -3042,6 +3042,83 @@ def debug_strategy_scan(payload: Dict[str, Any] = Body(default=None)):
     }
 
     return out
+
+@app.get("/debug/bars")
+def debug_bars(symbol: str = "BTC/USD", tf: str = "5Min", limit: int = 300, include_1min: bool = False):
+    """Debug helper: fetch recent OHLC bars for a symbol/timeframe.
+
+    Returns provider name, request params, row counts, first/last timestamps, and a small sample.
+    This is read-only and intended to diagnose "no_bars" situations.
+    """
+    telemetry: List[Dict[str, Any]] = []
+    t0 = time.monotonic()
+
+    try:
+        import br_router as br  # type: ignore[import]
+    except Exception as e:
+        return {"ok": False, "error": f"failed to import br_router: {e}"}
+
+    def _extract_ts(row: Any) -> Any:
+        if not isinstance(row, dict):
+            return None
+        for k in ("t", "ts", "time", "timestamp", "datetime"):
+            if k in row:
+                return row.get(k)
+        return None
+
+    def _fetch(timeframe: str) -> Dict[str, Any]:
+        t1 = time.monotonic()
+        try:
+            # Prefer passing a timeout kwarg if supported
+            timeout_sec = float(os.getenv("BARS_FETCH_TIMEOUT_SEC", "60") or 60)
+            try:
+                bars = br.get_bars(symbol, timeframe=timeframe, limit=limit, timeout=timeout_sec)
+            except TypeError:
+                bars = br.get_bars(symbol, timeframe=timeframe, limit=limit)
+            ms = int((time.monotonic() - t1) * 1000)
+
+            rows = len(bars) if isinstance(bars, list) else (0 if not bars else 1)
+            first_row = bars[0] if isinstance(bars, list) and bars else None
+            last_row = bars[-1] if isinstance(bars, list) and bars else None
+
+            return {
+                "ok": True,
+                "timeframe": timeframe,
+                "ms": ms,
+                "rows": rows,
+                "first_ts": _extract_ts(first_row),
+                "last_ts": _extract_ts(last_row),
+                "sample_last": last_row,
+                "sample_first": first_row,
+            }
+        except Exception as e:
+            ms = int((time.monotonic() - t1) * 1000)
+            return {
+                "ok": False,
+                "timeframe": timeframe,
+                "ms": ms,
+                "error": str(e),
+            }
+
+    out = {
+        "ok": True,
+        "provider": "br_router",
+        "symbol": symbol,
+        "tf": tf,
+        "limit": limit,
+        "include_1min": include_1min,
+        "result": {},
+        "telemetry": telemetry,
+    }
+
+    out["result"][tf] = _fetch(tf)
+    if include_1min:
+        out["result"]["1Min"] = _fetch("1Min")
+
+    out["ms_total"] = int((time.monotonic() - t0) * 1000)
+    return out
+
+
 @app.get("/debug/kraken/trades")
 def debug_kraken_trades(since_hours: int = 720, limit: int = 50000):
     """
