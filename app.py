@@ -5671,6 +5671,8 @@ def scheduler_run_v2(payload: Dict[str, Any] = Body(default=None)):
             return sym
     
     
+    _t_preload = time.monotonic()
+
     for sym in syms:
         _tr = _check_timeout("preload_bars", dry, config_snapshot)
         if _tr is not None:
