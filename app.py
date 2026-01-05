@@ -5828,7 +5828,7 @@ def scheduler_run_v2(payload: Dict[str, Any] = Body(default=None)):
                 telemetry.append({"stage": "slow_call", "name": "get_bars", "symbol": sym, "timeframe": tf, "ms": _ms_five})
 
 
-            if not one or not five:
+            if (not five) or (_preload_1min and (not one)):
                 contexts[sym_can] = None
                 telemetry.append({"symbol": sym, "stage": "preload_bars", "ok": False, "reason": "no_bars"})
             else:
