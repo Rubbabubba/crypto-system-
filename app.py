@@ -143,6 +143,19 @@ logging.basicConfig(
     force=True,
 )
 log = logging.getLogger("crypto-system")
+
+# ---------------------------------------------------------------------
+# Dust suppression (execution-level)
+# ---------------------------------------------------------------------
+# Kraken/exchange minimums mean some residual balances cannot be sold.
+# To avoid spamming repeated "below_min_exit_notional" actions, we
+# suppress repeated dust exit attempts for a TTL window.
+_DUST_SUPPRESS_LAST: dict[str, float] = {}  # key(asset)->last_epoch
+def _dust_asset_key(symbol: str) -> str:
+    try:
+        return (symbol.split("/", 1)[0] if symbol and "/" in symbol else (symbol or "")).strip().upper()
+    except Exception:
+        return (symbol or "").strip().upper()
 logger = log  # alias for older patches
 log.info("Logging initialized at level %s", LOG_LEVEL)
 __version__ = '2.0.0'
@@ -6228,9 +6241,26 @@ def scheduler_run_v2(payload: Dict[str, Any] = Body(default=None)):
                 # Generic dust/min-order handling (safe global floor; exchange mins vary by asset)
                 exit_min_usd = float(os.getenv("EXIT_MIN_NOTIONAL_USD", "6") or 6)
                 if final_notional < exit_min_usd:
-                    action_record["status"] = "skipped_below_min_exit_notional"
-                    action_record["error"] = f"below_min_exit_notional:${final_notional:.4f}<${exit_min_usd:.2f}"
-                    actions.append(action_record)
+                    # Dust suppression: emit at most once per TTL window per asset
+                    ttl = float(os.getenv("DUST_SUPPRESS_TTL_SEC", "86400") or 86400)
+                    now_ts = time.time()
+                    akey = _dust_asset_key(intent.symbol)
+                    last_ts = _DUST_SUPPRESS_LAST.get(akey, 0.0)
+                    if (now_ts - last_ts) >= ttl:
+                        _DUST_SUPPRESS_LAST[akey] = now_ts
+                        action_record["status"] = "dust_suppressed"
+                        action_record["error"] = f"dust_only:${final_notional:.4f}<${exit_min_usd:.2f};ttl={int(ttl)}s"
+                        actions.append(action_record)
+                    else:
+                        telemetry.append({
+                            "stage": "dust_suppressed",
+                            "symbol": intent.symbol,
+                            "strategy": getattr(intent, "strategy", None),
+                            "notional": final_notional,
+                            "min_exit_usd": exit_min_usd,
+                            "ttl_sec": ttl,
+                            "since_last_sec": now_ts - last_ts,
+                        })
                     continue
 
             resp = br.market_notional(
