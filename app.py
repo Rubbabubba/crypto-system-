@@ -5769,6 +5769,37 @@ def scheduler_run_v2(payload: Dict[str, Any] = Body(default=None)):
         telemetry.append({"stage": "kraken_positions", "ok": False, "error": f"{e.__class__.__name__}: {e}"})
         kraken_bal_map = {}
 
+    # ------------------------------------------------------------------
+    # Phase 0 (single-purpose): Effective-qty clamp for SELL exits
+    # - Kraken balances are canonical
+    # - Journal positions are attribution only
+    # - For multi-strategy assets, allocate Kraken qty pro-rata by journal qty
+    #   (prevents one strategy from consuming all available inventory)
+    # ------------------------------------------------------------------
+    _jr_asset_total: Dict[str, float] = {}
+    _jr_asset_strategy: Dict[Tuple[str, str], float] = {}
+    try:
+        if isinstance(positions, dict):
+            for (sym, strat), p in positions.items():
+                try:
+                    sym_s = (sym or "").strip().upper()
+                    strat_s = (strat or "").strip().lower()
+                    if not sym_s or not strat_s:
+                        continue
+                    base = (sym_s.split("/", 1)[0] if "/" in sym_s else sym_s[:3]).upper()
+                    # Ignore USD (cash) and ignore any non-positive qty
+                    if base == "USD":
+                        continue
+                    q = float(getattr(p, "qty", 0.0) or 0.0)
+                    if q <= 0:
+                        continue
+                    _jr_asset_total[base] = float(_jr_asset_total.get(base, 0.0) or 0.0) + q
+                    _jr_asset_strategy[(base, strat_s)] = float(_jr_asset_strategy.get((base, strat_s), 0.0) or 0.0) + q
+                except Exception:
+                    continue
+    except Exception:
+        pass
+
 
     risk_cfg = load_risk_config() or {}
     risk_engine = RiskEngine(risk_cfg)
@@ -6422,9 +6453,13 @@ def scheduler_run_v2(payload: Dict[str, Any] = Body(default=None)):
                 if base_asset == "BTC": cands.append("XBT")
                 if base_asset == "XBT": cands.append("BTC")
                 avail_qty = 0.0
+                avail_asset = base_asset
                 for a in cands:
                     try:
-                        avail_qty = max(avail_qty, float((kraken_bal_map or {}).get(a, 0.0) or 0.0))
+                        q = float((kraken_bal_map or {}).get(a, 0.0) or 0.0)
+                        if q > avail_qty:
+                            avail_qty = q
+                            avail_asset = a
                     except Exception:
                         pass
                 if avail_qty <= 0.0:
@@ -6432,10 +6467,85 @@ def scheduler_run_v2(payload: Dict[str, Any] = Body(default=None)):
                     action_record["error"] = f"insufficient_balance_live:{base_asset}:avail_qty={avail_qty}"
                     actions.append(action_record)
                     continue
-                # Cap exits so we never attempt to sell more than Kraken actually has
-                live_max_notional = avail_qty * px * 0.995
-                if live_max_notional > 0:
-                    final_notional = min(final_notional, live_max_notional)
+                # Phase 0: effective-qty clamp (pro-rata by journal qty per strategy)
+                # - total_journal is computed from reconciled positions (strategy-owned only)
+                # - effective_total = min(avail_qty, total_journal)  [Kraken canonical]
+                # - strategy_effective = effective_total * (strategy_journal / total_journal)
+                strat_key = str(getattr(intent, "strategy", "") or "").strip().lower()
+                base_journal = base_asset
+                if base_journal == "XBT":
+                    base_journal = "BTC"
+                total_journal = float(_jr_asset_total.get(base_journal, 0.0) or 0.0)
+                strat_journal = float(_jr_asset_strategy.get((base_journal, strat_key), 0.0) or 0.0)
+                effective_total_qty = min(float(avail_qty), float(total_journal)) if total_journal > 0 else 0.0
+                if total_journal > 0 and strat_journal > 0 and effective_total_qty > 0:
+                    ratio = max(0.0, min(1.0, strat_journal / total_journal))
+                    strat_effective_qty = effective_total_qty * ratio
+                elif total_journal <= 0 and avail_qty > 0:
+                    # No journal attribution for this asset; do not size exits from it in Phase 0.
+                    strat_effective_qty = 0.0
+                else:
+                    strat_effective_qty = 0.0
+
+                # Classification for observability
+                try:
+                    tol = 1e-12
+                    if total_journal <= tol and avail_qty > tol:
+                        cls = "UNATTRIBUTED_BALANCE"
+                    elif avail_qty <= tol and total_journal > tol:
+                        cls = "JOURNAL_EXCEEDS_KRAKEN"
+                    elif total_journal > avail_qty + tol:
+                        cls = "JOURNAL_EXCEEDS_KRAKEN"
+                    elif avail_qty > total_journal + tol:
+                        cls = "KRAKEN_EXCEEDS_JOURNAL"
+                    else:
+                        cls = "OK_MATCH"
+                except Exception:
+                    cls = "UNKNOWN"
+
+                # If this strategy has no effective qty, quarantine as orphaned/non-executable.
+                if strat_effective_qty <= 0.0:
+                    telemetry.append({
+                        "stage": "effective_qty_clamp",
+                        "symbol": intent.symbol,
+                        "strategy": strat_key,
+                        "asset": base_journal,
+                        "kraken_asset": avail_asset,
+                        "kraken_qty": float(avail_qty),
+                        "journal_qty_total": float(total_journal),
+                        "journal_qty_strategy": float(strat_journal),
+                        "effective_qty_total": float(effective_total_qty),
+                        "effective_qty_strategy": float(strat_effective_qty),
+                        "classification": cls,
+                        "decision": "skip_no_effective_qty",
+                    })
+                    action_record["status"] = "skipped_no_effective_qty"
+                    action_record["error"] = f"no_effective_qty:{base_journal}:kraken={avail_qty} journal_total={total_journal} strat_journal={strat_journal}"
+                    actions.append(action_record)
+                    continue
+
+                # Cap exits so we never attempt to sell more than this strategy's pro-rata effective qty
+                strat_live_max_notional = strat_effective_qty * px * 0.995
+                if strat_live_max_notional > 0:
+                    before = final_notional
+                    final_notional = min(final_notional, strat_live_max_notional)
+                    telemetry.append({
+                        "stage": "effective_qty_clamp",
+                        "symbol": intent.symbol,
+                        "strategy": strat_key,
+                        "asset": base_journal,
+                        "kraken_asset": avail_asset,
+                        "kraken_qty": float(avail_qty),
+                        "journal_qty_total": float(total_journal),
+                        "journal_qty_strategy": float(strat_journal),
+                        "effective_qty_total": float(effective_total_qty),
+                        "effective_qty_strategy": float(strat_effective_qty),
+                        "max_notional_strategy": float(strat_live_max_notional),
+                        "notional_before": float(before),
+                        "notional_after": float(final_notional),
+                        "classification": cls,
+                        "decision": "cap_notional",
+                    })
                 # Generic dust/min-order handling (safe global floor; exchange mins vary by asset)
                 exit_min_usd = float(os.getenv("EXIT_MIN_NOTIONAL_USD", "6") or 6)
                 if final_notional < exit_min_usd:
