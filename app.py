@@ -5465,6 +5465,37 @@ def _phase3_get_env_float(name: str, default: float) -> float:
     except Exception:
         return default
 
+def _bars_fetch_with_retries(symbol: str, timeframe: str, limit: int = 300):
+    """Phase 3 helper: fetch bars with bounded long timeout + retries.
+
+    NOTE: This is intentionally read-only and does not affect scheduler execution paths.
+    """
+    br = br_router
+    # reuse existing env knobs (same names as Phase 1)
+    timeout_sec = _phase3_get_env_int("BARS_FETCH_TIMEOUT_SEC", 60)
+    retries = _phase3_get_env_int("BARS_FETCH_RETRIES", 2)
+    backoff_sec = _phase3_get_env_int("BARS_FETCH_BACKOFF_SEC", 2)
+    attempts = max(1, int(retries) + 1)
+
+    last_err = None
+    for i in range(attempts):
+        try:
+            try:
+                return br.get_bars(symbol, timeframe=timeframe, limit=limit, timeout=timeout_sec)
+            except TypeError:
+                return br.get_bars(symbol, timeframe=timeframe, limit=limit)
+        except Exception as e:
+            last_err = e
+            if i < attempts - 1 and backoff_sec:
+                try:
+                    time.sleep(float(backoff_sec) * (2 ** i))
+                except Exception:
+                    pass
+
+    if last_err:
+        raise last_err
+    raise RuntimeError("bars_fetch_failed")
+
 def _phase3_classify_block(mfe_pct: float, mae_pct: float, hypo_pnl_pct: float) -> str:
     # Thresholds in percent
     bad_thresh = _phase3_get_env_float("PHASE3_BAD_THRESH_PCT", 0.25)
