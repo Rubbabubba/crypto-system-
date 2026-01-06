@@ -5446,6 +5446,42 @@ def scheduler_run_v2(payload: Dict[str, Any] = Body(default=None)):
     actions: List[Dict[str, Any]] = []
     telemetry: List[Dict[str, Any]] = []
 
+    # ------------------------------------------------------------------
+    # Phase 2: blocked trade logging (read-only)
+    # Standardize "why trade did not occur" events into telemetry.
+    # ------------------------------------------------------------------
+    def _log_blocked_trade(reason_code: str, detail: str, intent_obj: Any = None, *,
+                           side: str = None, kind: str = None, notional: float = None,
+                           qty: float = None, extra: Dict[str, Any] = None) -> None:
+        try:
+            rec: Dict[str, Any] = {
+                "stage": "blocked_trade",
+                "reason_code": reason_code,
+                "detail": detail,
+                "source": "scheduler_v2",
+            }
+            if intent_obj is not None:
+                rec.update({
+                    "symbol": getattr(intent_obj, "symbol", None),
+                    "strategy": getattr(intent_obj, "strategy", None),
+                    "kind": getattr(intent_obj, "kind", None),
+                })
+            if side is not None:
+                rec["side"] = side
+            if kind is not None:
+                rec["kind"] = kind
+            if notional is not None:
+                rec["notional"] = float(notional)
+            if qty is not None:
+                rec["qty"] = float(qty)
+            if extra:
+                for k, v in extra.items():
+                    if k not in rec:
+                        rec[k] = v
+            telemetry.append(rec)
+        except Exception:
+            pass
+
 
     # ------------------------------------------------------------------
     # Phase 1: timing + timeout instrumentation (single-purpose)
@@ -6320,6 +6356,7 @@ def scheduler_run_v2(payload: Dict[str, Any] = Body(default=None)):
                     "source": "scheduler_v2",
                 }
             )
+            _log_blocked_trade("blocked_by_min_notional", f"{final_notional:.4f}<{MIN_NOTIONAL_USD}", intent, side=side, kind=str(getattr(intent, "kind", None) or ""), notional=final_notional)
             continue
 
         # Stop-the-bleed: one action per (symbol,strategy) per run
@@ -6335,6 +6372,7 @@ def scheduler_run_v2(payload: Dict[str, Any] = Body(default=None)):
                     "source": "scheduler_v2",
                 }
             )
+            _log_blocked_trade("blocked_by_cooldown", "duplicate_action_same_run", intent, side=side, kind=str(getattr(intent, "kind", None) or ""), notional=final_notional)
             continue
         sent_keys.add(send_key)
 
@@ -6408,6 +6446,7 @@ def scheduler_run_v2(payload: Dict[str, Any] = Body(default=None)):
                         action_record["error"] = f"cooldown_same_side:{age:.1f}s<{cooldown_same}s"
                         try: log.info("scheduler_v2: %s %s %s blocked (%s)", intent.strategy, intent.symbol, side, action_record["error"])
                         except Exception: pass
+                        _log_blocked_trade("blocked_by_cooldown", "cooldown_same_side", intent, side=side, kind=str(getattr(intent, "kind", None) or ""), notional=final_notional)
                         actions.append(action_record)
                         continue
 
@@ -6416,6 +6455,7 @@ def scheduler_run_v2(payload: Dict[str, Any] = Body(default=None)):
                         action_record["error"] = f"cooldown_flip:{age:.1f}s<{cooldown_flip}s"
                         try: log.info("scheduler_v2: %s %s %s blocked (%s)", intent.strategy, intent.symbol, side, action_record["error"])
                         except Exception: pass
+                        _log_blocked_trade("blocked_by_cooldown", "cooldown_flip", intent, side=side, kind=str(getattr(intent, "kind", None) or ""), notional=final_notional)
                         actions.append(action_record)
                         continue
 
@@ -6424,6 +6464,7 @@ def scheduler_run_v2(payload: Dict[str, Any] = Body(default=None)):
                         action_record["error"] = f"min_hold:{age:.1f}s<{min_hold_seconds}s"
                         try: log.info("scheduler_v2: %s %s %s blocked (%s)", intent.strategy, intent.symbol, side, action_record["error"])
                         except Exception: pass
+                        _log_blocked_trade("blocked_by_cooldown", "min_hold", intent, side=side, kind=str(getattr(intent, "kind", None) or ""), notional=final_notional)
                         actions.append(action_record)
                         continue
         except Exception:
@@ -6465,6 +6506,7 @@ def scheduler_run_v2(payload: Dict[str, Any] = Body(default=None)):
                 if avail_qty <= 0.0:
                     action_record["status"] = "skipped_insufficient_balance_live"
                     action_record["error"] = f"insufficient_balance_live:{base_asset}:avail_qty={avail_qty}"
+                    _log_blocked_trade("blocked_by_balance", "insufficient_balance_live", intent, side=side, kind=str(getattr(intent, "kind", None) or ""), notional=final_notional)
                     actions.append(action_record)
                     continue
                 # Phase 0: effective-qty clamp (pro-rata by journal qty per strategy)
@@ -6521,6 +6563,7 @@ def scheduler_run_v2(payload: Dict[str, Any] = Body(default=None)):
                     })
                     action_record["status"] = "skipped_no_effective_qty"
                     action_record["error"] = f"no_effective_qty:{base_journal}:kraken={avail_qty} journal_total={total_journal} strat_journal={strat_journal}"
+                    _log_blocked_trade("blocked_by_balance", "no_effective_qty", intent, side=side, kind=str(getattr(intent, "kind", None) or ""), notional=final_notional)
                     actions.append(action_record)
                     continue
 
@@ -6558,6 +6601,7 @@ def scheduler_run_v2(payload: Dict[str, Any] = Body(default=None)):
                         _DUST_SUPPRESS_LAST[akey] = now_ts
                         action_record["status"] = "dust_suppressed"
                         action_record["error"] = f"dust_only:${final_notional:.4f}<${exit_min_usd:.2f};ttl={int(ttl)}s"
+                        _log_blocked_trade("blocked_by_dust", "dust_only", intent, side=side, kind=str(getattr(intent, "kind", None) or ""), notional=final_notional)
                         actions.append(action_record)
                     else:
                         telemetry.append({
@@ -6569,6 +6613,7 @@ def scheduler_run_v2(payload: Dict[str, Any] = Body(default=None)):
                             "ttl_sec": ttl,
                             "since_last_sec": now_ts - last_ts,
                         })
+                        _log_blocked_trade("blocked_by_dust", "dust_suppressed_ttl", intent, side=side, kind=str(getattr(intent, "kind", None) or ""), notional=final_notional, extra={"ttl_sec": ttl, "since_last_sec": now_ts - last_ts})
                     continue
 
             resp = br.market_notional(
@@ -6601,6 +6646,14 @@ def scheduler_run_v2(payload: Dict[str, Any] = Body(default=None)):
             log.error("scheduler_v2: broker error for %s %s: %s", intent.symbol, side, e)
             action_record["status"] = "error"
             action_record["error"] = f"{e.__class__.__name__}: {e}"
+            try:
+                _err_l = str(action_record.get("error") or "").lower()
+                if ("min" in _err_l and "volume" in _err_l) or ("order minimum" in _err_l) or ("minimum order" in _err_l):
+                    _log_blocked_trade("blocked_by_min_volume", "broker_rejected_min_volume", intent, side=side, kind=str(getattr(intent, "kind", None) or ""), notional=final_notional)
+                elif "insufficient" in _err_l or "balance" in _err_l or "funds" in _err_l:
+                    _log_blocked_trade("blocked_by_balance", "broker_rejected_insufficient_balance", intent, side=side, kind=str(getattr(intent, "kind", None) or ""), notional=final_notional)
+            except Exception:
+                pass
 
         # Journal v2: record every executed (or failed) broker call
         try:
