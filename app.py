@@ -5426,6 +5426,66 @@ def scheduler_run(payload: Dict[str, Any] = Body(default=None)):
             "telemetry": telemetry,
         }
         
+
+# --------------------------------------------------------------------------------------
+# Phase 3: Missed Opportunity Analysis (read-only)
+# - Tracks blocked trades and evaluates what happened after a short observation window.
+# - Produces telemetry records; never changes execution decisions.
+# --------------------------------------------------------------------------------------
+
+_PHASE3_QUEUE: List[Dict[str, Any]] = []
+_PHASE3_DONE: set = set()
+_PHASE3_RECORDS: List[Dict[str, Any]] = []
+
+def _phase3_parse_tf_seconds(tf: str) -> int:
+    tf = (tf or "").strip()
+    if tf.lower().endswith("min"):
+        try:
+            n = int(tf[:-3])
+            return max(1, n) * 60
+        except Exception:
+            return 300
+    if tf.lower().endswith("h"):
+        try:
+            n = int(tf[:-1])
+            return max(1, n) * 3600
+        except Exception:
+            return 3600
+    return 300
+
+def _phase3_get_env_int(name: str, default: int) -> int:
+    try:
+        return int(os.getenv(name, str(default)).strip())
+    except Exception:
+        return default
+
+def _phase3_get_env_float(name: str, default: float) -> float:
+    try:
+        return float(os.getenv(name, str(default)).strip())
+    except Exception:
+        return default
+
+def _phase3_classify_block(mfe_pct: float, mae_pct: float, hypo_pnl_pct: float) -> str:
+    # Thresholds in percent
+    bad_thresh = _phase3_get_env_float("PHASE3_BAD_THRESH_PCT", 0.25)
+    eps = _phase3_get_env_float("PHASE3_EPS_PCT", 0.05)
+    if abs(hypo_pnl_pct) < eps:
+        return "NEUTRAL_BLOCK"
+    if mae_pct > mfe_pct:
+        return "GOOD_BLOCK"
+    if hypo_pnl_pct >= bad_thresh:
+        return "BAD_BLOCK"
+    return "NEUTRAL_BLOCK"
+
+@app.get("/debug/phase3/records")
+def debug_phase3_records(limit: int = 50):
+    try:
+        lim = max(1, min(int(limit), 500))
+    except Exception:
+        lim = 50
+    return {"ok": True, "count": len(_PHASE3_RECORDS), "records": _PHASE3_RECORDS[-lim:]}
+
+
 # --------------------------------------------------------------------------------------
 # Scheduler v2: uses scheduler_core + risk_engine + br_router
 # --------------------------------------------------------------------------------------
@@ -6772,7 +6832,146 @@ def scheduler_run_v2(payload: Dict[str, Any] = Body(default=None)):
         u["reasons"] = uniq_reasons
         universe.append(u)
 
+    
     # ------------------------------------------------------------------
+    # Phase 3: Missed Opportunity Analysis (read-only)
+    # - Enqueue blocked_trade events
+    # - When the observation window has elapsed, compute MFE/MAE and classify
+    # ------------------------------------------------------------------
+    try:
+        now_ts = int(time.time())
+        window_bars = _phase3_get_env_int("PHASE3_WINDOW_BARS", 12)
+        tf_sec = _phase3_parse_tf_seconds(tf)
+
+        def _phase3_make_id(ts0: int, sym0: str, strat0: str, reason0: str, side0: str, kind0: str) -> str:
+            return f"{ts0}:{sym0}:{strat0}:{reason0}:{side0}:{kind0}"
+
+        # Enqueue newly observed blocked trades from this run
+        for row in telemetry:
+            if row.get("stage") != "blocked_trade":
+                continue
+            sym0 = row.get("symbol")
+            strat0 = row.get("strategy")
+            if not sym0 or not strat0:
+                continue
+            reason0 = row.get("reason_code") or "unknown"
+            side0 = row.get("side") or "unknown"
+            kind0 = row.get("kind") or row.get("kind_raw") or "unknown"
+            ts0 = int(row.get("ts") or now_ts)
+            _id = _phase3_make_id(ts0, sym0, strat0, reason0, side0, kind0)
+            if _id in _PHASE3_DONE:
+                continue
+            _PHASE3_QUEUE.append({
+                "id": _id,
+                "ts": ts0,
+                "symbol": sym0,
+                "strategy": strat0,
+                "reason_code": reason0,
+                "side": side0,
+                "kind": kind0,
+                "notional": float(row.get("notional") or 0.0),
+                "tf": tf,
+                "window_bars": window_bars,
+            })
+
+        # Process due items
+        due_after = max(1, window_bars) * max(1, tf_sec)
+        still_pending: List[Dict[str, Any]] = []
+        for item in _PHASE3_QUEUE:
+            try:
+                ts0 = int(item.get("ts") or 0)
+                if now_ts < ts0 + due_after:
+                    still_pending.append(item)
+                    continue
+
+                sym0 = item.get("symbol")
+                side0 = (item.get("side") or "").lower()
+                tf0 = item.get("tf") or tf
+                win = int(item.get("window_bars") or window_bars)
+
+                bars = _bars_fetch_with_retries(sym0, tf0, limit=max(300, win + 25))
+                # bars may be a list of dicts or a DataFrame-like; normalize to list[dict]
+                if hasattr(bars, "to_dict") and hasattr(bars, "__len__") and not isinstance(bars, (list, tuple)):
+                    try:
+                        # pandas DataFrame
+                        bars_list = bars.to_dict("records")
+                    except Exception:
+                        bars_list = []
+                else:
+                    bars_list = list(bars) if isinstance(bars, (list, tuple)) else []
+
+                # Filter to bars at/after ts0
+                bars_fut = [b for b in bars_list if isinstance(b, dict) and int(b.get("t") or 0) >= ts0]
+                if len(bars_fut) < win:
+                    # Not enough future bars yet; keep pending
+                    still_pending.append(item)
+                    continue
+
+                window = bars_fut[:win]
+                entry_bar = window[0]
+                entry_price = float(entry_bar.get("o") or entry_bar.get("c") or 0.0)
+                if entry_price <= 0:
+                    still_pending.append(item)
+                    continue
+
+                highs = [float(b.get("h") or b.get("c") or 0.0) for b in window]
+                lows  = [float(b.get("l") or b.get("c") or 0.0) for b in window]
+                closes = [float(b.get("c") or 0.0) for b in window]
+
+                hi = max(highs) if highs else entry_price
+                lo = min(lows) if lows else entry_price
+                end_close = closes[-1] if closes else entry_price
+
+                if side0 == "buy":
+                    mfe_pct = max(0.0, (hi - entry_price) / entry_price * 100.0)
+                    mae_pct = max(0.0, (entry_price - lo) / entry_price * 100.0)
+                    hypo_pnl_pct = (end_close - entry_price) / entry_price * 100.0
+                else:
+                    # Treat unknown as sell for exits
+                    mfe_pct = max(0.0, (entry_price - lo) / entry_price * 100.0)
+                    mae_pct = max(0.0, (hi - entry_price) / entry_price * 100.0)
+                    hypo_pnl_pct = (entry_price - end_close) / entry_price * 100.0
+
+                rec = {
+                    "stage": "missed_opportunity",
+                    "ts": ts0,
+                    "symbol": item.get("symbol"),
+                    "strategy": item.get("strategy"),
+                    "reason_code": item.get("reason_code"),
+                    "side": item.get("side"),
+                    "kind": item.get("kind"),
+                    "tf": tf0,
+                    "window_bars": win,
+                    "entry_price": entry_price,
+                    "mfe_pct": round(float(mfe_pct), 6),
+                    "mae_pct": round(float(mae_pct), 6),
+                    "hypo_pnl_pct": round(float(hypo_pnl_pct), 6),
+                    "block_quality": _phase3_classify_block(float(mfe_pct), float(mae_pct), float(hypo_pnl_pct)),
+                }
+                telemetry.append(rec)
+
+                # Store immutable record
+                _PHASE3_RECORDS.append(rec)
+                if len(_PHASE3_RECORDS) > 2000:
+                    del _PHASE3_RECORDS[:-1500]
+
+                _PHASE3_DONE.add(item.get("id"))
+            except Exception as e:
+                telemetry.append({
+                    "stage": "missed_opportunity_error",
+                    "id": item.get("id"),
+                    "symbol": item.get("symbol"),
+                    "strategy": item.get("strategy"),
+                    "error": f"{e.__class__.__name__}: {e}",
+                })
+                still_pending.append(item)
+
+        _PHASE3_QUEUE[:] = still_pending
+    except Exception as e:
+        telemetry.append({"stage": "missed_opportunity_init_error", "error": f"{e.__class__.__name__}: {e}"})
+
+
+# ------------------------------------------------------------------
     # FINAL RETURN — log telemetry, then respond
     # ------------------------------------------------------------------
     try:
