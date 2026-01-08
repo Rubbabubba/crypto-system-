@@ -2870,6 +2870,116 @@ def debug_strategy_scan(payload: Dict[str, Any] = Body(default=None)):
 
     # Load positions + risk config, then normalize positions to dict[(symbol,strat)] -> Position
     raw_positions = _load_reconciled_positions(use_strategy_col=True, include_legacy=False)
+    # ------------------------------------------------------------------
+    # Phase 0C (single-purpose): Kraken-truth positions for occupancy & gating
+    # - Kraken balances are the only source of truth for "open positions"
+    # - Journal positions are attribution only
+    # - Symbols with kraken_qty==0 are treated as flat (no phantom occupancy)
+    # - If Kraken has qty but journal has none, create a synthetic global position
+    # ------------------------------------------------------------------
+    try:
+        _kr_truth_positions: Dict[Tuple[str, str], Position] = {}
+        _kr_assets = {str(k or "").upper(): float(v or 0.0) for k, v in (kraken_bal_map or {}).items()}
+
+        removed = 0
+        adjusted = 0
+        synthetic = 0
+        assets = 0
+
+        # Helper to extract base asset from symbol
+        def _base_from_symbol(_sym: str) -> str:
+            s = (_sym or "").strip().upper()
+            if "/" in s:
+                return s.split("/", 1)[0].upper()
+            return (s[:3] if len(s) >= 3 else s).upper()
+
+        # Group journal positions by base asset
+        _asset_to_keys: Dict[str, List[Tuple[str, str]]] = {}
+        if isinstance(positions, dict):
+            for (sym, strat), p in positions.items():
+                try:
+                    base = _base_from_symbol(sym)
+                    if not base or base == "USD":
+                        continue
+                    _asset_to_keys.setdefault(base, []).append((sym, strat))
+                except Exception:
+                    continue
+
+        # Build kraken-truth positions map
+        for base, kqty in _kr_assets.items():
+            try:
+                kqty = float(kqty or 0.0)
+            except Exception:
+                kqty = 0.0
+            if base == "USD":
+                continue
+
+            keys = _asset_to_keys.get(base, []) or []
+            if kqty <= 0:
+                # Kraken flat => remove any journal positions for this asset
+                removed += len(keys)
+                continue
+
+            assets += 1
+
+            if not keys:
+                # Kraken has asset but journal doesn't => synthetic global position
+                sym_guess = f"{base}/USD"
+                _kr_truth_positions[(sym_guess, "global")] = Position(symbol=sym_guess, strategy="global", qty=kqty, avg_price=0.0)
+                synthetic += 1
+                continue
+
+            # Allocate Kraken qty pro-rata by journal qty across strategies
+            tot = 0.0
+            for (sym, strat) in keys:
+                try:
+                    p = positions.get((sym, strat))
+                    q = float(getattr(p, "qty", 0.0) or 0.0)
+                    if q > 0:
+                        tot += q
+                except Exception:
+                    continue
+
+            if tot <= 0:
+                # No positive journal qty; still keep a synthetic position
+                sym_guess = keys[0][0]
+                _kr_truth_positions[(sym_guess, "global")] = Position(symbol=sym_guess, strategy="global", qty=kqty, avg_price=0.0)
+                synthetic += 1
+                continue
+
+            remaining = kqty
+            # deterministic order for stable splits
+            for j, (sym, strat) in enumerate(sorted(keys, key=lambda t: (t[1], t[0]))):
+                p = positions.get((sym, strat))
+                jq = float(getattr(p, "qty", 0.0) or 0.0) if p is not None else 0.0
+                if jq <= 0:
+                    continue
+
+                if j == len(keys) - 1:
+                    eff = max(0.0, remaining)
+                else:
+                    eff = min(jq, (kqty * (jq / tot)))
+                    remaining -= eff
+
+                if eff <= 0:
+                    continue
+
+                avg = float(getattr(p, "avg_price", 0.0) or 0.0) if p is not None else 0.0
+                _kr_truth_positions[(sym, str(strat).strip().lower())] = Position(symbol=sym, strategy=str(strat).strip().lower(), qty=eff, avg_price=avg)
+                adjusted += 1
+
+        positions = _kr_truth_positions
+        telemetry.append({
+            "stage": "phase0_kraken_truth_positions",
+            "ok": True,
+            "assets": assets,
+            "removed": removed,
+            "adjusted": adjusted,
+            "synthetic": synthetic,
+        })
+    except Exception as e:
+        telemetry.append({"stage": "phase0_kraken_truth_positions", "ok": False, "error": f"{e.__class__.__name__}: {e}"})
+
     risk_cfg = load_risk_config() or {}
 
     positions: Dict[Tuple[str, str], Position] = {}
@@ -5897,97 +6007,6 @@ def scheduler_run_v2(payload: Dict[str, Any] = Body(default=None)):
         kraken_bal_map = {}
 
     # ------------------------------------------------------------------
-
-# ------------------------------------------------------------------
-# Phase 0C (single-purpose): Kraken-truth positions for scheduler occupancy
-# - Treat symbols as FLAT when Kraken tradable qty == 0
-# - Allocate Kraken qty pro-rata across journal strategies for same asset
-# - Create synthetic "global" position when Kraken holds asset but journal has none
-# ------------------------------------------------------------------
-_pos_truth_stats = {"removed": 0, "adjusted": 0, "synthetic": 0, "assets": 0}
-try:
-    from types import SimpleNamespace
-
-    if isinstance(positions, dict) and isinstance(kraken_bal_map, dict):
-        # Group journal positions by base asset (left side of SYMBOL/USD)
-        _asset_to_keys: Dict[str, List[Tuple[str, str]]] = {}
-        _asset_to_total: Dict[str, float] = {}
-
-        for (sym, strat), p in positions.items():
-            base = (str(sym).split("/")[0] if sym else "").upper().strip()
-            if not base or base == "USD":
-                continue
-            try:
-                q = float(getattr(p, "qty", 0.0) or 0.0)
-            except Exception:
-                q = 0.0
-            if q <= 0:
-                continue
-            _asset_to_keys.setdefault(base, []).append((sym, strat))
-            _asset_to_total[base] = _asset_to_total.get(base, 0.0) + q
-
-        _new_pos: Dict[Tuple[str, str], Any] = {}
-
-        for asset, keys in _asset_to_keys.items():
-            try:
-                kr_qty = float(kraken_bal_map.get(asset, 0.0) or 0.0)
-            except Exception:
-                kr_qty = 0.0
-
-            if kr_qty <= 0:
-                _pos_truth_stats["removed"] += len(keys)
-                continue
-
-            total = float(_asset_to_total.get(asset, 0.0) or 0.0)
-            if total <= 0:
-                continue
-
-            _pos_truth_stats["assets"] += 1
-
-            for (sym, strat) in keys:
-                p = positions.get((sym, strat))
-                try:
-                    jq = float(getattr(p, "qty", 0.0) or 0.0)
-                except Exception:
-                    jq = 0.0
-
-                share = (jq / total) if total > 0 else 0.0
-                eff = kr_qty * share
-
-                if eff <= 0:
-                    _pos_truth_stats["removed"] += 1
-                    continue
-
-                try:
-                    setattr(p, "qty", eff)
-                except Exception:
-                    p = SimpleNamespace(symbol=sym, strategy=strat, qty=eff, avg_price=float(getattr(p, "avg_price", 0.0) or 0.0))
-
-                _new_pos[(sym, strat)] = p
-                _pos_truth_stats["adjusted"] += 1
-
-        # Synthetic positions: Kraken has inventory but journal has none.
-        journal_assets = set(_asset_to_keys.keys())
-        for asset, _q in (kraken_bal_map or {}).items():
-            try:
-                q = float(_q or 0.0)
-            except Exception:
-                continue
-            if q <= 0:
-                continue
-            if asset in ("USD", "ZUSD", "USDT"):
-                continue
-            if asset not in journal_assets:
-                sym = f"{asset}/USD"
-                _new_pos[(sym, "global")] = SimpleNamespace(symbol=sym, strategy="global", qty=q, avg_price=0.0)
-                _pos_truth_stats["synthetic"] += 1
-
-        positions = _new_pos
-
-    telemetry.append({"stage": "phase0_kraken_truth_positions", "ok": True, **_pos_truth_stats})
-except Exception as e:
-    telemetry.append({"stage": "phase0_kraken_truth_positions", "ok": False, "error": f"{e.__class__.__name__}: {e}"})
-
     # Phase 0 (single-purpose): Effective-qty clamp for SELL exits
     # - Kraken balances are canonical
     # - Journal positions are attribution only
