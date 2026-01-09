@@ -5580,7 +5580,10 @@ def _bars_fetch_with_retries(symbol: str, timeframe: str, limit: int = 300):
 
     NOTE: This is intentionally read-only and does not affect scheduler execution paths.
     """
-    br = br_router
+    try:
+        import br_router as br  # type: ignore[import]
+    except Exception as e:
+        raise RuntimeError(f"phase3_import_br_router_failed:{e}")
     # reuse existing env knobs (same names as Phase 1)
     timeout_sec = _phase3_get_env_int("BARS_FETCH_TIMEOUT_SEC", 60)
     retries = _phase3_get_env_int("BARS_FETCH_RETRIES", 2)
@@ -6274,6 +6277,80 @@ def scheduler_run_v2(payload: Dict[str, Any] = Body(default=None)):
     #   2) Prefer stop_loss > exit > take_profit > entry/scale > other
     #   3) If tie, keep the first encountered (stable)
     # ------------------------------------------------------------------
+
+    # Helper: identify exits that are effectively non-executable (dust or no effective qty),
+    # so they do not block executable entries at the global symbol gate.
+    def _gate_exit_executable(it: Any) -> Dict[str, Any]:
+        try:
+            kind_l = (str(getattr(it, "kind", "") or "")).strip().lower()
+            side_l = (str(getattr(it, "side", "") or "")).strip().lower()
+            sym_l = _canon_symbol(str(getattr(it, "symbol", "") or ""))
+            strat_l = (str(getattr(it, "strategy", "") or "")).strip().lower() or "global"
+
+            # Always treat stop_loss as executable for gating purposes (safety > optimization).
+            if kind_l == "stop_loss":
+                return {"ok": True, "executable": True, "reason": "stop_loss", "est_notional": None}
+
+            # Only exits (SELL, non-entry kinds) can be non-executable in the dust/no-qty sense.
+            if side_l != "sell" or kind_l in entry_kinds:
+                return {"ok": True, "executable": True, "reason": "not_exit", "est_notional": None}
+
+            px0 = float(_last_price_safe(sym_l) or 0.0)
+            if px0 <= 0:
+                return {"ok": True, "executable": True, "reason": "no_price", "est_notional": None}
+
+            base_asset = (sym_l.split("/", 1)[0] if "/" in sym_l else str(sym_l)[:3]).upper()
+            cands = [base_asset]
+            if base_asset == "BTC": cands.append("XBT")
+            if base_asset == "XBT": cands.append("BTC")
+
+            avail_qty = 0.0
+            for a in cands:
+                try:
+                    q = float((kraken_bal_map or {}).get(a, 0.0) or 0.0)
+                    if q > avail_qty:
+                        avail_qty = q
+                except Exception:
+                    pass
+
+            # Compute pro-rata effective qty (same logic as Phase 0 clamp).
+            base_journal = base_asset
+            if base_journal == "XBT":
+                base_journal = "BTC"
+
+            total_journal = float(_jr_asset_total.get(base_journal, 0.0) or 0.0)
+            strat_journal = float(_jr_asset_strategy.get((base_journal, strat_l), 0.0) or 0.0)
+
+            effective_total_qty = min(float(avail_qty), float(total_journal)) if total_journal > 0 else 0.0
+            if total_journal > 0 and strat_journal > 0 and effective_total_qty > 0:
+                ratio = max(0.0, min(1.0, strat_journal / total_journal))
+                strat_effective_qty = effective_total_qty * ratio
+            else:
+                strat_effective_qty = 0.0
+
+            if strat_effective_qty <= 0.0:
+                return {"ok": True, "executable": False, "reason": "no_effective_qty", "est_notional": 0.0}
+
+            est_notional = float(strat_effective_qty) * float(px0) * 0.995
+            exit_min_usd = float(os.getenv("EXIT_MIN_NOTIONAL_USD", "6") or 6)
+
+            if est_notional >= exit_min_usd:
+                return {"ok": True, "executable": True, "reason": "above_min_exit", "est_notional": est_notional}
+
+            # Dust suppression TTL: if within TTL window, treat as non-executable for gating.
+            ttl = float(os.getenv("DUST_SUPPRESS_TTL_SEC", "86400") or 86400)
+            now_ts = time.time()
+            akey = _dust_asset_key(sym_l)
+            last_ts = float(_DUST_SUPPRESS_LAST.get(akey, 0.0) or 0.0)
+            if (now_ts - last_ts) < ttl:
+                return {"ok": True, "executable": False, "reason": "dust_suppressed_ttl", "est_notional": est_notional}
+
+            # First dust event in TTL window will still be "suppressed" downstream, but it is actionable
+            # as a one-time log/record. Allow it through the gate.
+            return {"ok": True, "executable": True, "reason": "dust_first_in_window", "est_notional": est_notional}
+        except Exception as e:
+            return {"ok": False, "executable": True, "reason": f"err:{e.__class__.__name__}:{e}", "est_notional": None}
+
     def _symbol_kind_priority(kind: str) -> int:
         k = (str(kind or "")).strip().lower()
         if k == "stop_loss":
@@ -6293,7 +6370,15 @@ def scheduler_run_v2(payload: Dict[str, Any] = Body(default=None)):
         for it in list(final_intents):
             sym_k = _canon_symbol(str(getattr(it, "symbol", "") or ""))
             kind_k = (str(getattr(it, "kind", "") or "")).strip().lower()
-            pr = _symbol_kind_priority(kind_k)
+pr = _symbol_kind_priority(kind_k)
+
+# Emergency Mode Lever #1: do not let non-executable exits (dust/no-qty) block executable entries.
+gate_meta = None
+if kind_k in ("stop_loss", "exit", "take_profit") or (str(getattr(it, "side", "") or "").strip().lower() == "sell" and kind_k not in entry_kinds):
+    gate_meta = _gate_exit_executable(it)
+    if gate_meta.get("ok") and not gate_meta.get("executable") and kind_k != "stop_loss":
+        # Demote below entries
+        pr = -5
 
             prev = best_by_symbol.get(sym_k)
             if prev is None:
@@ -6303,11 +6388,44 @@ def scheduler_run_v2(payload: Dict[str, Any] = Body(default=None)):
             prev_kind = (str(getattr(prev, "kind", "") or "")).strip().lower()
             prev_pr = _symbol_kind_priority(prev_kind)
 
-            if pr > prev_pr:
-                dropped_by_symbol.append(prev)
-                best_by_symbol[sym_k] = it
-            else:
-                dropped_by_symbol.append(it)
+if pr > prev_pr:
+    dropped_by_symbol.append(prev)
+    # If we are replacing a non-executable exit with something else, record why.
+    try:
+        prev_kind = (str(getattr(prev, "kind", "") or "")).strip().lower()
+        if prev_kind in ("exit", "take_profit") or (str(getattr(prev, "side", "") or "").strip().lower() == "sell" and prev_kind not in entry_kinds):
+            pm = _gate_exit_executable(prev)
+            if pm.get("ok") and not pm.get("executable"):
+                telemetry.append({
+                    "stage": "symbol_gate_nonexec_exit_replaced",
+                    "symbol": getattr(prev, "symbol", None),
+                    "strategy": getattr(prev, "strategy", None),
+                    "kind": getattr(prev, "kind", None),
+                    "side": getattr(prev, "side", None),
+                    "reason": pm.get("reason"),
+                    "est_notional": pm.get("est_notional"),
+                })
+    except Exception:
+        pass
+    best_by_symbol[sym_k] = it
+else:
+    dropped_by_symbol.append(it)
+    # If the dropped item is a non-executable exit, record it explicitly.
+    try:
+        if kind_k in ("exit", "take_profit") or (str(getattr(it, "side", "") or "").strip().lower() == "sell" and kind_k not in entry_kinds):
+            dm = _gate_exit_executable(it)
+            if dm.get("ok") and not dm.get("executable"):
+                telemetry.append({
+                    "stage": "symbol_gate_nonexec_exit_dropped",
+                    "symbol": getattr(it, "symbol", None),
+                    "strategy": getattr(it, "strategy", None),
+                    "kind": getattr(it, "kind", None),
+                    "side": getattr(it, "side", None),
+                    "reason": dm.get("reason"),
+                    "est_notional": dm.get("est_notional"),
+                })
+    except Exception:
+        pass
 
         if dropped_by_symbol:
             for it in dropped_by_symbol:
