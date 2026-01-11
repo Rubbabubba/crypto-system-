@@ -5,15 +5,15 @@
   "c2": [
     "BTC/USD",
     "ETH/USD",
-    "SOL/USD",
-    "SUI/USD",
-    "XRP/USD"
+    "XRP/USD",
+    "SUI/USD"
   ],
   "c3": [
     "ADA/USD",
-    "XRP/USD",
     "DOT/USD",
-    "SOL/USD"
+    "NEAR/USD",
+    "SOL/USD",
+    "XRP/USD"
   ],
   "c4": [
     "BCH/USD",
