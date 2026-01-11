@@ -6290,6 +6290,7 @@ def scheduler_run_v2(payload: Dict[str, Any] = Body(default=None)):
         return 0
 
     best_by_symbol: Dict[str, Any] = {}
+    best_pr_by_symbol: Dict[str, int] = {}
     dropped_by_symbol: List[Any] = []
 
     try:
@@ -6327,14 +6328,18 @@ def scheduler_run_v2(payload: Dict[str, Any] = Body(default=None)):
             prev = best_by_symbol.get(sym_k)
             if prev is None:
                 best_by_symbol[sym_k] = it
+                best_pr_by_symbol[sym_k] = pr
                 continue
 
             prev_kind = (str(getattr(prev, "kind", "") or "")).strip().lower()
-            prev_pr = _symbol_kind_priority(prev_kind)
+            prev_pr = best_pr_by_symbol.get(sym_k, _symbol_kind_priority(prev_kind))
+            if sym_k not in best_pr_by_symbol:
+                best_pr_by_symbol[sym_k] = prev_pr
 
             if pr > prev_pr:
                 dropped_by_symbol.append(prev)
                 best_by_symbol[sym_k] = it
+                best_pr_by_symbol[sym_k] = pr
             else:
                 dropped_by_symbol.append(it)
 
