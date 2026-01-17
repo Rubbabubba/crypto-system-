@@ -1,3 +1,0 @@
-# Crypto Trading Bots — Build v2.0.0
-# Updated: 2025-10-11 America/Chicago
-python-3.11.9
