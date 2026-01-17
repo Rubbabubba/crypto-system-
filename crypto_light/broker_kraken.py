@@ -96,15 +96,17 @@ import requests
 
 logger = logging.getLogger("broker_kraken")
 
+"""Kraken broker adapter.
+
+NOTE: This "Crypto System - Light" package is deployed as a proper Python
+package on Render (uvicorn crypto_light.app:app). To keep imports stable,
+we use explicit *package-relative* imports.
+"""
+
 # ---------------------------------------------------------------------------
-# Robust local import of symbol_map helpers (works in flat or packaged repo)
+# Symbol/timeframe helpers
 # ---------------------------------------------------------------------------
-try:
-    from symbol_map import to_kraken, from_kraken, tf_to_kraken
-except ModuleNotFoundError:
-    import sys
-    sys.path.append(os.path.dirname(os.path.abspath(__file__)))
-    from symbol_map import to_kraken, from_kraken, tf_to_kraken  # type: ignore
+from .symbol_map import to_kraken, from_kraken, tf_to_kraken
 
 
 # ---------------------------------------------------------------------------
