@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass
-from typing import Dict, Optional
+from typing import Dict, Optional, List, Any
 
 
 @dataclass
@@ -25,6 +25,11 @@ class InMemoryState:
         self.trades_today_by_symbol: Dict[str, int] = {}
         self.trades_today_utc_date: Optional[str] = None
 
+        # Lightweight telemetry buffer (in-memory, best-effort).
+        # Render logs are still the primary source of truth.
+        self.telemetry: List[Dict[str, Any]] = []
+        self.telemetry_max: int = 500
+
     def can_exit(self, symbol: str, cooldown_sec: int) -> bool:
         last = float(self.last_exit_ts_by_symbol.get(symbol, 0.0) or 0.0)
         return (time.time() - last) >= float(cooldown_sec)
@@ -40,3 +45,13 @@ class InMemoryState:
     def inc_trade(self, symbol: str) -> int:
         self.trades_today_by_symbol[symbol] = int(self.trades_today_by_symbol.get(symbol, 0)) + 1
         return self.trades_today_by_symbol[symbol]
+
+    def record_event(self, event: Dict[str, Any]) -> None:
+        """Append a telemetry event (best-effort)."""
+        try:
+            self.telemetry.append(event)
+            if len(self.telemetry) > self.telemetry_max:
+                self.telemetry = self.telemetry[-self.telemetry_max :]
+        except Exception:
+            # Never break trading for telemetry.
+            pass

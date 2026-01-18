@@ -2,8 +2,9 @@ from __future__ import annotations
 
 import logging
 from datetime import datetime, timezone
+from uuid import uuid4
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 
 from .config import load_settings
 from .models import WebhookPayload, WorkerExitPayload
@@ -17,6 +18,18 @@ log = logging.getLogger("crypto_light")
 
 app = FastAPI(title="Crypto System - Light", version="0.1.0")
 state = InMemoryState()
+
+
+def _log_event(level: str, event: dict) -> None:
+    """Unified telemetry: in-memory buffer + structured log line."""
+    state.record_event(event)
+    msg = f"telemetry {event}"  # keep it simple; Render log search is easy
+    if level == "warning":
+        log.warning(msg)
+    elif level == "error":
+        log.error(msg)
+    else:
+        log.info(msg)
 
 
 def _utc_date_str(now: datetime | None = None) -> str:
@@ -67,21 +80,68 @@ def health():
     }
 
 
+@app.get("/telemetry")
+def telemetry(limit: int = 100):
+    """Best-effort recent events (non-persistent)."""
+    lim = max(1, min(int(limit), 500))
+    return {"ok": True, "count": min(lim, len(state.telemetry)), "events": state.telemetry[-lim:]}
+
+
 @app.post("/webhook")
-def webhook(payload: WebhookPayload):
+def webhook(payload: WebhookPayload, request: Request):
+    req_id = request.headers.get("x-request-id") or str(uuid4())
+    client_ip = getattr(request.client, "host", None)
+
+    def ignored(reason: str, **extra):
+        evt = {
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "req_id": req_id,
+            "kind": "webhook",
+            "status": "ignored",
+            "reason": reason,
+            "client_ip": client_ip,
+            **extra,
+        }
+        _log_event("warning", evt)
+        return {"ok": True, "ignored": True, "reason": reason, **extra}
+
     # Security
     if not settings.webhook_secret or payload.secret != settings.webhook_secret:
+        evt = {
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "req_id": req_id,
+            "kind": "webhook",
+            "status": "rejected",
+            "reason": "invalid_secret",
+            "client_ip": client_ip,
+        }
+        _log_event("warning", evt)
         raise HTTPException(status_code=401, detail="invalid secret")
 
-    symbol = _validate_symbol(payload.symbol)
+    try:
+        symbol = _validate_symbol(payload.symbol)
+    except HTTPException as e:
+        evt = {
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "req_id": req_id,
+            "kind": "webhook",
+            "status": "rejected",
+            "reason": "symbol_not_allowed",
+            "client_ip": client_ip,
+            "symbol": str(payload.symbol),
+            "detail": getattr(e, "detail", None),
+        }
+        _log_event("warning", evt)
+        raise
+
     side = str(payload.side).lower().strip()
     strategy = str(payload.strategy).strip()
 
     if side not in ("buy", "sell"):
-        raise HTTPException(status_code=400, detail="side must be buy or sell")
+        return ignored("invalid_side", symbol=symbol, side=side, strategy=strategy)
 
     if not strategy:
-        raise HTTPException(status_code=400, detail="strategy is required")
+        return ignored("missing_strategy", symbol=symbol, side=side)
 
     now = datetime.now(timezone.utc)
     utc_date = _utc_date_str(now)
@@ -89,21 +149,47 @@ def webhook(payload: WebhookPayload):
 
     # Discipline: hard block new entries after flatten time
     if _is_flatten_time(now, settings.daily_flatten_time_utc) and side == "buy":
-        raise HTTPException(status_code=400, detail="entries disabled after daily flatten time")
+        return ignored(
+            "entries_disabled_after_flatten_time",
+            symbol=symbol,
+            side=side,
+            strategy=strategy,
+            utc=now.isoformat(),
+        )
 
     # Trade frequency guard
     trades = int(state.trades_today_by_symbol.get(symbol, 0) or 0)
     if side == "buy" and trades >= int(settings.max_trades_per_symbol_per_day):
-        raise HTTPException(status_code=400, detail=f"max trades reached for {symbol} today")
+        return ignored(
+            "max_trades_reached",
+            symbol=symbol,
+            side=side,
+            strategy=strategy,
+            trades_today=trades,
+            max_trades=int(settings.max_trades_per_symbol_per_day),
+        )
 
     # One position per symbol (spot long only)
     has_pos, _pos_notional = _has_position(symbol)
     if side == "buy" and has_pos:
-        raise HTTPException(status_code=400, detail=f"position already open for {symbol}")
+        return ignored(
+            "position_already_open",
+            symbol=symbol,
+            side=side,
+            strategy=strategy,
+            position_notional_usd=_pos_notional,
+        )
 
     notional = float(payload.notional_usd or settings.default_notional_usd)
     if notional < float(settings.min_order_notional_usd):
-        raise HTTPException(status_code=400, detail=f"notional below minimum: {notional}")
+        return ignored(
+            "notional_below_minimum",
+            symbol=symbol,
+            side=side,
+            strategy=strategy,
+            notional_usd=notional,
+            min_notional_usd=float(settings.min_order_notional_usd),
+        )
 
     # Execute
     px = float(broker.last_price(symbol))
@@ -111,11 +197,46 @@ def webhook(payload: WebhookPayload):
     if side == "sell":
         # Sell means: close existing spot position (sell by notional; broker caps to available base)
         res = broker.market_notional(symbol=symbol, side="sell", notional=notional, strategy=strategy, price=px)
+        _log_event(
+            "info",
+            {
+                "ts": datetime.now(timezone.utc).isoformat(),
+                "req_id": req_id,
+                "kind": "webhook",
+                "status": "executed",
+                "action": "sell",
+                "symbol": symbol,
+                "strategy": strategy,
+                "side": side,
+                "price": px,
+                "notional_usd": notional,
+                "client_ip": client_ip,
+            },
+        )
         return {"ok": True, "action": "sell", "symbol": symbol, "price": px, "result": res}
 
     # BUY entry
     stop_price, take_price = compute_brackets(px, settings.stop_pct, settings.take_pct)
     res = broker.market_notional(symbol=symbol, side="buy", notional=notional, strategy=strategy, price=px)
+
+    _log_event(
+        "info",
+        {
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "req_id": req_id,
+            "kind": "webhook",
+            "status": "executed",
+            "action": "buy",
+            "symbol": symbol,
+            "strategy": strategy,
+            "side": side,
+            "price": px,
+            "notional_usd": notional,
+            "stop": float(stop_price),
+            "take": float(take_price),
+            "client_ip": client_ip,
+        },
+    )
 
     # Track plan in-memory (nice-to-have; broker remains source of truth)
     state.plans[symbol] = TradePlan(
@@ -184,6 +305,18 @@ def worker_exit(payload: WorkerExitPayload):
             state.mark_exit(symbol)
             state.plans.pop(symbol, None)
             exits.append({"symbol": symbol, "reason": "daily_flatten", "notional": notional, "price": px, "result": res})
+            _log_event(
+                "info",
+                {
+                    "ts": datetime.now(timezone.utc).isoformat(),
+                    "kind": "exit",
+                    "status": "executed",
+                    "reason": "daily_flatten",
+                    "symbol": symbol,
+                    "price": px,
+                    "notional_usd": notional,
+                },
+            )
             continue
 
         # Otherwise: bracket exits (only if we have an in-memory plan)
@@ -199,10 +332,40 @@ def worker_exit(payload: WorkerExitPayload):
             state.mark_exit(symbol)
             state.plans.pop(symbol, None)
             exits.append({"symbol": symbol, "reason": "stop", "entry": plan.entry_price, "price": px, "result": res})
+            _log_event(
+                "info",
+                {
+                    "ts": datetime.now(timezone.utc).isoformat(),
+                    "kind": "exit",
+                    "status": "executed",
+                    "reason": "stop",
+                    "symbol": symbol,
+                    "entry": float(plan.entry_price),
+                    "price": px,
+                    "stop": float(plan.stop_price),
+                    "notional_usd": notional,
+                    "strategy": plan.strategy,
+                },
+            )
         elif px >= float(plan.take_price):
             res = broker.market_notional(symbol=symbol, side="sell", notional=notional, strategy=plan.strategy, price=px)
             state.mark_exit(symbol)
             state.plans.pop(symbol, None)
             exits.append({"symbol": symbol, "reason": "take", "entry": plan.entry_price, "price": px, "result": res})
+            _log_event(
+                "info",
+                {
+                    "ts": datetime.now(timezone.utc).isoformat(),
+                    "kind": "exit",
+                    "status": "executed",
+                    "reason": "take",
+                    "symbol": symbol,
+                    "entry": float(plan.entry_price),
+                    "price": px,
+                    "take": float(plan.take_price),
+                    "notional_usd": notional,
+                    "strategy": plan.strategy,
+                },
+            )
 
     return {"ok": True, "utc": now.isoformat(), "did_flatten": did_flatten, "exits": exits}
