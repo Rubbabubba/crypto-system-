@@ -21,6 +21,9 @@ class InMemoryState:
     def __init__(self) -> None:
         self.plans: Dict[str, TradePlan] = {}  # symbol -> plan
         self.last_exit_ts_by_symbol: Dict[str, float] = {}
+        # Pending exit orders (best-effort): symbol -> {"ts": float, "reason": str, "txid": str|None}
+        # Used to avoid re-submitting multiple exit orders while a limit exit is working.
+        self.pending_exits: Dict[str, Dict[str, Any]] = {}
         self.last_flatten_utc_date: Optional[str] = None  # YYYY-MM-DD
         self.trades_today_by_symbol: Dict[str, int] = {}
         self.trades_today_utc_date: Optional[str] = None
@@ -36,6 +39,15 @@ class InMemoryState:
 
     def mark_exit(self, symbol: str) -> None:
         self.last_exit_ts_by_symbol[symbol] = time.time()
+
+    def set_pending_exit(self, symbol: str, reason: str, txid: Optional[str] = None) -> None:
+        self.pending_exits[symbol] = {"ts": time.time(), "reason": reason, "txid": txid}
+
+    def clear_pending_exit(self, symbol: str) -> None:
+        try:
+            self.pending_exits.pop(symbol, None)
+        except Exception:
+            pass
 
     def reset_daily_counters_if_needed(self, utc_date: str) -> None:
         if self.trades_today_utc_date != utc_date:

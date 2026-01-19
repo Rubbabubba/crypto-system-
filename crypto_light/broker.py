@@ -20,6 +20,28 @@ def market_notional(symbol: str, side: str, notional: float, strategy: str, pric
     return broker_kraken.market_notional(symbol=symbol, side=side, notional=float(notional), price=price, strategy=strategy)
 
 
+def limit_notional(
+    symbol: str,
+    side: str,
+    notional: float,
+    limit_price: float,
+    strategy: str,
+    price: Optional[float] = None,
+) -> Dict:
+    return broker_kraken.limit_notional(
+        symbol=symbol,
+        side=side,
+        notional=float(notional),
+        limit_price=float(limit_price),
+        price=price,
+        strategy=strategy,
+    )
+
+
+def cancel_order(txid: str) -> Dict:
+    return broker_kraken.cancel_order(txid)
+
+
 def balances_by_asset() -> Dict[str, float]:
     out: Dict[str, float] = {}
     for item in broker_kraken.positions():

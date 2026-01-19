@@ -751,6 +751,131 @@ def market_notional(
         "result": res,
     }
 
+
+def limit_notional(
+    symbol: str,
+    side: str,
+    notional: float,
+    limit_price: float,
+    price: Optional[float] = None,
+    strategy: Optional[str] = None,
+    **kwargs: Any,
+) -> Dict[str, Any]:
+    """Limit order by USD notional.
+
+    This is primarily used for stop exits: when our stop triggers, we submit a
+    SELL limit slightly below the stop to reduce slippage vs a pure market exit.
+
+    NOTE: We do not wait for fills here. Callers should reconcile balances and
+    fall back to a market exit if the limit hasn't filled within a timeout.
+    """
+    side = side.lower().strip()
+    if side not in ("buy", "sell"):
+        raise ValueError("side must be 'buy' or 'sell'")
+
+    if not isinstance(limit_price, (int, float)) or not math.isfinite(float(limit_price)) or float(limit_price) <= 0:
+        raise ValueError("limit_price must be a positive number")
+
+    ui = symbol.upper()
+    pair = to_kraken(ui)
+
+    strat_tag = (strategy or "").strip()
+    if not strat_tag:
+        raise ValueError("missing strategy tag for order (strategy is required)")
+
+    # Cooldown gate (keyed on Kraken pair)
+    _cooldown_check(strat_tag, pair, side)
+
+    # Determine reference price for sizing (use passed in price or last_price)
+    if isinstance(price, (int, float)) and math.isfinite(float(price)) and float(price) > 0:
+        px = float(price)
+    else:
+        px = _ensure_price(ui)
+
+    volume = float(notional) / px
+
+    avail_for_sell: Optional[float] = None
+    if side == "sell":
+        try:
+            bal = _fetch_balances()
+        except Exception as e:
+            return {"ok": False, "error": f"limit_notional failed: balance fetch failed: {e}"}
+
+        base = (ui.split('/', 1)[0] if '/' in ui else ui).strip().upper()
+        avail = float(_get_balance_float(bal, base) or 0.0)
+        avail_for_sell = avail
+        if avail <= 0:
+            return {"ok": False, "error": f"limit_notional failed: insufficient {base} balance (avail={avail})"}
+
+        volume = min(volume, avail)
+        if float(volume) <= 0:
+            return {"ok": False, "error": f"limit_notional failed: sell volume <= 0 after balance cap (avail={avail})"}
+
+    meta = _pair_meta(pair)
+    ordermin = float(meta.get("ordermin") or 0.0)
+    lot_decimals = int(meta.get("lot_decimals") or 8)
+
+    volume = _truncate_to_decimals(float(volume), lot_decimals)
+    if volume <= 0.0:
+        return {"ok": False, "error": "limit_notional failed: volume <= 0 after precision truncation"}
+
+    if ordermin > 0.0 and float(volume) < ordermin:
+        if side == "sell" and avail_for_sell is not None:
+            if float(avail_for_sell) >= ordermin:
+                volume = _truncate_to_decimals(float(ordermin), lot_decimals)
+            else:
+                return {"ok": False, "error": f"limit_notional failed: dust_below_min_volume:{volume}<{ordermin} (pair={pair}) (avail={avail_for_sell})"}
+        else:
+            return {"ok": False, "error": f"limit_notional failed: below_min_volume:{volume}<{ordermin} (pair={pair})"}
+
+    payload = {
+        "pair": pair,
+        "type": "buy" if side == "buy" else "sell",
+        "ordertype": "limit",
+        "price": str(float(limit_price)),
+        "volume": _format_volume(volume, lot_decimals),
+        "userref": str(
+            _userref_for_strategy(strategy) if strategy is not None else _userref(ui, side, float(notional))
+        ),
+    }
+
+    try:
+        res = _priv("AddOrder", payload)
+    except Exception:
+        raise
+
+    txid = None
+    descr = None
+    try:
+        txid = (res.get("txid") or [None])[0]
+        descr = (res.get("descr") or {}).get("order")
+    except Exception:
+        pass
+
+    _cooldown_latch(strat_tag, pair, side)
+    return {
+        "pair": pair,
+        "side": side,
+        "notional": float(notional),
+        "volume": volume,
+        "limit_price": float(limit_price),
+        "txid": txid,
+        "descr": descr,
+        "result": res,
+    }
+
+
+def cancel_order(txid: str) -> Dict[str, Any]:
+    """Best-effort cancel by txid."""
+    t = str(txid or "").strip()
+    if not t:
+        return {"ok": False, "error": "missing txid"}
+    try:
+        res = _priv("CancelOrder", {"txid": t})
+        return {"ok": True, "txid": t, "result": res}
+    except Exception as e:
+        return {"ok": False, "txid": t, "error": str(e)}
+
 def orders() -> Any:
     try:
         return _priv("OpenOrders", {})

@@ -34,6 +34,12 @@ class Settings:
     stop_pct: float
     take_pct: float
     exit_cooldown_sec: int
+    # Stop execution quality
+    # When a stop triggers, we prefer submitting a limit sell slightly below the stop
+    # to reduce slippage. If it doesn't fill within stop_limit_timeout_sec, we cancel
+    # (best-effort) and fall back to a market sell.
+    stop_limit_buffer_pct: float
+    stop_limit_timeout_sec: int
 
     # Discipline
     daily_flatten_time_utc: str  # HH:MM
@@ -54,6 +60,8 @@ def load_settings() -> Settings:
         stop_pct=float(_getenv("STOP_PCT", "0.01") or 0.01),
         take_pct=float(_getenv("TAKE_PCT", "0.02") or 0.02),
         exit_cooldown_sec=int(float(_getenv("EXIT_COOLDOWN_SEC", "20") or 20)),
+        stop_limit_buffer_pct=float(_getenv("STOP_LIMIT_BUFFER_PCT", "0.15") or 0.15),
+        stop_limit_timeout_sec=int(float(_getenv("STOP_LIMIT_TIMEOUT_SEC", "60") or 60)),
         daily_flatten_time_utc=_getenv("DAILY_FLATTEN_TIME_UTC", "23:55"),
         max_trades_per_symbol_per_day=int(float(_getenv("MAX_TRADES_PER_SYMBOL_PER_DAY", "3") or 3)),
         log_level=_getenv("LOG_LEVEL", "INFO"),

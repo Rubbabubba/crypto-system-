@@ -289,12 +289,50 @@ def worker_exit(payload: WorkerExitPayload):
         qty = float(bal.get(base, 0.0) or 0.0)
         if qty <= 0:
             # clean up stale plan
+            state.clear_pending_exit(symbol)
             state.plans.pop(symbol, None)
             continue
 
         px = float(broker.last_price(symbol))
         notional = qty * px
         if notional < float(settings.exit_min_notional_usd):
+            # if we had a pending exit and we're now effectively flat, clear it
+            if symbol in state.pending_exits:
+                state.clear_pending_exit(symbol)
+                state.plans.pop(symbol, None)
+            continue
+
+        # Pending exit workflow: if we've already submitted a limit exit,
+        # give it time to fill. If it hasn't filled within a timeout, cancel
+        # (best-effort) and fall back to a market exit for the remaining size.
+        pending = state.pending_exits.get(symbol)
+        if pending:
+            age = float(now.timestamp()) - float(pending.get("ts") or now.timestamp())
+            if age >= float(settings.stop_limit_timeout_sec):
+                txid = pending.get("txid")
+                cancel_res = None
+                if txid:
+                    cancel_res = broker.cancel_order(str(txid))
+                res = broker.market_notional(symbol=symbol, side="sell", notional=notional, strategy="stop_fallback", price=px)
+                state.mark_exit(symbol)
+                state.clear_pending_exit(symbol)
+                state.plans.pop(symbol, None)
+                exits.append({"symbol": symbol, "reason": "stop_fallback_market", "notional": notional, "price": px, "result": res})
+                _log_event(
+                    "info",
+                    {
+                        "ts": datetime.now(timezone.utc).isoformat(),
+                        "kind": "exit",
+                        "status": "executed",
+                        "reason": "stop_fallback_market",
+                        "symbol": symbol,
+                        "price": px,
+                        "notional_usd": notional,
+                        "txid": txid,
+                        "cancel": cancel_res,
+                    },
+                )
+            # either way, don't submit more exits this tick
             continue
 
         # If daily flatten: exit everything
@@ -328,25 +366,74 @@ def worker_exit(payload: WorkerExitPayload):
             continue
 
         if px <= float(plan.stop_price):
-            res = broker.market_notional(symbol=symbol, side="sell", notional=notional, strategy=plan.strategy, price=px)
-            state.mark_exit(symbol)
-            state.plans.pop(symbol, None)
-            exits.append({"symbol": symbol, "reason": "stop", "entry": plan.entry_price, "price": px, "result": res})
-            _log_event(
-                "info",
-                {
-                    "ts": datetime.now(timezone.utc).isoformat(),
-                    "kind": "exit",
-                    "status": "executed",
-                    "reason": "stop",
-                    "symbol": symbol,
-                    "entry": float(plan.entry_price),
-                    "price": px,
-                    "stop": float(plan.stop_price),
-                    "notional_usd": notional,
-                    "strategy": plan.strategy,
-                },
+            # Stop triggered: prefer a limit sell slightly below the stop to cap slippage.
+            # If it doesn't fill within STOP_LIMIT_TIMEOUT_SEC, we'll cancel (best-effort)
+            # and market out the remaining size on the next worker tick.
+            stop_price = float(plan.stop_price)
+            buffer_pct = float(settings.stop_limit_buffer_pct)
+            limit_price = stop_price * (1.0 - buffer_pct / 100.0)
+
+            res = broker.limit_notional(
+                symbol=symbol,
+                side="sell",
+                notional=notional,
+                limit_price=limit_price,
+                strategy=plan.strategy,
+                price=px,
             )
+
+            txid = None
+            try:
+                txid = res.get("txid")
+            except Exception:
+                txid = None
+
+            if res.get("ok") is False or ("error" in res and res.get("error")):
+                # If Kraken rejects the limit (rare but possible), fall back immediately.
+                res2 = broker.market_notional(symbol=symbol, side="sell", notional=notional, strategy=plan.strategy, price=px)
+                state.mark_exit(symbol)
+                state.plans.pop(symbol, None)
+                exits.append({"symbol": symbol, "reason": "stop_market_fallback", "entry": plan.entry_price, "price": px, "result": res2})
+                _log_event(
+                    "info",
+                    {
+                        "ts": datetime.now(timezone.utc).isoformat(),
+                        "kind": "exit",
+                        "status": "executed",
+                        "reason": "stop_market_fallback",
+                        "symbol": symbol,
+                        "entry": float(plan.entry_price),
+                        "price": px,
+                        "stop": stop_price,
+                        "limit": float(limit_price),
+                        "notional_usd": notional,
+                        "strategy": plan.strategy,
+                        "limit_result": res,
+                        "market_result": res2,
+                    },
+                )
+            else:
+                # Track pending exit; reconcile balances on subsequent ticks.
+                state.set_pending_exit(symbol, reason="stop_limit", txid=txid)
+                state.mark_exit(symbol)
+                exits.append({"symbol": symbol, "reason": "stop_limit_placed", "entry": plan.entry_price, "price": px, "limit": limit_price, "txid": txid, "result": res})
+                _log_event(
+                    "info",
+                    {
+                        "ts": datetime.now(timezone.utc).isoformat(),
+                        "kind": "exit",
+                        "status": "placed",
+                        "reason": "stop_limit",
+                        "symbol": symbol,
+                        "entry": float(plan.entry_price),
+                        "price": px,
+                        "stop": stop_price,
+                        "limit": float(limit_price),
+                        "notional_usd": notional,
+                        "strategy": plan.strategy,
+                        "txid": txid,
+                    },
+                )
         elif px >= float(plan.take_price):
             res = broker.market_notional(symbol=symbol, side="sell", notional=notional, strategy=plan.strategy, price=px)
             state.mark_exit(symbol)
