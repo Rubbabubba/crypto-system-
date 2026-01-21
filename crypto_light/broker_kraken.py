@@ -74,6 +74,22 @@ def _load_strategy_to_userref() -> Dict[str, int]:
 _STRATEGY_TO_USERREF: Dict[str, int] = _load_strategy_to_userref()
 
 
+def _format_price(x: float, decimals: int) -> str:
+    """Format Kraken price string with correct per-pair precision.
+
+    Kraken rejects prices with more decimals than `pair_decimals` for the pair.
+    We truncate (not round) to avoid inadvertently crossing boundaries.
+    """
+    try:
+        d = max(0, int(decimals))
+    except Exception:
+        d = 0
+    px = _truncate_to_decimals(float(x), d)
+    if d <= 0:
+        return str(int(px))
+    return f"{px:.{d}f}"
+
+
 def _userref_for_strategy(strategy: Optional[str]) -> int:
     """Resolve a stable Kraken userref for a given strategy.
 
@@ -190,7 +206,7 @@ def _pair_meta(pair: str) -> Dict[str, Any]:
     """
     key = str(pair or "").strip().upper()
     if not key:
-        return {"ordermin": 0.0, "lot_decimals": 8}
+        return {"ordermin": 0.0, "lot_decimals": 8, "pair_decimals": 8}
 
     ttl = float(os.getenv("KRAKEN_PAIR_META_TTL_SEC", "3600") or 3600)
     now = time.time()
@@ -201,7 +217,8 @@ def _pair_meta(pair: str) -> Dict[str, Any]:
             try:
                 if (now - float(cached.get("ts") or 0.0)) < ttl:
                     return {"ordermin": float(cached.get("ordermin") or 0.0),
-                            "lot_decimals": int(cached.get("lot_decimals") or 8)}
+                            "lot_decimals": int(cached.get("lot_decimals") or 8),
+                            "pair_decimals": int(cached.get("pair_decimals") or 8)}
             except Exception:
                 pass
 
@@ -212,20 +229,22 @@ def _pair_meta(pair: str) -> Dict[str, Any]:
 
     ordermin = 0.0
     lot_decimals = 8
+    pair_decimals = 8
     if isinstance(res, dict) and res:
         try:
             v = next(iter(res.values()))
             if isinstance(v, dict):
                 ordermin = float(v.get("ordermin") or 0.0)
                 lot_decimals = int(v.get("lot_decimals") or 8)
+                pair_decimals = int(v.get("pair_decimals") or 8)
         except Exception:
             pass
 
-    meta = {"ts": now, "ordermin": float(ordermin), "lot_decimals": int(lot_decimals)}
+    meta = {"ts": now, "ordermin": float(ordermin), "lot_decimals": int(lot_decimals), "pair_decimals": int(pair_decimals)}
     with _PAIR_META_LOCK:
         _PAIR_META_CACHE[key] = meta
 
-    return {"ordermin": meta["ordermin"], "lot_decimals": meta["lot_decimals"]}
+    return {"ordermin": meta["ordermin"], "lot_decimals": meta["lot_decimals"], "pair_decimals": meta["pair_decimals"]}
 
 def _truncate_to_decimals(x: float, decimals: int) -> float:
     """Truncate (not round) to a fixed number of decimals."""
@@ -696,6 +715,7 @@ def market_notional(
     meta = _pair_meta(pair)
     ordermin = float(meta.get("ordermin") or 0.0)
     lot_decimals = int(meta.get("lot_decimals") or 8)
+    pair_decimals = int(meta.get("pair_decimals") or 8)
 
     # Truncate to allowed decimals (Kraken rejects or rounds unexpectedly otherwise).
     volume = _truncate_to_decimals(float(volume), lot_decimals)
@@ -729,8 +749,8 @@ def market_notional(
 
     try:
         res = _priv("AddOrder", payload)
-    except Exception:
-        raise
+    except Exception as e:
+        return {"ok": False, "error": f"market_notional failed: {e}"}
 
     txid = None
     descr = None
@@ -814,6 +834,7 @@ def limit_notional(
     meta = _pair_meta(pair)
     ordermin = float(meta.get("ordermin") or 0.0)
     lot_decimals = int(meta.get("lot_decimals") or 8)
+    pair_decimals = int(meta.get("pair_decimals") or 8)
 
     volume = _truncate_to_decimals(float(volume), lot_decimals)
     if volume <= 0.0:
@@ -832,7 +853,7 @@ def limit_notional(
         "pair": pair,
         "type": "buy" if side == "buy" else "sell",
         "ordertype": "limit",
-        "price": str(float(limit_price)),
+        "price": _format_price(limit_price, pair_decimals),
         "volume": _format_volume(volume, lot_decimals),
         "userref": str(
             _userref_for_strategy(strategy) if strategy is not None else _userref(ui, side, float(notional))
@@ -841,8 +862,8 @@ def limit_notional(
 
     try:
         res = _priv("AddOrder", payload)
-    except Exception:
-        raise
+    except Exception as e:
+        return {"ok": False, "error": f"limit_notional failed: {e}"}
 
     txid = None
     descr = None
