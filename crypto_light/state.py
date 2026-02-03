@@ -18,21 +18,49 @@ class TradePlan:
 
 
 class InMemoryState:
+    """Best-effort in-memory state.
+
+    IMPORTANT: On Render, in-memory state is per-instance. If you scale web instances > 1,
+    these guards will not be shared across instances. For deterministic protection, keep
+    web instances = 1, or add a shared store (Redis/Postgres) later.
+    """
+
     def __init__(self) -> None:
         self.plans: Dict[str, TradePlan] = {}  # symbol -> plan
+
+        # Entry/exit throttles
+        self.last_entry_ts_by_symbol: Dict[str, float] = {}
         self.last_exit_ts_by_symbol: Dict[str, float] = {}
+
         # Pending exit orders (best-effort): symbol -> {"ts": float, "reason": str, "txid": str|None}
-        # Used to avoid re-submitting multiple exit orders while a limit exit is working.
         self.pending_exits: Dict[str, Dict[str, Any]] = {}
+
+        # Daily flatten bookkeeping
         self.last_flatten_utc_date: Optional[str] = None  # YYYY-MM-DD
+
+        # Trade frequency (per UTC day)
         self.trades_today_by_symbol: Dict[str, int] = {}
         self.trades_today_utc_date: Optional[str] = None
 
+        # Idempotency (webhook retries)
+        # signal_id -> last_seen_ts
+        self.seen_signal_ids: Dict[str, float] = {}
+
         # Lightweight telemetry buffer (in-memory, best-effort).
-        # Render logs are still the primary source of truth.
         self.telemetry: List[Dict[str, Any]] = []
         self.telemetry_max: int = 500
 
+    # --------- Entry guards ---------
+    def can_enter(self, symbol: str, cooldown_sec: int) -> bool:
+        if cooldown_sec <= 0:
+            return True
+        last = float(self.last_entry_ts_by_symbol.get(symbol, 0.0) or 0.0)
+        return (time.time() - last) >= float(cooldown_sec)
+
+    def mark_enter(self, symbol: str) -> None:
+        self.last_entry_ts_by_symbol[symbol] = time.time()
+
+    # --------- Exit guards ---------
     def can_exit(self, symbol: str, cooldown_sec: int) -> bool:
         last = float(self.last_exit_ts_by_symbol.get(symbol, 0.0) or 0.0)
         return (time.time() - last) >= float(cooldown_sec)
@@ -40,6 +68,7 @@ class InMemoryState:
     def mark_exit(self, symbol: str) -> None:
         self.last_exit_ts_by_symbol[symbol] = time.time()
 
+    # --------- Pending exits ---------
     def set_pending_exit(self, symbol: str, reason: str, txid: Optional[str] = None) -> None:
         self.pending_exits[symbol] = {"ts": time.time(), "reason": reason, "txid": txid}
 
@@ -49,6 +78,7 @@ class InMemoryState:
         except Exception:
             pass
 
+    # --------- Daily counters ---------
     def reset_daily_counters_if_needed(self, utc_date: str) -> None:
         if self.trades_today_utc_date != utc_date:
             self.trades_today_utc_date = utc_date
@@ -58,6 +88,28 @@ class InMemoryState:
         self.trades_today_by_symbol[symbol] = int(self.trades_today_by_symbol.get(symbol, 0)) + 1
         return self.trades_today_by_symbol[symbol]
 
+    # --------- Webhook idempotency ---------
+    def seen_recent_signal(self, signal_id: str, ttl_sec: int) -> bool:
+        """Return True if we saw this signal_id within ttl_sec, else record and return False."""
+        if not signal_id:
+            return False
+        now = time.time()
+        last = float(self.seen_signal_ids.get(signal_id, 0.0) or 0.0)
+        if ttl_sec > 0 and (now - last) < float(ttl_sec):
+            return True
+        self.seen_signal_ids[signal_id] = now
+
+        # Opportunistic cleanup to avoid unbounded growth (best-effort)
+        try:
+            if len(self.seen_signal_ids) > 5000:
+                items = sorted(self.seen_signal_ids.items(), key=lambda kv: kv[1], reverse=True)
+                self.seen_signal_ids = dict(items[:4000])
+        except Exception:
+            pass
+
+        return False
+
+    # --------- Telemetry ---------
     def record_event(self, event: Dict[str, Any]) -> None:
         """Append a telemetry event (best-effort)."""
         try:
@@ -65,5 +117,4 @@ class InMemoryState:
             if len(self.telemetry) > self.telemetry_max:
                 self.telemetry = self.telemetry[-self.telemetry_max :]
         except Exception:
-            # Never break trading for telemetry.
             pass
