@@ -10,6 +10,11 @@ def _getenv(key: str, default: str | None = None) -> str:
     return "" if v is None else str(v)
 
 
+def _getbool(key: str, default: str = "0") -> bool:
+    v = _getenv(key, default).strip().lower()
+    return v in ("1", "true", "yes", "y", "on")
+
+
 def _csv(key: str, default: str = "") -> List[str]:
     raw = _getenv(key, default)
     parts = [p.strip().upper() for p in raw.split(",") if p.strip()]
@@ -26,24 +31,32 @@ class Settings:
     allowed_symbols: List[str]
 
     # Core trading params
+    trading_enabled: bool
     default_notional_usd: float
     min_order_notional_usd: float
     exit_min_notional_usd: float
+
+    # Entries / discipline
+    entry_cooldown_sec: int
+    no_new_entries_after_utc: str  # HH:MM or "" for 24/7
+    max_trades_per_symbol_per_day: int
+
+    # Idempotency / anti-spam
+    signal_dedupe_ttl_sec: int
 
     # Exits
     stop_pct: float
     take_pct: float
     exit_cooldown_sec: int
+
     # Stop execution quality
-    # When a stop triggers, we prefer submitting a limit sell slightly below the stop
-    # to reduce slippage. If it doesn't fill within stop_limit_timeout_sec, we cancel
-    # (best-effort) and fall back to a market sell.
     stop_limit_buffer_pct: float
     stop_limit_timeout_sec: int
 
-    # Discipline
+    # Daily flatten behavior
+    enforce_daily_flatten: bool
     daily_flatten_time_utc: str  # HH:MM
-    max_trades_per_symbol_per_day: int
+    block_entries_after_flatten: bool  # if true, blocks buys during flatten window
 
     # Runtime
     log_level: str
@@ -51,18 +64,41 @@ class Settings:
 
 def load_settings() -> Settings:
     return Settings(
+        # Security
         webhook_secret=_getenv("WEBHOOK_SECRET", ""),
         worker_secret=_getenv("WORKER_SECRET", ""),
+
+        # Universe
         allowed_symbols=_csv("ALLOWED_SYMBOLS", "BTC/USD,ETH/USD"),
+
+        # Core
+        trading_enabled=_getbool("TRADING_ENABLED", "1"),
         default_notional_usd=float(_getenv("DEFAULT_NOTIONAL_USD", _getenv("DEFAULT_NOTIONAL", "50")) or 50),
         min_order_notional_usd=float(_getenv("MIN_ORDER_NOTIONAL_USD", "5") or 5),
         exit_min_notional_usd=float(_getenv("EXIT_MIN_NOTIONAL_USD", "6") or 6),
+
+        # Entries / discipline
+        entry_cooldown_sec=int(float(_getenv("ENTRY_COOLDOWN_SEC", "0") or 0)),
+        no_new_entries_after_utc=_getenv("NO_NEW_ENTRIES_AFTER_UTC", ""),  # "" = 24/7
+        max_trades_per_symbol_per_day=int(float(_getenv("MAX_TRADES_PER_SYMBOL_PER_DAY", "999") or 999)),
+
+        # Idempotency
+        signal_dedupe_ttl_sec=int(float(_getenv("SIGNAL_DEDUPE_TTL_SEC", "90") or 90)),
+
+        # Exits
         stop_pct=float(_getenv("STOP_PCT", "0.01") or 0.01),
         take_pct=float(_getenv("TAKE_PCT", "0.02") or 0.02),
         exit_cooldown_sec=int(float(_getenv("EXIT_COOLDOWN_SEC", "20") or 20)),
+
+        # Stop execution quality
         stop_limit_buffer_pct=float(_getenv("STOP_LIMIT_BUFFER_PCT", "0.15") or 0.15),
         stop_limit_timeout_sec=int(float(_getenv("STOP_LIMIT_TIMEOUT_SEC", "60") or 60)),
+
+        # Daily flatten
+        enforce_daily_flatten=_getbool("ENFORCE_DAILY_FLATTEN", "1"),
         daily_flatten_time_utc=_getenv("DAILY_FLATTEN_TIME_UTC", "23:55"),
-        max_trades_per_symbol_per_day=int(float(_getenv("MAX_TRADES_PER_SYMBOL_PER_DAY", "3") or 3)),
+        block_entries_after_flatten=_getbool("BLOCK_ENTRIES_AFTER_FLATTEN", "0"),
+
+        # Runtime
         log_level=_getenv("LOG_LEVEL", "INFO"),
     )
