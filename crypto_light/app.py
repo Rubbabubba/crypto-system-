@@ -1,8 +1,6 @@
 from __future__ import annotations
 
 import json
-import os
-import time
 from datetime import datetime, timezone
 from typing import Any, Dict, Optional
 from uuid import uuid4
@@ -10,10 +8,10 @@ from uuid import uuid4
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
 
-from .broker_kraken import balances_by_asset as _balances_by_asset
-from .broker_kraken import base_asset as _base_asset
-from .broker_kraken import last_price as _last_price
-from .broker_kraken import market_notional as _market_notional
+from .broker import balances_by_asset as _balances_by_asset
+from .broker import base_asset as _base_asset
+from .broker import last_price as _last_price
+from .broker import market_notional as _market_notional
 from .config import load_settings
 from .models import WebhookPayload, WorkerExitPayload
 from .risk import compute_brackets
@@ -22,44 +20,26 @@ from .symbol_map import normalize_symbol
 
 settings = load_settings()
 state = InMemoryState()
-app = FastAPI(title="Crypto Light", version="1.0.0")
+app = FastAPI(title="Crypto Light", version="1.0.1")
 
 
 def _log_event(level: str, event: Dict[str, Any]) -> None:
-    """Emit structured JSON logs + store best-effort telemetry in memory."""
+    # store best-effort in memory
     try:
         state.record_event(event)
     except Exception:
         pass
 
+    # emit structured log
     try:
-        msg = json.dumps(event, default=str)
+        print(json.dumps(event, default=str))
     except Exception:
-        msg = str(event)
-
-    lvl = (level or "").lower()
-    if lvl in ("warning", "warn"):
-        print(msg)
-    elif lvl in ("error",):
-        print(msg)
-    else:
-        print(msg)
+        print(str(event))
 
 
 def _utc_date_str(now: Optional[datetime] = None) -> str:
     n = now or datetime.now(timezone.utc)
     return n.strftime("%Y-%m-%d")
-
-
-def _is_flatten_time(now: datetime, hhmm_utc: str) -> bool:
-    # hhmm_utc like "23:55"
-    try:
-        hh, mm = hhmm_utc.split(":", 1)
-        h = int(hh)
-        m = int(mm)
-    except Exception:
-        h, m = 23, 55
-    return (now.hour, now.minute) >= (h, m)
 
 
 def _is_after_utc_hhmm(now: datetime, hhmm_utc: str) -> bool:
@@ -88,6 +68,17 @@ def _within_minutes_after_utc_hhmm(now: datetime, hhmm_utc: str, window_min: int
     start = h * 60 + m
     cur = now.hour * 60 + now.minute
     return start <= cur < (start + max(1, int(window_min)))
+
+
+def _is_flatten_time(now: datetime, hhmm_utc: str) -> bool:
+    # hhmm_utc like "23:55"
+    try:
+        hh, mm = hhmm_utc.split(":", 1)
+        h = int(hh)
+        m = int(mm)
+    except Exception:
+        h, m = 23, 55
+    return (now.hour, now.minute) >= (h, m)
 
 
 def _validate_symbol(symbol: str) -> str:
@@ -138,172 +129,117 @@ def webhook(payload: WebhookPayload, request: Request):
 
     # Security
     if not settings.webhook_secret or payload.secret != settings.webhook_secret:
-        evt = {
-            "ts": datetime.now(timezone.utc).isoformat(),
-            "req_id": req_id,
-            "kind": "webhook",
-            "status": "rejected",
-            "reason": "invalid_secret",
-            "client_ip": client_ip,
-        }
-        _log_event("warning", evt)
+        _log_event(
+            "warning",
+            {
+                "ts": datetime.now(timezone.utc).isoformat(),
+                "req_id": req_id,
+                "kind": "webhook",
+                "status": "rejected",
+                "reason": "invalid_secret",
+                "client_ip": client_ip,
+            },
+        )
         raise HTTPException(status_code=401, detail="invalid secret")
 
-    try:
-        symbol = _validate_symbol(payload.symbol)
-    except HTTPException as e:
-        evt = {
-            "ts": datetime.now(timezone.utc).isoformat(),
-            "req_id": req_id,
-            "kind": "webhook",
-            "status": "rejected",
-            "reason": "symbol_not_allowed",
-            "client_ip": client_ip,
-            "symbol": str(payload.symbol),
-            "detail": getattr(e, "detail", None),
-        }
-        _log_event("warning", evt)
-        raise
+    # Symbol allowlist
+    symbol = _validate_symbol(payload.symbol)
 
     side = str(payload.side).lower().strip()
     strategy = str(payload.strategy).strip()
+    signal_name = (payload.signal or "").strip() or None
+    signal_id = (payload.signal_id or "").strip() or None
 
-    if side not in ("buy", "sell"):
-        return ignored("invalid_side", symbol=symbol, side=side, strategy=strategy)
-
-    if not strategy:
-        return ignored("missing_strategy", symbol=symbol, side=side)
+    if side != "buy":
+        return ignored("long_only_mode", symbol=symbol, side=side, strategy=strategy)
 
     now = datetime.now(timezone.utc)
     utc_date = _utc_date_str(now)
     state.reset_daily_counters_if_needed(utc_date)
 
-    # Idempotency / anti-retry: ignore repeated signal_id for a short TTL
-    signal_id = (payload.signal_id or "").strip()
-    signal_name = (payload.signal or "").strip()
+    # Idempotency / retries
     if signal_id and state.seen_recent_signal(signal_id, int(settings.signal_dedupe_ttl_sec)):
         return ignored(
             "duplicate_signal_id",
             symbol=symbol,
             side=side,
             strategy=strategy,
-            signal=signal_name or None,
+            signal=signal_name,
             signal_id=signal_id,
             ttl_sec=int(settings.signal_dedupe_ttl_sec),
         )
 
     # Master kill switch
-    if side == "buy" and not bool(settings.trading_enabled):
-        return ignored(
-            "trading_disabled",
-            symbol=symbol,
-            side=side,
-            strategy=strategy,
-            signal=signal_name or None,
-            signal_id=signal_id or None,
-        )
+    if not bool(settings.trading_enabled):
+        return ignored("trading_disabled", symbol=symbol, strategy=strategy, signal=signal_name, signal_id=signal_id)
 
-    # 24/7 by default. If NO_NEW_ENTRIES_AFTER_UTC is set (HH:MM), enforce it.
-    if side == "buy" and settings.no_new_entries_after_utc and _is_after_utc_hhmm(now, settings.no_new_entries_after_utc):
+    # 24/7 by default; enforce cutoff only if set
+    if settings.no_new_entries_after_utc and _is_after_utc_hhmm(now, settings.no_new_entries_after_utc):
         return ignored(
             "entries_disabled_after_cutoff",
             symbol=symbol,
-            side=side,
             strategy=strategy,
-            signal=signal_name or None,
-            signal_id=signal_id or None,
+            signal=signal_name,
+            signal_id=signal_id,
             cutoff_utc=settings.no_new_entries_after_utc,
             utc=now.isoformat(),
         )
 
-    # Daily flatten is optional. If enabled, you can block entries for a short window
-    # around flatten to avoid immediate re-entries while the worker is flattening.
-    if side == "buy" and settings.enforce_daily_flatten and settings.block_entries_after_flatten:
+    # Optional short “flatten window” entry block (off by default)
+    if settings.enforce_daily_flatten and settings.block_entries_after_flatten:
         if _within_minutes_after_utc_hhmm(now, settings.daily_flatten_time_utc, window_min=3):
             return ignored(
                 "entries_blocked_during_flatten_window",
                 symbol=symbol,
-                side=side,
                 strategy=strategy,
-                signal=signal_name or None,
-                signal_id=signal_id or None,
+                signal=signal_name,
+                signal_id=signal_id,
                 flatten_utc=settings.daily_flatten_time_utc,
                 utc=now.isoformat(),
             )
 
     # Entry cooldown (per symbol)
-    if side == "buy" and not state.can_enter(symbol, int(settings.entry_cooldown_sec)):
+    if not state.can_enter(symbol, int(settings.entry_cooldown_sec)):
         return ignored(
             "entry_cooldown_active",
             symbol=symbol,
-            side=side,
             strategy=strategy,
-            signal=signal_name or None,
-            signal_id=signal_id or None,
+            signal=signal_name,
+            signal_id=signal_id,
             cooldown_sec=int(settings.entry_cooldown_sec),
         )
 
-    # Trade frequency guard
+    # Max trades per symbol per UTC day
     trades = int(state.trades_today_by_symbol.get(symbol, 0) or 0)
-    if side == "buy" and trades >= int(settings.max_trades_per_symbol_per_day):
+    if trades >= int(settings.max_trades_per_symbol_per_day):
         return ignored(
             "max_trades_reached",
             symbol=symbol,
-            side=side,
             strategy=strategy,
             trades_today=trades,
             max_trades=int(settings.max_trades_per_symbol_per_day),
         )
 
-    # One position per symbol (spot long only)
-    has_pos, _pos_notional = _has_position(symbol)
-    if side == "buy" and has_pos:
-        return ignored(
-            "position_already_open",
-            symbol=symbol,
-            side=side,
-            strategy=strategy,
-            position_notional_usd=_pos_notional,
-        )
+    # One position per symbol
+    has_pos, pos_notional = _has_position(symbol)
+    if has_pos:
+        return ignored("position_already_open", symbol=symbol, strategy=strategy, position_notional_usd=pos_notional)
 
+    # Notional
     notional = float(payload.notional_usd or settings.default_notional_usd)
     if notional < float(settings.min_order_notional_usd):
         return ignored(
             "notional_below_minimum",
             symbol=symbol,
-            side=side,
             strategy=strategy,
             notional_usd=notional,
             min_notional_usd=float(settings.min_order_notional_usd),
         )
 
-    # Execute
+    # Execute BUY
     px = float(_last_price(symbol))
-
-    if side == "sell":
-        res = _market_notional(symbol=symbol, side="sell", notional=notional, strategy=strategy, price=px)
-        _log_event(
-            "info",
-            {
-                "ts": datetime.now(timezone.utc).isoformat(),
-                "req_id": req_id,
-                "kind": "webhook",
-                "status": "executed",
-                "action": "sell",
-                "symbol": symbol,
-                "strategy": strategy,
-                "signal": (payload.signal or None),
-                "signal_id": (payload.signal_id or None),
-                "side": side,
-                "price": px,
-                "notional_usd": notional,
-                "client_ip": client_ip,
-            },
-        )
-        return {"ok": True, "action": "sell", "symbol": symbol, "price": px, "result": res}
-
-    # BUY entry
     stop_price, take_price = compute_brackets(px, settings.stop_pct, settings.take_pct)
+
     res = _market_notional(symbol=symbol, side="buy", notional=notional, strategy=strategy, price=px)
 
     _log_event(
@@ -316,9 +252,8 @@ def webhook(payload: WebhookPayload, request: Request):
             "action": "buy",
             "symbol": symbol,
             "strategy": strategy,
-            "signal": (payload.signal or None),
-            "signal_id": (payload.signal_id or None),
-            "side": side,
+            "signal": signal_name,
+            "signal_id": signal_id,
             "price": px,
             "notional_usd": notional,
             "stop": float(stop_price),
@@ -327,10 +262,8 @@ def webhook(payload: WebhookPayload, request: Request):
         },
     )
 
-    # Mark entry for cooldown
+    # Mark entry + plan
     state.mark_enter(symbol)
-
-    # Track plan in-memory (nice-to-have; broker remains source of truth)
     state.plans[symbol] = TradePlan(
         symbol=symbol,
         side="buy",
@@ -351,8 +284,8 @@ def webhook(payload: WebhookPayload, request: Request):
         "stop": stop_price,
         "take": take_price,
         "trade_count_today": n,
-        "signal": payload.signal,
-        "signal_id": payload.signal_id,
+        "signal": signal_name,
+        "signal_id": signal_id,
         "result": res,
     }
 
@@ -368,7 +301,6 @@ def worker_exit(payload: WorkerExitPayload):
         now = datetime.now(timezone.utc)
         utc_date = _utc_date_str(now)
 
-        # Daily flatten: once per UTC date (optional)
         did_flatten = False
         if settings.enforce_daily_flatten and _is_flatten_time(now, settings.daily_flatten_time_utc) and state.last_flatten_utc_date != utc_date:
             did_flatten = True
@@ -376,7 +308,6 @@ def worker_exit(payload: WorkerExitPayload):
 
         exits = []
 
-        # Reconcile balances
         bal = _balances_by_asset()
 
         for symbol in settings.allowed_symbols:
@@ -387,14 +318,10 @@ def worker_exit(payload: WorkerExitPayload):
                 state.clear_pending_exit(symbol)
                 continue
 
-            has_plan = symbol in state.plans
             plan = state.plans.get(symbol)
-
-            # Determine entry price for brackets
             entry_px = float(plan.entry_price) if plan else float(_last_price(symbol))
             stop_px, take_px = compute_brackets(entry_px, settings.stop_pct, settings.take_pct)
 
-            # Use plan if present; otherwise create an inferred plan
             if not plan:
                 plan = TradePlan(
                     symbol=symbol,
@@ -421,17 +348,10 @@ def worker_exit(payload: WorkerExitPayload):
             if not reason:
                 continue
 
-            # Exit cooldown
             if not state.can_exit(symbol, int(settings.exit_cooldown_sec)):
                 continue
 
-            # Avoid re-submitting multiple exits while a pending exit is working
-            pending = state.pending_exits.get(symbol)
-            if pending:
-                # If pending is too old, let broker_kraken handle timeout / fallback
-                pass
-
-            # Execute exit: sell by notional (broker caps to available base)
+            # Exit notional: use plan notional, but never below EXIT_MIN_NOTIONAL_USD
             notional_exit = max(float(settings.exit_min_notional_usd), float(plan.notional_usd))
             res = _market_notional(symbol=symbol, side="sell", notional=notional_exit, strategy=plan.strategy, price=px)
 
@@ -465,4 +385,5 @@ def worker_exit(payload: WorkerExitPayload):
                 "error": str(e),
             },
         )
+        # never 500 the worker loop
         return JSONResponse(status_code=200, content={"ok": False, "error": str(e)})
