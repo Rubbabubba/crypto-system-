@@ -1,4 +1,5 @@
-"""symbol_map.py — minimal symbol + timeframe normalization for Kraken.
+"""
+symbol_map.py — minimal symbol + timeframe normalization for Kraken.
 
 Keeps the deployment self-contained (no missing imports on Render).
 
@@ -6,13 +7,13 @@ Accepted symbol formats:
 - "BTC/USD" (preferred in env allowlist)
 - "BTCUSD" (TradingView / exchange-style)
 - "KRAKEN:BTCUSD" (TradingView tickerid)
+- "BTC-USD", "BTC_USD"
 
-Kraken pair codes returned:
-- "XBTUSD" for BTC/USD
-
-Timeframes:
-- "5Min", "5", "5m" -> 5
-- "60", "1H", "1h" -> 60
+Exports:
+- normalize_symbol(): returns UI allowlist form like "BTC/USD"
+- to_kraken(): returns Kraken pair code like "XBTUSD"
+- from_kraken(): returns UI symbol "BTC/USD"
+- tf_to_kraken(): timeframe normalization to minutes
 
 This is intentionally small and opinionated.
 """
@@ -47,31 +48,57 @@ _QUOTE_MAP = {
 }
 
 
-def _normalize_symbol(sym: str) -> str:
+def _strip_tv_prefix(sym: str) -> str:
     s = (sym or "").strip().upper()
-    if not s:
-        return s
-    # TradingView style: KRAKEN:BTCUSD
     if ":" in s:
         s = s.split(":", 1)[1]
-    # Preferred allowlist style: BTC/USD
+    return s
+
+
+def _normalize_delims(sym: str) -> str:
+    s = (sym or "").strip().upper()
+    s = _strip_tv_prefix(s)
     s = s.replace("-", "/").replace("_", "/")
     return s
 
 
-def to_kraken(symbol: str) -> str:
-    """Convert UI symbol to Kraken pair code used in public/private endpoints."""
-    s = _normalize_symbol(symbol)
+def normalize_symbol(symbol: str) -> str:
+    """
+    Normalize any accepted symbol format into UI allowlist form: "BASE/QUOTE" (e.g., "BTC/USD").
+    - Converts "BTCUSD" -> "BTC/USD"
+    - Converts "KRAKEN:BTCUSD" -> "BTC/USD"
+    - Converts "XBTUSD" -> "BTC/USD" (UI uses BTC)
+    """
+    s = _normalize_delims(symbol)
+    if not s:
+        return s
 
+    # Already BASE/QUOTE
     if "/" in s:
         base, quote = s.split("/", 1)
     else:
-        # BTCUSD -> BTC / USD
+        # BTCUSD / XBTUSD -> split by known quote suffix
         m = re.match(r"^([A-Z0-9]{2,6})(USD|USDT|USDC|EUR)$", s)
         if not m:
             raise ValueError(f"unsupported symbol format: {symbol}")
         base, quote = m.group(1), m.group(2)
 
+    # UI uses BTC not XBT
+    if base == "XBT":
+        base = "BTC"
+
+    # sanity normalize quotes
+    quote = _QUOTE_MAP.get(quote, quote)
+
+    return f"{base}/{quote}"
+
+
+def to_kraken(symbol: str) -> str:
+    """Convert UI symbol (or accepted formats) to Kraken pair code used in endpoints."""
+    ui = normalize_symbol(symbol)
+    base, quote = ui.split("/", 1)
+
+    # Kraken uses XBT
     base = _BASE_MAP.get(base, base)
     quote = _QUOTE_MAP.get(quote, quote)
 
@@ -93,7 +120,6 @@ def from_kraken(pair: str) -> str:
         if p.endswith(q):
             base = p[: -len(q)]
             quote = q
-            # XBT back to BTC for UI
             if base == "XBT":
                 base = "BTC"
             return f"{base}/{quote}"
@@ -108,6 +134,7 @@ def tf_to_kraken(timeframe: str) -> Optional[int]:
         return None
 
     tfu = tf.upper()
+
     # common TradingView ...Min
     m = re.match(r"^(\d+)\s*MIN$", tfu)
     if m:
