@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import json
+import os
+import time
 from datetime import datetime, timezone
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Set
 from uuid import uuid4
 
+import requests
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
 
@@ -20,17 +23,28 @@ from .symbol_map import normalize_symbol
 
 settings = load_settings()
 state = InMemoryState()
-app = FastAPI(title="Crypto Light", version="1.0.1")
+app = FastAPI(title="Crypto Light", version="1.0.2")
+
+# ---------- Scanner config (soft allow) ----------
+SCANNER_URL = os.getenv("SCANNER_URL", "").strip()
+SCANNER_REFRESH_SEC = int(float(os.getenv("SCANNER_REFRESH_SEC", "300") or 300))
+SCANNER_SOFT_ALLOW = (os.getenv("SCANNER_SOFT_ALLOW", "1").strip().lower() in ("1", "true", "yes", "on"))
+SCANNER_TIMEOUT_SEC = float(os.getenv("SCANNER_TIMEOUT_SEC", "10") or 10)
+
+_SCANNER_CACHE: Dict[str, Any] = {
+    "ts": 0.0,
+    "active_symbols": set(),   # type: Set[str]
+    "ok": False,
+    "last_error": None,
+    "raw": None,
+}
 
 
 def _log_event(level: str, event: Dict[str, Any]) -> None:
-    # store best-effort in memory
     try:
         state.record_event(event)
     except Exception:
         pass
-
-    # emit structured log
     try:
         print(json.dumps(event, default=str))
     except Exception:
@@ -43,7 +57,6 @@ def _utc_date_str(now: Optional[datetime] = None) -> str:
 
 
 def _is_after_utc_hhmm(now: datetime, hhmm_utc: str) -> bool:
-    """Return True if now (UTC) is after or equal to HH:MM (UTC)."""
     if not hhmm_utc:
         return False
     try:
@@ -56,7 +69,6 @@ def _is_after_utc_hhmm(now: datetime, hhmm_utc: str) -> bool:
 
 
 def _within_minutes_after_utc_hhmm(now: datetime, hhmm_utc: str, window_min: int) -> bool:
-    """True if now is within [HH:MM, HH:MM+window) UTC."""
     if not hhmm_utc:
         return False
     try:
@@ -71,7 +83,6 @@ def _within_minutes_after_utc_hhmm(now: datetime, hhmm_utc: str, window_min: int
 
 
 def _is_flatten_time(now: datetime, hhmm_utc: str) -> bool:
-    # hhmm_utc like "23:55"
     try:
         hh, mm = hhmm_utc.split(":", 1)
         h = int(hh)
@@ -98,9 +109,89 @@ def _has_position(symbol: str) -> tuple[bool, float]:
     return True, float(qty * px)
 
 
+# ---------- Scanner helpers ----------
+def _scanner_should_refresh() -> bool:
+    if not SCANNER_URL:
+        return False
+    return (time.time() - float(_SCANNER_CACHE["ts"] or 0.0)) >= float(SCANNER_REFRESH_SEC)
+
+
+def _scanner_refresh() -> None:
+    if not SCANNER_URL:
+        return
+
+    try:
+        r = requests.get(SCANNER_URL, timeout=SCANNER_TIMEOUT_SEC)
+        r.raise_for_status()
+        j = r.json()
+
+        # Expected: {"ok": true, "active_symbols": ["SOL/USD", ...], ...}
+        active = j.get("active_symbols") or j.get("active_coins") or []
+        active_norm = set()
+
+        for s in active:
+            try:
+                active_norm.add(normalize_symbol(str(s)))
+            except Exception:
+                continue
+
+        _SCANNER_CACHE["ts"] = time.time()
+        _SCANNER_CACHE["active_symbols"] = active_norm
+        _SCANNER_CACHE["ok"] = bool(j.get("ok", True)) and len(active_norm) > 0
+        _SCANNER_CACHE["last_error"] = None
+        _SCANNER_CACHE["raw"] = j
+
+    except Exception as e:
+        _SCANNER_CACHE["ts"] = time.time()
+        _SCANNER_CACHE["ok"] = False
+        _SCANNER_CACHE["last_error"] = str(e)
+
+
+def _symbol_allowed_by_scanner(symbol: str) -> tuple[bool, str, Dict[str, Any]]:
+    """
+    Returns (allowed, reason, meta)
+    Soft allow:
+      - If scanner is down OR returns empty => allow (fallback)
+      - If scanner is healthy => allow only if symbol is in active set
+    """
+    if not SCANNER_URL:
+        return True, "scanner_disabled", {"scanner_url": ""}
+
+    if _scanner_should_refresh():
+        _scanner_refresh()
+
+    ok = bool(_SCANNER_CACHE.get("ok"))
+    active = _SCANNER_CACHE.get("active_symbols") or set()
+    err = _SCANNER_CACHE.get("last_error")
+
+    meta = {
+        "scanner_ok": ok,
+        "scanner_error": err,
+        "scanner_active_count": len(active),
+        "scanner_soft_allow": SCANNER_SOFT_ALLOW,
+    }
+
+    if not ok or len(active) == 0:
+        if SCANNER_SOFT_ALLOW:
+            return True, "scanner_fallback_allow", meta
+        return False, "scanner_unavailable_block", meta
+
+    if symbol in active:
+        return True, "scanner_active_allow", meta
+
+    return False, "not_in_active_set", meta
+
+
 @app.get("/health")
 def health():
-    return {"ok": True, "ts": datetime.now(timezone.utc).isoformat()}
+    return {
+        "ok": True,
+        "utc": datetime.now(timezone.utc).isoformat(),
+        "scanner_url": SCANNER_URL or None,
+        "scanner_ok": bool(_SCANNER_CACHE.get("ok")),
+        "scanner_active_count": len(_SCANNER_CACHE.get("active_symbols") or set()),
+        "scanner_soft_allow": SCANNER_SOFT_ALLOW,
+    }
 
 
 @app.get("/telemetry")
@@ -127,7 +218,7 @@ def webhook(payload: WebhookPayload, request: Request):
         _log_event("warning", evt)
         return {"ok": True, "ignored": True, "reason": reason, **extra}
 
-    # Security
+    # Secret
     if not settings.webhook_secret or payload.secret != settings.webhook_secret:
         _log_event(
             "warning",
@@ -142,8 +233,20 @@ def webhook(payload: WebhookPayload, request: Request):
         )
         raise HTTPException(status_code=401, detail="invalid secret")
 
-    # Symbol allowlist
+    # Symbol allowlist (static env allowlist)
     symbol = _validate_symbol(payload.symbol)
+
+    # Scanner gate (dynamic top5) — soft allow enabled by env
+    allowed, allow_reason, allow_meta = _symbol_allowed_by_scanner(symbol)
+    if not allowed:
+        return ignored(
+            allow_reason,
+            symbol=symbol,
+            strategy=str(payload.strategy),
+            signal=(payload.signal or None),
+            signal_id=(payload.signal_id or None),
+            **allow_meta,
+        )
 
     side = str(payload.side).lower().strip()
     strategy = str(payload.strategy).strip()
@@ -157,12 +260,11 @@ def webhook(payload: WebhookPayload, request: Request):
     utc_date = _utc_date_str(now)
     state.reset_daily_counters_if_needed(utc_date)
 
-    # Idempotency / retries
+    # Idempotency / TV retries
     if signal_id and state.seen_recent_signal(signal_id, int(settings.signal_dedupe_ttl_sec)):
         return ignored(
             "duplicate_signal_id",
             symbol=symbol,
-            side=side,
             strategy=strategy,
             signal=signal_name,
             signal_id=signal_id,
@@ -173,7 +275,7 @@ def webhook(payload: WebhookPayload, request: Request):
     if not bool(settings.trading_enabled):
         return ignored("trading_disabled", symbol=symbol, strategy=strategy, signal=signal_name, signal_id=signal_id)
 
-    # 24/7 by default; enforce cutoff only if set
+    # 24/7 by default; cutoff enforced only if set
     if settings.no_new_entries_after_utc and _is_after_utc_hhmm(now, settings.no_new_entries_after_utc):
         return ignored(
             "entries_disabled_after_cutoff",
@@ -185,7 +287,7 @@ def webhook(payload: WebhookPayload, request: Request):
             utc=now.isoformat(),
         )
 
-    # Optional short “flatten window” entry block (off by default)
+    # Optional short flatten window block (off by default)
     if settings.enforce_daily_flatten and settings.block_entries_after_flatten:
         if _within_minutes_after_utc_hhmm(now, settings.daily_flatten_time_utc, window_min=3):
             return ignored(
@@ -198,7 +300,7 @@ def webhook(payload: WebhookPayload, request: Request):
                 utc=now.isoformat(),
             )
 
-    # Entry cooldown (per symbol)
+    # Entry cooldown
     if not state.can_enter(symbol, int(settings.entry_cooldown_sec)):
         return ignored(
             "entry_cooldown_active",
@@ -209,7 +311,7 @@ def webhook(payload: WebhookPayload, request: Request):
             cooldown_sec=int(settings.entry_cooldown_sec),
         )
 
-    # Max trades per symbol per UTC day
+    # Max trades/day per symbol
     trades = int(state.trades_today_by_symbol.get(symbol, 0) or 0)
     if trades >= int(settings.max_trades_per_symbol_per_day):
         return ignored(
@@ -258,11 +360,11 @@ def webhook(payload: WebhookPayload, request: Request):
             "notional_usd": notional,
             "stop": float(stop_price),
             "take": float(take_price),
+            "scanner_gate": {"allowed": True, "reason": allow_reason, **allow_meta},
             "client_ip": client_ip,
         },
     )
 
-    # Mark entry + plan
     state.mark_enter(symbol)
     state.plans[symbol] = TradePlan(
         symbol=symbol,
@@ -286,13 +388,14 @@ def webhook(payload: WebhookPayload, request: Request):
         "trade_count_today": n,
         "signal": signal_name,
         "signal_id": signal_id,
+        "scanner_gate": {"reason": allow_reason, **allow_meta},
         "result": res,
     }
 
 
 @app.post("/worker/exit")
 def worker_exit(payload: WorkerExitPayload):
-    # Security
+    # Worker secret
     if settings.worker_secret:
         if not payload.worker_secret or payload.worker_secret != settings.worker_secret:
             raise HTTPException(status_code=401, detail="invalid worker secret")
@@ -307,7 +410,6 @@ def worker_exit(payload: WorkerExitPayload):
             state.last_flatten_utc_date = utc_date
 
         exits = []
-
         bal = _balances_by_asset()
 
         for symbol in settings.allowed_symbols:
@@ -351,7 +453,6 @@ def worker_exit(payload: WorkerExitPayload):
             if not state.can_exit(symbol, int(settings.exit_cooldown_sec)):
                 continue
 
-            # Exit notional: use plan notional, but never below EXIT_MIN_NOTIONAL_USD
             notional_exit = max(float(settings.exit_min_notional_usd), float(plan.notional_usd))
             res = _market_notional(symbol=symbol, side="sell", notional=notional_exit, strategy=plan.strategy, price=px)
 
@@ -385,5 +486,4 @@ def worker_exit(payload: WorkerExitPayload):
                 "error": str(e),
             },
         )
-        # never 500 the worker loop
         return JSONResponse(status_code=200, content={"ok": False, "error": str(e)})
