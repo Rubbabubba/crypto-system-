@@ -62,3 +62,7 @@ def balances_by_asset() -> Dict[str, float]:
 def base_asset(symbol: str) -> str:
     s = str(symbol).upper().strip()
     return s.split("/", 1)[0] if "/" in s else s
+
+
+def get_bars(symbol: str, timeframe: str = "5Min", limit: int = 300):
+    return broker_kraken.get_bars(symbol=symbol, timeframe=timeframe, limit=int(limit))

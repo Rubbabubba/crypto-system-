@@ -4,7 +4,7 @@ import json
 import os
 import time
 from datetime import datetime, timezone
-from typing import Any, Dict, Optional, Set, Tuple
+from typing import Any, Dict, Optional, Set
 from uuid import uuid4
 
 import requests
@@ -15,46 +15,53 @@ from .broker import balances_by_asset as _balances_by_asset
 from .broker import base_asset as _base_asset
 from .broker import last_price as _last_price
 from .broker import market_notional as _market_notional
+from .broker import get_bars as _get_bars
 from .config import load_settings
-from .models import WebhookPayload, WorkerExitPayload
+from .models import WebhookPayload, WorkerExitPayload, WorkerScanPayload
 from .risk import compute_brackets
 from .state import InMemoryState, TradePlan
 from .symbol_map import normalize_symbol
 
 settings = load_settings()
 state = InMemoryState()
-app = FastAPI(title="Crypto Light", version="1.1.0")
+app = FastAPI(title="Crypto Light", version="1.0.2")
 
-# ---------- Scanner config ----------
+
+# ---------- Entry engine (optional; replaces TradingView) ----------
+ENTRY_ENGINE_ENABLED = (os.getenv("ENTRY_ENGINE_ENABLED", "1").strip().lower() in ("1", "true", "yes", "on"))
+ENTRY_ENGINE_STRATEGIES = {s.strip().lower() for s in os.getenv("ENTRY_ENGINE_STRATEGIES", "rb1,tc1").split(",") if s.strip()}
+ENTRY_ENGINE_TIMEFRAME = os.getenv("ENTRY_ENGINE_TIMEFRAME", "5Min").strip() or "5Min"   # must match broker get_bars
+ENTRY_ENGINE_LIMIT_BARS = int(float(os.getenv("ENTRY_ENGINE_LIMIT_BARS", "300") or 300))
+
+# RB1 params (5m)
+RB1_LOOKBACK_BARS = int(float(os.getenv("RB1_LOOKBACK_BARS", "48") or 48))
+RB1_BREAKOUT_BUFFER_PCT = float(os.getenv("RB1_BREAKOUT_BUFFER_PCT", "0.0005") or 0.0005)  # 0.05%
+
+# TC1 params
+TC1_LTF_EMA = int(float(os.getenv("TC1_LTF_EMA", "20") or 20))
+TC1_HTF_TIMEFRAME = os.getenv("TC1_HTF_TIMEFRAME", "60Min").strip() or "60Min"
+TC1_HTF_LIMIT_BARS = int(float(os.getenv("TC1_HTF_LIMIT_BARS", "300") or 300))
+TC1_HTF_FAST = int(float(os.getenv("TC1_HTF_FAST", "50") or 50))
+TC1_HTF_SLOW = int(float(os.getenv("TC1_HTF_SLOW", "200") or 200))
+TC1_RECLAIM_BUFFER_PCT = float(os.getenv("TC1_RECLAIM_BUFFER_PCT", "0.0005") or 0.0005)  # 0.05%
+
+
+# ---------- Scanner config (soft allow) ----------
 SCANNER_URL = os.getenv("SCANNER_URL", "").strip()
 SCANNER_REFRESH_SEC = int(float(os.getenv("SCANNER_REFRESH_SEC", "300") or 300))
 SCANNER_SOFT_ALLOW = (os.getenv("SCANNER_SOFT_ALLOW", "1").strip().lower() in ("1", "true", "yes", "on"))
 SCANNER_TIMEOUT_SEC = float(os.getenv("SCANNER_TIMEOUT_SEC", "10") or 10)
 
-# Expansion behavior:
-# - If true and scanner is healthy: allow ANY base that scanner selects (do not intersect with ALLOWED_SYMBOLS)
-ALLOW_SCANNER_NEW_SYMBOLS = os.getenv("ALLOW_SCANNER_NEW_SYMBOLS", "1").strip().lower() in ("1", "true", "yes", "on")
-
-# If true: bypass ALLOWED_SYMBOLS entirely (still gated by scanner if scanner is healthy)
-ALLOW_ANY_SYMBOL = os.getenv("ALLOW_ANY_SYMBOL", "0").strip().lower() in ("1", "true", "yes", "on")
-
 _SCANNER_CACHE: Dict[str, Any] = {
     "ts": 0.0,
+    "active_symbols": set(),   # type: Set[str]
     "ok": False,
     "last_error": None,
     "raw": None,
-    # new format
-    "active_bases": set(),             # type: Set[str]    e.g., {"ETH","ADA"}
-    "best_symbol_by_base": {},         # type: Dict[str,str] e.g., {"ETH":"ETH/USDT"}
-    # backwards compat
-    "active_symbols": set(),           # type: Set[str]    e.g., {"ETH/USDT","ADA/USD"}
 }
 
 
 def _log_event(level: str, event: Dict[str, Any]) -> None:
-    event = dict(event)
-    event.setdefault("level", level)
-    event.setdefault("utc", datetime.now(timezone.utc).isoformat())
     try:
         state.record_event(event)
     except Exception:
@@ -82,24 +89,130 @@ def _is_after_utc_hhmm(now: datetime, hhmm_utc: str) -> bool:
     return (now.hour, now.minute) >= (h, m)
 
 
-def _normalize_allowed_symbols(raw: list[str]) -> Set[str]:
-    out: Set[str] = set()
-    for s in raw or []:
-        try:
-            out.add(normalize_symbol(s))
-        except Exception:
-            continue
+def _ema(values: list[float], period: int) -> list[float]:
+    """Simple EMA series; returns list same length as values."""
+    if period <= 1 or not values:
+        return values[:]
+    k = 2.0 / (period + 1.0)
+    out: list[float] = []
+    ema = float(values[0])
+    out.append(ema)
+    for v in values[1:]:
+        ema = (float(v) * k) + (ema * (1.0 - k))
+        out.append(ema)
     return out
 
 
-_ALLOWED_SYMBOLS: Set[str] = _normalize_allowed_symbols(settings.allowed_symbols)
+def _rb1_long_signal(symbol: str) -> tuple[bool, dict]:
+    """True breakout: close crosses above prior N-bar high (edge-trigger)."""
+    bars = _get_bars(symbol, timeframe=ENTRY_ENGINE_TIMEFRAME, limit=max(ENTRY_ENGINE_LIMIT_BARS, RB1_LOOKBACK_BARS + 5))
+    if not bars or len(bars) < (RB1_LOOKBACK_BARS + 3):
+        return False, {"reason": "insufficient_bars", "bars": len(bars) if bars else 0}
+
+    highs = [float(b["h"]) for b in bars]
+    closes = [float(b["c"]) for b in bars]
+    ts = [int(float(b["t"])) for b in bars]
+
+    # prior range high excludes current bar
+    look = highs[-(RB1_LOOKBACK_BARS+1):-1]
+    range_high = max(look)
+    prev_close = closes[-2]
+    cur_close = closes[-1]
+
+    level = range_high * (1.0 + RB1_BREAKOUT_BUFFER_PCT)
+    fired = (prev_close <= level) and (cur_close > level)
+
+    meta = {"range_high": range_high, "level": level, "prev_close": prev_close, "close": cur_close, "bar_ts": ts[-1]}
+    return fired, meta
 
 
-def _base_from_symbol(ui_symbol: str) -> str:
-    base, _quote = ui_symbol.split("/", 1)
-    return base.strip().upper()
+def _tc1_long_signal(symbol: str) -> tuple[bool, dict]:
+    """Trend pullback continuation:
+    - HTF uptrend: EMA_fast > EMA_slow AND EMA_fast rising
+    - LTF reclaim: close crosses back above LTF EMA after being below
+    """
+    # HTF trend
+    htf = _get_bars(symbol, timeframe=TC1_HTF_TIMEFRAME, limit=max(TC1_HTF_LIMIT_BARS, TC1_HTF_SLOW + 5))
+    if not htf or len(htf) < (TC1_HTF_SLOW + 3):
+        return False, {"reason": "insufficient_htf_bars", "bars": len(htf) if htf else 0}
+
+    htf_closes = [float(b["c"]) for b in htf]
+    ema_fast = _ema(htf_closes, TC1_HTF_FAST)
+    ema_slow = _ema(htf_closes, TC1_HTF_SLOW)
+    uptrend = (ema_fast[-1] > ema_slow[-1]) and (ema_fast[-1] > ema_fast[-2])
+
+    # LTF reclaim
+    ltf = _get_bars(symbol, timeframe=ENTRY_ENGINE_TIMEFRAME, limit=max(ENTRY_ENGINE_LIMIT_BARS, TC1_LTF_EMA + 10))
+    if not ltf or len(ltf) < (TC1_LTF_EMA + 5):
+        return False, {"reason": "insufficient_ltf_bars", "bars": len(ltf) if ltf else 0, "uptrend": uptrend}
+
+    ltf_closes = [float(b["c"]) for b in ltf]
+    ltf_ts = [int(float(b["t"])) for b in ltf]
+    ltf_ema = _ema(ltf_closes, TC1_LTF_EMA)
+
+    prev_close = ltf_closes[-2]
+    cur_close = ltf_closes[-1]
+    prev_ema = ltf_ema[-2]
+    cur_ema = ltf_ema[-1]
+
+    buffer = cur_ema * TC1_RECLAIM_BUFFER_PCT
+    fired = uptrend and (prev_close < (prev_ema - buffer)) and (cur_close > (cur_ema + buffer))
+
+    meta = {
+        "uptrend": uptrend,
+        "htf_fast": ema_fast[-1],
+        "htf_slow": ema_slow[-1],
+        "ltf_ema": cur_ema,
+        "prev_close": prev_close,
+        "close": cur_close,
+        "bar_ts": ltf_ts[-1],
+    }
+    return fired, meta
 
 
+
+def _within_minutes_after_utc_hhmm(now: datetime, hhmm_utc: str, window_min: int) -> bool:
+    if not hhmm_utc:
+        return False
+    try:
+        hh, mm = hhmm_utc.split(":", 1)
+        h = int(hh)
+        m = int(mm)
+    except Exception:
+        return False
+    start = h * 60 + m
+    cur = now.hour * 60 + now.minute
+    return start <= cur < (start + max(1, int(window_min)))
+
+
+def _is_flatten_time(now: datetime, hhmm_utc: str) -> bool:
+    try:
+        hh, mm = hhmm_utc.split(":", 1)
+        h = int(hh)
+        m = int(mm)
+    except Exception:
+        h, m = 23, 55
+    return (now.hour, now.minute) >= (h, m)
+
+
+def _validate_symbol(symbol: str) -> str:
+    sym = normalize_symbol(symbol)
+    if sym not in settings.allowed_symbols:
+        raise HTTPException(status_code=400, detail=f"symbol_not_allowed: {sym}")
+    return sym
+
+
+def _has_position(symbol: str) -> tuple[bool, float]:
+    bal = _balances_by_asset()
+    base = _base_asset(symbol)
+    qty = float(bal.get(base, 0.0) or 0.0)
+    if qty <= 0:
+        return False, 0.0
+    px = float(_last_price(symbol))
+    return True, float(qty * px)
+
+
+# ---------- Scanner helpers ----------
 def _scanner_should_refresh() -> bool:
     if not SCANNER_URL:
         return False
@@ -115,50 +228,21 @@ def _scanner_refresh() -> None:
         r.raise_for_status()
         j = r.json()
 
-        active_bases: Set[str] = set()
-        best_symbol_by_base: Dict[str, str] = {}
-        active_symbols: Set[str] = set()
+        # Expected: {"ok": true, "active_symbols": ["SOL/USD", ...], ...}
+        active = j.get("active_symbols") or j.get("active_coins") or []
+        active_norm = set()
 
-        # NEW expected (scanner v2): {"active_bases":[...], "best_symbol_by_base":{...}}
-        if isinstance(j.get("active_bases"), list):
-            for b in j.get("active_bases") or []:
-                if not b:
-                    continue
-                active_bases.add(str(b).strip().upper())
-
-        if isinstance(j.get("best_symbol_by_base"), dict):
-            for b, sym in (j.get("best_symbol_by_base") or {}).items():
-                if not b or not sym:
-                    continue
-                b_up = str(b).strip().upper()
-                try:
-                    best_symbol_by_base[b_up] = normalize_symbol(str(sym))
-                except Exception:
-                    continue
-
-        # BACK-COMPAT: older scanner: {"active_symbols":[...]}
-        # If provided, we will derive bases and normalize symbols.
-        if isinstance(j.get("active_symbols"), list) or isinstance(j.get("active_coins"), list):
-            raw_syms = j.get("active_symbols") or j.get("active_coins") or []
-            for s in raw_syms:
-                try:
-                    ui = normalize_symbol(str(s))
-                    active_symbols.add(ui)
-                    active_bases.add(_base_from_symbol(ui))
-                except Exception:
-                    continue
-
-        ok = bool(j.get("ok", True))
-        # Treat "healthy" only if we have bases (new) or symbols (old)
-        healthy = ok and (len(active_bases) > 0 or len(active_symbols) > 0)
+        for s in active:
+            try:
+                active_norm.add(normalize_symbol(str(s)))
+            except Exception:
+                continue
 
         _SCANNER_CACHE["ts"] = time.time()
-        _SCANNER_CACHE["ok"] = bool(healthy)
+        _SCANNER_CACHE["active_symbols"] = active_norm
+        _SCANNER_CACHE["ok"] = bool(j.get("ok", True)) and len(active_norm) > 0
         _SCANNER_CACHE["last_error"] = None
         _SCANNER_CACHE["raw"] = j
-        _SCANNER_CACHE["active_bases"] = active_bases
-        _SCANNER_CACHE["best_symbol_by_base"] = best_symbol_by_base
-        _SCANNER_CACHE["active_symbols"] = active_symbols
 
     except Exception as e:
         _SCANNER_CACHE["ts"] = time.time()
@@ -166,320 +250,531 @@ def _scanner_refresh() -> None:
         _SCANNER_CACHE["last_error"] = str(e)
 
 
-def _scanner_meta() -> Dict[str, Any]:
-    ok = bool(_SCANNER_CACHE.get("ok"))
-    err = _SCANNER_CACHE.get("last_error")
-    bases = _SCANNER_CACHE.get("active_bases") or set()
-    syms = _SCANNER_CACHE.get("active_symbols") or set()
-    return {
-        "scanner_url": SCANNER_URL,
-        "scanner_ok": ok,
-        "scanner_error": err,
-        "scanner_active_base_count": len(bases),
-        "scanner_active_symbol_count": len(syms),
-        "scanner_soft_allow": SCANNER_SOFT_ALLOW,
-    }
-
-
-def _base_allowed_by_scanner(base: str) -> Tuple[bool, str, Dict[str, Any]]:
+def _symbol_allowed_by_scanner(symbol: str) -> tuple[bool, str, Dict[str, Any]]:
     """
-    Base-level gating:
-      - If scanner disabled => allow
-      - If scanner down/empty => allow if soft_allow else block
-      - If scanner healthy => allow only if base in active_bases
+    Returns (allowed, reason, meta)
+    Soft allow:
+      - If scanner is down OR returns empty => allow (fallback)
+      - If scanner is healthy => allow only if symbol is in active set
     """
     if not SCANNER_URL:
-        return True, "scanner_disabled", _scanner_meta()
+        return True, "scanner_disabled", {"scanner_url": ""}
 
     if _scanner_should_refresh():
         _scanner_refresh()
 
-    meta = _scanner_meta()
     ok = bool(_SCANNER_CACHE.get("ok"))
-    bases: Set[str] = _SCANNER_CACHE.get("active_bases") or set()
+    active = _SCANNER_CACHE.get("active_symbols") or set()
+    err = _SCANNER_CACHE.get("last_error")
 
-    if not ok or len(bases) == 0:
+    meta = {
+        "scanner_ok": ok,
+        "scanner_error": err,
+        "scanner_active_count": len(active),
+        "scanner_soft_allow": SCANNER_SOFT_ALLOW,
+    }
+
+    if not ok or len(active) == 0:
         if SCANNER_SOFT_ALLOW:
             return True, "scanner_fallback_allow", meta
         return False, "scanner_unavailable_block", meta
 
-    if base in bases:
+    if symbol in active:
         return True, "scanner_active_allow", meta
 
-    return False, "base_not_in_active_set", meta
-
-
-def _resolve_symbol_scanner_quote(base: str, requested_ui_symbol: str) -> Tuple[str, Dict[str, Any]]:
-    """
-    scanner_quote behavior:
-      - If scanner provides best_symbol_by_base[BASE], execute that UI symbol.
-      - Else execute the requested symbol.
-    """
-    chosen = requested_ui_symbol
-    info: Dict[str, Any] = {"requested_symbol": requested_ui_symbol}
-
-    best_map: Dict[str, str] = _SCANNER_CACHE.get("best_symbol_by_base") or {}
-    best = best_map.get(base)
-    if best:
-        chosen = best
-        info["scanner_best_symbol"] = best
-
-    info["executed_symbol"] = chosen
-    info["used_scanner_quote"] = bool(best)
-    return chosen, info
-
-
-def _allowed_by_static_allowlist(ui_symbol: str) -> Tuple[bool, str]:
-    """
-    Static allowlist check (from ALLOWED_SYMBOLS).
-    Can be bypassed with ALLOW_ANY_SYMBOL or (scanner healthy + ALLOW_SCANNER_NEW_SYMBOLS).
-    """
-    if ALLOW_ANY_SYMBOL:
-        return True, "allow_any_symbol_enabled"
-
-    # If allowlist empty, treat as allow-all (useful if you intentionally clear ALLOWED_SYMBOLS)
-    if len(_ALLOWED_SYMBOLS) == 0:
-        return True, "allowlist_empty_allow_all"
-
-    if ui_symbol in _ALLOWED_SYMBOLS:
-        return True, "allowlist_allow"
-
-    return False, "not_in_allowed_symbols"
-
-
-@app.post("/webhook")
-async def webhook(req: Request):
-    """
-    TradingView webhook entry.
-    Payload example:
-    {
-      "secret":"...",
-      "symbol":"BTC/USD",
-      "side":"buy",
-      "strategy":"rb1",
-      "signal":"range_breakout_edge",
-      "signal_id":"BTCUSD_5m_rb1_long"
-    }
-    """
-    rid = str(uuid4())
-    now = datetime.now(timezone.utc)
-
-    try:
-        body = await req.body()
-        payload = WebhookPayload.model_validate_json(body)
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"invalid_payload: {e}")
-
-    # Secret check
-    if payload.secret != settings.webhook_secret:
-        _log_event("WARN", {"event": "webhook_ignored", "rid": rid, "reason": "bad_secret"})
-        raise HTTPException(status_code=401, detail="unauthorized")
-
-    if not settings.trading_enabled:
-        _log_event("INFO", {"event": "webhook_ignored", "rid": rid, "reason": "trading_disabled"})
-        return {"ok": True, "ignored": True, "reason": "trading_disabled"}
-
-    # Normalize symbol (incoming may be BTCUSD, KRAKEN:BTCUSD, BTC/USD, etc.)
-    try:
-        requested_ui_symbol = normalize_symbol(payload.symbol)
-    except Exception as e:
-        _log_event("WARN", {"event": "webhook_ignored", "rid": rid, "reason": "bad_symbol", "symbol": payload.symbol, "err": str(e)})
-        return {"ok": True, "ignored": True, "reason": "bad_symbol"}
-
-    base = _base_from_symbol(requested_ui_symbol)
-
-    # Scanner base gating
-    allowed_scanner, scanner_reason, scanner_meta = _base_allowed_by_scanner(base)
-    if not allowed_scanner:
-        _log_event("INFO", {
-            "event": "webhook_ignored",
-            "rid": rid,
-            "reason": scanner_reason,
-            "base": base,
-            "symbol": requested_ui_symbol,
-            "scanner": scanner_meta,
-        })
-        return {"ok": True, "ignored": True, "reason": scanner_reason, "scanner": scanner_meta}
-
-    # Decide which symbol to execute (scanner_quote behavior)
-    exec_ui_symbol, exec_sym_meta = _resolve_symbol_scanner_quote(base, requested_ui_symbol)
-
-    # Static allowlist behavior:
-    # - If scanner is healthy and ALLOW_SCANNER_NEW_SYMBOLS => do NOT intersect with ALLOWED_SYMBOLS
-    # - Else apply allowlist unless ALLOW_ANY_SYMBOL is enabled
-    scanner_is_healthy = bool(_SCANNER_CACHE.get("ok")) and len((_SCANNER_CACHE.get("active_bases") or set())) > 0
-    if not (scanner_is_healthy and ALLOW_SCANNER_NEW_SYMBOLS):
-        allow_ok, allow_reason = _allowed_by_static_allowlist(exec_ui_symbol)
-        if not allow_ok:
-            _log_event("INFO", {
-                "event": "webhook_ignored",
-                "rid": rid,
-                "reason": allow_reason,
-                "symbol": exec_ui_symbol,
-                "requested_symbol": requested_ui_symbol,
-                "base": base,
-            })
-            return {"ok": True, "ignored": True, "reason": allow_reason}
-
-    # No-new-entries cutoff ("" means 24/7)
-    if payload.side.lower() == "buy" and settings.no_new_entries_after_utc:
-        if _is_after_utc_hhmm(now, settings.no_new_entries_after_utc):
-            _log_event("INFO", {"event": "webhook_ignored", "rid": rid, "reason": "no_new_entries_after_cutoff", "cutoff": settings.no_new_entries_after_utc})
-            return {"ok": True, "ignored": True, "reason": "no_new_entries_after_cutoff"}
-
-    # Daily flatten window block (optional)
-    if payload.side.lower() == "buy" and settings.enforce_daily_flatten and settings.block_entries_after_flatten:
-        if _is_after_utc_hhmm(now, settings.daily_flatten_time_utc):
-            _log_event("INFO", {"event": "webhook_ignored", "rid": rid, "reason": "blocked_after_flatten_time", "flatten_time": settings.daily_flatten_time_utc})
-            return {"ok": True, "ignored": True, "reason": "blocked_after_flatten_time"}
-
-    # One position per symbol (base-level protection still via state positions)
-    if payload.side.lower() == "buy" and state.has_open_position(exec_ui_symbol):
-        _log_event("INFO", {"event": "webhook_ignored", "rid": rid, "reason": "position_already_open", "symbol": exec_ui_symbol})
-        return {"ok": True, "ignored": True, "reason": "position_already_open"}
-
-    # Cooldown per symbol
-    if payload.side.lower() == "buy":
-        ok_cd, remaining = state.entry_cooldown_ok(exec_ui_symbol, settings.entry_cooldown_sec)
-        if not ok_cd:
-            _log_event("INFO", {"event": "webhook_ignored", "rid": rid, "reason": "entry_cooldown", "symbol": exec_ui_symbol, "remaining_sec": remaining})
-            return {"ok": True, "ignored": True, "reason": "entry_cooldown", "remaining_sec": remaining}
-
-    # Per-day trade cap (default 999)
-    if payload.side.lower() == "buy":
-        day = _utc_date_str(now)
-        if not state.trades_per_day_ok(exec_ui_symbol, day, settings.max_trades_per_symbol_per_day):
-            _log_event("INFO", {"event": "webhook_ignored", "rid": rid, "reason": "max_trades_per_day", "symbol": exec_ui_symbol, "day": day})
-            return {"ok": True, "ignored": True, "reason": "max_trades_per_day"}
-
-    # Dedupe by signal_id (anti-spam)
-    if payload.signal_id:
-        if not state.signal_dedupe_ok(payload.signal_id, settings.signal_dedupe_ttl_sec):
-            _log_event("INFO", {"event": "webhook_ignored", "rid": rid, "reason": "signal_dedupe", "signal_id": payload.signal_id})
-            return {"ok": True, "ignored": True, "reason": "signal_dedupe"}
-
-    # Build trade plan (stop/take)
-    try:
-        px = float(_last_price(exec_ui_symbol))
-        brackets = compute_brackets(
-            side=payload.side.lower(),
-            entry_price=px,
-            stop_pct=settings.stop_pct,
-            take_pct=settings.take_pct,
-        )
-    except Exception as e:
-        _log_event("ERROR", {"event": "webhook_error", "rid": rid, "reason": "price_or_brackets_failed", "symbol": exec_ui_symbol, "err": str(e)})
-        return JSONResponse(status_code=500, content={"ok": False, "error": "price_or_brackets_failed"})
-
-    # Place market order for default notional
-    try:
-        order = _market_notional(
-            symbol=exec_ui_symbol,
-            side=payload.side.lower(),
-            notional=float(settings.default_notional_usd),
-            strategy=payload.strategy,
-            price=None,
-        )
-    except Exception as e:
-        _log_event("ERROR", {"event": "webhook_error", "rid": rid, "reason": "order_failed", "symbol": exec_ui_symbol, "err": str(e)})
-        return JSONResponse(status_code=500, content={"ok": False, "error": "order_failed", "detail": str(e)})
-
-    # Track plan in memory
-    plan = TradePlan(
-        symbol=exec_ui_symbol,
-        side=payload.side.lower(),
-        strategy=payload.strategy,
-        signal=payload.signal,
-        signal_id=payload.signal_id,
-        entry_time_utc=now.isoformat(),
-        entry_price=px,
-        stop_price=brackets["stop"],
-        take_price=brackets["take"],
-        qty=float(order.get("qty") or 0.0),
-        order_id=str(order.get("order_id") or ""),
-    )
-    state.set_plan(exec_ui_symbol, plan)
-
-    # Mark trade count + cooldown
-    day = _utc_date_str(now)
-    if payload.side.lower() == "buy":
-        state.bump_trade_count(exec_ui_symbol, day)
-        state.set_last_entry(exec_ui_symbol, time.time())
-
-    _log_event("INFO", {
-        "event": "webhook_executed",
-        "rid": rid,
-        "symbol": exec_ui_symbol,
-        "requested_symbol": requested_ui_symbol,
-        "base": base,
-        "side": payload.side.lower(),
-        "strategy": payload.strategy,
-        "signal": payload.signal,
-        "signal_id": payload.signal_id,
-        "order": order,
-        "plan": plan.model_dump(),
-        "scanner": scanner_meta,
-        "scanner_quote": exec_sym_meta,
-    })
-
-    return {
-        "ok": True,
-        "executed": True,
-        "symbol": exec_ui_symbol,
-        "requested_symbol": requested_ui_symbol,
-        "scanner": scanner_meta,
-        "scanner_quote": exec_sym_meta,
-        "order": order,
-        "plan": plan.model_dump(),
-    }
-
-
-@app.post("/worker/exit")
-async def worker_exit(req: Request):
-    """
-    Background exit runner calls this endpoint.
-    """
-    rid = str(uuid4())
-    try:
-        body = await req.body()
-        payload = WorkerExitPayload.model_validate_json(body)
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"invalid_payload: {e}")
-
-    if payload.worker_secret != settings.worker_secret:
-        raise HTTPException(status_code=401, detail="unauthorized")
-
-    # Delegate to existing state logic
-    try:
-        res = state.run_exit_cycle(
-            balances_by_asset=_balances_by_asset,
-            base_asset=_base_asset,
-            last_price=_last_price,
-            market_notional=_market_notional,
-            settings=settings,
-        )
-        return {"ok": True, "rid": rid, "result": res}
-    except Exception as e:
-        _log_event("ERROR", {"event": "worker_exit_error", "rid": rid, "err": str(e)})
-        return {"ok": False, "rid": rid, "error": str(e)}
-
-
-@app.get("/telemetry")
-def telemetry():
-    return {"ok": True, "events": state.get_events(limit=250)}
+    return False, "not_in_active_set", meta
 
 
 @app.get("/health")
 def health():
-    # light scanner refresh for visibility only
-    if SCANNER_URL and _scanner_should_refresh():
-        _scanner_refresh()
-
     return {
         "ok": True,
         "utc": datetime.now(timezone.utc).isoformat(),
-        "scanner": _scanner_meta(),
-        "allow_any_symbol": ALLOW_ANY_SYMBOL,
-        "allow_scanner_new_symbols": ALLOW_SCANNER_NEW_SYMBOLS,
-        "allowed_symbols_count": len(_ALLOWED_SYMBOLS),
+        "scanner_url": SCANNER_URL or None,
+        "scanner_ok": bool(_SCANNER_CACHE.get("ok")),
+        "scanner_active_count": len(_SCANNER_CACHE.get("active_symbols") or set()),
+        "scanner_soft_allow": SCANNER_SOFT_ALLOW,
     }
+
+
+@app.get("/telemetry")
+def telemetry(limit: int = 100):
+    lim = max(1, min(int(limit), 500))
+    return {"ok": True, "count": len(state.telemetry), "items": state.telemetry[-lim:]}
+
+
+
+def _execute_long_entry(
+    *,
+    symbol: str,
+    strategy: str,
+    signal_name: str | None,
+    signal_id: str | None,
+    notional: float | None,
+    source: str,
+    req_id: str,
+    client_ip: str | None = None,
+    extra: dict | None = None,
+):
+    def ignored(reason: str, **extra_fields):
+        evt = {
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "req_id": req_id,
+            "kind": source,
+            "status": "ignored",
+            "reason": reason,
+            **(extra_fields or {}),
+        }
+        _log_event("warning", evt)
+        return {"ok": True, "ignored": True, "reason": reason, **(extra_fields or {})}
+
+    now = datetime.now(timezone.utc)
+    utc_date = _utc_date_str(now)
+    state.reset_daily_counters_if_needed(utc_date)
+
+    if signal_id and state.seen_recent_signal(signal_id, int(settings.signal_dedupe_ttl_sec)):
+        return ignored("duplicate_signal_id", symbol=symbol, strategy=strategy, signal=signal_name, signal_id=signal_id)
+
+    if not bool(settings.trading_enabled):
+        return ignored("trading_disabled", symbol=symbol, strategy=strategy, signal=signal_name, signal_id=signal_id)
+
+    # daily loss cap
+    if state.daily_pnl_usd <= -float(settings.max_daily_loss_usd):
+        return ignored("max_daily_loss_reached", symbol=symbol, strategy=strategy, daily_pnl_usd=state.daily_pnl_usd)
+
+    # cooldown
+    if not state.can_enter(symbol, int(settings.entry_cooldown_sec)):
+        return ignored("entry_cooldown", symbol=symbol, cooldown_sec=int(settings.entry_cooldown_sec))
+
+    # max trades per day per symbol
+    if not state.can_trade_symbol_today(symbol, int(settings.max_trades_per_symbol_per_day)):
+        return ignored("max_trades_per_symbol_per_day", symbol=symbol, max_per_day=int(settings.max_trades_per_symbol_per_day))
+
+    # one position per symbol
+    has_pos, pos_notional = _has_position(symbol)
+    if has_pos:
+        return ignored("position_already_open", symbol=symbol, position_notional_usd=pos_notional, strategy=strategy)
+
+    _notional = float(notional or settings.default_notional_usd)
+    if _notional < float(settings.min_order_notional_usd):
+        return ignored("notional_below_minimum", symbol=symbol, notional_usd=_notional, min_notional_usd=float(settings.min_order_notional_usd))
+
+    px = float(_last_price(symbol))
+    stop_price, take_price = compute_brackets(px, settings.stop_pct, settings.take_pct)
+
+    res = _market_notional(symbol=symbol, side="buy", notional=_notional, strategy=strategy, price=px)
+
+    evt = {
+        "ts": datetime.now(timezone.utc).isoformat(),
+        "req_id": req_id,
+        "kind": source,
+        "status": "executed",
+        "action": "buy",
+        "symbol": symbol,
+        "strategy": strategy,
+        "signal": signal_name,
+        "signal_id": signal_id,
+        "price": px,
+        "notional_usd": _notional,
+        "stop": float(stop_price),
+        "take": float(take_price),
+        "order": res,
+        "client_ip": client_ip,
+    }
+    if extra:
+        evt.update(extra)
+    _log_event("info", evt)
+
+    state.mark_enter(symbol)
+    state.plans[symbol] = TradePlan(
+        symbol=symbol,
+        strategy=strategy,
+        side="buy",
+        entry_price=float(px),
+        stop=float(stop_price),
+        take=float(take_price),
+        notional_usd=float(_notional),
+        opened_ts=time.time(),
+    )
+
+    return {"ok": True, "executed": True, "symbol": symbol, "strategy": strategy, "price": px, "stop": float(stop_price), "take": float(take_price)}
+
+@app.post("/webhook")
+def webhook(payload: WebhookPayload, request: Request):
+    req_id = request.headers.get("x-request-id") or str(uuid4())
+    client_ip = getattr(request.client, "host", None)
+
+    def ignored(reason: str, **extra):
+        evt = {
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "req_id": req_id,
+            "kind": "webhook",
+            "status": "ignored",
+            "reason": reason,
+            "client_ip": client_ip,
+            **extra,
+        }
+        _log_event("warning", evt)
+        return {"ok": True, "ignored": True, "reason": reason, **extra}
+
+    # Secret
+    if not settings.webhook_secret or payload.secret != settings.webhook_secret:
+        _log_event(
+            "warning",
+            {
+                "ts": datetime.now(timezone.utc).isoformat(),
+                "req_id": req_id,
+                "kind": "webhook",
+                "status": "rejected",
+                "reason": "invalid_secret",
+                "client_ip": client_ip,
+            },
+        )
+        raise HTTPException(status_code=401, detail="invalid secret")
+
+    # Symbol allowlist (static env allowlist)
+    symbol = _validate_symbol(payload.symbol)
+
+    # Scanner gate (dynamic top5) — soft allow enabled by env
+    allowed, allow_reason, allow_meta = _symbol_allowed_by_scanner(symbol)
+    if not allowed:
+        return ignored(
+            allow_reason,
+            symbol=symbol,
+            strategy=str(payload.strategy),
+            signal=(payload.signal or None),
+            signal_id=(payload.signal_id or None),
+            **allow_meta,
+        )
+
+    side = str(payload.side).lower().strip()
+    strategy = str(payload.strategy).strip()
+    signal_name = (payload.signal or "").strip() or None
+    signal_id = (payload.signal_id or "").strip() or None
+
+    if side != "buy":
+        return ignored("long_only_mode", symbol=symbol, side=side, strategy=strategy)
+
+    now = datetime.now(timezone.utc)
+    utc_date = _utc_date_str(now)
+    state.reset_daily_counters_if_needed(utc_date)
+
+    # Idempotency / TV retries
+    if signal_id and state.seen_recent_signal(signal_id, int(settings.signal_dedupe_ttl_sec)):
+        return ignored(
+            "duplicate_signal_id",
+            symbol=symbol,
+            strategy=strategy,
+            signal=signal_name,
+            signal_id=signal_id,
+            ttl_sec=int(settings.signal_dedupe_ttl_sec),
+        )
+
+    # Master kill switch
+    if not bool(settings.trading_enabled):
+        return ignored("trading_disabled", symbol=symbol, strategy=strategy, signal=signal_name, signal_id=signal_id)
+
+    # 24/7 by default; cutoff enforced only if set
+    if settings.no_new_entries_after_utc and _is_after_utc_hhmm(now, settings.no_new_entries_after_utc):
+        return ignored(
+            "entries_disabled_after_cutoff",
+            symbol=symbol,
+            strategy=strategy,
+            signal=signal_name,
+            signal_id=signal_id,
+            cutoff_utc=settings.no_new_entries_after_utc,
+            utc=now.isoformat(),
+        )
+
+    # Optional short flatten window block (off by default)
+    if settings.enforce_daily_flatten and settings.block_entries_after_flatten:
+        if _within_minutes_after_utc_hhmm(now, settings.daily_flatten_time_utc, window_min=3):
+            return ignored(
+                "entries_blocked_during_flatten_window",
+                symbol=symbol,
+                strategy=strategy,
+                signal=signal_name,
+                signal_id=signal_id,
+                flatten_utc=settings.daily_flatten_time_utc,
+                utc=now.isoformat(),
+            )
+
+    # Entry cooldown
+    if not state.can_enter(symbol, int(settings.entry_cooldown_sec)):
+        return ignored(
+            "entry_cooldown_active",
+            symbol=symbol,
+            strategy=strategy,
+            signal=signal_name,
+            signal_id=signal_id,
+            cooldown_sec=int(settings.entry_cooldown_sec),
+        )
+
+    # Max trades/day per symbol
+    trades = int(state.trades_today_by_symbol.get(symbol, 0) or 0)
+    if trades >= int(settings.max_trades_per_symbol_per_day):
+        return ignored(
+            "max_trades_reached",
+            symbol=symbol,
+            strategy=strategy,
+            trades_today=trades,
+            max_trades=int(settings.max_trades_per_symbol_per_day),
+        )
+
+    # One position per symbol
+    has_pos, pos_notional = _has_position(symbol)
+    if has_pos:
+        return ignored("position_already_open", symbol=symbol, strategy=strategy, position_notional_usd=pos_notional)
+
+    # Notional
+    notional = float(payload.notional_usd or settings.default_notional_usd)
+    if notional < float(settings.min_order_notional_usd):
+        return ignored(
+            "notional_below_minimum",
+            symbol=symbol,
+            strategy=strategy,
+            notional_usd=notional,
+            min_notional_usd=float(settings.min_order_notional_usd),
+        )
+
+    # Execute BUY
+    px = float(_last_price(symbol))
+    stop_price, take_price = compute_brackets(px, settings.stop_pct, settings.take_pct)
+
+    res = _market_notional(symbol=symbol, side="buy", notional=notional, strategy=strategy, price=px)
+
+    _log_event(
+        "info",
+        {
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "req_id": req_id,
+            "kind": "webhook",
+            "status": "executed",
+            "action": "buy",
+            "symbol": symbol,
+            "strategy": strategy,
+            "signal": signal_name,
+            "signal_id": signal_id,
+            "price": px,
+            "notional_usd": notional,
+            "stop": float(stop_price),
+            "take": float(take_price),
+            "scanner_gate": {"allowed": True, "reason": allow_reason, **allow_meta},
+            "client_ip": client_ip,
+        },
+    )
+
+    state.mark_enter(symbol)
+    state.plans[symbol] = TradePlan(
+        symbol=symbol,
+        side="buy",
+        notional_usd=notional,
+        entry_price=px,
+        stop_price=stop_price,
+        take_price=take_price,
+        strategy=strategy,
+        opened_ts=now.timestamp(),
+    )
+    n = state.inc_trade(symbol)
+
+    return {
+        "ok": True,
+        "action": "buy",
+        "symbol": symbol,
+        "price": px,
+        "stop": stop_price,
+        "take": take_price,
+        "trade_count_today": n,
+        "signal": signal_name,
+        "signal_id": signal_id,
+        "scanner_gate": {"reason": allow_reason, **allow_meta},
+        "result": res,
+    }
+
+
+@app.post("/worker/exit")
+def worker_exit(payload: WorkerExitPayload):
+    # Worker secret
+    if settings.worker_secret:
+        if not payload.worker_secret or payload.worker_secret != settings.worker_secret:
+            raise HTTPException(status_code=401, detail="invalid worker secret")
+
+    try:
+        now = datetime.now(timezone.utc)
+        utc_date = _utc_date_str(now)
+
+        did_flatten = False
+        if settings.enforce_daily_flatten and _is_flatten_time(now, settings.daily_flatten_time_utc) and state.last_flatten_utc_date != utc_date:
+            did_flatten = True
+            state.last_flatten_utc_date = utc_date
+
+        exits = []
+        bal = _balances_by_asset()
+
+        for symbol in settings.allowed_symbols:
+            base = _base_asset(symbol)
+            qty = float(bal.get(base, 0.0) or 0.0)
+            if qty <= 0:
+                state.plans.pop(symbol, None)
+                state.clear_pending_exit(symbol)
+                continue
+
+            plan = state.plans.get(symbol)
+            entry_px = float(plan.entry_price) if plan else float(_last_price(symbol))
+            stop_px, take_px = compute_brackets(entry_px, settings.stop_pct, settings.take_pct)
+
+            if not plan:
+                plan = TradePlan(
+                    symbol=symbol,
+                    side="buy",
+                    notional_usd=float(settings.default_notional_usd),
+                    entry_price=entry_px,
+                    stop_price=stop_px,
+                    take_price=take_px,
+                    strategy="unknown",
+                    opened_ts=now.timestamp(),
+                )
+                state.plans[symbol] = plan
+
+            px = float(_last_price(symbol))
+            reason = None
+
+            if did_flatten:
+                reason = "daily_flatten"
+            elif px <= float(plan.stop_price):
+                reason = "stop"
+            elif px >= float(plan.take_price):
+                reason = "take"
+
+            if not reason:
+                continue
+
+            if not state.can_exit(symbol, int(settings.exit_cooldown_sec)):
+                continue
+
+            notional_exit = max(float(settings.exit_min_notional_usd), float(plan.notional_usd))
+            res = _market_notional(symbol=symbol, side="sell", notional=notional_exit, strategy=plan.strategy, price=px)
+
+            state.mark_exit(symbol)
+            state.set_pending_exit(symbol, reason=reason, txid=None)
+
+            evt = {
+                "ts": datetime.now(timezone.utc).isoformat(),
+                "kind": "exit",
+                "status": "executed",
+                "symbol": symbol,
+                "strategy": plan.strategy,
+                "reason": reason,
+                "price": px,
+                "notional_usd": notional_exit,
+            }
+            _log_event("info", evt)
+            exits.append({"symbol": symbol, "reason": reason, "price": px, "result": res})
+
+        return {"ok": True, "utc": now.isoformat(), "did_flatten": did_flatten, "exits": exits}
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        _log_event(
+            "error",
+            {
+                "ts": datetime.now(timezone.utc).isoformat(),
+                "kind": "worker_exit",
+                "status": "error",
+                "error": str(e),
+            },
+        )
+        return JSONResponse(status_code=200, content={"ok": False, "error": str(e)})
+
+
+@app.post("/worker/scan_entries")
+def scan_entries(payload: WorkerScanPayload, request: Request):
+    req_id = request.headers.get("x-request-id") or str(uuid4())
+    client_ip = getattr(request.client, "host", None)
+
+    # Secret
+    if settings.worker_secret and (payload.worker_secret or "") != settings.worker_secret:
+        _log_event(
+            "warning",
+            {
+                "ts": datetime.now(timezone.utc).isoformat(),
+                "req_id": req_id,
+                "kind": "entry_engine",
+                "status": "rejected",
+                "reason": "invalid_worker_secret",
+                "client_ip": client_ip,
+            },
+        )
+        raise HTTPException(status_code=401, detail="invalid worker secret")
+
+    if not ENTRY_ENGINE_ENABLED:
+        return {"ok": True, "enabled": False, "reason": "ENTRY_ENGINE_DISABLED"}
+
+    # Determine universe: scanner picks + baseline allowlist (soft allow)
+    active = []
+    scanner_meta = {}
+    if SCANNER_URL:
+        ok, reason, meta = _scanner_fetch_active_symbols()
+        scanner_meta = {"ok": ok, "reason": reason, **(meta or {})}
+        if ok:
+            active = sorted(list(_SCANNER_CACHE["active_symbols"]))
+    # Always include baseline allowlist to ensure majors can still be traded even if scanner is down.
+    for s in sorted(list(settings.allowed_symbols)):
+        if s not in active:
+            active.append(s)
+
+    results = []
+    for sym in active:
+        try:
+            sym_n = _validate_symbol(sym)
+        except Exception:
+            continue
+
+        # RB1
+        if "rb1" in ENTRY_ENGINE_STRATEGIES:
+            fired, meta = _rb1_long_signal(sym_n)
+            if fired:
+                bar_ts = meta.get("bar_ts") or int(time.time())
+                signal_id = f"{sym_n.replace('/','')}_rb1_{bar_ts}"
+                if payload.dry_run:
+                    results.append({"symbol": sym_n, "strategy": "rb1", "fired": True, "dry_run": True, "meta": meta})
+                else:
+                    out = _execute_long_entry(
+                        symbol=sym_n,
+                        strategy="rb1",
+                        signal_name="range_breakout_edge_engine",
+                        signal_id=signal_id,
+                        notional=None,
+                        source="entry_engine",
+                        req_id=req_id,
+                        client_ip=client_ip,
+                        extra={"engine": "rb1", "signal_meta": meta, "scanner": scanner_meta},
+                    )
+                    if out.get("executed"):
+                        results.append({"symbol": sym_n, "strategy": "rb1", "executed": True, "meta": meta})
+        # TC1
+        if "tc1" in ENTRY_ENGINE_STRATEGIES:
+            fired, meta = _tc1_long_signal(sym_n)
+            if fired:
+                bar_ts = meta.get("bar_ts") or int(time.time())
+                signal_id = f"{sym_n.replace('/','')}_tc1_{bar_ts}"
+                if payload.dry_run:
+                    results.append({"symbol": sym_n, "strategy": "tc1", "fired": True, "dry_run": True, "meta": meta})
+                else:
+                    out = _execute_long_entry(
+                        symbol=sym_n,
+                        strategy="tc1",
+                        signal_name="pullback_reclaim_edge_engine",
+                        signal_id=signal_id,
+                        notional=None,
+                        source="entry_engine",
+                        req_id=req_id,
+                        client_ip=client_ip,
+                        extra={"engine": "tc1", "signal_meta": meta, "scanner": scanner_meta},
+                    )
+                    if out.get("executed"):
+                        results.append({"symbol": sym_n, "strategy": "tc1", "executed": True, "meta": meta})
+
+    return {"ok": True, "utc": datetime.now(timezone.utc).isoformat(), "universe_count": len(active), "scanner": scanner_meta, "results": results}
+

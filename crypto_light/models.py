@@ -15,3 +15,7 @@ class WebhookPayload(BaseModel):
 
 class WorkerExitPayload(BaseModel):
     worker_secret: str | None = None
+
+class WorkerScanPayload(BaseModel):
+    worker_secret: str | None = None
+    dry_run: bool | None = False
