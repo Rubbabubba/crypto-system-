@@ -720,106 +720,96 @@ def worker_exit(payload: WorkerExitPayload):
 
 
 @app.post("/worker/scan_entries")
-def scan_entries(payload: WorkerScanPayload, request: Request):
-    req_id = request.headers.get("x-request-id") or str(uuid4())
-    client_ip = getattr(request.client, "host", None)
-
-    # Secret
-    if settings.worker_secret and (payload.worker_secret or "") != settings.worker_secret:
-        _log_event(
-            "warning",
-            {
-                "ts": datetime.now(timezone.utc).isoformat(),
-                "req_id": req_id,
-                "kind": "entry_engine",
-                "status": "rejected",
-                "reason": "invalid_worker_secret",
-                "client_ip": client_ip,
-            },
-        )
+def scan_entries(req: WorkerScanRequest):
+    if req.worker_secret != WORKER_SECRET:
         raise HTTPException(status_code=401, detail="invalid worker secret")
 
-    if not ENTRY_ENGINE_ENABLED:
-        return {"ok": True, "enabled": False, "reason": "ENTRY_ENGINE_DISABLED"}
-
-    # Determine universe: scanner picks + baseline allowlist (soft allow)
-    active = []
-    scanner_meta = {}
-    if SCANNER_URL:
-        # Keep scanner failures from crashing the worker.
-        # NOTE: _scanner_fetch_active_symbols() returns a list[str], not a tuple.
-        try:
-            if _scanner_should_refresh():
-                _scanner_refresh()
-            ok = bool(_SCANNER_CACHE.get("ok"))
-            reason = None if ok else ("scanner_unavailable" if _SCANNER_CACHE.get("last_error") else "scanner_empty")
-            active = sorted(list(_SCANNER_CACHE.get("active_symbols") or set()))
-            scanner_meta = {
-                "ok": ok,
-                "reason": reason,
-                "active_count": len(active),
-                "last_refresh_utc": _SCANNER_CACHE.get("last_refresh_utc"),
-                "last_error": _SCANNER_CACHE.get("last_error"),
-            }
-        except Exception as e:
-            scanner_meta = {"ok": False, "reason": "scanner_exception", "error": str(e)}
-            active = []
-    # Always include baseline allowlist to ensure majors can still be traded even if scanner is down.
-    for s in sorted(list(settings.allowed_symbols)):
-        if s not in active:
-            active.append(s)
-
+    diagnostics = []
     results = []
-    for sym in active:
-        try:
-            sym_n = _validate_symbol(sym)
-        except Exception:
+
+    scanner_ok, scanner_reason, scanner_meta = _scanner_fetch_active_symbols()
+
+    if not scanner_ok:
+        return {
+            "ok": False,
+            "utc": utc_now_iso(),
+            "scanner": {
+                "ok": False,
+                "reason": scanner_reason,
+                "meta": scanner_meta
+            },
+            "results": [],
+            "diagnostics": []
+        }
+
+    symbols = scanner_meta.get("active_symbols", [])
+    diagnostics_summary = {
+        "universe_count": len(symbols),
+        "passed_all_filters": 0,
+        "blocked_by_position": 0,
+        "blocked_by_cooldown": 0,
+        "blocked_by_signal": 0,
+        "blocked_by_risk": 0,
+    }
+
+    for sym in symbols:
+        diag = {
+            "symbol": sym,
+            "entry_signal": False,
+            "cooldown_block": False,
+            "position_block": False,
+            "risk_block": False,
+            "reason": None,
+        }
+
+        # ---- existing checks ----
+
+        if has_open_position(sym):
+            diag["position_block"] = True
+            diagnostics_summary["blocked_by_position"] += 1
+            diagnostics.append(diag)
             continue
 
-        # RB1
-        if "rb1" in ENTRY_ENGINE_STRATEGIES:
-            fired, meta = _rb1_long_signal(sym_n)
-            if fired:
-                bar_ts = meta.get("bar_ts") or int(time.time())
-                signal_id = f"{sym_n.replace('/','')}_rb1_{bar_ts}"
-                if payload.dry_run:
-                    results.append({"symbol": sym_n, "strategy": "rb1", "fired": True, "dry_run": True, "meta": meta})
-                else:
-                    out = _execute_long_entry(
-                        symbol=sym_n,
-                        strategy="rb1",
-                        signal_name="range_breakout_edge_engine",
-                        signal_id=signal_id,
-                        notional=None,
-                        source="entry_engine",
-                        req_id=req_id,
-                        client_ip=client_ip,
-                        extra={"engine": "rb1", "signal_meta": meta, "scanner": scanner_meta},
-                    )
-                    if out.get("executed"):
-                        results.append({"symbol": sym_n, "strategy": "rb1", "executed": True, "meta": meta})
-        # TC1
-        if "tc1" in ENTRY_ENGINE_STRATEGIES:
-            fired, meta = _tc1_long_signal(sym_n)
-            if fired:
-                bar_ts = meta.get("bar_ts") or int(time.time())
-                signal_id = f"{sym_n.replace('/','')}_tc1_{bar_ts}"
-                if payload.dry_run:
-                    results.append({"symbol": sym_n, "strategy": "tc1", "fired": True, "dry_run": True, "meta": meta})
-                else:
-                    out = _execute_long_entry(
-                        symbol=sym_n,
-                        strategy="tc1",
-                        signal_name="pullback_reclaim_edge_engine",
-                        signal_id=signal_id,
-                        notional=None,
-                        source="entry_engine",
-                        req_id=req_id,
-                        client_ip=client_ip,
-                        extra={"engine": "tc1", "signal_meta": meta, "scanner": scanner_meta},
-                    )
-                    if out.get("executed"):
-                        results.append({"symbol": sym_n, "strategy": "tc1", "executed": True, "meta": meta})
+        if is_in_cooldown(sym):
+            diag["cooldown_block"] = True
+            diagnostics_summary["blocked_by_cooldown"] += 1
+            diagnostics.append(diag)
+            continue
 
-    return {"ok": True, "utc": datetime.now(timezone.utc).isoformat(), "universe_count": len(active), "scanner": scanner_meta, "results": results}
+        signal_ok, signal_meta = compute_entry_signal(sym)
+        if not signal_ok:
+            diag["blocked_by_signal"] = True
+            diag["reason"] = signal_meta
+            diagnostics_summary["blocked_by_signal"] += 1
+            diagnostics.append(diag)
+            continue
 
+        risk_ok, risk_reason = risk_manager_allows_trade(sym)
+        if not risk_ok:
+            diag["risk_block"] = True
+            diag["reason"] = risk_reason
+            diagnostics_summary["blocked_by_risk"] += 1
+            diagnostics.append(diag)
+            continue
+
+        diag["entry_signal"] = True
+        diagnostics_summary["passed_all_filters"] += 1
+
+        if not req.dry_run:
+            place_entry_order(sym)
+
+        results.append({"symbol": sym, "status": "entry_triggered"})
+        diagnostics.append(diag)
+
+    return {
+        "ok": True,
+        "utc": utc_now_iso(),
+        "scanner": {
+            "ok": True,
+            "reason": None,
+            "active_count": len(symbols)
+        },
+        "results": results,
+        "diagnostics_summary": diagnostics_summary,
+        "diagnostics": diagnostics
+    }
