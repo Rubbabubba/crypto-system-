@@ -23,6 +23,10 @@ from .state import InMemoryState, TradePlan
 from .symbol_map import normalize_symbol
 
 settings = load_settings()
+
+# Keep a normalized set for fast membership checks.
+ALLOWED_SYMBOLS = set(getattr(settings, 'allowed_symbols', []) or [])
+
 state = InMemoryState()
 app = FastAPI(title="Crypto Light", version="1.0.2")
 
@@ -318,6 +322,58 @@ def _scanner_fetch_active_symbols_and_meta() -> tuple[bool, str | None, dict, li
     except Exception as e:
         meta['error'] = f'{type(e).__name__}: {e}'
         return False, 'exception', meta, []
+def _build_universe(payload, scanner_syms: list[str]) -> list[str]:
+    """Build the scan universe safely.
+
+    Priority:
+      1) Explicit payload.symbols (if provided and non-empty)
+      2) Scanner symbols (scanner_syms)
+      3) Fallback to settings.allowed_symbols
+
+    Applies allow-list unless payload.force_scan is truthy AND SCANNER_SOFT_ALLOW is enabled.
+    Never raises.
+    """
+    try:
+        requested = getattr(payload, "symbols", None) or []
+        force_scan = bool(getattr(payload, "force_scan", False))
+    except Exception:
+        requested, force_scan = [], False
+
+    def _norm_list(items):
+        out = []
+        seen = set()
+        for s in items or []:
+            try:
+                sym = normalize_symbol(str(s))
+            except Exception:
+                continue
+            if sym in seen:
+                continue
+            seen.add(sym)
+            out.append(sym)
+        return out
+
+    requested_norm = _norm_list(requested)
+    scanner_norm = _norm_list(scanner_syms)
+
+    if requested_norm:
+        universe = requested_norm
+    elif scanner_norm:
+        universe = scanner_norm
+    else:
+        universe = _norm_list(getattr(settings, "allowed_symbols", []) or [])
+
+    allowed = set(getattr(settings, "allowed_symbols", []) or [])
+    if allowed and not (force_scan and SCANNER_SOFT_ALLOW):
+        universe = [s for s in universe if s in allowed]
+
+    if not universe and allowed:
+        # stable de-dupe
+        universe = list(dict.fromkeys(list(allowed)))
+
+    return universe
+
+
 def _scanner_refresh() -> None:
     if not SCANNER_URL:
         return
