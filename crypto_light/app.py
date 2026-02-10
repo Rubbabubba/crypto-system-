@@ -4,7 +4,7 @@ import json
 import os
 import time
 from datetime import datetime, timezone
-from typing import Any, Dict, Optional, Set
+from typing import Any, Dict, Optional, Set, List, Tuple
 from uuid import uuid4
 
 import requests
@@ -93,6 +93,14 @@ def _log_event(level: str, event: Dict[str, Any]) -> None:
         print(json.dumps(event, default=str))
     except Exception:
         print(str(event))
+
+def utc_now_iso() -> str:
+    """UTC timestamp in ISO-8601 format.
+
+    Kept as a small helper because multiple endpoints include an 'utc' field.
+    """
+    return datetime.now(timezone.utc).isoformat()
+
 
 
 
@@ -207,6 +215,76 @@ def _tc1_long_signal(symbol: str) -> tuple[bool, dict]:
 
 
 
+
+def _entry_signals_for_symbol(symbol: str) -> Dict[str, bool]:
+    """Compute entry signals for a symbol for enabled strategies.
+
+    Returns a mapping like: {"rb1": True/False, "tc1": True/False}
+
+    This function never raises; failures are treated as no-signal for that strategy
+    (and are surfaced by the caller when it wraps this call).
+    """
+    out: Dict[str, bool] = {}
+
+    if not ENTRY_ENGINE_ENABLED:
+        return out
+
+    sym = normalize_symbol(symbol)
+
+    if "rb1" in ENTRY_ENGINE_STRATEGIES:
+        try:
+            fired, _meta = _rb1_long_signal(sym)
+            out["rb1"] = bool(fired)
+        except Exception:
+            out["rb1"] = False
+
+    if "tc1" in ENTRY_ENGINE_STRATEGIES:
+        try:
+            fired, _meta = _tc1_long_signal(sym)
+            out["tc1"] = bool(fired)
+        except Exception:
+            out["tc1"] = False
+
+    return out
+
+
+def place_entry(symbol: str, *, strategy: str) -> Tuple[bool, str, Dict[str, Any]]:
+    """Execute a long entry for the given symbol/strategy.
+
+    Contract: returns (ok, reason, meta)
+      - ok: True only when an order was attempted successfully
+      - reason: short human-readable reason string
+      - meta: diagnostics (prices, ids, etc.)
+
+    Never raises.
+    """
+    req_id = str(uuid4())
+    sym = normalize_symbol(symbol)
+    strat = (strategy or "").strip().lower() or "unknown"
+
+    try:
+        res = _execute_long_entry(
+            symbol=sym,
+            strategy=strat,
+            signal_name=f"scan_{strat}",
+            signal_id=f"scan:{sym}:{strat}:{req_id}",
+            notional=float(getattr(settings, "default_notional_usd", 50.0) or 50.0),
+            source="scan_entries",
+            req_id=req_id,
+            client_ip=None,
+            extra={"mode": "scan_entries"},
+        )
+        if res.get("ignored"):
+            return False, str(res.get("reason") or "ignored"), res
+        if res.get("executed"):
+            return True, "executed", res
+        return False, "no_action", res
+    except Exception as e:
+        meta = {"error_type": type(e).__name__, "error": str(e), "symbol": sym, "strategy": strat, "req_id": req_id}
+        _log_event("error", {"ts": utc_now_iso(), "kind": "scan_entries", "status": "error", **meta})
+        return False, "exception", meta
+
+
 def _within_minutes_after_utc_hhmm(now: datetime, hhmm_utc: str, window_min: int) -> bool:
     if not hhmm_utc:
         return False
@@ -261,10 +339,10 @@ def _scanner_fetch_active_symbols() -> list[str]:
     Never raises; returns [] on failure.
     """
     try:
-        url = settings.scanner_url
+        url = SCANNER_URL
         if not url:
             return []
-        r = requests.get(url, timeout=settings.scanner_timeout_sec)
+        r = requests.get(url, timeout=SCANNER_TIMEOUT_SEC)
         r.raise_for_status()
         data = r.json()
         syms = data.get("active_symbols") or []
