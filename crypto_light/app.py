@@ -872,11 +872,7 @@ def scan_entries(payload: WorkerScanPayload):
     scanner_ok, scanner_reason, scanner_meta, scanner_syms = _scanner_fetch_active_symbols_and_meta()
 
     # 2) Universe (explicit symbols > allowed list (+ scanner if soft allow))
-    universe = payload.get("universe") or scanner_syms or []
-    universe = [str(s).upper().strip() for s in universe if str(s).strip()]
-    # Deduplicate while preserving order
-    seen = set()
-    universe = [s for s in universe if not (s in seen or seen.add(s))]
+    universe = _build_universe(payload, scanner_syms)
 
     # 3) Snapshot positions once
     positions = get_positions()

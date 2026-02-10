@@ -19,3 +19,9 @@ class WorkerExitPayload(BaseModel):
 class WorkerScanPayload(BaseModel):
     worker_secret: str | None = None
     dry_run: bool | None = False
+
+    # Optional controls used by /worker/scan_entries
+    # - symbols: explicit universe override (e.g. [\"BTC/USD\", \"ETH/USD\"])
+    # - force_scan: bypass allow-list filtering when SCANNER_SOFT_ALLOW is enabled
+    symbols: list[str] | None = None
+    force_scan: bool = False
