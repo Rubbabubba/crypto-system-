@@ -219,6 +219,37 @@ def _scanner_should_refresh() -> bool:
     return (time.time() - float(_SCANNER_CACHE["ts"] or 0.0)) >= float(SCANNER_REFRESH_SEC)
 
 
+def _scanner_fetch_active_symbols() -> list[str]:
+    """Fetch scanner / knows how to normalize symbols and apply dedup/filters.
+    Returns a list of *normalized* symbols (e.g. BTC/USD) suitable for allow-checks.
+    Never raises; returns [] on failure.
+    """
+    try:
+        url = settings.scanner_url
+        if not url:
+            return []
+        r = requests.get(url, timeout=settings.scanner_timeout_sec)
+        r.raise_for_status()
+        data = r.json()
+        syms = data.get("active_symbols") or []
+        out: list[str] = []
+        for s in syms:
+            try:
+                out.append(normalize_symbol(str(s)))
+            except Exception:
+                continue
+        # de-dupe preserve order
+        seen=set()
+        dedup=[]
+        for s in out:
+            if s in seen:
+                continue
+            seen.add(s)
+            dedup.append(s)
+        return dedup
+    except Exception:
+        return []
+
 def _scanner_refresh() -> None:
     if not SCANNER_URL:
         return
