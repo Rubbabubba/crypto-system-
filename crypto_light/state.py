@@ -40,6 +40,7 @@ class InMemoryState:
 
         # Trade frequency (per UTC day)
         self.trades_today_by_symbol: Dict[str, int] = {}
+        self.trades_today_total: int = 0
         self.trades_today_utc_date: Optional[str] = None
 
         # Idempotency (webhook retries)
@@ -83,11 +84,16 @@ class InMemoryState:
         if self.trades_today_utc_date != utc_date:
             self.trades_today_utc_date = utc_date
             self.trades_today_by_symbol = {}
+            self.trades_today_total = 0
 
     def inc_trade(self, symbol: str) -> int:
         self.trades_today_by_symbol[symbol] = int(self.trades_today_by_symbol.get(symbol, 0)) + 1
         return self.trades_today_by_symbol[symbol]
 
+
+    def inc_trade_total(self) -> int:
+        self.trades_today_total = int(getattr(self, 'trades_today_total', 0) or 0) + 1
+        return self.trades_today_total
     # --------- Webhook idempotency ---------
     def seen_recent_signal(self, signal_id: str, ttl_sec: int) -> bool:
         """Return True if we saw this signal_id within ttl_sec, else record and return False."""

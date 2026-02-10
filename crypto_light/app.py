@@ -75,6 +75,17 @@ SCANNER_REFRESH_SEC = int(float(os.getenv("SCANNER_REFRESH_SEC", "300") or 300))
 SCANNER_SOFT_ALLOW = (os.getenv("SCANNER_SOFT_ALLOW", "1").strip().lower() in ("1", "true", "yes", "on"))
 SCANNER_TIMEOUT_SEC = float(os.getenv("SCANNER_TIMEOUT_SEC", "10") or 10)
 
+# ---------- Universe normalization / safety constraints ----------
+SCANNER_DRIVEN_UNIVERSE = (os.getenv('SCANNER_DRIVEN_UNIVERSE', '1').strip().lower() in ('1','true','yes','on'))
+SCANNER_TARGET_N = int(float(os.getenv('SCANNER_TARGET_N', os.getenv('TOP_N', '5')) or 5))
+UNIVERSE_USD_ONLY = (os.getenv('UNIVERSE_USD_ONLY', '0').strip().lower() in ('1','true','yes','on'))
+UNIVERSE_PREFER_USD_FOR_STABLES = (os.getenv('UNIVERSE_PREFER_USD_FOR_STABLES', '0').strip().lower() in ('1','true','yes','on'))
+FILTER_UNIVERSE_BY_ALLOWED_SYMBOLS = (os.getenv('FILTER_UNIVERSE_BY_ALLOWED_SYMBOLS', '0').strip().lower() in ('1','true','yes','on'))
+
+MAX_OPEN_POSITIONS = int(float(os.getenv('MAX_OPEN_POSITIONS', '2') or 2))
+MAX_ENTRIES_PER_SCAN = int(float(os.getenv('MAX_ENTRIES_PER_SCAN', '1') or 1))
+MAX_ENTRIES_PER_DAY = int(float(os.getenv('MAX_ENTRIES_PER_DAY', '5') or 5))
+
 _SCANNER_CACHE: Dict[str, Any] = {
     "ts": 0.0,
     "active_symbols": set(),   # type: Set[str]
@@ -94,14 +105,6 @@ def _log_event(level: str, event: Dict[str, Any]) -> None:
     except Exception:
         print(str(event))
 
-def utc_now_iso() -> str:
-    """UTC timestamp in ISO-8601 format.
-
-    Kept as a small helper because multiple endpoints include an 'utc' field.
-    """
-    return datetime.now(timezone.utc).isoformat()
-
-
 
 
 def get_positions() -> list[dict]:
@@ -115,6 +118,10 @@ def get_positions() -> list[dict]:
         [{"symbol": "BTCUSD", "qty": 0.25}, ...]
     """
     return []
+
+def utc_now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
 
 def _utc_date_str(now: Optional[datetime] = None) -> str:
     n = now or datetime.now(timezone.utc)
@@ -215,76 +222,6 @@ def _tc1_long_signal(symbol: str) -> tuple[bool, dict]:
 
 
 
-
-def _entry_signals_for_symbol(symbol: str) -> Dict[str, bool]:
-    """Compute entry signals for a symbol for enabled strategies.
-
-    Returns a mapping like: {"rb1": True/False, "tc1": True/False}
-
-    This function never raises; failures are treated as no-signal for that strategy
-    (and are surfaced by the caller when it wraps this call).
-    """
-    out: Dict[str, bool] = {}
-
-    if not ENTRY_ENGINE_ENABLED:
-        return out
-
-    sym = normalize_symbol(symbol)
-
-    if "rb1" in ENTRY_ENGINE_STRATEGIES:
-        try:
-            fired, _meta = _rb1_long_signal(sym)
-            out["rb1"] = bool(fired)
-        except Exception:
-            out["rb1"] = False
-
-    if "tc1" in ENTRY_ENGINE_STRATEGIES:
-        try:
-            fired, _meta = _tc1_long_signal(sym)
-            out["tc1"] = bool(fired)
-        except Exception:
-            out["tc1"] = False
-
-    return out
-
-
-def place_entry(symbol: str, *, strategy: str) -> Tuple[bool, str, Dict[str, Any]]:
-    """Execute a long entry for the given symbol/strategy.
-
-    Contract: returns (ok, reason, meta)
-      - ok: True only when an order was attempted successfully
-      - reason: short human-readable reason string
-      - meta: diagnostics (prices, ids, etc.)
-
-    Never raises.
-    """
-    req_id = str(uuid4())
-    sym = normalize_symbol(symbol)
-    strat = (strategy or "").strip().lower() or "unknown"
-
-    try:
-        res = _execute_long_entry(
-            symbol=sym,
-            strategy=strat,
-            signal_name=f"scan_{strat}",
-            signal_id=f"scan:{sym}:{strat}:{req_id}",
-            notional=float(getattr(settings, "default_notional_usd", 50.0) or 50.0),
-            source="scan_entries",
-            req_id=req_id,
-            client_ip=None,
-            extra={"mode": "scan_entries"},
-        )
-        if res.get("ignored"):
-            return False, str(res.get("reason") or "ignored"), res
-        if res.get("executed"):
-            return True, "executed", res
-        return False, "no_action", res
-    except Exception as e:
-        meta = {"error_type": type(e).__name__, "error": str(e), "symbol": sym, "strategy": strat, "req_id": req_id}
-        _log_event("error", {"ts": utc_now_iso(), "kind": "scan_entries", "status": "error", **meta})
-        return False, "exception", meta
-
-
 def _within_minutes_after_utc_hhmm(now: datetime, hhmm_utc: str, window_min: int) -> bool:
     if not hhmm_utc:
         return False
@@ -339,10 +276,10 @@ def _scanner_fetch_active_symbols() -> list[str]:
     Never raises; returns [] on failure.
     """
     try:
-        url = SCANNER_URL
+        url = settings.scanner_url
         if not url:
             return []
-        r = requests.get(url, timeout=SCANNER_TIMEOUT_SEC)
+        r = requests.get(url, timeout=settings.scanner_timeout_sec)
         r.raise_for_status()
         data = r.json()
         syms = data.get("active_symbols") or []
@@ -373,56 +310,75 @@ def _scanner_fetch_active_symbols_and_meta() -> tuple[bool, str | None, dict, li
     - ok: True if HTTP 200 and JSON parsed
     - reason: short string when ok=False
     - meta: dict of useful fields (status_code, url, last_error, last_refresh_utc, etc)
-    - symbols: list[str] of normalized symbols (e.g., 'ETH/USDT')
+    - symbols: list[str] of normalized symbols (e.g., 'ETH/USD')
 
     Never raises.
     """
-    url = getattr(settings, 'scanner_url', None) or os.getenv('SCANNER_URL', '').strip()
-    meta: dict = {'scanner_url': url}
+    url = (SCANNER_URL or os.getenv("SCANNER_URL", "").strip())
+    meta: dict = {"scanner_url": url}
     if not url:
-        return False, 'missing_scanner_url', meta, []
+        return False, "missing_scanner_url", meta, []
+
     try:
-        r = requests.get(url, timeout=10)
-        meta['status_code'] = r.status_code
-        meta['elapsed_ms'] = int(getattr(getattr(r, 'elapsed', None), 'total_seconds', lambda: 0)() * 1000)
+        r = requests.get(url, timeout=SCANNER_TIMEOUT_SEC)
+        meta["status_code"] = r.status_code
+        try:
+            meta["elapsed_ms"] = int(getattr(getattr(r, "elapsed", None), "total_seconds", lambda: 0)() * 1000)
+        except Exception:
+            meta["elapsed_ms"] = None
+
         if r.status_code != 200:
-            # try to include short body for diagnostics
-            body = (r.text or '')
-            meta['body_snippet'] = body[:500]
-            return False, f'http_{r.status_code}', meta, []
-        data = r.json()
-        # expected keys: ok, active_symbols, meta, last_error, last_refresh_utc
-        meta['scanner_ok'] = bool(data.get('ok'))
-        meta['last_error'] = data.get('last_error')
-        meta['last_refresh_utc'] = data.get('last_refresh_utc')
-        if isinstance(data.get('meta'), dict):
-            meta['scanner_meta'] = data.get('meta')
-        syms = data.get('active_symbols')
-        if not isinstance(syms, list):
-            return False, 'invalid_active_symbols', meta, []
-        # normalize/clean
+            meta["body_snippet"] = (r.text or "")[:500]
+            return False, f"http_{r.status_code}", meta, []
+
+        data = r.json() if r.content else {}
+        meta["scanner_ok"] = bool(data.get("ok", True))
+        meta["last_error"] = data.get("last_error")
+        meta["last_refresh_utc"] = data.get("last_refresh_utc")
+        if isinstance(data.get("meta"), dict):
+            meta["scanner_meta"] = data.get("meta")
+
+        raw_syms = data.get("active_symbols")
+        if not isinstance(raw_syms, list):
+            return False, "invalid_active_symbols", meta, []
+
         clean: list[str] = []
-        for s in syms:
+        for s in raw_syms:
             if not isinstance(s, str):
                 continue
-            s2 = s.strip().upper()
-            if not s2 or '/' not in s2:
+            try:
+                clean.append(normalize_symbol(s))
+            except Exception:
                 continue
-            clean.append(s2)
-        return True, None, meta, clean
+
+        # de-dupe preserve order
+        seen: set[str] = set()
+        dedup: list[str] = []
+        for s in clean:
+            if s in seen:
+                continue
+            seen.add(s)
+            dedup.append(s)
+
+        return True, None, meta, dedup
+
     except Exception as e:
-        meta['error'] = f'{type(e).__name__}: {e}'
-        return False, 'exception', meta, []
+        meta["error"] = f"{type(e).__name__}: {e}"
+        return False, "exception", meta, []
 def _build_universe(payload, scanner_syms: list[str]) -> list[str]:
     """Build the scan universe safely.
 
     Priority:
       1) Explicit payload.symbols (if provided and non-empty)
-      2) Scanner symbols (scanner_syms)
+      2) Scanner symbols (scanner_syms)  <-- primary mode
       3) Fallback to settings.allowed_symbols
 
-    Applies allow-list unless payload.force_scan is truthy AND SCANNER_SOFT_ALLOW is enabled.
-    Never raises.
+    Optional behaviors (env-driven):
+      - SCANNER_TARGET_N: cap universe size from scanner (default 5)
+      - UNIVERSE_USD_ONLY: keep only */USD
+      - UNIVERSE_PREFER_USD_FOR_STABLES: when USD-only, convert BASE/USDT or BASE/USDC -> BASE/USD
+        *only if BASE/USD exists in scanner list*, else drop it.
+      - FILTER_UNIVERSE_BY_ALLOWED_SYMBOLS: intersect universe with ALLOWED_SYMBOLS (default off)
     """
     try:
         requested = getattr(payload, "symbols", None) or []
@@ -431,8 +387,8 @@ def _build_universe(payload, scanner_syms: list[str]) -> list[str]:
         requested, force_scan = [], False
 
     def _norm_list(items):
-        out = []
-        seen = set()
+        out: list[str] = []
+        seen: set[str] = set()
         for s in items or []:
             try:
                 sym = normalize_symbol(str(s))
@@ -447,19 +403,41 @@ def _build_universe(payload, scanner_syms: list[str]) -> list[str]:
     requested_norm = _norm_list(requested)
     scanner_norm = _norm_list(scanner_syms)
 
+    # Build raw universe
     if requested_norm:
         universe = requested_norm
     elif scanner_norm:
-        universe = scanner_norm
+        universe = scanner_norm[: max(1, int(SCANNER_TARGET_N or 5))] if SCANNER_DRIVEN_UNIVERSE else scanner_norm
     else:
         universe = _norm_list(getattr(settings, "allowed_symbols", []) or [])
 
+    # USD-only filtering / conversion
+    if UNIVERSE_USD_ONLY:
+        scanner_set = set(scanner_norm)
+        out: list[str] = []
+        for s in universe:
+            try:
+                base, quote = s.split("/", 1)
+            except Exception:
+                continue
+            if quote == "USD":
+                out.append(s)
+                continue
+            if UNIVERSE_PREFER_USD_FOR_STABLES and quote in ("USDT", "USDC"):
+                cand = f"{base}/USD"
+                if cand in scanner_set:
+                    out.append(cand)
+                # else: drop (don't silently trade a different quote)
+        # de-dupe preserve order
+        universe = list(dict.fromkeys(out))
+
+    # Allowed-symbol filtering (off by default for scanner-driven universe)
     allowed = set(getattr(settings, "allowed_symbols", []) or [])
-    if allowed and not (force_scan and SCANNER_SOFT_ALLOW):
+    if allowed and FILTER_UNIVERSE_BY_ALLOWED_SYMBOLS and not (force_scan and SCANNER_SOFT_ALLOW):
         universe = [s for s in universe if s in allowed]
 
+    # Stable fallback: if universe empty but allowed configured, use allowed
     if not universe and allowed:
-        # stable de-dupe
         universe = list(dict.fromkeys(list(allowed)))
 
     return universe
@@ -533,12 +511,16 @@ def _symbol_allowed_by_scanner(symbol: str) -> tuple[bool, str, Dict[str, Any]]:
 
 @app.get("/health")
 def health():
+    scanner_ok, scanner_reason, scanner_meta, scanner_syms = _scanner_fetch_active_symbols_and_meta()
     return {
         "ok": True,
-        "utc": datetime.now(timezone.utc).isoformat(),
+        "utc": utc_now_iso(),
         "scanner_url": SCANNER_URL or None,
-        "scanner_ok": bool(_SCANNER_CACHE.get("ok")),
-        "scanner_active_count": len(_SCANNER_CACHE.get("active_symbols") or set()),
+        "scanner_ok": scanner_ok and (len(scanner_syms) > 0),
+        "scanner_reason": scanner_reason,
+        "scanner_active_count": len(scanner_syms),
+        "scanner_last_refresh_utc": (scanner_meta or {}).get("last_refresh_utc"),
+        "scanner_last_error": (scanner_meta or {}).get("last_error"),
         "scanner_soft_allow": SCANNER_SOFT_ALLOW,
     }
 
@@ -934,6 +916,95 @@ def worker_exit(payload: WorkerExitPayload):
         return JSONResponse(status_code=200, content={"ok": False, "error": str(e)})
 
 
+
+def _entry_signals_for_symbol(symbol: str) -> tuple[dict, dict]:
+    """Return (signals, debug) for the given symbol.
+
+    signals: {"rb1": bool, "tc1": bool}
+    debug:   {"rb1": {...}, "tc1": {...}}
+    """
+    signals: dict = {}
+    debug: dict = {}
+
+    rb1_fired, rb1_meta = _rb1_long_signal(symbol)
+    signals["rb1"] = bool(rb1_fired)
+    debug["rb1"] = rb1_meta
+
+    tc1_fired, tc1_meta = _tc1_long_signal(symbol)
+    signals["tc1"] = bool(tc1_fired)
+    debug["tc1"] = tc1_meta
+
+    return signals, debug
+
+
+def _count_open_positions(open_set: set[str]) -> int:
+    # Prefer live open_set from broker snapshot when available; fall back to in-memory plans.
+    try:
+        return max(len(open_set or set()), len(getattr(state, "plans", {}) or {}))
+    except Exception:
+        return len(open_set or set())
+
+
+def place_entry(symbol: str, strategy: str) -> tuple[bool, str, dict]:
+    """Execute a long entry with safety constraints. Never raises."""
+    now = datetime.now(timezone.utc)
+    utc_date = _utc_date_str(now)
+    try:
+        state.reset_daily_counters_if_needed(utc_date)
+    except Exception:
+        pass
+
+    # Global / config safety checks
+    if not getattr(settings, "trading_enabled", True):
+        return False, "trading_disabled", {}
+
+    # Daily entry cap (global)
+    try:
+        total_today = int(getattr(state, "trades_today_total", 0) or 0)
+        if MAX_ENTRIES_PER_DAY > 0 and total_today >= int(MAX_ENTRIES_PER_DAY):
+            return False, "max_entries_per_day_reached", {"entries_today": total_today, "max_entries_per_day": MAX_ENTRIES_PER_DAY}
+    except Exception:
+        pass
+
+    # Time-of-day discipline
+    try:
+        if _is_after_utc_hhmm(now, getattr(settings, "no_new_entries_after_utc", "") or ""):
+            return False, "blocked_by_time_window", {"no_new_entries_after_utc": getattr(settings, "no_new_entries_after_utc", "")}
+    except Exception:
+        pass
+
+    # Per-symbol trade frequency cap
+    try:
+        count_for_symbol = int(getattr(state, "trades_today_by_symbol", {}).get(symbol, 0) or 0)
+        if getattr(settings, "max_trades_per_symbol_per_day", 999) and count_for_symbol >= int(getattr(settings, "max_trades_per_symbol_per_day", 999)):
+            return False, "max_trades_per_symbol_per_day_reached", {"trades_today": count_for_symbol, "max": getattr(settings, "max_trades_per_symbol_per_day", 999)}
+    except Exception:
+        pass
+
+    # Cooldown
+    try:
+        if not state.can_enter(symbol, getattr(settings, "entry_cooldown_sec", 0)):
+            return False, "cooldown_active", {"cooldown_sec": getattr(settings, "entry_cooldown_sec", 0)}
+    except Exception:
+        pass
+
+    # Execute via existing engine
+    try:
+        ok, reason, meta = _execute_long_entry(symbol=symbol, strategy=strategy, signal_name=strategy)
+        if ok:
+            try:
+                state.mark_enter(symbol)
+                state.inc_trade(symbol)
+                # global counter (added in state.py patch)
+                if hasattr(state, "inc_trade_total"):
+                    state.inc_trade_total()
+            except Exception:
+                pass
+        return bool(ok), str(reason), meta or {}
+    except Exception as e:
+        return False, f"exception:{type(e).__name__}", {"error": str(e)}
+
+
 @app.post("/worker/scan_entries")
 def scan_entries(payload: WorkerScanPayload):
     """
@@ -955,6 +1026,7 @@ def scan_entries(payload: WorkerScanPayload):
     # 3) Snapshot positions once
     positions = get_positions()
     open_set = {p["symbol"] for p in positions if p.get("qty", 0) > 0}
+    open_positions_count = _count_open_positions(open_set)
 
     # 4) Evaluate signals + build diagnostics
     per_symbol: Dict[str, Any] = {}
@@ -973,8 +1045,14 @@ def scan_entries(payload: WorkerScanPayload):
             per_symbol[sym] = d
             continue
 
+        if open_positions_count >= MAX_OPEN_POSITIONS:
+            d["skip"].append("max_open_positions_reached")
+            d["max_open_positions"] = MAX_OPEN_POSITIONS
+            per_symbol[sym] = d
+            continue
+
         try:
-            fired = _entry_signals_for_symbol(sym)  # {"rb1": bool, "tc1": bool, ...}
+            fired, sig_debug = _entry_signals_for_symbol(sym)  # (signals, debug)
         except Exception as e:
             d["skip"].append(f"signal_error:{type(e).__name__}")
             d["signal_error"] = str(e)
@@ -982,6 +1060,7 @@ def scan_entries(payload: WorkerScanPayload):
             continue
 
         d["signals"] = fired
+        d["signal_debug"] = sig_debug
 
         fired_strats = [k for k, v in fired.items() if v]
         if not fired_strats:
@@ -993,6 +1072,12 @@ def scan_entries(payload: WorkerScanPayload):
         strategy = "rb1" if fired.get("rb1") else fired_strats[0]
         d["eligible"] = True
         d["chosen_strategy"] = strategy
+        # per-scan entry cap
+        if MAX_ENTRIES_PER_SCAN > 0 and len(candidates) >= MAX_ENTRIES_PER_SCAN:
+            d["eligible"] = False
+            d["skip"].append("max_entries_per_scan_reached")
+            per_symbol[sym] = d
+            continue
         candidates.append((sym, strategy))
         per_symbol[sym] = d
 
@@ -1040,8 +1125,17 @@ def scan_entries(payload: WorkerScanPayload):
                 "scanner_soft_allow": SCANNER_SOFT_ALLOW,
                 "allowed_symbols_count": len(ALLOWED_SYMBOLS),
                 "allowed_symbols_sample": sorted(list(ALLOWED_SYMBOLS))[:50],
+                "scanner_driven_universe": SCANNER_DRIVEN_UNIVERSE,
+                "scanner_target_n": SCANNER_TARGET_N,
+                "universe_usd_only": UNIVERSE_USD_ONLY,
+                "prefer_usd_for_stables": UNIVERSE_PREFER_USD_FOR_STABLES,
+                "filter_universe_by_allowed_symbols": FILTER_UNIVERSE_BY_ALLOWED_SYMBOLS,
+                "max_open_positions": MAX_OPEN_POSITIONS,
+                "max_entries_per_scan": MAX_ENTRIES_PER_SCAN,
+                "max_entries_per_day": MAX_ENTRIES_PER_DAY,
             },
             "positions_count": len(positions),
+            "open_positions_count": open_positions_count,
             "positions_open": sorted(list(open_set))[:50],
             "candidates": [{"symbol": s, "strategy": st} for (s, st) in candidates],
             "per_symbol": per_symbol,
