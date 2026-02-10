@@ -27,6 +27,25 @@ state = InMemoryState()
 app = FastAPI(title="Crypto Light", version="1.0.2")
 
 
+def _require_worker_secret(provided: str | None) -> tuple[bool, str | None]:
+    """Validate worker secret for /worker/* endpoints.
+
+    Behavior:
+    - If WORKER_SECRET is not configured (empty), allow requests.
+    - If configured, require the caller to pass the same secret.
+    """
+    expected = (settings.worker_secret or "").strip()
+    if not expected:
+        return True, None
+
+    provided = (provided or "").strip()
+    if not provided:
+        return False, "missing worker_secret"
+    if provided != expected:
+        return False, "invalid worker_secret"
+    return True, None
+
+
 # ---------- Entry engine (optional; replaces TradingView) ----------
 ENTRY_ENGINE_ENABLED = (os.getenv("ENTRY_ENGINE_ENABLED", "1").strip().lower() in ("1", "true", "yes", "on"))
 ENTRY_ENGINE_STRATEGIES = {s.strip().lower() for s in os.getenv("ENTRY_ENGINE_STRATEGIES", "rb1,tc1").split(",") if s.strip()}
