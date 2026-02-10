@@ -95,6 +95,19 @@ def _log_event(level: str, event: Dict[str, Any]) -> None:
         print(str(event))
 
 
+
+def get_positions() -> list[dict]:
+    """Return currently-open positions.
+
+    This 'crypto_light' build doesn't integrate with a broker/exchange yet.
+    The scanner uses positions only to avoid emitting entry signals for symbols
+    you already hold. For now we default to an empty list.
+
+    Expected return format (when implemented):
+        [{"symbol": "BTCUSD", "qty": 0.25}, ...]
+    """
+    return []
+
 def _utc_date_str(now: Optional[datetime] = None) -> str:
     n = now or datetime.now(timezone.utc)
     return n.strftime("%Y-%m-%d")
@@ -859,7 +872,11 @@ def scan_entries(payload: WorkerScanPayload):
     scanner_ok, scanner_reason, scanner_meta, scanner_syms = _scanner_fetch_active_symbols_and_meta()
 
     # 2) Universe (explicit symbols > allowed list (+ scanner if soft allow))
-    universe = _build_universe(payload, scanner_syms)
+    universe = payload.get("universe") or scanner_syms or []
+    universe = [str(s).upper().strip() for s in universe if str(s).strip()]
+    # Deduplicate while preserving order
+    seen = set()
+    universe = [s for s in universe if not (s in seen or seen.add(s))]
 
     # 3) Snapshot positions once
     positions = get_positions()
