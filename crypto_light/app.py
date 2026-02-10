@@ -720,96 +720,115 @@ def worker_exit(payload: WorkerExitPayload):
 
 
 @app.post("/worker/scan_entries")
-def scan_entries(req: WorkerScanRequest):
-    if req.worker_secret != WORKER_SECRET:
-        raise HTTPException(status_code=401, detail="invalid worker secret")
+def scan_entries(payload: WorkerScanPayload):
+    """
+    Scan the current universe for entry signals (RB1/TC1), optionally executing orders.
 
-    diagnostics = []
-    results = []
+    This endpoint ALWAYS returns a rich diagnostics payload so you can see exactly why
+    you got 0 entries (no signals, already in position, symbol not allowed, etc.).
+    """
+    ok, reason = _require_worker_secret(payload.worker_secret)
+    if not ok:
+        return JSONResponse(status_code=401, content={"ok": False, "utc": utc_now_iso(), "error": reason})
 
-    scanner_ok, scanner_reason, scanner_meta = _scanner_fetch_active_symbols()
+    # 1) Scanner → symbols (soft allowlist) + meta
+    scanner_ok, scanner_reason, scanner_meta, scanner_syms = _scanner_fetch_active_symbols_and_meta()
 
-    if not scanner_ok:
-        return {
-            "ok": False,
-            "utc": utc_now_iso(),
-            "scanner": {
-                "ok": False,
-                "reason": scanner_reason,
-                "meta": scanner_meta
-            },
-            "results": [],
-            "diagnostics": []
-        }
+    # 2) Universe (explicit symbols > allowed list (+ scanner if soft allow))
+    universe = _build_universe(payload, scanner_syms)
 
-    symbols = scanner_meta.get("active_symbols", [])
-    diagnostics_summary = {
-        "universe_count": len(symbols),
-        "passed_all_filters": 0,
-        "blocked_by_position": 0,
-        "blocked_by_cooldown": 0,
-        "blocked_by_signal": 0,
-        "blocked_by_risk": 0,
-    }
+    # 3) Snapshot positions once
+    positions = get_positions()
+    open_set = {p["symbol"] for p in positions if p.get("qty", 0) > 0}
 
-    for sym in symbols:
-        diag = {
+    # 4) Evaluate signals + build diagnostics
+    per_symbol: Dict[str, Any] = {}
+    candidates: List[Tuple[str, str]] = []  # (symbol, strategy)
+    for sym in universe:
+        d: Dict[str, Any] = {
             "symbol": sym,
-            "entry_signal": False,
-            "cooldown_block": False,
-            "position_block": False,
-            "risk_block": False,
-            "reason": None,
+            "in_position": sym in open_set,
+            "signals": {},
+            "eligible": False,
+            "skip": [],
         }
 
-        # ---- existing checks ----
-
-        if has_open_position(sym):
-            diag["position_block"] = True
-            diagnostics_summary["blocked_by_position"] += 1
-            diagnostics.append(diag)
+        if sym in open_set:
+            d["skip"].append("already_in_position")
+            per_symbol[sym] = d
             continue
 
-        if is_in_cooldown(sym):
-            diag["cooldown_block"] = True
-            diagnostics_summary["blocked_by_cooldown"] += 1
-            diagnostics.append(diag)
+        try:
+            fired = _entry_signals_for_symbol(sym)  # {"rb1": bool, "tc1": bool, ...}
+        except Exception as e:
+            d["skip"].append(f"signal_error:{type(e).__name__}")
+            d["signal_error"] = str(e)
+            per_symbol[sym] = d
             continue
 
-        signal_ok, signal_meta = compute_entry_signal(sym)
-        if not signal_ok:
-            diag["blocked_by_signal"] = True
-            diag["reason"] = signal_meta
-            diagnostics_summary["blocked_by_signal"] += 1
-            diagnostics.append(diag)
+        d["signals"] = fired
+
+        fired_strats = [k for k, v in fired.items() if v]
+        if not fired_strats:
+            d["skip"].append("no_signal")
+            per_symbol[sym] = d
             continue
 
-        risk_ok, risk_reason = risk_manager_allows_trade(sym)
-        if not risk_ok:
-            diag["risk_block"] = True
-            diag["reason"] = risk_reason
-            diagnostics_summary["blocked_by_risk"] += 1
-            diagnostics.append(diag)
+        # If both fire, prefer RB1 (breakout) over TC1 (trend continuation)
+        strategy = "rb1" if fired.get("rb1") else fired_strats[0]
+        d["eligible"] = True
+        d["chosen_strategy"] = strategy
+        candidates.append((sym, strategy))
+        per_symbol[sym] = d
+
+    # 5) Execute (or dry-run)
+    results: List[Dict[str, Any]] = []
+    for sym, strategy in candidates:
+        if payload.dry_run:
+            results.append({"symbol": sym, "strategy": strategy, "status": "dry_run"})
             continue
 
-        diag["entry_signal"] = True
-        diagnostics_summary["passed_all_filters"] += 1
+        ok2, reason2, meta2 = place_entry(sym, strategy=strategy)
+        results.append(
+            {
+                "symbol": sym,
+                "strategy": strategy,
+                "ok": ok2,
+                "status": "executed" if ok2 else "skipped",
+                "reason": reason2,
+                "meta": meta2,
+            }
+        )
 
-        if not req.dry_run:
-            place_entry_order(sym)
-
-        results.append({"symbol": sym, "status": "entry_triggered"})
-        diagnostics.append(diag)
-
+    # 6) Return diagnostics
     return {
         "ok": True,
         "utc": utc_now_iso(),
+        "universe_count": len(universe),
         "scanner": {
-            "ok": True,
-            "reason": None,
-            "active_count": len(symbols)
+            "ok": scanner_ok,
+            "reason": scanner_reason,
+            "active_count": len(scanner_syms),
+            "last_refresh_utc": (scanner_meta or {}).get("last_refresh_utc"),
+            "last_error": (scanner_meta or {}).get("last_error"),
+            "active_symbols": scanner_syms,
         },
         "results": results,
-        "diagnostics_summary": diagnostics_summary,
-        "diagnostics": diagnostics
+        "diagnostics": {
+            "request": {
+                "dry_run": payload.dry_run,
+                "force_scan": getattr(payload, "force_scan", False),
+                "symbols_provided": payload.symbols or [],
+            },
+            "config": {
+                "scanner_url": SCANNER_URL,
+                "scanner_soft_allow": SCANNER_SOFT_ALLOW,
+                "allowed_symbols_count": len(ALLOWED_SYMBOLS),
+                "allowed_symbols_sample": sorted(list(ALLOWED_SYMBOLS))[:50],
+            },
+            "positions_count": len(positions),
+            "positions_open": sorted(list(open_set))[:50],
+            "candidates": [{"symbol": s, "strategy": st} for (s, st) in candidates],
+            "per_symbol": per_symbol,
+        },
     }
