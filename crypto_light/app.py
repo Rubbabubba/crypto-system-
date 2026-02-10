@@ -746,10 +746,24 @@ def scan_entries(payload: WorkerScanPayload, request: Request):
     active = []
     scanner_meta = {}
     if SCANNER_URL:
-        ok, reason, meta = _scanner_fetch_active_symbols()
-        scanner_meta = {"ok": ok, "reason": reason, **(meta or {})}
-        if ok:
-            active = sorted(list(_SCANNER_CACHE["active_symbols"]))
+        # Keep scanner failures from crashing the worker.
+        # NOTE: _scanner_fetch_active_symbols() returns a list[str], not a tuple.
+        try:
+            if _scanner_should_refresh():
+                _scanner_refresh()
+            ok = bool(_SCANNER_CACHE.get("ok"))
+            reason = None if ok else ("scanner_unavailable" if _SCANNER_CACHE.get("last_error") else "scanner_empty")
+            active = sorted(list(_SCANNER_CACHE.get("active_symbols") or set()))
+            scanner_meta = {
+                "ok": ok,
+                "reason": reason,
+                "active_count": len(active),
+                "last_refresh_utc": _SCANNER_CACHE.get("last_refresh_utc"),
+                "last_error": _SCANNER_CACHE.get("last_error"),
+            }
+        except Exception as e:
+            scanner_meta = {"ok": False, "reason": "scanner_exception", "error": str(e)}
+            active = []
     # Always include baseline allowlist to ensure majors can still be traded even if scanner is down.
     for s in sorted(list(settings.allowed_symbols)):
         if s not in active:
