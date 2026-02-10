@@ -269,6 +269,55 @@ def _scanner_fetch_active_symbols() -> list[str]:
     except Exception:
         return []
 
+
+
+def _scanner_fetch_active_symbols_and_meta() -> tuple[bool, str | None, dict, list[str]]:
+    """Fetch active symbols + include scanner meta/diagnostics.
+
+    Returns: (ok, reason, meta, symbols)
+    - ok: True if HTTP 200 and JSON parsed
+    - reason: short string when ok=False
+    - meta: dict of useful fields (status_code, url, last_error, last_refresh_utc, etc)
+    - symbols: list[str] of normalized symbols (e.g., 'ETH/USDT')
+
+    Never raises.
+    """
+    url = getattr(settings, 'scanner_url', None) or os.getenv('SCANNER_URL', '').strip()
+    meta: dict = {'scanner_url': url}
+    if not url:
+        return False, 'missing_scanner_url', meta, []
+    try:
+        r = requests.get(url, timeout=10)
+        meta['status_code'] = r.status_code
+        meta['elapsed_ms'] = int(getattr(getattr(r, 'elapsed', None), 'total_seconds', lambda: 0)() * 1000)
+        if r.status_code != 200:
+            # try to include short body for diagnostics
+            body = (r.text or '')
+            meta['body_snippet'] = body[:500]
+            return False, f'http_{r.status_code}', meta, []
+        data = r.json()
+        # expected keys: ok, active_symbols, meta, last_error, last_refresh_utc
+        meta['scanner_ok'] = bool(data.get('ok'))
+        meta['last_error'] = data.get('last_error')
+        meta['last_refresh_utc'] = data.get('last_refresh_utc')
+        if isinstance(data.get('meta'), dict):
+            meta['scanner_meta'] = data.get('meta')
+        syms = data.get('active_symbols')
+        if not isinstance(syms, list):
+            return False, 'invalid_active_symbols', meta, []
+        # normalize/clean
+        clean: list[str] = []
+        for s in syms:
+            if not isinstance(s, str):
+                continue
+            s2 = s.strip().upper()
+            if not s2 or '/' not in s2:
+                continue
+            clean.append(s2)
+        return True, None, meta, clean
+    except Exception as e:
+        meta['error'] = f'{type(e).__name__}: {e}'
+        return False, 'exception', meta, []
 def _scanner_refresh() -> None:
     if not SCANNER_URL:
         return
