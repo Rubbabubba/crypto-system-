@@ -938,16 +938,12 @@ def _entry_signals_for_symbol(symbol: str) -> tuple[dict, dict]:
 
 
 def _count_open_positions(open_set: set[str]) -> int:
-    # Prefer live open_set from broker snapshot when available; fall back to in-memory plans.
-    try:
-        return max(len(open_set or set()), len(getattr(state, "plans", {}) or {}))
-    except Exception:
-        return len(open_set or set())
+    """Count open positions safely.
 
-
-def place_entry(symbol: str, strategy: str) -> tuple[bool, str, dict]:
-    """Execute a long entry with safety constraints. Never raises."""
-    now = datetime.now(timezone.utc)
+    IMPORTANT: We should not count in-memory "plans" as open positions when we have a live
+    broker snapshot, or we can deadlock trading after a restart (stale plans).
+    """
+    return len(open_set or set())
     utc_date = _utc_date_str(now)
     try:
         state.reset_daily_counters_if_needed(utc_date)
@@ -1135,6 +1131,7 @@ def scan_entries(payload: WorkerScanPayload):
                 "max_entries_per_day": MAX_ENTRIES_PER_DAY,
             },
             "positions_count": len(positions),
+            "plans_count": len(getattr(state, "plans", {}) or {}),
             "open_positions_count": open_positions_count,
             "positions_open": sorted(list(open_set))[:50],
             "candidates": [{"symbol": s, "strategy": st} for (s, st) in candidates],
