@@ -94,6 +94,24 @@ class InMemoryState:
             self.daily_pnl_utc_date = utc_date
             self.daily_pnl_usd = 0.0
 
+    def can_trade_symbol_today(self, symbol: str, max_trades_per_day: int) -> bool:
+        """Per-symbol daily trade limiter.
+
+        Some parts of the app call a helper method rather than reading
+        `trades_today_by_symbol` directly. Keep this here so entry execution
+        can't crash when the limiter is enabled.
+        """
+        try:
+            m = int(max_trades_per_day)
+        except Exception:
+            m = 0
+
+        # 0 or negative means "unlimited"
+        if m <= 0:
+            return True
+
+        return int(self.trades_today_by_symbol.get(symbol, 0)) < m
+
     def inc_trade(self, symbol: str) -> int:
         self.trades_today_by_symbol[symbol] = int(self.trades_today_by_symbol.get(symbol, 0)) + 1
         return self.trades_today_by_symbol[symbol]
