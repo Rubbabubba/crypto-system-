@@ -28,7 +28,7 @@ settings = load_settings()
 ALLOWED_SYMBOLS = set(getattr(settings, 'allowed_symbols', []) or [])
 
 state = InMemoryState()
-app = FastAPI(title="Crypto Light", version="1.0.2")
+app = FastAPI(title="Crypto Light", version="1.0.3")
 
 
 def _require_worker_secret(provided: str | None) -> tuple[bool, str | None]:
@@ -60,6 +60,12 @@ ENTRY_ENGINE_LIMIT_BARS = int(float(os.getenv("ENTRY_ENGINE_LIMIT_BARS", "300") 
 RB1_LOOKBACK_BARS = int(float(os.getenv("RB1_LOOKBACK_BARS", "48") or 48))
 RB1_BREAKOUT_BUFFER_PCT = float(os.getenv("RB1_BREAKOUT_BUFFER_PCT", "0.0005") or 0.0005)  # 0.05%
 
+# RB1 near-breakout params (optional)
+# If RB1_NEAR_BREAKOUT_PCT > 0, we will also fire when price is within this percent below breakout level
+# and momentum is positive (close > prev_close) unless RB1_NEAR_REQUIRE_UP=0.
+RB1_NEAR_BREAKOUT_PCT = float(os.getenv("RB1_NEAR_BREAKOUT_PCT", "0") or 0)  # e.g. 0.0015 = 0.15%
+RB1_NEAR_REQUIRE_UP = int(float(os.getenv("RB1_NEAR_REQUIRE_UP", "1") or 1)) == 1
+
 # TC1 params
 TC1_LTF_EMA = int(float(os.getenv("TC1_LTF_EMA", "20") or 20))
 TC1_HTF_TIMEFRAME = os.getenv("TC1_HTF_TIMEFRAME", "60Min").strip() or "60Min"
@@ -67,6 +73,10 @@ TC1_HTF_LIMIT_BARS = int(float(os.getenv("TC1_HTF_LIMIT_BARS", "300") or 300))
 TC1_HTF_FAST = int(float(os.getenv("TC1_HTF_FAST", "50") or 50))
 TC1_HTF_SLOW = int(float(os.getenv("TC1_HTF_SLOW", "200") or 200))
 TC1_RECLAIM_BUFFER_PCT = float(os.getenv("TC1_RECLAIM_BUFFER_PCT", "0.0005") or 0.0005)  # 0.05%
+
+# TC1 trend-soften epsilon (optional)
+# If >0, allow HTF uptrend when EMA_fast is within epsilon below EMA_slow (still requires EMA_fast rising).
+TC1_TREND_SOFTEN_EPSILON = float(os.getenv("TC1_TREND_SOFTEN_EPSILON", "0") or 0)  # e.g. 0.002 = 0.2%
 
 
 # ---------- Scanner config (soft allow) ----------
@@ -171,9 +181,36 @@ def _rb1_long_signal(symbol: str) -> tuple[bool, dict]:
     cur_close = closes[-1]
 
     level = range_high * (1.0 + RB1_BREAKOUT_BUFFER_PCT)
-    fired = (prev_close <= level) and (cur_close > level)
 
-    meta = {"range_high": range_high, "level": level, "prev_close": prev_close, "close": cur_close, "bar_ts": ts[-1]}
+    # Primary breakout (edge-trigger)
+    breakout = (prev_close <= level) and (cur_close > level)
+
+    # Optional near-breakout: allow early entry when close is within X% of the level.
+    near = False
+    near_threshold = None
+    dist_pct = None
+    if RB1_NEAR_BREAKOUT_PCT and RB1_NEAR_BREAKOUT_PCT > 0:
+        near_threshold = level * (1.0 - RB1_NEAR_BREAKOUT_PCT)
+        dist_pct = (level - cur_close) / level if level else None
+        momentum_ok = (cur_close > prev_close) if RB1_NEAR_REQUIRE_UP else True
+        # Still require we haven't already broken out in prior bar to avoid repeated triggers.
+        near = (prev_close < level) and (cur_close >= near_threshold) and momentum_ok
+
+    fired = breakout or near
+
+    meta = {
+        "range_high": range_high,
+        "level": level,
+        "prev_close": prev_close,
+        "close": cur_close,
+        "bar_ts": ts[-1],
+        "breakout": breakout,
+        "near": near,
+        "near_pct": RB1_NEAR_BREAKOUT_PCT,
+        "near_threshold": near_threshold,
+        "dist_to_level_pct": dist_pct,
+        "require_up": RB1_NEAR_REQUIRE_UP,
+    }
     return fired, meta
 
 
@@ -190,7 +227,10 @@ def _tc1_long_signal(symbol: str) -> tuple[bool, dict]:
     htf_closes = [float(b["c"]) for b in htf]
     ema_fast = _ema(htf_closes, TC1_HTF_FAST)
     ema_slow = _ema(htf_closes, TC1_HTF_SLOW)
-    uptrend = (ema_fast[-1] > ema_slow[-1]) and (ema_fast[-1] > ema_fast[-2])
+    raw_uptrend = (ema_fast[-1] > ema_slow[-1]) and (ema_fast[-1] > ema_fast[-2])
+    eps = TC1_TREND_SOFTEN_EPSILON if TC1_TREND_SOFTEN_EPSILON and TC1_TREND_SOFTEN_EPSILON > 0 else 0.0
+    softened = (ema_fast[-1] >= (ema_slow[-1] * (1.0 - eps))) and (ema_fast[-1] > ema_fast[-2])
+    uptrend = softened
 
     # LTF reclaim
     ltf = _get_bars(symbol, timeframe=ENTRY_ENGINE_TIMEFRAME, limit=max(ENTRY_ENGINE_LIMIT_BARS, TC1_LTF_EMA + 10))
@@ -211,7 +251,10 @@ def _tc1_long_signal(symbol: str) -> tuple[bool, dict]:
 
     meta = {
         "uptrend": uptrend,
+        "uptrend_raw": raw_uptrend,
+        "trend_soften_epsilon": eps,
         "htf_fast": ema_fast[-1],
+        "htf_fast_prev": ema_fast[-2],
         "htf_slow": ema_slow[-1],
         "ltf_ema": cur_ema,
         "prev_close": prev_close,
@@ -1000,6 +1043,23 @@ def _count_open_positions(open_set: set[str]) -> int:
     except Exception as e:
         return False, f"exception:{type(e).__name__}", {"error": str(e)}
 
+
+
+
+@app.post("/worker/reset_plans")
+def worker_reset_plans(payload: WorkerScanPayload):
+    """Admin endpoint to clear stale in-memory plans.
+    Uses the same worker secret gate as scan_entries/exit.
+    NOTE: In-memory state is per-instance; this clears only the current instance.
+    """
+    # Worker secret
+    if settings.worker_secret:
+        if not payload.worker_secret or payload.worker_secret != settings.worker_secret:
+            raise HTTPException(status_code=401, detail="invalid worker secret")
+
+    cleared = len(state.plans)
+    state.plans.clear()
+    return {"ok": True, "utc": utc_now_iso(), "cleared_plans": cleared}
 
 @app.post("/worker/scan_entries")
 def scan_entries(payload: WorkerScanPayload):
