@@ -980,6 +980,39 @@ def _entry_signals_for_symbol(symbol: str) -> tuple[dict, dict]:
     return signals, debug
 
 
+
+def place_entry(symbol: str, *, strategy: str, req_id: str | None = None, client_ip: str | None = None, notional: float | None = None):
+    """
+    Wrapper used by /worker/scan_entries to execute an entry in live mode.
+
+    Returns a tuple: (ok, reason, meta)
+      - ok: bool
+      - reason: str | None (present when ok=False or executed=False)
+      - meta: dict (full structured execution result)
+    """
+    rid = req_id or str(uuid4())
+    res = _execute_long_entry(
+        symbol=symbol,
+        strategy=strategy,
+        signal_name=strategy,
+        signal_id=None,
+        notional=notional,
+        source="scan_entries",
+        req_id=rid,
+        client_ip=client_ip,
+        extra={"strategy": strategy},
+    )
+    # _execute_long_entry returns a dict like:
+    #   {"ok": True, "executed": True|False, "reason": "..."} or {"ok": False, "error": "..."}
+    ok = bool(res.get("ok", False))
+    reason = res.get("reason") or res.get("error")
+    # If ok but not executed, treat as not-ok for scan_entries "placed" reporting.
+    if ok and not res.get("executed", False):
+        return False, reason or "not_executed", res
+    return ok, reason, res
+
+
+
 def _count_open_positions(open_set: set[str]) -> int:
     """Count open positions safely.
 
