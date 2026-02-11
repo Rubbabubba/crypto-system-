@@ -49,6 +49,10 @@ class Settings:
     take_pct: float
     exit_cooldown_sec: int
 
+    # Daily risk
+    max_daily_loss_usd: float
+
+
     # Stop execution quality
     stop_limit_buffer_pct: float
     stop_limit_timeout_sec: int
@@ -89,6 +93,9 @@ def load_settings() -> Settings:
         stop_pct=float(_getenv("STOP_PCT", "0.01") or 0.01),
         take_pct=float(_getenv("TAKE_PCT", "0.02") or 0.02),
         exit_cooldown_sec=int(float(_getenv("EXIT_COOLDOWN_SEC", "20") or 20)),
+
+        # Daily risk
+        max_daily_loss_usd=float(_getenv("MAX_DAILY_LOSS_USD", "25") or 25),
 
         # Stop execution quality
         stop_limit_buffer_pct=float(_getenv("STOP_LIMIT_BUFFER_PCT", "0.15") or 0.15),
