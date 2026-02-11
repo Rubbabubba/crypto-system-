@@ -65,7 +65,7 @@ RB1_BREAKOUT_BUFFER_PCT = float(os.getenv("RB1_BREAKOUT_BUFFER_PCT", "0.0005") o
 # and momentum is positive (close > prev_close) unless RB1_NEAR_REQUIRE_UP=0.
 RB1_NEAR_BREAKOUT_PCT = float(os.getenv("RB1_NEAR_BREAKOUT_PCT", "0") or 0)  # e.g. 0.0015 = 0.15%
 RB1_NEAR_REQUIRE_UP = int(float(os.getenv("RB1_NEAR_REQUIRE_UP", "1") or 1)) == 1
-RB1_NEAR_UP_MODE = (os.getenv(\"RB1_NEAR_UP_MODE\", \"gt\") or \"gt\").strip().lower()  # gt (default) or ge
+RB1_NEAR_UP_MODE = (os.getenv("RB1_NEAR_UP_MODE", "gt") or "gt").strip().lower()  # gt (default) or ge
 
 # TC1 params
 TC1_LTF_EMA = int(float(os.getenv("TC1_LTF_EMA", "20") or 20))
