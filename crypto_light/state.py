@@ -43,6 +43,10 @@ class InMemoryState:
         self.trades_today_total: int = 0
         self.trades_today_utc_date: Optional[str] = None
 
+        # Daily P&L guardrails (best-effort). Updated only when we can compute it.
+        self.daily_pnl_usd: float = 0.0
+        self.daily_pnl_utc_date: Optional[str] = None
+
         # Idempotency (webhook retries)
         # signal_id -> last_seen_ts
         self.seen_signal_ids: Dict[str, float] = {}
@@ -85,6 +89,10 @@ class InMemoryState:
             self.trades_today_utc_date = utc_date
             self.trades_today_by_symbol = {}
             self.trades_today_total = 0
+        # Keep daily P&L window aligned to UTC day as well.
+        if self.daily_pnl_utc_date != utc_date:
+            self.daily_pnl_utc_date = utc_date
+            self.daily_pnl_usd = 0.0
 
     def inc_trade(self, symbol: str) -> int:
         self.trades_today_by_symbol[symbol] = int(self.trades_today_by_symbol.get(symbol, 0)) + 1

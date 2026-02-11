@@ -65,6 +65,7 @@ RB1_BREAKOUT_BUFFER_PCT = float(os.getenv("RB1_BREAKOUT_BUFFER_PCT", "0.0005") o
 # and momentum is positive (close > prev_close) unless RB1_NEAR_REQUIRE_UP=0.
 RB1_NEAR_BREAKOUT_PCT = float(os.getenv("RB1_NEAR_BREAKOUT_PCT", "0") or 0)  # e.g. 0.0015 = 0.15%
 RB1_NEAR_REQUIRE_UP = int(float(os.getenv("RB1_NEAR_REQUIRE_UP", "1") or 1)) == 1
+RB1_NEAR_UP_MODE = (os.getenv(\"RB1_NEAR_UP_MODE\", \"gt\") or \"gt\").strip().lower()  # gt (default) or ge
 
 # TC1 params
 TC1_LTF_EMA = int(float(os.getenv("TC1_LTF_EMA", "20") or 20))
@@ -192,7 +193,7 @@ def _rb1_long_signal(symbol: str) -> tuple[bool, dict]:
     if RB1_NEAR_BREAKOUT_PCT and RB1_NEAR_BREAKOUT_PCT > 0:
         near_threshold = level * (1.0 - RB1_NEAR_BREAKOUT_PCT)
         dist_pct = (level - cur_close) / level if level else None
-        momentum_ok = (cur_close > prev_close) if RB1_NEAR_REQUIRE_UP else True
+        momentum_ok = ((cur_close >= prev_close) if RB1_NEAR_UP_MODE == 'ge' else (cur_close > prev_close)) if RB1_NEAR_REQUIRE_UP else True
         # Still require we haven't already broken out in prior bar to avoid repeated triggers.
         near = (prev_close < level) and (cur_close >= near_threshold) and momentum_ok
 
@@ -210,6 +211,7 @@ def _rb1_long_signal(symbol: str) -> tuple[bool, dict]:
         "near_threshold": near_threshold,
         "dist_to_level_pct": dist_pct,
         "require_up": RB1_NEAR_REQUIRE_UP,
+        "up_mode": RB1_NEAR_UP_MODE,
     }
     return fired, meta
 
