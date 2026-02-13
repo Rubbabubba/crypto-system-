@@ -118,17 +118,74 @@ def _log_event(level: str, event: Dict[str, Any]) -> None:
 
 
 
-def get_positions() -> list[dict]:
-    """Return currently-open positions.
+def get_positions(broker, settings) -> list[dict]:
+    """Return open positions derived from balances + live prices.
 
-    This 'crypto_light' build doesn't integrate with a broker/exchange yet.
-    The scanner uses positions only to avoid emitting entry signals for symbols
-    you already hold. For now we default to an empty list.
+    We treat very small holdings as *dust* and ignore them to avoid repeated
+    exit attempts that will fail exchange min-order checks.
 
-    Expected return format (when implemented):
-        [{"symbol": "BTCUSD", "qty": 0.25}, ...]
+    Return format: [{"symbol": "BTC/USD", "qty": 0.01, "notional_usd": 650}]
     """
-    return []
+    balances = broker.get_balances()
+    prices = broker.get_prices(settings.allowed_symbols)
+
+    positions: list[dict] = []
+    for sym in settings.allowed_symbols:
+        try:
+            base, quote = sym.split("/")
+        except ValueError:
+            continue
+        qty = float(balances.get(base, 0.0) or 0.0)
+        px = float(prices.get(sym, 0.0) or 0.0)
+        if qty <= 0 or px <= 0:
+            continue
+        notional = qty * px
+        if notional < settings.min_position_notional_usd:
+            # treat as dust
+            continue
+        positions.append({
+            "symbol": sym,
+            "asset": base,
+            "qty": qty,
+            "price": px,
+            "notional_usd": notional,
+        })
+    return positions
+        base, _quote = sym.split("/")
+        qty = float(balances.get(base, 0.0) or 0.0)
+        px = float(prices.get(sym, 0.0) or 0.0)
+        if qty <= 0 or px <= 0:
+            continue
+        notional = qty * px
+        if notional < float(settings.min_position_notional_usd):
+            continue
+        out.append({
+            "symbol": sym,
+            "asset": base,
+            "qty": qty,
+            "price": px,
+            "notional_usd": notional,
+        })
+    return out
+        return []
+
+    positions: list[dict] = []
+    for sym in settings.allowed_symbols:
+        try:
+            base, quote = sym.split("/", 1)
+        except Exception:
+            continue
+        if quote.upper() != "USD":
+            continue
+        qty = float(balances.get(base, 0.0) or 0.0)
+        px = float(prices.get(sym, 0.0) or 0.0)
+        if qty <= 0 or px <= 0:
+            continue
+        notional = qty * px
+        if notional < float(getattr(settings, "min_position_notional_usd", 0.0) or 0.0):
+            continue
+        positions.append({"symbol": sym, "qty": qty, "price": px, "notional_usd": notional})
+    return positions
 
 def utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
@@ -305,7 +362,19 @@ def _has_position(symbol: str) -> tuple[bool, float]:
     if qty <= 0:
         return False, 0.0
     px = float(_last_price(symbol))
-    return True, float(qty * px)
+    notional = float(qty * px)
+
+    # Treat tiny holdings as dust (not a real position) to avoid endless exit loops
+    try:
+        meta = broker.get_pair_meta(symbol)
+        min_vol = float(meta.get("ordermin", 0.0) or 0.0)
+    except Exception:
+        min_vol = 0.0
+    if (min_vol > 0 and qty < min_vol) or (notional < float(settings.min_position_notional_usd)):
+        return False, notional
+
+    return True, notional
+
 
 
 # ---------- Scanner helpers ----------
@@ -631,6 +700,26 @@ def _execute_long_entry(
     _notional = float(notional or settings.default_notional_usd)
     if _notional < float(settings.min_order_notional_usd):
         return ignored("notional_below_minimum", symbol=symbol, notional_usd=_notional, min_notional_usd=float(settings.min_order_notional_usd))
+    # Exposure caps (portfolio + per-symbol)
+    try:
+        open_positions = get_positions(broker, settings)
+        total_exposure = sum(float(p.get("notional_usd", 0.0) or 0.0) for p in open_positions)
+    except Exception:
+        open_positions = []
+        total_exposure = 0.0
+
+    if (total_exposure + _notional) > float(settings.max_exposure_usd):
+        return ignored("max_exposure_reached", symbol=symbol, total_exposure_usd=total_exposure, attempted_add_usd=_notional, max_exposure_usd=float(settings.max_exposure_usd))
+
+    existing_symbol_exposure = 0.0
+    for p in open_positions:
+        if p.get("symbol") == symbol:
+            existing_symbol_exposure = float(p.get("notional_usd", 0.0) or 0.0)
+            break
+
+    if (existing_symbol_exposure + _notional) > float(settings.max_symbol_exposure_usd):
+        return ignored("max_symbol_exposure_reached", symbol=symbol, existing_symbol_exposure_usd=existing_symbol_exposure, attempted_usd=_notional, max_symbol_exposure_usd=float(settings.max_symbol_exposure_usd))
+
 
     px = float(_last_price(symbol))
     stop_price, take_price = compute_brackets(px, settings.stop_pct, settings.take_pct)
@@ -892,33 +981,63 @@ def worker_exit(payload: WorkerExitPayload):
                 state.clear_pending_exit(symbol)
                 continue
 
-            plan = state.plans.get(symbol)
-            entry_px = float(plan.entry_price) if plan else float(_last_price(symbol))
-            stop_px, take_px = compute_brackets(entry_px, settings.stop_pct, settings.take_pct)
-
-            if not plan:
-                plan = TradePlan(
-                    symbol=symbol,
-                    side="buy",
-                    notional_usd=float(settings.default_notional_usd),
-                    entry_price=entry_px,
-                    stop_price=stop_px,
-                    take_price=take_px,
-                    strategy="unknown",
-                    opened_ts=now.timestamp(),
-                )
-                state.plans[symbol] = plan
-
             px = float(_last_price(symbol))
+            notional_usd = float(qty * px)
+
+            # Dust guard: ignore tiny holdings that Kraken won't let us close.
+            try:
+                meta = broker.get_pair_meta(symbol)
+                min_vol = float(meta.get("ordermin", 0.0) or 0.0)
+            except Exception:
+                min_vol = 0.0
+
+            if (min_vol and qty < min_vol) or (notional_usd < float(settings.min_position_notional_usd)):
+                state.plans.pop(symbol, None)
+                state.clear_pending_exit(symbol)
+                ignored_list.append({
+                    "symbol": symbol,
+                    "reason": "dust_position_ignored",
+                    "qty": qty,
+                    "notional_usd": notional_usd,
+                    "min_vol": min_vol,
+                    "min_position_notional_usd": float(settings.min_position_notional_usd),
+                })
+                continue
+
+            plan = state.plans.get(symbol)
+            if not plan:
+                # No stored plan; don't force exits.
+                continue
+
+            # Update high watermark + trailing stop
+            if plan.high_watermark <= 0:
+                plan.high_watermark = px
+            if px > plan.high_watermark:
+                plan.high_watermark = px
+
+            effective_stop = float(plan.stop_price)
+            if float(settings.trail_pct) > 0:
+                plan.trailing_stop_price = float(plan.high_watermark) * (1.0 - float(settings.trail_pct))
+                effective_stop = max(effective_stop, float(plan.trailing_stop_price))
+
+            # Brackets
+            entry_px = float(plan.entry_price or px)
+            stop_px = effective_stop
+            take_px = float(plan.take_price or (entry_px * (1.0 + float(settings.take_pct))))
+
+            # Auto-exit reasons
             reason = None
-
-            if did_flatten:
-                reason = "daily_flatten"
-            elif px <= float(plan.stop_price):
+            if px <= stop_px:
                 reason = "stop"
-            elif px >= float(plan.take_price):
+            elif px >= take_px:
                 reason = "take"
+            else:
+                # Time-based exit (0 disables)
+                if int(settings.max_hold_sec) > 0 and (time.time() - float(plan.opened_ts)) >= int(settings.max_hold_sec):
+                    reason = "time"
 
+            if not reason:
+                continue
             if not reason:
                 continue
 
@@ -1115,7 +1234,7 @@ def scan_entries(payload: WorkerScanPayload):
     universe = _build_universe(payload, scanner_syms)
 
     # 3) Snapshot positions once
-    positions = get_positions()
+    positions = get_positions(broker, settings)
     open_set = {p["symbol"] for p in positions if p.get("qty", 0) > 0}
     open_positions_count = _count_open_positions(open_set)
 
@@ -1233,3 +1352,118 @@ def scan_entries(payload: WorkerScanPayload):
             "per_symbol": per_symbol,
         },
     }
+
+
+# ---------- Observability ----------
+
+@app.get("/health")
+def health() -> Dict[str, Any]:
+    return {"ok": True, "utc": utc_now_iso()}
+
+
+@app.get("/dashboard.json")
+def dashboard_json() -> Dict[str, Any]:
+    bal = broker.get_balances()
+    positions = get_positions(broker, settings)
+    total_exposure = sum(float(p.get("notional_usd", 0.0) or 0.0) for p in positions)
+
+    # Pull recent trades from Kraken (requires trading permissions)
+    recent_trades: List[Dict[str, Any]] = []
+    trades_error = None
+    try:
+        recent_trades = broker.trades_history(int(settings.dashboard_trades_limit))
+    except Exception as e:
+        trades_error = str(e)
+
+    return {
+        "ok": True,
+        "utc": utc_now_iso(),
+        "exposure_usd": total_exposure,
+        "exposure_caps": {
+            "max_exposure_usd": float(settings.max_exposure_usd),
+            "max_symbol_exposure_usd": float(settings.max_symbol_exposure_usd),
+            "min_position_notional_usd": float(settings.min_position_notional_usd),
+        },
+        "balances": bal,
+        "positions": positions,
+        "plans": {k: v.model_dump() for k, v in (getattr(state, "plans", {}) or {}).items()},
+        "recent_trades": recent_trades,
+        "trades_error": trades_error,
+    }
+
+
+@app.get("/dashboard")
+def dashboard() -> HTMLResponse:
+    d = dashboard_json()
+
+    def esc(x: Any) -> str:
+        return html.escape(str(x))
+
+    positions_rows = "".join(
+        [
+            f"<tr><td>{esc(p['symbol'])}</td><td>{esc(p['qty'])}</td><td>{esc(round(p['price'], 8))}</td><td>{esc(round(p['notional_usd'], 2))}</td></tr>"
+            for p in d.get("positions", [])
+        ]
+    )
+    if not positions_rows:
+        positions_rows = "<tr><td colspan='4'>(none)</td></tr>"
+
+    trades_rows = "".join(
+        [
+            f"<tr><td>{esc(t.get('time'))}</td><td>{esc(t.get('pair'))}</td><td>{esc(t.get('type'))}</td><td>{esc(t.get('vol'))}</td><td>{esc(t.get('price'))}</td></tr>"
+            for t in (d.get("recent_trades", []) or [])
+        ]
+    )
+    if not trades_rows:
+        trades_rows = "<tr><td colspan='5'>(none or not enabled)</td></tr>"
+
+    html_body = f"""
+    <html>
+      <head>
+        <title>Crypto System Dashboard</title>
+        <meta name='viewport' content='width=device-width, initial-scale=1' />
+        <style>
+          body {{ font-family: Arial, sans-serif; padding: 16px; }}
+          .card {{ border: 1px solid #ddd; border-radius: 12px; padding: 12px; margin-bottom: 12px; }}
+          table {{ border-collapse: collapse; width: 100%; }}
+          th, td {{ border-bottom: 1px solid #eee; padding: 8px; text-align: left; }}
+          th {{ background: #fafafa; }}
+          .muted {{ color: #666; font-size: 12px; }}
+        </style>
+      </head>
+      <body>
+        <h2>Crypto System Dashboard</h2>
+        <div class='muted'>UTC: {esc(d.get('utc'))}</div>
+
+        <div class='card'>
+          <h3>Exposure</h3>
+          <div>Total exposure (USD): <b>{esc(round(d.get('exposure_usd', 0.0), 2))}</b></div>
+          <div class='muted'>Caps: max_exposure_usd={esc(d['exposure_caps']['max_exposure_usd'])}, max_symbol_exposure_usd={esc(d['exposure_caps']['max_symbol_exposure_usd'])}, min_position_notional_usd={esc(d['exposure_caps']['min_position_notional_usd'])}</div>
+        </div>
+
+        <div class='card'>
+          <h3>Positions</h3>
+          <table>
+            <thead><tr><th>Symbol</th><th>Qty</th><th>Price</th><th>Notional USD</th></tr></thead>
+            <tbody>{positions_rows}</tbody>
+          </table>
+        </div>
+
+        <div class='card'>
+          <h3>Recent Trades (Kraken)</h3>
+          <div class='muted'>{esc(d.get('trades_error') or '')}</div>
+          <table>
+            <thead><tr><th>Time</th><th>Pair</th><th>Side</th><th>Vol</th><th>Price</th></tr></thead>
+            <tbody>{trades_rows}</tbody>
+          </table>
+        </div>
+
+        <div class='card'>
+          <h3>Raw JSON</h3>
+          <div class='muted'>GET /dashboard.json</div>
+        </div>
+      </body>
+    </html>
+    """
+
+    return HTMLResponse(content=html_body)

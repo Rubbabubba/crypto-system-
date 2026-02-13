@@ -15,6 +15,9 @@ class TradePlan:
     take_price: float
     strategy: str
     opened_ts: float
+    high_watermark: float = 0.0
+    trailing_stop_price: float = 0.0
+    last_exit_attempt_ts: float = 0.0
 
 
 class InMemoryState:

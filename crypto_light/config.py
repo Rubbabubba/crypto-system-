@@ -36,6 +36,19 @@ class Settings:
     min_order_notional_usd: float
     exit_min_notional_usd: float
 
+    # Exposure caps
+    max_exposure_usd: float              # portfolio-wide cap (sum of open position notionals)
+    max_symbol_exposure_usd: float       # per-symbol cap
+    min_position_notional_usd: float     # ignore positions below this notional (treat as dust)
+
+    # Advanced exits
+    trail_pct: float                     # trailing stop % (0 disables)
+    max_hold_sec: int                    # time-based exit (0 disables)
+
+    # Dashboard
+    dashboard_trades_limit: int
+
+
     # Entries / discipline
     entry_cooldown_sec: int
     no_new_entries_after_utc: str  # HH:MM or "" for 24/7
@@ -80,6 +93,19 @@ def load_settings() -> Settings:
         default_notional_usd=float(_getenv("DEFAULT_NOTIONAL_USD", _getenv("DEFAULT_NOTIONAL", "50")) or 50),
         min_order_notional_usd=float(_getenv("MIN_ORDER_NOTIONAL_USD", "5") or 5),
         exit_min_notional_usd=float(_getenv("EXIT_MIN_NOTIONAL_USD", "6") or 6),
+
+        # Exposure caps
+        max_exposure_usd=float(_getenv("MAX_EXPOSURE_USD", "500") or 500),
+        max_symbol_exposure_usd=float(_getenv("MAX_SYMBOL_EXPOSURE_USD", "250") or 250),
+        min_position_notional_usd=float(_getenv("MIN_POSITION_NOTIONAL_USD", "10") or 10),
+
+        # Advanced exits
+        trail_pct=float(_getenv("TRAIL_PCT", "0") or 0),
+        max_hold_sec=int(float(_getenv("MAX_HOLD_SEC", "0") or 0)),
+
+        # Dashboard
+        dashboard_trades_limit=int(float(_getenv("DASHBOARD_TRADES_LIMIT", "50") or 50)),
+
 
         # Entries / discipline
         entry_cooldown_sec=int(float(_getenv("ENTRY_COOLDOWN_SEC", "0") or 0)),
