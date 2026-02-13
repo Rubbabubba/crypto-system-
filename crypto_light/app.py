@@ -1193,18 +1193,6 @@ def _count_open_positions(open_set: set[str]) -> int:
 
 
 
-       try:
-                state.mark_enter(symbol)
-                state.inc_trade(symbol)
-                # global counter (added in state.py patch)
-                if hasattr(state, "inc_trade_total"):
-                    state.inc_trade_total()
-            except Exception:
-                pass
-        return bool(ok), str(reason), meta or {}
-    except Exception as e:
-        return False, f"exception:{type(e).__name__}", {"error": str(e)}
-
 
 
 
