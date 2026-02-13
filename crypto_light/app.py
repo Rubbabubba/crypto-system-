@@ -3,6 +3,8 @@ from __future__ import annotations
 
 
 import logging
+
+log = logging.getLogger("crypto_light")
 import json
 import os
 import time
@@ -13,8 +15,6 @@ from uuid import uuid4
 import requests
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
-
-log = logging.getLogger("crypto_light")
 
 from .broker import balances_by_asset as _balances_by_asset
 from .broker import base_asset as _base_asset
@@ -734,8 +734,8 @@ def _execute_long_entry(
         strategy=strategy,
         side="buy",
         entry_price=float(px),
-        stop=float(stop_price),
-        take=float(take_price),
+        stop_price=float(stop_price),
+        take_price=float(take_price),
         notional_usd=float(_notional),
         opened_ts=time.time(),
     )
