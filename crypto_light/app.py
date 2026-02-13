@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+
+
 import logging
 import json
 import os
@@ -1330,12 +1332,41 @@ def scan_entries(payload: WorkerScanPayload):
 
 @app.get("/dashboard")
 def dashboard():
-    """Lightweight runtime status for Render health checks + debugging."""
+    # Dashboard is a JSON snapshot. Keep it resilient: failures here should not break the whole service.
     try:
         positions = get_positions()
-    except Exception as e:
+    except Exception:
         positions = []
-        log.warning("dashboard get_positions failed: %s", e)
+
+    # Safe serialization for plans/state (TradePlan is a dataclass)
+    open_plans = []
+    try:
+        from dataclasses import asdict, is_dataclass
+        for p in getattr(state, "plans", {}).values():
+            open_plans.append(asdict(p) if is_dataclass(p) else p)
+    except Exception:
+        open_plans = []
+
+    # Telemetry buffer is best-effort and may be absent/non-serializable
+    telemetry_out = None
+    try:
+        telemetry_out = list(getattr(state, "telemetry", []) or [])
+    except Exception:
+        telemetry_out = None
+
+    return {
+        "ok": True,
+        "utc": utc_now_iso(),
+        "settings": {
+            "max_open_positions": getattr(settings, "max_open_positions", None),
+            "max_entries_per_day": getattr(settings, "max_entries_per_day", None),
+            "max_entries_per_scan": getattr(settings, "max_entries_per_scan", None),
+            "scanner_url": getattr(settings, "scanner_url", None),
+        },
+        "open_positions": positions,
+        "open_plans": open_plans,
+        "telemetry": telemetry_out,
+    }
 
     t = None
     try:
@@ -1371,4 +1402,3 @@ def performance():
         "open_positions": positions,
         "total_open_notional_usd": total_exposure,
     }
-
