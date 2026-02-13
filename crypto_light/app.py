@@ -125,80 +125,59 @@ def _log_event(level: str, event: Dict[str, Any]) -> None:
 
 
 
-def get_positions(broker_=None, settings_=None) -> list[dict]:
-    """Return open positions derived from balances + live prices.
+def get_positions() -> list[dict]:
+    """Return open positions derived from Kraken balances + live USD prices.
 
-    This is *spot holdings* (Kraken balances), expressed as synthetic USD pairs.
-    We treat very small holdings as *dust* and ignore them to avoid repeated exit attempts.
+    - Uses normalized balances from `balances_by_asset()` (e.g., "BTC", "ADA").
+    - Prices are fetched per-symbol via `last_price("ASSET/USD")`.
+    - Ignores *dust* positions below `settings.min_position_notional_usd` to prevent
+      repeated exit/entry churn around exchange minimums.
 
-    Return format: [{"symbol": "BTC/USD", "qty": 0.01, "notional_usd": 650}]
+    Return format:
+      [{"symbol": "BTC/USD", "asset": "BTC", "qty": 0.01, "price": 65000, "notional_usd": 650}]
     """
-    b = broker_ if broker_ is not None else globals().get("broker")
-    s = settings_ if settings_ is not None else globals().get("settings")
-    if b is None or s is None:
-        return []
-
     try:
-        balances = b.get_balances() or {}
+        balances = _balances_by_asset() or {}
     except Exception as e:
-        log.warning("get_positions failed to fetch balances: %s", e)
+        log.exception("balances_by_asset failed: %s", e)
         return []
-
-    # Build a price universe from balances (preferred) plus any configured symbols.
-    allowed = list(getattr(s, "allowed_symbols", []) or [])
-    bases_from_bal = []
-    for asset, qty in (balances or {}).items():
-        try:
-            q = float(qty or 0.0)
-        except Exception:
-            continue
-        if q <= 0:
-            continue
-        a = str(asset).upper()
-        if a in {"USD", "ZUSD"}:
-            continue
-        bases_from_bal.append(a)
-
-    # Synthetic USD symbols for every non-USD balance, plus allowed symbols.
-    sym_set = set(allowed)
-    for base in bases_from_bal:
-        sym_set.add(f"{base}/USD")
-
-    symbols = sorted(sym_set)
-
-    try:
-        prices = b.get_prices(symbols) or {}
-    except Exception as e:
-        log.warning("get_positions failed to fetch prices: %s", e)
-        prices = {}
-
-    min_notional = float(getattr(s, "min_position_notional_usd", 0.0) or 0.0)
 
     positions: list[dict] = []
-    for sym in symbols:
+    for asset, qty in balances.items():
+        asset_u = str(asset).upper().strip()
+        if asset_u == "USD":
+            continue
+
         try:
-            base, quote = sym.split("/", 1)
+            qty_f = float(qty or 0.0)
         except Exception:
             continue
-        if quote.upper() != "USD":
+        if qty_f <= 0:
             continue
 
-        qty = float(balances.get(base, 0.0) or 0.0)
-        px = float(prices.get(sym, 0.0) or 0.0)
-        if qty <= 0 or px <= 0:
+        sym = f"{asset_u}/USD"
+        try:
+            px = float(_last_price(sym) or 0.0)
+        except Exception:
+            px = 0.0
+        if px <= 0:
             continue
 
-        notional = qty * px
-        if min_notional and notional < min_notional:
+        notional = qty_f * px
+        if notional < float(getattr(settings, "min_position_notional_usd", 0.0) or 0.0):
             continue
 
-        positions.append({
-            "symbol": sym,
-            "asset": base,
-            "qty": qty,
-            "price": px,
-            "notional_usd": notional,
-        })
+        positions.append(
+            {
+                "symbol": sym,
+                "asset": asset_u,
+                "qty": qty_f,
+                "price": px,
+                "notional_usd": notional,
+            }
+        )
+
+    positions.sort(key=lambda x: float(x.get("notional_usd", 0.0) or 0.0), reverse=True)
     return positions
 
 def utc_now_iso() -> str:
