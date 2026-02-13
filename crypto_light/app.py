@@ -128,8 +128,8 @@ def _log_event(level: str, event: Dict[str, Any]) -> None:
 def get_positions(broker_=None, settings_=None) -> list[dict]:
     """Return open positions derived from balances + live prices.
 
-    We treat very small holdings as *dust* and ignore them to avoid repeated
-    exit attempts that will fail exchange min-order checks.
+    This is *spot holdings* (Kraken balances), expressed as synthetic USD pairs.
+    We treat very small holdings as *dust* and ignore them to avoid repeated exit attempts.
 
     Return format: [{"symbol": "BTC/USD", "qty": 0.01, "notional_usd": 650}]
     """
@@ -140,15 +140,42 @@ def get_positions(broker_=None, settings_=None) -> list[dict]:
 
     try:
         balances = b.get_balances() or {}
-        prices = b.get_prices(getattr(s, "allowed_symbols", []) or []) or {}
     except Exception as e:
-        log.warning("get_positions failed to fetch balances/prices: %s", e)
+        log.warning("get_positions failed to fetch balances: %s", e)
         return []
+
+    # Build a price universe from balances (preferred) plus any configured symbols.
+    allowed = list(getattr(s, "allowed_symbols", []) or [])
+    bases_from_bal = []
+    for asset, qty in (balances or {}).items():
+        try:
+            q = float(qty or 0.0)
+        except Exception:
+            continue
+        if q <= 0:
+            continue
+        a = str(asset).upper()
+        if a in {"USD", "ZUSD"}:
+            continue
+        bases_from_bal.append(a)
+
+    # Synthetic USD symbols for every non-USD balance, plus allowed symbols.
+    sym_set = set(allowed)
+    for base in bases_from_bal:
+        sym_set.add(f"{base}/USD")
+
+    symbols = sorted(sym_set)
+
+    try:
+        prices = b.get_prices(symbols) or {}
+    except Exception as e:
+        log.warning("get_positions failed to fetch prices: %s", e)
+        prices = {}
 
     min_notional = float(getattr(s, "min_position_notional_usd", 0.0) or 0.0)
 
     positions: list[dict] = []
-    for sym in (getattr(s, "allowed_symbols", []) or []):
+    for sym in symbols:
         try:
             base, quote = sym.split("/", 1)
         except Exception:
@@ -728,19 +755,23 @@ def _execute_long_entry(
         evt.update(extra)
     _log_event("info", evt)
 
-    state.mark_enter(symbol)
-    state.plans[symbol] = TradePlan(
-        symbol=symbol,
-        strategy=strategy,
-        side="buy",
-        entry_price=float(px),
-        stop_price=float(stop_price),
-        take_price=float(take_price),
-        notional_usd=float(_notional),
-        opened_ts=time.time(),
-    )
+    if res.get("ok"):
+        state.mark_enter(symbol)
+        state.plans[symbol] = TradePlan(
+            symbol=symbol,
+            strategy=strategy,
+            side="buy",
+            entry_price=float(px),
+            stop_price=float(stop_price),
+            take_price=float(take_price),
+            notional_usd=float(_notional),
+            opened_ts=time.time(),
+        )
+        return {"ok": True, "executed": True, "symbol": symbol, "strategy": strategy, "price": px, "stop": float(stop_price), "take": float(take_price)}
 
-    return {"ok": True, "executed": True, "symbol": symbol, "strategy": strategy, "price": px, "stop": float(stop_price), "take": float(take_price)}
+    # Do NOT create a plan or cooldown on failed orders (e.g., insufficient funds).
+    return {"ok": False, "executed": False, "symbol": symbol, "strategy": strategy, "price": px, "stop": float(stop_price), "take": float(take_price), "error": res.get("error") or "order_failed"}
+
 
 @app.post("/webhook")
 def webhook(payload: WebhookPayload, request: Request):
