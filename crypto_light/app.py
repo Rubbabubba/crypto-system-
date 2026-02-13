@@ -22,7 +22,7 @@ from .broker import last_price as _last_price
 from .broker import market_notional as _market_notional
 from .broker import get_bars as _get_bars
 from .config import load_settings
-from .models import WebhookPayload, WorkerExitPayload, WorkerScanPayload
+from .models import WebhookPayload, WorkerExitPayload, WorkerScanPayload, WorkerExitDiagnosticsPayload, WorkerAdoptPositionsPayload
 from .risk import compute_brackets
 from .state import InMemoryState, TradePlan
 from .symbol_map import normalize_symbol
@@ -1003,6 +1003,13 @@ def worker_exit(payload: WorkerExitPayload):
             stop_px, take_px = compute_brackets(entry_px, settings.stop_pct, settings.take_pct)
 
             if not plan:
+                # If we don't have a plan for an existing holding, we *can* adopt it
+                # so exits can run — but avoid creating plans for dust positions.
+                pos_notional = qty * px
+                adopt_floor = max(float(getattr(settings, "min_position_notional_usd", 0.0) or 0.0),
+                                  float(getattr(settings, "exit_min_notional_usd", 0.0) or 0.0))
+                if pos_notional < adopt_floor:
+                    continue
                 plan = TradePlan(
                     symbol=symbol,
                     side="buy",
@@ -1186,6 +1193,179 @@ def _count_open_positions(open_set: set[str]) -> int:
 
 
 
+       try:
+                state.mark_enter(symbol)
+                state.inc_trade(symbol)
+                # global counter (added in state.py patch)
+                if hasattr(state, "inc_trade_total"):
+                    state.inc_trade_total()
+            except Exception:
+                pass
+        return bool(ok), str(reason), meta or {}
+    except Exception as e:
+        return False, f"exception:{type(e).__name__}", {"error": str(e)}
+
+
+
+
+
+@app.post("/worker/exit_diagnostics")
+def worker_exit_diagnostics(payload: WorkerExitDiagnosticsPayload):
+    """Dry-run style view of what /worker/exit would attempt.
+
+    No orders are placed. This is purely diagnostic.
+    """
+    require_worker_secret(payload.worker_secret)
+
+    balances = _balances_by_asset()
+    symbols = payload.symbols or []
+    selected = set([normalize_symbol(s) for s in symbols]) if symbols else None
+
+    diagnostics: list[dict] = []
+    for symbol, plan in list(state.plans.items()):
+        sym = normalize_symbol(symbol)
+        if selected is not None and sym not in selected:
+            continue
+
+        base = _base_asset(sym)
+        qty = float(balances.get(base, 0.0) or 0.0)
+        px = float(_last_price(sym) or 0.0)
+        notional = qty * px if (qty > 0 and px > 0) else 0.0
+
+        stop_px = float(getattr(plan, "stop_price", 0.0) or 0.0)
+        take_px = float(getattr(plan, "take_price", 0.0) or 0.0)
+
+        should_exit = False
+        reason = None
+        if qty <= 0 or px <= 0:
+            reason = "no_qty_or_price"
+        elif stop_px and px <= stop_px:
+            should_exit = True
+            reason = "stop_hit"
+        elif take_px and px >= take_px:
+            should_exit = True
+            reason = "take_hit"
+        else:
+            reason = "no_exit_signal"
+
+        exit_floor = float(getattr(settings, "exit_min_notional_usd", 0.0) or 0.0)
+        target_notional = max(exit_floor, float(getattr(plan, "notional_usd", 0.0) or 0.0))
+
+        ok_to_place = should_exit
+        if should_exit:
+            if notional <= 0:
+                ok_to_place = False
+            elif notional < target_notional * 0.98:
+                # likely not enough qty to satisfy a market-notional sell request
+                ok_to_place = False
+                reason = (reason or "exit") + "_insufficient_qty_for_target_notional"
+
+        diagnostics.append({
+            "symbol": sym,
+            "qty": qty,
+            "price": px,
+            "position_notional_usd": notional,
+            "plan": {
+                "side": getattr(plan, "side", None),
+                "notional_usd": float(getattr(plan, "notional_usd", 0.0) or 0.0),
+                "entry_price": float(getattr(plan, "entry_price", 0.0) or 0.0),
+                "stop_price": stop_px,
+                "take_price": take_px,
+                "strategy": getattr(plan, "strategy", None),
+                "opened_ts": getattr(plan, "opened_ts", None),
+            },
+            "should_exit": should_exit,
+            "ok_to_place": ok_to_place,
+            "reason": reason,
+            "target_exit_notional_usd": target_notional,
+        })
+
+    return {
+        "ok": True,
+        "utc": utc_now_iso(),
+        "plans_count": len(state.plans),
+        "diagnostics": diagnostics,
+    }
+
+
+@app.post("/worker/adopt_positions")
+def worker_adopt_positions(payload: WorkerAdoptPositionsPayload):
+    """Create TradePlans for current Kraken balances (so exits can work).
+
+    This does NOT place any orders — it only builds plans in memory.
+    """
+    require_worker_secret(payload.worker_secret)
+
+    balances = _balances_by_asset()
+
+    if payload.reset_plans:
+        state.plans.clear()
+
+    include_dust = bool(payload.include_dust)
+    min_notional = float(payload.min_notional_usd) if payload.min_notional_usd is not None else None
+
+    adopted: list[dict] = []
+    skipped: list[dict] = []
+
+    # Adopt all non-USD assets with a USD price
+    for asset, qty_raw in balances.items():
+        asset_u = str(asset).upper().strip()
+        if asset_u == "USD":
+            continue
+        qty = float(qty_raw or 0.0)
+        if qty <= 0:
+            continue
+
+        sym = normalize_symbol(f"{asset_u}/USD")
+        px = float(_last_price(sym) or 0.0)
+        if px <= 0:
+            skipped.append({"asset": asset_u, "symbol": sym, "reason": "no_price"})
+            continue
+
+        notional = qty * px
+        floor = min_notional if min_notional is not None else float(getattr(settings, "min_position_notional_usd", 0.0) or 0.0)
+        if (not include_dust) and (notional < floor):
+            skipped.append({"asset": asset_u, "symbol": sym, "notional_usd": notional, "reason": "dust"})
+            continue
+
+        if sym in state.plans:
+            skipped.append({"asset": asset_u, "symbol": sym, "notional_usd": notional, "reason": "plan_exists"})
+            continue
+
+        stop_px, take_px = compute_brackets(
+            entry_price=px,
+            stop_pct=float(settings.stop_pct),
+            take_pct=float(settings.take_pct),
+        )
+        plan = TradePlan(
+            symbol=sym,
+            side="buy",
+            notional_usd=float(notional),
+            entry_price=float(px),
+            stop_price=float(stop_px),
+            take_price=float(take_px),
+            strategy="adopted",
+            opened_ts=time.time(),
+        )
+        state.plans[sym] = plan
+        adopted.append({
+            "symbol": sym,
+            "asset": asset_u,
+            "qty": qty,
+            "price": px,
+            "notional_usd": notional,
+            "stop_price": stop_px,
+            "take_price": take_px,
+        })
+
+    return {
+        "ok": True,
+        "utc": utc_now_iso(),
+        "adopted_count": len(adopted),
+        "skipped_count": len(skipped),
+        "adopted": adopted,
+        "skipped": skipped,
+    }
 
 @app.post("/worker/reset_plans")
 def worker_reset_plans(payload: WorkerScanPayload):

@@ -20,6 +20,18 @@ class WorkerScanPayload(BaseModel):
     worker_secret: str | None = None
     dry_run: bool | None = False
 
+class WorkerExitDiagnosticsPayload(BaseModel):
+    worker_secret: str | None = None
+    dry_run: bool | None = True
+    symbols: list[str] | None = None
+
+class WorkerAdoptPositionsPayload(BaseModel):
+    worker_secret: str | None = None
+    include_dust: bool | None = False
+    min_notional_usd: float | None = None
+    reset_plans: bool | None = False
+
+
     # Optional controls used by /worker/scan_entries
     # - symbols: explicit universe override (e.g. [\"BTC/USD\", \"ETH/USD\"])
     # - force_scan: bypass allow-list filtering when SCANNER_SOFT_ALLOW is enabled
