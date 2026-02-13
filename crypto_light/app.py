@@ -901,110 +901,121 @@ def webhook(payload: WebhookPayload, request: Request):
 
 @app.post("/worker/exit")
 def worker_exit(payload: WorkerExitPayload):
-    # Worker secret
-    if settings.worker_secret:
-        if not payload.worker_secret or payload.worker_secret != settings.worker_secret:
-            raise HTTPException(status_code=401, detail="invalid worker secret")
+    """Attempt to exit open positions based on current price vs plan brackets.
+
+    This endpoint is called by the background worker. It is *idempotent* and
+    should never crash the service.
+
+    Key behaviors:
+    - Treat tiny holdings as dust and stop trying to exit them.
+    - Build/refresh a simple TradePlan per symbol (entry/stop/take).
+    - Submit market sells via `broker.market_notional(...)` when an exit triggers.
+    """
+    resp = _auth_or_401(payload.token)
+    if resp:
+        return resp
 
     try:
-        now = datetime.now(timezone.utc)
-        utc_date = _utc_date_str(now)
-
+        now_utc = datetime.now(timezone.utc).isoformat()
+        exits: list[dict] = []
         did_flatten = False
-        if settings.enforce_daily_flatten and _is_flatten_time(now, settings.daily_flatten_time_utc) and state.last_flatten_utc_date != utc_date:
-            did_flatten = True
-            state.last_flatten_utc_date = utc_date
 
-        exits = []
-        bal = _balances_by_asset()
+        balances = _balances_by_asset() or {}
 
-    # Exit universe: don't limit to allowed_symbols; include any symbols we have active plans for,
-    # and any non-USD assets with a balance (so scanner-driven symbols can still be managed).
-    universe = set(settings.allowed_symbols) | set(getattr(state, 'plans', {}).keys())
-    for asset, qty in (bal or {}).items():
+        # Build a universe from configured symbols + any symbols we have plans for,
+        # plus any USD-quoted symbols implied by balances (helps when allowed_symbols changes).
+        universe = set(settings.allowed_symbols) | set(getattr(state, "plans", {}).keys())
+        for asset, qty in balances.items():
+            try:
+                qty_f = float(qty or 0.0)
+            except Exception:
+                continue
+            if qty_f > 0:
+                universe.add(f"{asset}/USD")
+
+        # Prices in one shot (ignore failures gracefully)
         try:
-            q = float(qty)
+            prices = broker.get_prices(sorted(universe))
         except Exception:
-            q = 0.0
-        if asset and asset != 'USD' and q > 0:
-            universe.add(f"{asset}/USD")
-    for symbol in sorted(universe):
+            prices = {}
+
+        for symbol in sorted(universe):
             base = _base_asset(symbol)
-            qty = float(bal.get(base, 0.0) or 0.0)
-            if qty <= 0:
+            try:
+                qty = float(balances.get(base, 0.0) or 0.0)
+            except Exception:
+                qty = 0.0
+
+            px = float(prices.get(symbol, 0.0) or 0.0)
+            notional = qty * px if (qty > 0 and px > 0) else 0.0
+
+            # No position: clean up any old plan/cooldowns and move on
+            if qty <= 0 or px <= 0:
                 state.plans.pop(symbol, None)
-                state.clear_pending_exit(symbol)
+                continue
+
+            # Dust holdings: don't keep hammering exits that will fail exchange min-size
+            min_notional = float(getattr(settings, "min_position_notional_usd", 0.0) or 0.0)
+            if min_notional and notional < min_notional:
+                state.plans.pop(symbol, None)
+                exits.append({
+                    "symbol": symbol,
+                    "reason": "dust",
+                    "price": px,
+                    "notional_usd": notional,
+                    "result": {"ok": True, "skipped": True, "detail": "below min_position_notional_usd"},
+                })
                 continue
 
             plan = state.plans.get(symbol)
-            entry_px = float(plan.entry_price) if plan else float(_last_price(symbol))
-            stop_px, take_px = compute_brackets(entry_px, settings.stop_pct, settings.take_pct)
-
             if not plan:
-                plan = TradePlan(
-                    symbol=symbol,
-                    side="buy",
-                    notional_usd=float(settings.default_notional_usd),
-                    entry_price=entry_px,
-                    stop_price=stop_px,
-                    take_price=take_px,
-                    strategy="unknown",
-                    opened_ts=now.timestamp(),
-                )
+                # Create a plan anchored on current price (best effort)
+                plan = TradePlan(symbol=symbol, entry_price=px, entry_utc=now_utc)
+                plan = compute_brackets(plan, settings)
                 state.plans[symbol] = plan
 
-            px = float(_last_price(symbol))
             reason = None
-
-            if did_flatten:
-                reason = "daily_flatten"
-            elif px <= float(plan.stop_price):
+            if px <= plan.stop_price:
                 reason = "stop"
-            elif px >= float(plan.take_price):
+            elif px >= plan.take_price:
                 reason = "take"
 
             if not reason:
                 continue
 
-            if not state.can_exit(symbol, int(settings.exit_cooldown_sec)):
+            # Throttle exits per symbol
+            if not state.can_exit(symbol, now_utc, settings.exit_cooldown_sec):
+                exits.append({
+                    "symbol": symbol,
+                    "reason": reason,
+                    "price": px,
+                    "result": {"ok": True, "skipped": True, "detail": "exit_cooldown"},
+                })
                 continue
 
-            notional_exit = max(float(settings.exit_min_notional_usd), float(plan.notional_usd))
-            res = _market_notional(symbol=symbol, side="sell", notional=notional_exit, strategy=plan.strategy, price=px)
+            # Sell whatever we can, but never below exchange min-size: we already filtered dust,
+            # but fills/fees can still create tiny remainders; in that case, just stop.
+            desired_notional = max(float(getattr(settings, "exit_min_notional_usd", 0.0) or 0.0), notional)
+            sell_notional = min(notional, desired_notional)
 
-            state.mark_exit(symbol)
-            state.set_pending_exit(symbol, reason=reason, txid=None)
+            result = _market_notional(symbol, side="sell", notional_usd=sell_notional)
+            exits.append({"symbol": symbol, "reason": reason, "price": px, "result": result})
 
-            evt = {
-                "ts": datetime.now(timezone.utc).isoformat(),
-                "kind": "exit",
-                "status": "executed",
-                "symbol": symbol,
-                "strategy": plan.strategy,
-                "reason": reason,
-                "price": px,
-                "notional_usd": notional_exit,
-            }
-            _log_event("info", evt)
-            exits.append({"symbol": symbol, "reason": reason, "price": px, "result": res})
+            if result.get("ok"):
+                did_flatten = True
+                # After a successful sell, clear plan so we don't immediately re-trigger
+                state.plans.pop(symbol, None)
+                state.mark_exit(symbol, now_utc)
 
-        return {"ok": True, "utc": now.isoformat(), "did_flatten": did_flatten, "exits": exits}
-
-    except HTTPException:
-        raise
+        return JSONResponse(status_code=200, content={
+            "ok": True,
+            "utc": now_utc,
+            "did_flatten": did_flatten,
+            "exits": exits,
+        })
     except Exception as e:
-        _log_event(
-            "error",
-            {
-                "ts": datetime.now(timezone.utc).isoformat(),
-                "kind": "worker_exit",
-                "status": "error",
-                "error": str(e),
-            },
-        )
+        logger.exception("worker_exit failed")
         return JSONResponse(status_code=200, content={"ok": False, "error": str(e)})
-
-
 
 def _entry_signals_for_symbol(symbol: str) -> tuple[dict, dict]:
     """Return (signals, debug) for the given symbol.
