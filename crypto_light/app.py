@@ -681,7 +681,10 @@ def _execute_long_entry(
     if _notional < float(settings.min_order_notional_usd):
         return ignored("notional_below_minimum", symbol=symbol, notional_usd=_notional, min_notional_usd=float(settings.min_order_notional_usd))
 
-    stop_price, take_price = compute_brackets(px, settings.stop_pct, settings.take_pct)
+    if stop_price is None or take_price is None:
+        # Determine reference price for bracket computation
+        px = float(px_override) if px_override is not None else float(_last_price(symbol))
+        stop_price, take_price = compute_brackets(px, settings.stop_pct, settings.take_pct)
 
     # Exposure caps (0 disables)
     max_total = float(getattr(settings, "max_total_exposure_usd", 0.0) or 0.0)
@@ -889,7 +892,11 @@ def webhook(payload: WebhookPayload, request: Request):
         )
 
     # Execute BUY
-    stop_price, take_price = compute_brackets(px, settings.stop_pct, settings.take_pct)
+    stop_price = payload.stop_price
+    take_price = payload.take_price
+    if stop_price is None or take_price is None:
+        px = float(_last_price(symbol))
+        stop_price, take_price = compute_brackets(px, settings.stop_pct, settings.take_pct)
 
     # Exposure caps (0 disables)
     max_total = float(getattr(settings, "max_total_exposure_usd", 0.0) or 0.0)
@@ -1005,7 +1012,6 @@ def worker_exit(payload: WorkerExitPayload):
             entry_px = float(plan.entry_price) if plan else float(_last_price(symbol))
             stop_px, take_px = compute_brackets(entry_px, settings.stop_pct, settings.take_pct)
 
-            px = float(_last_price(symbol))
 
 
             if not plan:
