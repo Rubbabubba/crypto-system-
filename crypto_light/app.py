@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+
+log = logging.getLogger("crypto_light")
+
+import logging
 import json
 import os
 import time
@@ -9,7 +13,7 @@ from uuid import uuid4
 
 import requests
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import JSONResponse, HTMLResponse
+from fastapi.responses import JSONResponse
 
 from .broker import balances_by_asset as _balances_by_asset
 from .broker import base_asset as _base_asset
@@ -26,10 +30,6 @@ settings = load_settings()
 
 # Keep a normalized set for fast membership checks.
 ALLOWED_SYMBOLS = set(getattr(settings, 'allowed_symbols', []) or [])
-
-# Ignore positions below this USD notional ("dust") so we don't spam exit attempts
-# that Kraken will reject due to minimum order size / min volume rules.
-MIN_POSITION_NOTIONAL_USD = float(os.getenv('MIN_POSITION_NOTIONAL_USD', '5') or 5)
 
 state = InMemoryState()
 app = FastAPI(title="Crypto Light", version="1.0.3")
@@ -122,40 +122,56 @@ def _log_event(level: str, event: Dict[str, Any]) -> None:
 
 
 
-def get_positions() -> list[dict]:
+
+
+def get_positions(broker_=None, settings_=None) -> list[dict]:
     """Return open positions derived from balances + live prices.
 
     We treat very small holdings as *dust* and ignore them to avoid repeated
     exit attempts that will fail exchange min-order checks.
 
-    Return format: [{"symbol": "BTC/USD", "qty": 0.01, "notional_usd": 650}, ...]
+    Return format: [{"symbol": "BTC/USD", "qty": 0.01, "notional_usd": 650}]
     """
-    try:
-        balances = _balances_by_asset()
-    except Exception:
+    b = broker_ if broker_ is not None else globals().get("broker")
+    s = settings_ if settings_ is not None else globals().get("settings")
+    if b is None or s is None:
         return []
 
-    out: list[dict] = []
-    for sym in (ALLOWED_SYMBOLS or []):
-        base = _base_asset(sym)
+    try:
+        balances = b.get_balances() or {}
+        prices = b.get_prices(getattr(s, "allowed_symbols", []) or []) or {}
+    except Exception as e:
+        log.warning("get_positions failed to fetch balances/prices: %s", e)
+        return []
+
+    min_notional = float(getattr(s, "min_position_notional_usd", 0.0) or 0.0)
+
+    positions: list[dict] = []
+    for sym in (getattr(s, "allowed_symbols", []) or []):
+        try:
+            base, quote = sym.split("/", 1)
+        except Exception:
+            continue
+        if quote.upper() != "USD":
+            continue
+
         qty = float(balances.get(base, 0.0) or 0.0)
-        if qty <= 0:
+        px = float(prices.get(sym, 0.0) or 0.0)
+        if qty <= 0 or px <= 0:
             continue
-        px = float(_last_price(sym) or 0.0)
-        if px <= 0:
-            continue
+
         notional = qty * px
-        if notional < float(MIN_POSITION_NOTIONAL_USD or 0.0):
-            # treat as dust
+        if min_notional and notional < min_notional:
             continue
-        out.append({
+
+        positions.append({
             "symbol": sym,
             "asset": base,
             "qty": qty,
             "price": px,
             "notional_usd": notional,
         })
-    return out
+    return positions
 
 def utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
@@ -647,14 +663,7 @@ def _execute_long_entry(
         return ignored("entry_cooldown", symbol=symbol, cooldown_sec=int(settings.entry_cooldown_sec))
 
     # max trades per day per symbol
-    max_per_sym = int(settings.max_trades_per_symbol_per_day)
-    # Backward compatible: older state objects may not have can_trade_symbol_today()
-    if hasattr(state, 'can_trade_symbol_today'):
-        can_trade = state.can_trade_symbol_today(symbol, max_per_sym)
-    else:
-        can_trade = int(getattr(state, 'trades_today_by_symbol', {}).get(symbol, 0)) < max_per_sym
-    if not can_trade:
-        return {'ok': False, 'status': 'skipped', 'reason': 'max_trades_per_symbol_per_day_reached'}
+    if not state.can_trade_symbol_today(symbol, int(settings.max_trades_per_symbol_per_day)):
         return ignored("max_trades_per_symbol_per_day", symbol=symbol, max_per_day=int(settings.max_trades_per_symbol_per_day))
 
     # one position per symbol
@@ -669,6 +678,32 @@ def _execute_long_entry(
     px = float(_last_price(symbol))
     stop_price, take_price = compute_brackets(px, settings.stop_pct, settings.take_pct)
 
+    # Exposure caps (0 disables)
+    max_total = float(getattr(settings, "max_total_exposure_usd", 0.0) or 0.0)
+    max_symbol = float(getattr(settings, "max_symbol_exposure_usd", 0.0) or 0.0)
+    if max_total or max_symbol:
+        positions = get_positions()
+        total_exposure = sum(float(p.get("notional_usd", 0.0) or 0.0) for p in positions)
+        sym_exposure = sum(float(p.get("notional_usd", 0.0) or 0.0) for p in positions if p.get("symbol") == symbol)
+        if max_total and (total_exposure + _notional) > max_total:
+            log.info("Skip entry %s: total exposure cap (%.2f + %.2f > %.2f)", symbol, total_exposure, _notional, max_total)
+            return {"ok": True, "skipped": True, "reason": "max_total_exposure_usd"}
+        if max_symbol and (sym_exposure + _notional) > max_symbol:
+            log.info("Skip entry %s: symbol exposure cap (%.2f + %.2f > %.2f)", symbol, sym_exposure, _notional, max_symbol)
+            return {"ok": True, "skipped": True, "reason": "max_symbol_exposure_usd"}
+    # Exposure caps (0 disables)
+    max_total = float(getattr(settings, "max_total_exposure_usd", 0.0) or 0.0)
+    max_symbol = float(getattr(settings, "max_symbol_exposure_usd", 0.0) or 0.0)
+    if max_total or max_symbol:
+        positions = get_positions()
+        total_exposure = sum(float(p.get("notional_usd", 0.0) or 0.0) for p in positions)
+        sym_exposure = sum(float(p.get("notional_usd", 0.0) or 0.0) for p in positions if p.get("symbol") == symbol)
+        if max_total and (total_exposure + _notional) > max_total:
+            log.info("Skip entry %s: total exposure cap (%.2f + %.2f > %.2f)", symbol, total_exposure, _notional, max_total)
+            return {"ok": True, "skipped": True, "reason": "max_total_exposure_usd"}
+        if max_symbol and (sym_exposure + _notional) > max_symbol:
+            log.info("Skip entry %s: symbol exposure cap (%.2f + %.2f > %.2f)", symbol, sym_exposure, _notional, max_symbol)
+            return {"ok": True, "skipped": True, "reason": "max_symbol_exposure_usd"}
     res = _market_notional(symbol=symbol, side="buy", notional=_notional, strategy=strategy, price=px)
 
     evt = {
@@ -848,6 +883,32 @@ def webhook(payload: WebhookPayload, request: Request):
     px = float(_last_price(symbol))
     stop_price, take_price = compute_brackets(px, settings.stop_pct, settings.take_pct)
 
+    # Exposure caps (0 disables)
+    max_total = float(getattr(settings, "max_total_exposure_usd", 0.0) or 0.0)
+    max_symbol = float(getattr(settings, "max_symbol_exposure_usd", 0.0) or 0.0)
+    if max_total or max_symbol:
+        positions = get_positions()
+        total_exposure = sum(float(p.get("notional_usd", 0.0) or 0.0) for p in positions)
+        sym_exposure = sum(float(p.get("notional_usd", 0.0) or 0.0) for p in positions if p.get("symbol") == symbol)
+        if max_total and (total_exposure + notional) > max_total:
+            log.info("Skip entry %s: total exposure cap (%.2f + %.2f > %.2f)", symbol, total_exposure, notional, max_total)
+            return {"ok": True, "skipped": True, "reason": "max_total_exposure_usd"}
+        if max_symbol and (sym_exposure + notional) > max_symbol:
+            log.info("Skip entry %s: symbol exposure cap (%.2f + %.2f > %.2f)", symbol, sym_exposure, notional, max_symbol)
+            return {"ok": True, "skipped": True, "reason": "max_symbol_exposure_usd"}
+    # Exposure caps (0 disables)
+    max_total = float(getattr(settings, "max_total_exposure_usd", 0.0) or 0.0)
+    max_symbol = float(getattr(settings, "max_symbol_exposure_usd", 0.0) or 0.0)
+    if max_total or max_symbol:
+        positions = get_positions()
+        total_exposure = sum(float(p.get("notional_usd", 0.0) or 0.0) for p in positions)
+        sym_exposure = sum(float(p.get("notional_usd", 0.0) or 0.0) for p in positions if p.get("symbol") == symbol)
+        if max_total and (total_exposure + notional) > max_total:
+            log.info("Skip entry %s: total exposure cap (%.2f + %.2f > %.2f)", symbol, total_exposure, notional, max_total)
+            return {"ok": True, "skipped": True, "reason": "max_total_exposure_usd"}
+        if max_symbol and (sym_exposure + notional) > max_symbol:
+            log.info("Skip entry %s: symbol exposure cap (%.2f + %.2f > %.2f)", symbol, sym_exposure, notional, max_symbol)
+            return {"ok": True, "skipped": True, "reason": "max_symbol_exposure_usd"}
     res = _market_notional(symbol=symbol, side="buy", notional=notional, strategy=strategy, price=px)
 
     _log_event(
@@ -901,121 +962,100 @@ def webhook(payload: WebhookPayload, request: Request):
 
 @app.post("/worker/exit")
 def worker_exit(payload: WorkerExitPayload):
-    """Attempt to exit open positions based on current price vs plan brackets.
-
-    This endpoint is called by the background worker. It is *idempotent* and
-    should never crash the service.
-
-    Key behaviors:
-    - Treat tiny holdings as dust and stop trying to exit them.
-    - Build/refresh a simple TradePlan per symbol (entry/stop/take).
-    - Submit market sells via `broker.market_notional(...)` when an exit triggers.
-    """
-    resp = _auth_or_401(payload.token)
-    if resp:
-        return resp
+    # Worker secret
+    if settings.worker_secret:
+        if not payload.worker_secret or payload.worker_secret != settings.worker_secret:
+            raise HTTPException(status_code=401, detail="invalid worker secret")
 
     try:
-        now_utc = datetime.now(timezone.utc).isoformat()
-        exits: list[dict] = []
+        now = datetime.now(timezone.utc)
+        utc_date = _utc_date_str(now)
+
         did_flatten = False
+        if settings.enforce_daily_flatten and _is_flatten_time(now, settings.daily_flatten_time_utc) and state.last_flatten_utc_date != utc_date:
+            did_flatten = True
+            state.last_flatten_utc_date = utc_date
 
-        balances = _balances_by_asset() or {}
+        exits = []
+        bal = _balances_by_asset()
 
-        # Build a universe from configured symbols + any symbols we have plans for,
-        # plus any USD-quoted symbols implied by balances (helps when allowed_symbols changes).
-        universe = set(settings.allowed_symbols) | set(getattr(state, "plans", {}).keys())
-        for asset, qty in balances.items():
-            try:
-                qty_f = float(qty or 0.0)
-            except Exception:
-                continue
-            if qty_f > 0:
-                universe.add(f"{asset}/USD")
-
-        # Prices in one shot (ignore failures gracefully)
-        try:
-            prices = broker.get_prices(sorted(universe))
-        except Exception:
-            prices = {}
-
-        for symbol in sorted(universe):
+        for symbol in settings.allowed_symbols:
             base = _base_asset(symbol)
-            try:
-                qty = float(balances.get(base, 0.0) or 0.0)
-            except Exception:
-                qty = 0.0
-
-            px = float(prices.get(symbol, 0.0) or 0.0)
-            notional = qty * px if (qty > 0 and px > 0) else 0.0
-
-            # No position: clean up any old plan/cooldowns and move on
-            if qty <= 0 or px <= 0:
+            qty = float(bal.get(base, 0.0) or 0.0)
+            if qty <= 0:
                 state.plans.pop(symbol, None)
-                continue
-
-            # Dust holdings: don't keep hammering exits that will fail exchange min-size
-            min_notional = float(getattr(settings, "min_position_notional_usd", 0.0) or 0.0)
-            if min_notional and notional < min_notional:
-                state.plans.pop(symbol, None)
-                exits.append({
-                    "symbol": symbol,
-                    "reason": "dust",
-                    "price": px,
-                    "notional_usd": notional,
-                    "result": {"ok": True, "skipped": True, "detail": "below min_position_notional_usd"},
-                })
+                state.clear_pending_exit(symbol)
                 continue
 
             plan = state.plans.get(symbol)
+            entry_px = float(plan.entry_price) if plan else float(_last_price(symbol))
+            stop_px, take_px = compute_brackets(entry_px, settings.stop_pct, settings.take_pct)
+
             if not plan:
-                # Create a plan anchored on current price (best effort)
-                plan = TradePlan(symbol=symbol, entry_price=px, entry_utc=now_utc)
-                plan = compute_brackets(plan, settings)
+                plan = TradePlan(
+                    symbol=symbol,
+                    side="buy",
+                    notional_usd=float(settings.default_notional_usd),
+                    entry_price=entry_px,
+                    stop_price=stop_px,
+                    take_price=take_px,
+                    strategy="unknown",
+                    opened_ts=now.timestamp(),
+                )
                 state.plans[symbol] = plan
 
+            px = float(_last_price(symbol))
             reason = None
-            if px <= plan.stop_price:
+
+            if did_flatten:
+                reason = "daily_flatten"
+            elif px <= float(plan.stop_price):
                 reason = "stop"
-            elif px >= plan.take_price:
+            elif px >= float(plan.take_price):
                 reason = "take"
 
             if not reason:
                 continue
 
-            # Throttle exits per symbol
-            if not state.can_exit(symbol, now_utc, settings.exit_cooldown_sec):
-                exits.append({
-                    "symbol": symbol,
-                    "reason": reason,
-                    "price": px,
-                    "result": {"ok": True, "skipped": True, "detail": "exit_cooldown"},
-                })
+            if not state.can_exit(symbol, int(settings.exit_cooldown_sec)):
                 continue
 
-            # Sell whatever we can, but never below exchange min-size: we already filtered dust,
-            # but fills/fees can still create tiny remainders; in that case, just stop.
-            desired_notional = max(float(getattr(settings, "exit_min_notional_usd", 0.0) or 0.0), notional)
-            sell_notional = min(notional, desired_notional)
+            notional_exit = max(float(settings.exit_min_notional_usd), float(plan.notional_usd))
+            res = _market_notional(symbol=symbol, side="sell", notional=notional_exit, strategy=plan.strategy, price=px)
 
-            result = _market_notional(symbol, side="sell", notional_usd=sell_notional)
-            exits.append({"symbol": symbol, "reason": reason, "price": px, "result": result})
+            state.mark_exit(symbol)
+            state.set_pending_exit(symbol, reason=reason, txid=None)
 
-            if result.get("ok"):
-                did_flatten = True
-                # After a successful sell, clear plan so we don't immediately re-trigger
-                state.plans.pop(symbol, None)
-                state.mark_exit(symbol, now_utc)
+            evt = {
+                "ts": datetime.now(timezone.utc).isoformat(),
+                "kind": "exit",
+                "status": "executed",
+                "symbol": symbol,
+                "strategy": plan.strategy,
+                "reason": reason,
+                "price": px,
+                "notional_usd": notional_exit,
+            }
+            _log_event("info", evt)
+            exits.append({"symbol": symbol, "reason": reason, "price": px, "result": res})
 
-        return JSONResponse(status_code=200, content={
-            "ok": True,
-            "utc": now_utc,
-            "did_flatten": did_flatten,
-            "exits": exits,
-        })
+        return {"ok": True, "utc": now.isoformat(), "did_flatten": did_flatten, "exits": exits}
+
+    except HTTPException:
+        raise
     except Exception as e:
-        logger.exception("worker_exit failed")
+        _log_event(
+            "error",
+            {
+                "ts": datetime.now(timezone.utc).isoformat(),
+                "kind": "worker_exit",
+                "status": "error",
+                "error": str(e),
+            },
+        )
         return JSONResponse(status_code=200, content={"ok": False, "error": str(e)})
+
+
 
 def _entry_signals_for_symbol(symbol: str) -> tuple[dict, dict]:
     """Return (signals, debug) for the given symbol.
@@ -1164,12 +1204,6 @@ def scan_entries(payload: WorkerScanPayload):
         return JSONResponse(status_code=401, content={"ok": False, "utc": utc_now_iso(), "error": reason})
 
     # 1) Scanner → symbols (soft allowlist) + meta
-    # Option D: run exit checks every scan cycle (so TP/SL triggers without a separate cron hit)
-    try:
-        _ = worker_exit(WorkerExitPayload(worker_secret=payload.worker_secret))
-    except Exception as e:
-        logger.warning(f"pre-scan auto-exit skipped: {e}")
-
     scanner_ok, scanner_reason, scanner_meta, scanner_syms = _scanner_fetch_active_symbols_and_meta()
 
     # 2) Universe (explicit symbols > allowed list (+ scanner if soft allow))
@@ -1253,11 +1287,6 @@ def scan_entries(payload: WorkerScanPayload):
         )
 
     # 6) Return diagnostics
-    try:
-        _ = worker_exit(WorkerExitPayload(worker_secret=payload.worker_secret))
-    except Exception as e:
-        logger.warning(f"post-scan auto-exit skipped: {e}")
-
     return {
         "ok": True,
         "utc": utc_now_iso(),
@@ -1299,3 +1328,48 @@ def scan_entries(payload: WorkerScanPayload):
             "per_symbol": per_symbol,
         },
     }
+
+@app.get("/dashboard")
+def dashboard():
+    """Lightweight runtime status for Render health checks + debugging."""
+    try:
+        positions = get_positions()
+    except Exception as e:
+        positions = []
+        log.warning("dashboard get_positions failed: %s", e)
+
+    t = None
+    try:
+        t = telemetry.snapshot()  # type: ignore[attr-defined]
+    except Exception:
+        try:
+            t = telemetry.to_dict()  # type: ignore[attr-defined]
+        except Exception:
+            t = None
+
+    return {
+        "ok": True,
+        "time": utc_now_iso(),
+        "mode": getattr(settings, "mode", None),
+        "allowed_symbols": getattr(settings, "allowed_symbols", None),
+        "positions": positions,
+        "open_plans": list(plans.values()) if isinstance(plans, dict) else None,
+        "telemetry": t,
+    }
+
+
+@app.get("/performance")
+def performance():
+    """Very simple P&L proxy using current positions (mark-to-market).
+
+    If you're logging fills elsewhere, you can swap this for realized P&L.
+    """
+    positions = get_positions()
+    total_exposure = sum(float(p.get("notional_usd", 0.0) or 0.0) for p in positions)
+    return {
+        "ok": True,
+        "time": utc_now_iso(),
+        "open_positions": positions,
+        "total_open_notional_usd": total_exposure,
+    }
+

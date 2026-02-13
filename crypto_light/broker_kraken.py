@@ -208,12 +208,6 @@ def _pair_meta(pair: str) -> Dict[str, Any]:
     if not key:
         return {"ordermin": 0.0, "lot_decimals": 8, "pair_decimals": 8}
 
-
-# Public helper: expose pair metadata (min volume, precisions, etc.)
-def pair_meta(pair: str) -> Dict[str, Any]:
-    return _pair_meta(pair)
-
-
     ttl = float(os.getenv("KRAKEN_PAIR_META_TTL_SEC", "3600") or 3600)
     now = time.time()
 
