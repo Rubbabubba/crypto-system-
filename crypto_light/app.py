@@ -1,10 +1,6 @@
 from __future__ import annotations
 
-
-
 import logging
-
-log = logging.getLogger("crypto_light")
 import json
 import os
 import time
@@ -15,6 +11,8 @@ from uuid import uuid4
 import requests
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
+
+log = logging.getLogger("crypto_light")
 
 from .broker import balances_by_asset as _balances_by_asset
 from .broker import base_asset as _base_asset
@@ -354,6 +352,7 @@ def _has_position(symbol: str) -> tuple[bool, float]:
     qty = float(bal.get(base, 0.0) or 0.0)
     if qty <= 0:
         return False, 0.0
+    px = float(_last_price(symbol) or 0.0)
     return True, float(qty * px)
 
 
@@ -637,6 +636,9 @@ def _execute_long_entry(
     req_id: str,
     client_ip: str | None = None,
     extra: dict | None = None,
+    px_override: float | None = None,
+    stop_price: float | None = None,
+    take_price: float | None = None,
 ):
     def ignored(reason: str, **extra_fields):
         evt = {
@@ -1003,7 +1005,17 @@ def worker_exit(payload: WorkerExitPayload):
         exits = []
         bal = _balances_by_asset()
 
-        for symbol in settings.allowed_symbols:
+        # Iterate over balances-derived holdings / adopted plans (not allowed_symbols)
+
+        pos_syms = {p.get('symbol') for p in get_positions() if p.get('symbol')}
+
+        plan_syms = set(state.plans.keys()) if hasattr(state, 'plans') else set()
+
+        symbols = sorted({sym for sym in (pos_syms | plan_syms) if sym})
+
+        for symbol in symbols:
+
+            px = float(_last_price(symbol) or 0.0)
             base = _base_asset(symbol)
             qty = float(bal.get(base, 0.0) or 0.0)
             if qty <= 0:
@@ -1012,7 +1024,7 @@ def worker_exit(payload: WorkerExitPayload):
                 continue
 
             plan = state.plans.get(symbol)
-            entry_px = float(plan.entry_price) if plan else float(_last_price(symbol))
+            entry_px = float(plan.entry_price) if plan else (px if px > 0 else float(_last_price(symbol)))
             stop_px, take_px = compute_brackets(entry_px, settings.stop_pct, settings.take_pct)
 
 
