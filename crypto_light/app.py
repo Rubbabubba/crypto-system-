@@ -354,7 +354,6 @@ def _has_position(symbol: str) -> tuple[bool, float]:
     qty = float(bal.get(base, 0.0) or 0.0)
     if qty <= 0:
         return False, 0.0
-    px = float(_last_price(symbol))
     return True, float(qty * px)
 
 
@@ -682,7 +681,6 @@ def _execute_long_entry(
     if _notional < float(settings.min_order_notional_usd):
         return ignored("notional_below_minimum", symbol=symbol, notional_usd=_notional, min_notional_usd=float(settings.min_order_notional_usd))
 
-    px = float(_last_price(symbol))
     stop_price, take_price = compute_brackets(px, settings.stop_pct, settings.take_pct)
 
     # Exposure caps (0 disables)
@@ -891,7 +889,6 @@ def webhook(payload: WebhookPayload, request: Request):
         )
 
     # Execute BUY
-    px = float(_last_price(symbol))
     stop_price, take_price = compute_brackets(px, settings.stop_pct, settings.take_pct)
 
     # Exposure caps (0 disables)
@@ -922,13 +919,14 @@ def webhook(payload: WebhookPayload, request: Request):
             return {"ok": True, "skipped": True, "reason": "max_symbol_exposure_usd"}
     res = _market_notional(symbol=symbol, side="buy", notional=notional, strategy=strategy, price=px)
 
+    # Log the attempt
     _log_event(
         "info",
         {
             "ts": datetime.now(timezone.utc).isoformat(),
             "req_id": req_id,
             "kind": "webhook",
-            "status": "executed",
+            "status": "executed" if (res and res.get("ok")) else "error",
             "action": "buy",
             "symbol": symbol,
             "strategy": strategy,
@@ -939,9 +937,14 @@ def webhook(payload: WebhookPayload, request: Request):
             "stop": float(stop_price),
             "take": float(take_price),
             "scanner_gate": {"allowed": True, "reason": allow_reason, **allow_meta},
+            "order": res,
             "client_ip": client_ip,
         },
     )
+
+    # Guard: only create the plan (and count the trade) if the entry order actually succeeded.
+    if not (res and res.get("ok")):
+        return {"ok": False, "action": "buy", "symbol": symbol, "error": (res or {}).get("error") or "entry_order_failed", "order": res}
 
     state.mark_enter(symbol)
     state.plans[symbol] = TradePlan(
@@ -1002,6 +1005,9 @@ def worker_exit(payload: WorkerExitPayload):
             entry_px = float(plan.entry_price) if plan else float(_last_price(symbol))
             stop_px, take_px = compute_brackets(entry_px, settings.stop_pct, settings.take_pct)
 
+            px = float(_last_price(symbol))
+
+
             if not plan:
                 # If we don't have a plan for an existing holding, we *can* adopt it
                 # so exits can run — but avoid creating plans for dust positions.
@@ -1022,7 +1028,6 @@ def worker_exit(payload: WorkerExitPayload):
                 )
                 state.plans[symbol] = plan
 
-            px = float(_last_price(symbol))
             reason = None
 
             if did_flatten:
@@ -1203,7 +1208,7 @@ def worker_exit_diagnostics(payload: WorkerExitDiagnosticsPayload):
 
     No orders are placed. This is purely diagnostic.
     """
-    require_worker_secret(payload.worker_secret)
+    _require_worker_secret(payload.worker_secret)
 
     balances = _balances_by_asset()
     symbols = payload.symbols or []
@@ -1282,7 +1287,7 @@ def worker_adopt_positions(payload: WorkerAdoptPositionsPayload):
 
     This does NOT place any orders — it only builds plans in memory.
     """
-    require_worker_secret(payload.worker_secret)
+    _require_worker_secret(payload.worker_secret)
 
     balances = _balances_by_asset()
 
@@ -1483,7 +1488,7 @@ def scan_entries(payload: WorkerScanPayload):
             "request": {
                 "dry_run": payload.dry_run,
                 "force_scan": getattr(payload, "force_scan", False),
-                "symbols_provided": payload.symbols or [],
+                "symbols_provided": (getattr(payload, "symbols", None) or []),
             },
             "config": {
                 "scanner_url": SCANNER_URL,
