@@ -347,13 +347,27 @@ def _validate_symbol(symbol: str) -> str:
 
 
 def _has_position(symbol: str) -> tuple[bool, float]:
+    """Return (has_position, position_notional_usd).
+
+    IMPORTANT: treat tiny 'dust' balances as *not* a position so they don't block entries/exits.
+    """
     bal = _balances_by_asset()
     base = _base_asset(symbol)
     qty = float(bal.get(base, 0.0) or 0.0)
     if qty <= 0:
         return False, 0.0
+
     px = float(_last_price(symbol) or 0.0)
-    return True, float(qty * px)
+    notional = float(qty * px) if px > 0 else 0.0
+
+    try:
+        settings = _get_settings()
+        if settings.min_position_notional_usd and notional < settings.min_position_notional_usd:
+            return False, notional
+    except Exception:
+        pass
+
+    return True, notional
 
 
 # ---------- Scanner helpers ----------
@@ -899,8 +913,15 @@ def webhook(payload: WebhookPayload, request: Request):
     # Execute BUY
     stop_price = payload.stop_price
     take_price = payload.take_price
-    if stop_price is None or take_price is None:
+    # Determine entry price for brackets/notional. If the alert didn't include a price,
+    # fall back to the latest trade price.
+    px = float(getattr(payload, "price", 0.0) or 0.0)
+    if px <= 0:
+        px = float(getattr(payload, "entry_price", 0.0) or 0.0)
+    if px <= 0:
         px = float(_last_price(symbol))
+    
+    if stop_price is None or take_price is None:
         stop_price, take_price = compute_brackets(px, settings.stop_pct, settings.take_pct)
 
     # Exposure caps (0 disables)
@@ -1008,10 +1029,10 @@ def worker_exit(payload: WorkerExitPayload):
         # Iterate over balances-derived holdings / adopted plans (not allowed_symbols)
 
         pos_syms = {p.get('symbol') for p in get_positions() if p.get('symbol')}
-
         plan_syms = set(state.plans.keys()) if hasattr(state, 'plans') else set()
-
-        symbols = sorted({sym for sym in (pos_syms | plan_syms) if sym})
+        state_open = set(getattr(state, "open_positions", []) or [])
+        # Iterate over balances-derived holdings + state.open_positions + any planned symbols.
+        symbols = sorted({sym for sym in (pos_syms | plan_syms | state_open) if sym})
 
         for symbol in symbols:
 
@@ -1033,6 +1054,15 @@ def worker_exit(payload: WorkerExitPayload):
                 # If we don't have a plan for an existing holding, we *can* adopt it
                 # so exits can run — but avoid creating plans for dust positions.
                 pos_notional = qty * px
+                # Treat tiny balances as dust: don't plan exits and don't block re-entries.
+                dust_floor = float(getattr(settings, "min_position_notional_usd", 0.0) or 0.0)
+                if dust_floor and pos_notional < dust_floor:
+                    # Clear any stale plan/exit intent for dust holdings.
+                    if hasattr(state, "plans"):
+                        state.plans.pop(symbol, None)
+                    if hasattr(state, "clear_pending_exit"):
+                        state.clear_pending_exit(symbol)
+                    continue
                 adopt_floor = max(float(getattr(settings, "min_position_notional_usd", 0.0) or 0.0),
                                   float(getattr(settings, "exit_min_notional_usd", 0.0) or 0.0))
                 if pos_notional < adopt_floor:
