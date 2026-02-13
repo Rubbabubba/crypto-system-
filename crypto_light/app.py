@@ -1,8 +1,5 @@
 from __future__ import annotations
 
-
-log = logging.getLogger("crypto_light")
-
 import logging
 import json
 import os
@@ -14,6 +11,8 @@ from uuid import uuid4
 import requests
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
+
+log = logging.getLogger("crypto_light")
 
 from .broker import balances_by_asset as _balances_by_asset
 from .broker import base_asset as _base_asset
