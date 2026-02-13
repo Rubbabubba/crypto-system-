@@ -116,33 +116,38 @@ def _log_event(level: str, event: Dict[str, Any]) -> None:
     except Exception:
         print(str(event))
 
-
-
 def get_positions(broker, settings) -> list[dict]:
     """Return open positions derived from balances + live prices.
 
-    We treat very small holdings as *dust* and ignore them to avoid repeated
-    exit attempts that will fail exchange min-order checks.
-
-    Return format: [{"symbol": "BTC/USD", "qty": 0.01, "notional_usd": 650}]
+    We treat very small holdings as dust and ignore them.
+    Return format:
+    [{"symbol": "BTC/USD", "qty": 0.01, "notional_usd": 650}]
     """
     balances = broker.get_balances()
     prices = broker.get_prices(settings.allowed_symbols)
 
     positions: list[dict] = []
+
     for sym in settings.allowed_symbols:
         try:
-            base, quote = sym.split("/")
-        except ValueError:
+            base, quote = sym.split("/", 1)
+        except Exception:
             continue
+
+        if quote.upper() != "USD":
+            continue
+
         qty = float(balances.get(base, 0.0) or 0.0)
         px = float(prices.get(sym, 0.0) or 0.0)
+
         if qty <= 0 or px <= 0:
             continue
+
         notional = qty * px
-        if notional < settings.min_position_notional_usd:
-            # treat as dust
+
+        if notional < float(getattr(settings, "min_position_notional_usd", 0.0) or 0.0):
             continue
+
         positions.append({
             "symbol": sym,
             "asset": base,
@@ -150,41 +155,7 @@ def get_positions(broker, settings) -> list[dict]:
             "price": px,
             "notional_usd": notional,
         })
-    return positions
-        base, _quote = sym.split("/")
-        qty = float(balances.get(base, 0.0) or 0.0)
-        px = float(prices.get(sym, 0.0) or 0.0)
-        if qty <= 0 or px <= 0:
-            continue
-        notional = qty * px
-        if notional < float(settings.min_position_notional_usd):
-            continue
-        out.append({
-            "symbol": sym,
-            "asset": base,
-            "qty": qty,
-            "price": px,
-            "notional_usd": notional,
-        })
-    return out
-        return []
 
-    positions: list[dict] = []
-    for sym in settings.allowed_symbols:
-        try:
-            base, quote = sym.split("/", 1)
-        except Exception:
-            continue
-        if quote.upper() != "USD":
-            continue
-        qty = float(balances.get(base, 0.0) or 0.0)
-        px = float(prices.get(sym, 0.0) or 0.0)
-        if qty <= 0 or px <= 0:
-            continue
-        notional = qty * px
-        if notional < float(getattr(settings, "min_position_notional_usd", 0.0) or 0.0):
-            continue
-        positions.append({"symbol": sym, "qty": qty, "price": px, "notional_usd": notional})
     return positions
 
 def utc_now_iso() -> str:
