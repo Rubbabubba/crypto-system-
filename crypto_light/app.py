@@ -681,9 +681,12 @@ def _execute_long_entry(
     if _notional < float(settings.min_order_notional_usd):
         return ignored("notional_below_minimum", symbol=symbol, notional_usd=_notional, min_notional_usd=float(settings.min_order_notional_usd))
 
+    # Determine reference price for fills/brackets.
+    # IMPORTANT: `px` is used later for sizing and bracket calc.
+    px = float(px_override) if px_override is not None else float(_last_price(symbol))
+
+    # If caller didn't supply brackets, compute them from `px`.
     if stop_price is None or take_price is None:
-        # Determine reference price for bracket computation
-        px = float(px_override) if px_override is not None else float(_last_price(symbol))
         stop_price, take_price = compute_brackets(px, settings.stop_pct, settings.take_pct)
 
     # Exposure caps (0 disables)
