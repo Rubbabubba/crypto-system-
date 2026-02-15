@@ -1079,6 +1079,10 @@ def worker_exit(payload: WorkerExitPayload):
                 )
                 state.plans[symbol] = plan
 
+            # Age tracking for time-based exits and observability
+            opened_ts = float(getattr(plan, "opened_ts", 0.0) or 0.0)
+            age_sec = now.timestamp() - opened_ts if opened_ts > 0 else 0.0
+
             reason = None
 
             if did_flatten:
@@ -1087,6 +1091,13 @@ def worker_exit(payload: WorkerExitPayload):
                 reason = "stop"
             elif px >= float(plan.take_price):
                 reason = "take"
+            else:
+                # Time-based exit (capital rotation). Disabled when max_hold_sec <= 0.
+                max_hold = int(getattr(settings, "max_hold_sec", 0) or 0)
+                if max_hold > 0:
+                    grace = int(getattr(settings, "time_exit_grace_sec", 0) or 0)
+                    if age_sec >= float(max_hold + grace):
+                        reason = "time"
 
             if not reason:
                 continue
@@ -1109,9 +1120,11 @@ def worker_exit(payload: WorkerExitPayload):
                 "reason": reason,
                 "price": px,
                 "notional_usd": notional_exit,
+                "age_sec": round(age_sec, 3),
+                "max_hold_sec": int(getattr(settings, "max_hold_sec", 0) or 0),
             }
             _log_event("info", evt)
-            exits.append({"symbol": symbol, "reason": reason, "price": px, "result": res})
+            exits.append({"symbol": symbol, "reason": reason, "price": px, "age_sec": round(age_sec, 3), "result": res})
 
         return {"ok": True, "utc": now.isoformat(), "did_flatten": did_flatten, "exits": exits}
 

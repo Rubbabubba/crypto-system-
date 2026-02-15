@@ -56,6 +56,8 @@ class Settings:
     stop_pct: float
     take_pct: float
     exit_cooldown_sec: int
+    max_hold_sec: int  # 0 disables
+    time_exit_grace_sec: int
 
     # Daily risk
     max_daily_loss_usd: float
@@ -93,7 +95,7 @@ def load_settings() -> Settings:
         min_position_notional_usd=float(_getenv("MIN_POSITION_NOTIONAL_USD", "10") or 10),
 
         # Exposure caps
-        max_total_exposure_usd=float(_getenv("MAX_TOTAL_EXPOSURE_USD", "0") or 0),
+        max_total_exposure_usd=float(_getenv("MAX_TOTAL_EXPOSURE_USD", _getenv("MAX_EXPOSURE_USD", "0")) or 0),
         max_symbol_exposure_usd=float(_getenv("MAX_SYMBOL_EXPOSURE_USD", "0") or 0),
 
         # Entries / discipline
@@ -108,6 +110,8 @@ def load_settings() -> Settings:
         stop_pct=float(_getenv("STOP_PCT", "0.01") or 0.01),
         take_pct=float(_getenv("TAKE_PCT", "0.02") or 0.02),
         exit_cooldown_sec=int(float(_getenv("EXIT_COOLDOWN_SEC", "20") or 20)),
+        max_hold_sec=int(float(_getenv("MAX_HOLD_SEC", "0") or 0)),
+        time_exit_grace_sec=int(float(_getenv("TIME_EXIT_GRACE_SEC", "60") or 60)),
 
         # Daily risk
         max_daily_loss_usd=float(_getenv("MAX_DAILY_LOSS_USD", "25") or 25),
