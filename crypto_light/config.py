@@ -66,6 +66,13 @@ class Settings:
     time_exit_grace_sec: int
 
     # Daily risk
+
+    # Break-even
+    breakeven_enabled: bool
+    breakeven_trigger_pct: float
+    breakeven_offset_pct: float
+
+    # Daily risk
     max_daily_loss_usd: float
 
 
@@ -123,6 +130,11 @@ def load_settings() -> Settings:
         exit_cooldown_sec=int(float(_getenv("EXIT_COOLDOWN_SEC", "20") or 20)),
         max_hold_sec=int(float(_getenv("MAX_HOLD_SEC", "0") or 0)),
         time_exit_grace_sec=int(float(_getenv("TIME_EXIT_GRACE_SEC", "60") or 60)),
+
+        # Break-even
+        breakeven_enabled=_getbool("BREAKEVEN_ENABLED", "0"),
+        breakeven_trigger_pct=float(_getenv("BREAKEVEN_TRIGGER_PCT", "0.015") or 0.015),
+        breakeven_offset_pct=float(_getenv("BREAKEVEN_OFFSET_PCT", "0.0") or 0.0),
 
         # Daily risk
         max_daily_loss_usd=float(_getenv("MAX_DAILY_LOSS_USD", "25") or 25),

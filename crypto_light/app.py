@@ -1114,6 +1114,40 @@ def worker_exit(payload: WorkerExitPayload):
             opened_ts = float(getattr(plan, "opened_ts", 0.0) or 0.0)
             age_sec = now.timestamp() - opened_ts if opened_ts > 0 else 0.0
 
+
+
+            # Break-even stop logic (optional). Disabled unless BREAKEVEN_ENABLED=1.
+            try:
+                if bool(getattr(settings, "breakeven_enabled", False)) and not bool(getattr(plan, "breakeven_armed", False)):
+                    trigger = float(getattr(settings, "breakeven_trigger_pct", 0.0) or 0.0)
+                    offset = float(getattr(settings, "breakeven_offset_pct", 0.0) or 0.0)
+                    if trigger > 0 and entry_px > 0 and px > 0:
+                        if px >= (entry_px * (1.0 + trigger)):
+                            be_stop = entry_px * (1.0 + offset)
+                            # Never loosen the stop; only tighten it upward.
+                            if be_stop > float(getattr(plan, "stop_price", 0.0) or 0.0):
+                                plan.stop_price = float(be_stop)
+                            plan.breakeven_armed = True
+                            plan.breakeven_triggered_ts = now.timestamp()
+                            _log_event(
+                                "info",
+                                {
+                                    "ts": datetime.now(timezone.utc).isoformat(),
+                                    "kind": "plan_update",
+                                    "status": "breakeven_set",
+                                    "symbol": symbol,
+                                    "strategy": plan.strategy,
+                                    "entry_price": float(entry_px),
+                                    "price": float(px),
+                                    "stop_price": float(plan.stop_price),
+                                    "trigger_pct": float(trigger),
+                                    "offset_pct": float(offset),
+                                },
+                            )
+            except Exception:
+                # Break-even should never crash the exit loop.
+                pass
+
             reason = None
 
             if did_flatten:

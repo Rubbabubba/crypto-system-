@@ -17,6 +17,8 @@ class TradePlan:
     opened_ts: float
 
 
+    breakeven_armed: bool = False
+    breakeven_triggered_ts: float = 0.0
 class InMemoryState:
     """Best-effort in-memory state.
 
