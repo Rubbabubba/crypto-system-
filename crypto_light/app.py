@@ -768,7 +768,7 @@ def _execute_long_entry(
         "ts": datetime.now(timezone.utc).isoformat(),
         "req_id": req_id,
         "kind": source,
-        "status": "executed",
+        "status": "dry_run" if dry_run else "executed",
         "action": "buy",
         "symbol": symbol,
         "strategy": strategy,
@@ -1055,6 +1055,7 @@ def worker_exit(payload: WorkerExitPayload):
             state.last_flatten_utc_date = utc_date
 
         exits: list[dict] = []
+        evaluations: list[dict] = []
         bal = _balances_by_asset()
 
         # --- Deterministic lifecycle cycle ---
@@ -1074,6 +1075,8 @@ def worker_exit(payload: WorkerExitPayload):
         max_hold = int(getattr(settings, "max_hold_sec", 0) or 0)
         grace = int(getattr(settings, "time_exit_grace_sec", 0) or 0)
         cooldown = int(getattr(settings, "exit_cooldown_sec", 0) or 0)
+        dry_run = bool(getattr(settings, "exit_dry_run", False))
+        diagnostics = bool(getattr(settings, "exit_diagnostics", False))
 
         def _ensure_plan(symbol: str, *, qty: float, px: float) -> TradePlan | None:
             """Return an existing plan, or adopt a holding into a plan if eligible.
@@ -1147,17 +1150,23 @@ def worker_exit(payload: WorkerExitPayload):
                 },
             )
 
-        def _choose_exit_reason(*, px: float, plan: TradePlan, age_sec: float) -> str | None:
-            """Select a single exit action for this cycle (or None)."""
-            if did_flatten:
-                return "daily_flatten"
-            if px <= float(plan.stop_price):
-                return "stop"
-            if px >= float(plan.take_price):
-                return "take"
-            if max_hold > 0 and age_sec >= float(max_hold + grace):
-                return "time"
-            return None
+        def _choose_exit_reason(*, px: float, plan: TradePlan, age_sec: float) -> tuple[str | None, dict]:
+            """Select a single exit action for this cycle (or None), plus a decision trace."""
+            eligible = {
+                "eligible_daily_flatten": bool(did_flatten),
+                "eligible_stop": px <= float(plan.stop_price),
+                "eligible_take": px >= float(plan.take_price),
+                "eligible_time": (max_hold > 0 and age_sec >= float(max_hold + grace)),
+            }
+            if eligible["eligible_daily_flatten"]:
+                return "daily_flatten", eligible
+            if eligible["eligible_stop"]:
+                return "stop", eligible
+            if eligible["eligible_take"]:
+                return "take", eligible
+            if eligible["eligible_time"]:
+                return "time", eligible
+            return None, eligible
 
         for symbol in symbols:
             # Phase 1: snapshot current holding
@@ -1187,30 +1196,55 @@ def worker_exit(payload: WorkerExitPayload):
             age_sec = (now.timestamp() - opened_ts) if opened_ts > 0 else 0.0
 
             # Phase 4: lifecycle updates (state mutation only)
+            be_before = bool(getattr(plan, "breakeven_armed", False))
             try:
                 _maybe_apply_breakeven(plan, px=px, entry_px=entry_px)
             except Exception:
                 # Lifecycle updates should never crash the exit loop.
                 pass
+            be_after = bool(getattr(plan, "breakeven_armed", False))
 
             # Phase 5: decide action (at most one)
-            reason = _choose_exit_reason(px=px, plan=plan, age_sec=age_sec)
+            reason, trace = _choose_exit_reason(px=px, plan=plan, age_sec=age_sec)
+            # Optional diagnostics per symbol
+            if diagnostics:
+                evaluations.append({
+                    "symbol": symbol,
+                    "strategy": plan.strategy,
+                    "price": float(px),
+                    "qty": float(qty),
+                    "entry_price": float(entry_px),
+                    "stop_price": float(plan.stop_price),
+                    "take_price": float(plan.take_price),
+                    "age_sec": round(age_sec, 3),
+                    "max_hold_sec": int(getattr(settings, "max_hold_sec", 0) or 0),
+                    "breakeven_before": bool(be_before),
+                    "breakeven_after": bool(be_after),
+                    "breakeven_set": bool((not be_before) and be_after),
+                    "decision": reason,
+                    **trace,
+                    "can_exit": bool(state.can_exit(symbol, cooldown)),
+                    "dry_run": bool(dry_run),
+                })
             if not reason:
                 continue
-            if not state.can_exit(symbol, cooldown):
+            can_exit_now = state.can_exit(symbol, cooldown)
+            if not can_exit_now:
                 continue
 
             # Phase 6: execute
             notional_exit = max(float(settings.exit_min_notional_usd), float(plan.notional_usd))
-            res = _market_notional(symbol=symbol, side="sell", notional=notional_exit, strategy=plan.strategy, price=px)
-
-            state.mark_exit(symbol)
-            state.set_pending_exit(symbol, reason=reason, txid=None)
+            if dry_run:
+                res = {"ok": True, "dry_run": True, "side": "sell", "symbol": symbol, "notional": notional_exit}
+            else:
+                res = _market_notional(symbol=symbol, side="sell", notional=notional_exit, strategy=plan.strategy, price=px)
+                state.mark_exit(symbol)
+                state.set_pending_exit(symbol, reason=reason, txid=None)
 
             evt = {
                 "ts": datetime.now(timezone.utc).isoformat(),
                 "kind": "exit",
-                "status": "executed",
+                "status": "dry_run" if dry_run else "executed",
                 "symbol": symbol,
                 "strategy": plan.strategy,
                 "reason": reason,
@@ -1220,9 +1254,12 @@ def worker_exit(payload: WorkerExitPayload):
                 "max_hold_sec": int(getattr(settings, "max_hold_sec", 0) or 0),
             }
             _log_event("info", evt)
-            exits.append({"symbol": symbol, "reason": reason, "price": px, "age_sec": round(age_sec, 3), "result": res})
+            exits.append({"symbol": symbol, "reason": reason, "price": px, "age_sec": round(age_sec, 3), "dry_run": bool(dry_run), "result": res})
 
-        return {"ok": True, "utc": now.isoformat(), "did_flatten": did_flatten, "exits": exits}
+        resp = {"ok": True, "utc": now.isoformat(), "did_flatten": did_flatten, "exits": exits}
+        if diagnostics:
+            resp["evaluations"] = evaluations
+        return resp
 
     except HTTPException:
         raise
