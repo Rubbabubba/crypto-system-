@@ -1054,122 +1054,153 @@ def worker_exit(payload: WorkerExitPayload):
             did_flatten = True
             state.last_flatten_utc_date = utc_date
 
-        exits = []
+        exits: list[dict] = []
         bal = _balances_by_asset()
 
-        # Iterate over balances-derived holdings / adopted plans (not allowed_symbols)
-
-        pos_syms = {p.get('symbol') for p in get_positions() if p.get('symbol')}
-        plan_syms = set(state.plans.keys()) if hasattr(state, 'plans') else set()
+        # --- Deterministic lifecycle cycle ---
+        # Universe = balances-derived holdings + state.open_positions + any planned symbols.
+        # We evaluate each symbol once per cycle and take at most one action.
+        pos_syms = {p.get("symbol") for p in get_positions() if p.get("symbol")}
+        plan_syms = set(getattr(state, "plans", {}).keys()) if hasattr(state, "plans") else set()
         state_open = set(getattr(state, "open_positions", []) or [])
-        # Iterate over balances-derived holdings + state.open_positions + any planned symbols.
         symbols = sorted({sym for sym in (pos_syms | plan_syms | state_open) if sym})
 
-        for symbol in symbols:
+        # Config knobs
+        dust_floor = float(getattr(settings, "min_position_notional_usd", 0.0) or 0.0)
+        adopt_floor = max(
+            float(getattr(settings, "min_position_notional_usd", 0.0) or 0.0),
+            float(getattr(settings, "exit_min_notional_usd", 0.0) or 0.0),
+        )
+        max_hold = int(getattr(settings, "max_hold_sec", 0) or 0)
+        grace = int(getattr(settings, "time_exit_grace_sec", 0) or 0)
+        cooldown = int(getattr(settings, "exit_cooldown_sec", 0) or 0)
 
-            px = float(_last_price(symbol) or 0.0)
+        def _ensure_plan(symbol: str, *, qty: float, px: float) -> TradePlan | None:
+            """Return an existing plan, or adopt a holding into a plan if eligible.
+
+            Adoption is intentionally conservative:
+            - Never create plans for dust holdings.
+            - Never create plans below adopt_floor.
+            - Adopted plans start their clock at adoption time to avoid breaking live legacy balances.
+            """
+            plan0 = state.plans.get(symbol)
+            if plan0:
+                return plan0
+            pos_notional = float(qty) * float(px)
+            if dust_floor and pos_notional < dust_floor:
+                # Dust holdings: do not track or exit.
+                state.plans.pop(symbol, None)
+                state.clear_pending_exit(symbol)
+                return None
+            if pos_notional < adopt_floor:
+                return None
+
+            entry_px = float(px) if px > 0 else float(_last_price(symbol) or 0.0)
+            if entry_px <= 0:
+                return None
+            stop_px, take_px = compute_brackets(entry_px, settings.stop_pct, settings.take_pct)
+            plan_new = TradePlan(
+                symbol=symbol,
+                side="buy",
+                notional_usd=float(settings.default_notional_usd),
+                entry_price=float(entry_px),
+                stop_price=float(stop_px),
+                take_price=float(take_px),
+                strategy="unknown",
+                opened_ts=now.timestamp(),
+            )
+            state.plans[symbol] = plan_new
+            return plan_new
+
+        def _maybe_apply_breakeven(plan: TradePlan, *, px: float, entry_px: float) -> None:
+            """Move stop to break-even once, if enabled and trigger reached."""
+            if not bool(getattr(settings, "breakeven_enabled", False)):
+                return
+            if bool(getattr(plan, "breakeven_armed", False)):
+                return
+            trigger = float(getattr(settings, "breakeven_trigger_pct", 0.0) or 0.0)
+            offset = float(getattr(settings, "breakeven_offset_pct", 0.0) or 0.0)
+            if trigger <= 0 or entry_px <= 0 or px <= 0:
+                return
+            if px < (entry_px * (1.0 + trigger)):
+                return
+
+            be_stop = entry_px * (1.0 + offset)
+            # Never loosen the stop; only tighten it upward.
+            if be_stop > float(getattr(plan, "stop_price", 0.0) or 0.0):
+                plan.stop_price = float(be_stop)
+            plan.breakeven_armed = True
+            plan.breakeven_triggered_ts = now.timestamp()
+            _log_event(
+                "info",
+                {
+                    "ts": datetime.now(timezone.utc).isoformat(),
+                    "kind": "plan_update",
+                    "status": "breakeven_set",
+                    "symbol": plan.symbol,
+                    "strategy": plan.strategy,
+                    "entry_price": float(entry_px),
+                    "price": float(px),
+                    "stop_price": float(plan.stop_price),
+                    "trigger_pct": float(trigger),
+                    "offset_pct": float(offset),
+                },
+            )
+
+        def _choose_exit_reason(*, px: float, plan: TradePlan, age_sec: float) -> str | None:
+            """Select a single exit action for this cycle (or None)."""
+            if did_flatten:
+                return "daily_flatten"
+            if px <= float(plan.stop_price):
+                return "stop"
+            if px >= float(plan.take_price):
+                return "take"
+            if max_hold > 0 and age_sec >= float(max_hold + grace):
+                return "time"
+            return None
+
+        for symbol in symbols:
+            # Phase 1: snapshot current holding
+            try:
+                px = float(_last_price(symbol) or 0.0)
+            except Exception:
+                px = 0.0
+            if px <= 0:
+                continue
+
             base = _base_asset(symbol)
             qty = float(bal.get(base, 0.0) or 0.0)
             if qty <= 0:
+                # No holding: clear stale state.
                 state.plans.pop(symbol, None)
                 state.clear_pending_exit(symbol)
                 continue
 
-            plan = state.plans.get(symbol)
-            entry_px = float(plan.entry_price) if plan else (px if px > 0 else float(_last_price(symbol)))
-            stop_px, take_px = compute_brackets(entry_px, settings.stop_pct, settings.take_pct)
-
-
-
+            # Phase 2: plan resolution / conservative adoption
+            plan = _ensure_plan(symbol, qty=qty, px=px)
             if not plan:
-                # If we don't have a plan for an existing holding, we *can* adopt it
-                # so exits can run — but avoid creating plans for dust positions.
-                pos_notional = qty * px
-                # Treat tiny balances as dust: don't plan exits and don't block re-entries.
-                dust_floor = float(getattr(settings, "min_position_notional_usd", 0.0) or 0.0)
-                if dust_floor and pos_notional < dust_floor:
-                    # Clear any stale plan/exit intent for dust holdings.
-                    if hasattr(state, "plans"):
-                        state.plans.pop(symbol, None)
-                    if hasattr(state, "clear_pending_exit"):
-                        state.clear_pending_exit(symbol)
-                    continue
-                adopt_floor = max(float(getattr(settings, "min_position_notional_usd", 0.0) or 0.0),
-                                  float(getattr(settings, "exit_min_notional_usd", 0.0) or 0.0))
-                if pos_notional < adopt_floor:
-                    continue
-                plan = TradePlan(
-                    symbol=symbol,
-                    side="buy",
-                    notional_usd=float(settings.default_notional_usd),
-                    entry_price=entry_px,
-                    stop_price=stop_px,
-                    take_price=take_px,
-                    strategy="unknown",
-                    opened_ts=now.timestamp(),
-                )
-                state.plans[symbol] = plan
+                continue
 
-            # Age tracking for time-based exits and observability
+            # Phase 3: derived metrics
+            entry_px = float(getattr(plan, "entry_price", 0.0) or 0.0) or float(px)
             opened_ts = float(getattr(plan, "opened_ts", 0.0) or 0.0)
-            age_sec = now.timestamp() - opened_ts if opened_ts > 0 else 0.0
+            age_sec = (now.timestamp() - opened_ts) if opened_ts > 0 else 0.0
 
-
-
-            # Break-even stop logic (optional). Disabled unless BREAKEVEN_ENABLED=1.
+            # Phase 4: lifecycle updates (state mutation only)
             try:
-                if bool(getattr(settings, "breakeven_enabled", False)) and not bool(getattr(plan, "breakeven_armed", False)):
-                    trigger = float(getattr(settings, "breakeven_trigger_pct", 0.0) or 0.0)
-                    offset = float(getattr(settings, "breakeven_offset_pct", 0.0) or 0.0)
-                    if trigger > 0 and entry_px > 0 and px > 0:
-                        if px >= (entry_px * (1.0 + trigger)):
-                            be_stop = entry_px * (1.0 + offset)
-                            # Never loosen the stop; only tighten it upward.
-                            if be_stop > float(getattr(plan, "stop_price", 0.0) or 0.0):
-                                plan.stop_price = float(be_stop)
-                            plan.breakeven_armed = True
-                            plan.breakeven_triggered_ts = now.timestamp()
-                            _log_event(
-                                "info",
-                                {
-                                    "ts": datetime.now(timezone.utc).isoformat(),
-                                    "kind": "plan_update",
-                                    "status": "breakeven_set",
-                                    "symbol": symbol,
-                                    "strategy": plan.strategy,
-                                    "entry_price": float(entry_px),
-                                    "price": float(px),
-                                    "stop_price": float(plan.stop_price),
-                                    "trigger_pct": float(trigger),
-                                    "offset_pct": float(offset),
-                                },
-                            )
+                _maybe_apply_breakeven(plan, px=px, entry_px=entry_px)
             except Exception:
-                # Break-even should never crash the exit loop.
+                # Lifecycle updates should never crash the exit loop.
                 pass
 
-            reason = None
-
-            if did_flatten:
-                reason = "daily_flatten"
-            elif px <= float(plan.stop_price):
-                reason = "stop"
-            elif px >= float(plan.take_price):
-                reason = "take"
-            else:
-                # Time-based exit (capital rotation). Disabled when max_hold_sec <= 0.
-                max_hold = int(getattr(settings, "max_hold_sec", 0) or 0)
-                if max_hold > 0:
-                    grace = int(getattr(settings, "time_exit_grace_sec", 0) or 0)
-                    if age_sec >= float(max_hold + grace):
-                        reason = "time"
-
+            # Phase 5: decide action (at most one)
+            reason = _choose_exit_reason(px=px, plan=plan, age_sec=age_sec)
             if not reason:
                 continue
-
-            if not state.can_exit(symbol, int(settings.exit_cooldown_sec)):
+            if not state.can_exit(symbol, cooldown):
                 continue
 
+            # Phase 6: execute
             notional_exit = max(float(settings.exit_min_notional_usd), float(plan.notional_usd))
             res = _market_notional(symbol=symbol, side="sell", notional=notional_exit, strategy=plan.strategy, price=px)
 
