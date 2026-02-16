@@ -36,6 +36,12 @@ class Settings:
     min_order_notional_usd: float
     exit_min_notional_usd: float
 
+    # Sizing
+    sizing_mode: str  # 'fixed' or 'risk_pct_equity'
+    risk_per_trade: float
+    max_notional_usd: float  # 0 disables
+
+
     # Position detection / dust
     min_position_notional_usd: float
 
@@ -90,6 +96,11 @@ def load_settings() -> Settings:
         default_notional_usd=float(_getenv("DEFAULT_NOTIONAL_USD", _getenv("DEFAULT_NOTIONAL", "50")) or 50),
         min_order_notional_usd=float(_getenv("MIN_ORDER_NOTIONAL_USD", "5") or 5),
         exit_min_notional_usd=float(_getenv("EXIT_MIN_NOTIONAL_USD", "6") or 6),
+        # Sizing
+        sizing_mode=_getenv("SIZING_MODE", "fixed").strip().lower() or "fixed",
+        risk_per_trade=float(_getenv("RISK_PER_TRADE", "0.03") or 0.03),
+        max_notional_usd=float(_getenv("MAX_NOTIONAL_USD", "0") or 0),
+
 
         # Position detection / dust
         min_position_notional_usd=float(_getenv("MIN_POSITION_NOTIONAL_USD", "10") or 10),

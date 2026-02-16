@@ -19,6 +19,7 @@ from .broker import base_asset as _base_asset
 from .broker import last_price as _last_price
 from .broker import market_notional as _market_notional
 from .broker import get_bars as _get_bars
+from .sizing import compute_risk_pct_equity_notional
 from .config import load_settings
 from .models import WebhookPayload, WorkerExitPayload, WorkerScanPayload, WorkerExitDiagnosticsPayload, WorkerAdoptPositionsPayload
 from .risk import compute_brackets
@@ -693,9 +694,66 @@ def _execute_long_entry(
     if has_pos:
         return ignored("position_already_open", symbol=symbol, position_notional_usd=pos_notional, strategy=strategy)
 
-    _notional = float(notional or settings.default_notional_usd)
+
+    # Exposure caps (0 disables). We may need current exposure for sizing.
+    max_total = float(getattr(settings, "max_total_exposure_usd", 0.0) or 0.0)
+    max_symbol = float(getattr(settings, "max_symbol_exposure_usd", 0.0) or 0.0)
+
+    positions: list[dict] = []
+    total_exposure = 0.0
+    sym_exposure = 0.0
+
+    sizing_mode = str(getattr(settings, "sizing_mode", "fixed") or "fixed").strip().lower()
+
+    if max_total or max_symbol or (notional is None and sizing_mode == "risk_pct_equity"):
+        positions = get_positions()
+        total_exposure = sum(float(p.get("notional_usd", 0.0) or 0.0) for p in positions)
+        sym_exposure = sum(float(p.get("notional_usd", 0.0) or 0.0) for p in positions if p.get("symbol") == symbol)
+
+    # Determine entry notional (fixed by default; risk sizing is opt-in).
+    sizing_meta: dict | None = None
+    if notional is not None:
+        _notional = float(notional)
+    elif sizing_mode == "risk_pct_equity":
+        bals = _balances_by_asset()
+        usd_cash = float(bals.get("USD", 0.0) or 0.0)
+        res = compute_risk_pct_equity_notional(
+            equity_usd=usd_cash,
+            risk_per_trade=float(getattr(settings, "risk_per_trade", 0.03) or 0.03),
+            stop_pct=float(settings.stop_pct),
+            min_order_notional_usd=float(settings.min_order_notional_usd),
+            available_cash_usd=usd_cash,
+            max_total_exposure_usd=max_total,
+            current_total_exposure_usd=total_exposure,
+            max_symbol_exposure_usd=max_symbol,
+            current_symbol_exposure_usd=sym_exposure,
+            max_notional_usd=float(getattr(settings, "max_notional_usd", 0.0) or 0.0),
+        )
+        sizing_meta = res.to_dict()
+        if not res.ok:
+            return ignored(res.reason, symbol=symbol, strategy=strategy, **(sizing_meta or {}))
+        _notional = float(res.notional_usd)
+    else:
+        _notional = float(settings.default_notional_usd)
+
     if _notional < float(settings.min_order_notional_usd):
-        return ignored("notional_below_minimum", symbol=symbol, notional_usd=_notional, min_notional_usd=float(settings.min_order_notional_usd))
+        return ignored(
+            "notional_below_minimum",
+            symbol=symbol,
+            strategy=strategy,
+            notional_usd=_notional,
+            min_notional_usd=float(settings.min_order_notional_usd),
+            **(sizing_meta or {}),
+        )
+
+    # Enforce exposure caps (0 disables)
+    if max_total or max_symbol:
+        if max_total and (total_exposure + _notional) > max_total:
+            log.info("Skip entry %s: total exposure cap (%.2f + %.2f > %.2f)", symbol, total_exposure, _notional, max_total)
+            return {"ok": True, "skipped": True, "reason": "max_total_exposure_usd", **(sizing_meta or {})}
+        if max_symbol and (sym_exposure + _notional) > max_symbol:
+            log.info("Skip entry %s: symbol exposure cap (%.2f + %.2f > %.2f)", symbol, sym_exposure, _notional, max_symbol)
+            return {"ok": True, "skipped": True, "reason": "max_symbol_exposure_usd", **(sizing_meta or {})}
 
     # Determine reference price for fills/brackets.
     # IMPORTANT: `px` is used later for sizing and bracket calc.
@@ -705,34 +763,7 @@ def _execute_long_entry(
     if stop_price is None or take_price is None:
         stop_price, take_price = compute_brackets(px, settings.stop_pct, settings.take_pct)
 
-    # Exposure caps (0 disables)
-    max_total = float(getattr(settings, "max_total_exposure_usd", 0.0) or 0.0)
-    max_symbol = float(getattr(settings, "max_symbol_exposure_usd", 0.0) or 0.0)
-    if max_total or max_symbol:
-        positions = get_positions()
-        total_exposure = sum(float(p.get("notional_usd", 0.0) or 0.0) for p in positions)
-        sym_exposure = sum(float(p.get("notional_usd", 0.0) or 0.0) for p in positions if p.get("symbol") == symbol)
-        if max_total and (total_exposure + _notional) > max_total:
-            log.info("Skip entry %s: total exposure cap (%.2f + %.2f > %.2f)", symbol, total_exposure, _notional, max_total)
-            return {"ok": True, "skipped": True, "reason": "max_total_exposure_usd"}
-        if max_symbol and (sym_exposure + _notional) > max_symbol:
-            log.info("Skip entry %s: symbol exposure cap (%.2f + %.2f > %.2f)", symbol, sym_exposure, _notional, max_symbol)
-            return {"ok": True, "skipped": True, "reason": "max_symbol_exposure_usd"}
-    # Exposure caps (0 disables)
-    max_total = float(getattr(settings, "max_total_exposure_usd", 0.0) or 0.0)
-    max_symbol = float(getattr(settings, "max_symbol_exposure_usd", 0.0) or 0.0)
-    if max_total or max_symbol:
-        positions = get_positions()
-        total_exposure = sum(float(p.get("notional_usd", 0.0) or 0.0) for p in positions)
-        sym_exposure = sum(float(p.get("notional_usd", 0.0) or 0.0) for p in positions if p.get("symbol") == symbol)
-        if max_total and (total_exposure + _notional) > max_total:
-            log.info("Skip entry %s: total exposure cap (%.2f + %.2f > %.2f)", symbol, total_exposure, _notional, max_total)
-            return {"ok": True, "skipped": True, "reason": "max_total_exposure_usd"}
-        if max_symbol and (sym_exposure + _notional) > max_symbol:
-            log.info("Skip entry %s: symbol exposure cap (%.2f + %.2f > %.2f)", symbol, sym_exposure, _notional, max_symbol)
-            return {"ok": True, "skipped": True, "reason": "max_symbol_exposure_usd"}
     res = _market_notional(symbol=symbol, side="buy", notional=_notional, strategy=strategy, price=px)
-
     evt = {
         "ts": datetime.now(timezone.utc).isoformat(),
         "req_id": req_id,
