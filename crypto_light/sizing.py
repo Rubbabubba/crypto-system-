@@ -26,6 +26,83 @@ class SizingResult:
         }
 
 
+
+def compute_equity_fraction_notional(
+    *,
+    equity_usd: float,
+    fraction: float,
+    min_order_notional_usd: float,
+    available_cash_usd: float,
+    max_total_exposure_usd: float = 0.0,
+    current_total_exposure_usd: float = 0.0,
+    max_symbol_exposure_usd: float = 0.0,
+    current_symbol_exposure_usd: float = 0.0,
+    max_notional_usd: float = 0.0,
+) -> SizingResult:
+    """Size position as a fraction of total account equity (spot-friendly).
+
+    equity_usd should represent total account value (cash + open positions).
+    """
+    try:
+        equity = float(equity_usd or 0.0)
+        frac = float(fraction or 0.0)
+    except Exception:
+        return SizingResult(ok=False, reason="bad_inputs")
+
+    if equity <= 0.0:
+        return SizingResult(ok=False, equity_usd=equity, reason="no_equity")
+    if frac <= 0.0:
+        return SizingResult(ok=False, equity_usd=equity, reason="fraction_disabled")
+
+    target = equity * frac
+    notional = target
+    capped_by = ""
+
+    # Optional hard cap.
+    if max_notional_usd and max_notional_usd > 0 and notional > max_notional_usd:
+        notional = float(max_notional_usd)
+        capped_by = "max_notional"
+
+    # Cap by remaining total exposure.
+    if max_total_exposure_usd and max_total_exposure_usd > 0:
+        remaining = float(max_total_exposure_usd) - float(current_total_exposure_usd or 0.0)
+        if remaining <= 0:
+            return SizingResult(ok=False, equity_usd=equity, target_notional_usd=target, reason="total_exposure_cap")
+        if notional > remaining:
+            notional = remaining
+            capped_by = capped_by or "total_exposure_cap"
+
+    # Cap by remaining symbol exposure.
+    if max_symbol_exposure_usd and max_symbol_exposure_usd > 0:
+        remaining_sym = float(max_symbol_exposure_usd) - float(current_symbol_exposure_usd or 0.0)
+        if remaining_sym <= 0:
+            return SizingResult(ok=False, equity_usd=equity, target_notional_usd=target, reason="symbol_exposure_cap")
+        if notional > remaining_sym:
+            notional = remaining_sym
+            capped_by = capped_by or "symbol_exposure_cap"
+
+    # Cap by available cash (spot).
+    cash = float(available_cash_usd or 0.0)
+    if cash <= 0.0:
+        return SizingResult(ok=False, equity_usd=equity, target_notional_usd=target, reason="no_cash")
+    if notional > cash:
+        notional = cash
+        capped_by = capped_by or "cash_cap"
+
+    # Minimum notional guard.
+    if notional < float(min_order_notional_usd or 0.0):
+        return SizingResult(ok=False, equity_usd=equity, target_notional_usd=target, notional_usd=notional, reason="below_min_notional")
+
+    return SizingResult(
+        ok=True,
+        notional_usd=float(notional),
+        equity_usd=float(equity),
+        risk_usd=0.0,
+        target_notional_usd=float(target),
+        capped_by=capped_by,
+        reason="",
+    )
+
 def compute_risk_pct_equity_notional(
     *,
     equity_usd: float,

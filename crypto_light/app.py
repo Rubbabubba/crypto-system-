@@ -19,7 +19,7 @@ from .broker import base_asset as _base_asset
 from .broker import last_price as _last_price
 from .broker import market_notional as _market_notional
 from .broker import get_bars as _get_bars
-from .sizing import compute_risk_pct_equity_notional
+from .sizing import compute_risk_pct_equity_notional, compute_equity_fraction_notional
 from .config import load_settings
 from .models import WebhookPayload, WorkerExitPayload, WorkerScanPayload, WorkerExitDiagnosticsPayload, WorkerAdoptPositionsPayload
 from .risk import compute_brackets
@@ -705,7 +705,7 @@ def _execute_long_entry(
 
     sizing_mode = str(getattr(settings, "sizing_mode", "fixed") or "fixed").strip().lower()
 
-    if max_total or max_symbol or (notional is None and sizing_mode == "risk_pct_equity"):
+    if max_total or max_symbol or (notional is None and sizing_mode in ("risk_pct_equity", "equity_fraction")):
         positions = get_positions()
         total_exposure = sum(float(p.get("notional_usd", 0.0) or 0.0) for p in positions)
         sym_exposure = sum(float(p.get("notional_usd", 0.0) or 0.0) for p in positions if p.get("symbol") == symbol)
@@ -714,11 +714,33 @@ def _execute_long_entry(
     sizing_meta: dict | None = None
     if notional is not None:
         _notional = float(notional)
+    elif sizing_mode == "equity_fraction":
+        bals = _balances_by_asset()
+        usd_cash = float(bals.get("USD", 0.0) or 0.0)
+        # Total account value proxy (cash + value of open positions). For spot, this is a safe
+        # and stable basis for "use X% of account value per trade".
+        equity_total = float(usd_cash) + float(total_exposure or 0.0)
+        res = compute_equity_fraction_notional(
+            equity_usd=equity_total,
+            fraction=float(getattr(settings, "equity_fraction_per_trade", 0.05) or 0.05),
+            min_order_notional_usd=float(settings.min_order_notional_usd),
+            available_cash_usd=usd_cash,
+            max_total_exposure_usd=max_total,
+            current_total_exposure_usd=total_exposure,
+            max_symbol_exposure_usd=max_symbol,
+            current_symbol_exposure_usd=sym_exposure,
+            max_notional_usd=float(getattr(settings, "max_notional_usd", 0.0) or 0.0),
+        )
+        sizing_meta = res.to_dict()
+        if not res.ok:
+            return ignored(res.reason, symbol=symbol, strategy=strategy, **(sizing_meta or {}))
+        _notional = float(res.notional_usd)
     elif sizing_mode == "risk_pct_equity":
         bals = _balances_by_asset()
         usd_cash = float(bals.get("USD", 0.0) or 0.0)
+        equity_total = float(usd_cash) + float(total_exposure or 0.0)
         res = compute_risk_pct_equity_notional(
-            equity_usd=usd_cash,
+            equity_usd=equity_total,
             risk_per_trade=float(getattr(settings, "risk_per_trade", 0.03) or 0.03),
             stop_pct=float(settings.stop_pct),
             min_order_notional_usd=float(settings.min_order_notional_usd),
@@ -733,6 +755,7 @@ def _execute_long_entry(
         if not res.ok:
             return ignored(res.reason, symbol=symbol, strategy=strategy, **(sizing_meta or {}))
         _notional = float(res.notional_usd)
+
     else:
         _notional = float(settings.default_notional_usd)
 
