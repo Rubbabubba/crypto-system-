@@ -1177,7 +1177,7 @@ def worker_exit(payload: WorkerExitPayload):
             """Select a single exit action for this cycle (or None), plus a decision trace."""
             eligible = {
                 "eligible_daily_flatten": bool(did_flatten),
-                "eligible_stop": px <= float(plan.stop_price),
+                "eligible_stop": (px <= float(plan.stop_price)) and (age_sec >= float(getattr(settings, "min_hold_sec_before_stop", 0) or 0)),
                 "eligible_take": px >= float(plan.take_price),
                 "eligible_time": (max_hold > 0 and age_sec >= float(max_hold + grace)),
             }
@@ -1261,8 +1261,21 @@ def worker_exit(payload: WorkerExitPayload):
                 res = {"ok": True, "dry_run": True, "side": "sell", "symbol": symbol, "notional": notional_exit}
             else:
                 res = _market_notional(symbol=symbol, side="sell", notional=notional_exit, strategy=plan.strategy, price=px)
-                state.mark_exit(symbol)
-                state.set_pending_exit(symbol, reason=reason, txid=None)
+                if bool(res.get("ok")):
+                    state.mark_exit(symbol)
+                    state.set_pending_exit(symbol, reason=reason, txid=res.get("txid"))
+                else:
+                    # Do not latch exit cooldowns or pending state if the order failed.
+                    state.clear_pending_exit(symbol)
+                # Stopout cooldown latch: only on successful orders (anti-churn)
+                try:
+                    if bool(res.get("ok")):
+                        if reason == "stop" and hasattr(state, "mark_stopout"):
+                            state.mark_stopout(symbol)
+                        elif reason == "take" and hasattr(state, "clear_stopout"):
+                            state.clear_stopout(symbol)
+                except Exception:
+                    pass
 
             evt = {
                 "ts": datetime.now(timezone.utc).isoformat(),
@@ -1393,10 +1406,24 @@ def _count_open_positions(open_set: set[str]) -> int:
     except Exception:
         pass
 
-    # Cooldown
+    # Cooldown (per-symbol)
     try:
         if not state.can_enter(symbol, getattr(settings, "entry_cooldown_sec", 0)):
             return False, "cooldown_active", {"cooldown_sec": getattr(settings, "entry_cooldown_sec", 0)}
+    except Exception:
+        pass
+
+    # Cooldown (global)
+    try:
+        if hasattr(state, "can_enter_global") and not state.can_enter_global(getattr(settings, "global_entry_cooldown_sec", 0)):
+            return False, "global_cooldown_active", {"global_cooldown_sec": getattr(settings, "global_entry_cooldown_sec", 0)}
+    except Exception:
+        pass
+
+    # Stopout cooldown (per-symbol)
+    try:
+        if hasattr(state, "can_enter_after_stopout") and not state.can_enter_after_stopout(symbol, getattr(settings, "stopout_cooldown_sec", 0)):
+            return False, "stopout_cooldown_active", {"stopout_cooldown_sec": getattr(settings, "stopout_cooldown_sec", 0)}
     except Exception:
         pass
 
@@ -1406,6 +1433,8 @@ def _count_open_positions(open_set: set[str]) -> int:
         if ok:
             try:
                 state.mark_enter(symbol)
+                if hasattr(state, "mark_enter_global"):
+                    state.mark_enter_global()
                 state.inc_trade(symbol)
                 # global counter (added in state.py patch)
                 if hasattr(state, "inc_trade_total"):

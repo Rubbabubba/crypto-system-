@@ -647,6 +647,55 @@ def _ensure_price(symbol: str) -> float:
         raise RuntimeError(f"no price available for {symbol}")
     return p
 
+
+def _best_bid_ask(pair: str) -> tuple[float | None, float | None]:
+    """Best-effort best bid/ask for a Kraken pair via public Depth."""
+    try:
+        ob = _pub("Depth", {"pair": str(pair), "count": 1}) or {}
+    except Exception:
+        ob = {}
+    if not isinstance(ob, dict) or not ob:
+        return None, None
+    try:
+        book = next(iter(ob.values()))
+    except Exception:
+        return None, None
+    if not isinstance(book, dict):
+        return None, None
+    bid = None
+    ask = None
+    try:
+        bids = book.get("bids") or []
+        if bids and isinstance(bids[0], (list, tuple)) and bids[0]:
+            bid = float(bids[0][0])
+    except Exception:
+        bid = None
+    try:
+        asks = book.get("asks") or []
+        if asks and isinstance(asks[0], (list, tuple)) and asks[0]:
+            ask = float(asks[0][0])
+    except Exception:
+        ask = None
+    return bid, ask
+
+
+def _query_order(txid: str) -> dict:
+    """Query a single Kraken order (best-effort)."""
+    if not txid:
+        return {}
+    try:
+        res = _priv("QueryOrders", {"txid": str(txid)}) or {}
+    except Exception:
+        return {}
+    if not isinstance(res, dict):
+        return {}
+    # res is mapping txid -> order
+    try:
+        return res.get(str(txid)) or next(iter(res.values()))
+    except Exception:
+        return {}
+
+
 def market_notional(
     symbol: str,
     side: str,
@@ -735,41 +784,157 @@ def market_notional(
         else:
             return {"ok": False, "error": f"market_notional failed: below_min_volume:{volume}<{ordermin} (pair={pair})"}
 
-    payload = {
-        "pair": pair,
-        "type": "buy" if side == "buy" else "sell",
-        "ordertype": "market",
-        "volume": _format_volume(volume, lot_decimals),
-        "userref": str(
-            _userref_for_strategy(strategy)
-            if strategy is not None
-            else _userref(ui, side, float(notional))
-        ),
-    }
+    
+    exec_mode = (os.getenv("EXECUTION_MODE", "market") or "market").strip().lower()
+    post_offset = float(os.getenv("POST_ONLY_OFFSET_PCT", "0.0002") or 0.0002)
+    chase_sec = int(float(os.getenv("LIMIT_CHASE_SEC", "10") or 10))
+    chase_steps = int(float(os.getenv("LIMIT_CHASE_STEPS", "1") or 1))
+    market_fallback = (os.getenv("MARKET_FALLBACK", "1").strip().lower() in ("1","true","yes","on"))
 
-    try:
-        res = _priv("AddOrder", payload)
-    except Exception as e:
-        return {"ok": False, "error": f"market_notional failed: {e}"}
+    def _place_market() -> Dict[str, Any]:
+        payload_mkt = {
+            "pair": pair,
+            "type": "buy" if side == "buy" else "sell",
+            "ordertype": "market",
+            "volume": _format_volume(volume, lot_decimals),
+            "userref": str(_userref_for_strategy(strategy) if strategy is not None else _userref(ui, side, float(notional))),
+        }
+        try:
+            res_m = _priv("AddOrder", payload_mkt)
+        except Exception as e:
+            return {"ok": False, "error": f"market_notional failed: {e}"}
 
-    txid = None
-    descr = None
-    try:
-        txid = (res.get("txid") or [None])[0]
-        descr = (res.get("descr") or {}).get("order")
-    except Exception:
-        pass
+        txid_m = None
+        descr_m = None
+        try:
+            txid_m = (res_m.get("txid") or [None])[0]
+            descr_m = (res_m.get("descr") or {}).get("order")
+        except Exception:
+            pass
 
-    _cooldown_latch(strat_tag, pair, side)
-    return {
-        "pair": pair,
-        "side": side,
-        "notional": float(notional),
-        "volume": volume,
-        "txid": txid,
-        "descr": descr,
-        "result": res,
-    }
+        _cooldown_latch(strat_tag, pair, side)
+        return {
+            "ok": True,
+            "filled": True,  # market orders are expected to fill immediately
+            "execution": "market",
+            "pair": pair,
+            "side": side,
+            "notional": float(notional),
+            "volume": float(volume),
+            "txid": txid_m,
+            "descr": descr_m,
+            "result": res_m,
+        }
+
+    def _place_post_only_once(limit_px: float) -> Dict[str, Any]:
+        payload_lim = {
+            "pair": pair,
+            "type": "buy" if side == "buy" else "sell",
+            "ordertype": "limit",
+            "price": _format_price(float(limit_px), pair_decimals),
+            "volume": _format_volume(volume, lot_decimals),
+            "oflags": "post",
+            "userref": str(_userref_for_strategy(strategy) if strategy is not None else _userref(ui, side, float(notional))),
+        }
+        try:
+            res_l = _priv("AddOrder", payload_lim)
+        except Exception as e:
+            return {"ok": False, "error": f"maker_first failed: {e}"}
+
+        txid_l = None
+        descr_l = None
+        try:
+            txid_l = (res_l.get("txid") or [None])[0]
+            descr_l = (res_l.get("descr") or {}).get("order")
+        except Exception:
+            pass
+
+        # Wait for fill
+        start = time.time()
+        filled = False
+        status = None
+        vol_exec = 0.0
+        while txid_l and (time.time() - start) < max(1, chase_sec):
+            od = _query_order(str(txid_l)) or {}
+            status = od.get("status")
+            try:
+                vol_exec = float(od.get("vol_exec") or 0.0)
+            except Exception:
+                vol_exec = 0.0
+            if status == "closed" and vol_exec > 0:
+                filled = True
+                break
+            time.sleep(1.0)
+
+        if filled:
+            _cooldown_latch(strat_tag, pair, side)
+            return {
+                "ok": True,
+                "filled": True,
+                "execution": "post_only_limit",
+                "pair": pair,
+                "side": side,
+                "notional": float(notional),
+                "volume": float(volume),
+                "limit_price": float(limit_px),
+                "txid": txid_l,
+                "descr": descr_l,
+                "status": status,
+                "vol_exec": vol_exec,
+                "result": res_l,
+            }
+
+        # Not filled within chase_sec: cancel the order.
+        try:
+            _priv("CancelOrder", {"txid": str(txid_l)})
+        except Exception:
+            pass
+
+        return {
+            "ok": False,
+            "filled": False,
+            "execution": "post_only_limit",
+            "pair": pair,
+            "side": side,
+            "notional": float(notional),
+            "volume": float(volume),
+            "limit_price": float(limit_px),
+            "txid": txid_l,
+            "descr": descr_l,
+            "status": status,
+            "vol_exec": vol_exec,
+            "error": "maker_not_filled",
+        }
+
+    # Maker-first execution: try post-only limit (optionally chase), then fallback to market.
+    if exec_mode == "maker_first":
+        last_err = None
+        for step in range(max(1, chase_steps)):
+            bid, ask = _best_bid_ask(pair)
+            if side == "buy":
+                ref = bid if (bid and bid > 0) else px
+                limit_px = float(ref) * (1.0 - float(post_offset))
+            else:
+                ref = ask if (ask and ask > 0) else px
+                limit_px = float(ref) * (1.0 + float(post_offset))
+
+            out = _place_post_only_once(limit_px=float(limit_px))
+            if out.get("ok"):
+                return out
+            last_err = out
+
+        if market_fallback:
+            mkt = _place_market()
+            # Preserve context about maker attempts
+            if last_err:
+                mkt["maker_first"] = {"attempt_failed": True, "last_error": last_err}
+            return mkt
+
+        # No fallback: return last maker attempt details
+        return last_err or {"ok": False, "error": "maker_first_failed"}
+
+    # Default: market
+    return _place_market()
 
 
 def limit_notional(

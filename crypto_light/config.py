@@ -43,6 +43,19 @@ class Settings:
     max_notional_usd: float  # 0 disables
 
 
+
+    # Execution (fees)
+    execution_mode: str  # 'market' or 'maker_first'
+    post_only_offset_pct: float
+    limit_chase_sec: int
+    limit_chase_steps: int
+    market_fallback: bool
+
+    # Anti-churn
+    global_entry_cooldown_sec: int
+    stopout_cooldown_sec: int
+    min_hold_sec_before_stop: int
+
     # Position detection / dust
     min_position_notional_usd: float
 
@@ -112,6 +125,19 @@ def load_settings() -> Settings:
         equity_fraction_per_trade=float(_getenv("EQUITY_FRACTION_PER_TRADE", "0.05") or 0.05),
         max_notional_usd=float(_getenv("MAX_NOTIONAL_USD", "0") or 0),
 
+
+
+        # Execution (fees)
+        execution_mode=_getenv("EXECUTION_MODE", "market").strip().lower() or "market",
+        post_only_offset_pct=float(_getenv("POST_ONLY_OFFSET_PCT", "0.0002") or 0.0002),
+        limit_chase_sec=int(float(_getenv("LIMIT_CHASE_SEC", "10") or 10)),
+        limit_chase_steps=int(float(_getenv("LIMIT_CHASE_STEPS", "1") or 1)),
+        market_fallback=_getbool("MARKET_FALLBACK", "1"),
+
+        # Anti-churn
+        global_entry_cooldown_sec=int(float(_getenv("GLOBAL_ENTRY_COOLDOWN_SEC", "0") or 0)),
+        stopout_cooldown_sec=int(float(_getenv("STOPOUT_COOLDOWN_SEC", "0") or 0)),
+        min_hold_sec_before_stop=int(float(_getenv("MIN_HOLD_SEC_BEFORE_STOP", "0") or 0)),
 
         # Position detection / dust
         min_position_notional_usd=float(_getenv("MIN_POSITION_NOTIONAL_USD", "10") or 10),
