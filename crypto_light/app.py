@@ -732,6 +732,8 @@ def _execute_long_entry(
             max_notional_usd=float(getattr(settings, "max_notional_usd", 0.0) or 0.0),
         )
         sizing_meta = res.to_dict()
+        # Avoid passing duplicate keys into ignored(); sizing meta may include its own 'reason'.
+        sizing_meta.pop("reason", None)
         if not res.ok:
             return ignored(res.reason, symbol=symbol, strategy=strategy, **(sizing_meta or {}))
         _notional = float(res.notional_usd)
@@ -752,6 +754,8 @@ def _execute_long_entry(
             max_notional_usd=float(getattr(settings, "max_notional_usd", 0.0) or 0.0),
         )
         sizing_meta = res.to_dict()
+        # Avoid passing duplicate keys into ignored(); sizing meta may include its own 'reason'.
+        sizing_meta.pop("reason", None)
         if not res.ok:
             return ignored(res.reason, symbol=symbol, strategy=strategy, **(sizing_meta or {}))
         _notional = float(res.notional_usd)
