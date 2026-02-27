@@ -395,13 +395,19 @@ def _signal_mm1(symbol: str) -> tuple[bool, dict]:
 
     mid = (float(bid) + float(ask)) / 2.0
     spr = (float(ask) - float(bid)) / mid if mid > 0 else 0.0
-    spr_ok = (float(spr) >= float(MM1_SPREAD_MIN_PCT)) and (float(spr) <= float(MM1_SPREAD_MAX_PCT))
+    # Use settings (env-driven) rather than module constants so deploy-time env changes
+    # are always reflected in decisions + diagnostics.
+    min_pct = float(getattr(settings, "mm1_spread_min_pct", MM1_SPREAD_MIN_PCT) or MM1_SPREAD_MIN_PCT)
+    max_pct = float(getattr(settings, "mm1_spread_max_pct", MM1_SPREAD_MAX_PCT) or MM1_SPREAD_MAX_PCT)
+    spr_ok = (float(spr) >= float(min_pct)) and (float(spr) <= float(max_pct))
     dbg = {
         "bid": float(bid),
         "ask": float(ask),
         "mid": float(mid),
         "spread_pct": float(spr),
         "spr_ok": bool(spr_ok),
+        "min_spread_pct": float(min_pct),
+        "max_spread_pct": float(max_pct),
     }
     return bool(spr_ok), dbg
 
@@ -562,12 +568,18 @@ def _has_position(symbol: str) -> tuple[bool, float]:
     px = float(_last_price(symbol) or 0.0)
     notional = float(qty * px) if px > 0 else 0.0
 
+    # IMPORTANT:
+    # Use the module-level `settings` (loaded from env at startup). A previous refactor
+    # attempted to call `_get_settings()` here, but that function does not exist, which
+    # silently disabled the dust filter (caught by the broad exception handler).
     try:
-        settings = _get_settings()
-        if settings.min_position_notional_usd and notional < settings.min_position_notional_usd:
+        min_pos = float(getattr(settings, "min_position_notional_usd", 0.0) or 0.0)
+        if min_pos and notional < min_pos:
             return False, notional
     except Exception:
-        pass
+        # If anything goes wrong, fail *open* (treat as position) to avoid accidental
+        # double-entry. Callers will still have other safety gates.
+        return True, notional
 
     return True, notional
 
@@ -1966,14 +1978,31 @@ def scan_entries(payload: WorkerScanPayload):
             strategy = "rb1" if fired.get("rb1") else fired_strats[0]
         d["eligible"] = True
         d["chosen_strategy"] = strategy
-        # per-scan entry cap
-        if MAX_ENTRIES_PER_SCAN > 0 and len(candidates) >= MAX_ENTRIES_PER_SCAN:
-            d["eligible"] = False
-            d["skip"].append("max_entries_per_scan_reached")
-            per_symbol[sym] = d
-            continue
         candidates.append((sym, strategy))
         per_symbol[sym] = d
+
+    # Apply per-scan entry cap *after* we have all candidates so we can prioritize
+    # strategies (especially important in quiet regime where MM1/CR1 should be favored).
+    if MAX_ENTRIES_PER_SCAN > 0 and len(candidates) > MAX_ENTRIES_PER_SCAN:
+        def _pri(s: str) -> int:
+            s = (s or "").lower()
+            if bool(regime_quiet) and STRATEGY_MODE != "legacy":
+                # Quiet regime: prioritize inventory-friendly / maker-capture first.
+                return {"mm1": 0, "cr1": 1, "rb1": 2, "tc1": 3}.get(s, 9)
+            # Non-quiet: prioritize directional edge.
+            return {"rb1": 0, "tc1": 1, "cr1": 2, "mm1": 3}.get(s, 9)
+
+        candidates_sorted = sorted(candidates, key=lambda x: (_pri(x[1]), universe.index(x[0]) if x[0] in universe else 10**9))
+        winners = set(candidates_sorted[:MAX_ENTRIES_PER_SCAN])
+        # Mark losers in diagnostics
+        for sym, strat in candidates_sorted[MAX_ENTRIES_PER_SCAN:]:
+            d = per_symbol.get(sym) or {"symbol": sym, "skip": []}
+            d.setdefault("skip", [])
+            d["eligible"] = False
+            if "max_entries_per_scan_reached" not in d["skip"]:
+                d["skip"].append("max_entries_per_scan_reached")
+            per_symbol[sym] = d
+        candidates = [c for c in candidates_sorted[:MAX_ENTRIES_PER_SCAN]]
 
     # 5) Execute (or dry-run)
     results: List[Dict[str, Any]] = []
