@@ -702,6 +702,11 @@ def market_notional(
     notional: float,
     price: Optional[float] = None,
     strategy: Optional[str] = None,
+    exec_mode_override: Optional[str] = None,
+    post_offset_override: Optional[float] = None,
+    chase_sec_override: Optional[int] = None,
+    chase_steps_override: Optional[int] = None,
+    market_fallback_override: Optional[bool] = None,
     **kwargs: Any,
 ) -> Dict[str, Any]:
     """
@@ -785,11 +790,14 @@ def market_notional(
             return {"ok": False, "error": f"market_notional failed: below_min_volume:{volume}<{ordermin} (pair={pair})"}
 
     
-    exec_mode = (os.getenv("EXECUTION_MODE", "market") or "market").strip().lower()
-    post_offset = float(os.getenv("POST_ONLY_OFFSET_PCT", "0.0002") or 0.0002)
-    chase_sec = int(float(os.getenv("LIMIT_CHASE_SEC", "10") or 10))
-    chase_steps = int(float(os.getenv("LIMIT_CHASE_STEPS", "1") or 1))
-    market_fallback = (os.getenv("MARKET_FALLBACK", "1").strip().lower() in ("1","true","yes","on"))
+    exec_mode = (str(exec_mode_override).strip().lower() if exec_mode_override is not None else (os.getenv("EXECUTION_MODE", "market") or "market").strip().lower())
+    post_offset = float(post_offset_override) if post_offset_override is not None else float(os.getenv("POST_ONLY_OFFSET_PCT", "0.0002") or 0.0002)
+    chase_sec = int(chase_sec_override) if chase_sec_override is not None else int(float(os.getenv("LIMIT_CHASE_SEC", "10") or 10))
+    chase_steps = int(chase_steps_override) if chase_steps_override is not None else int(float(os.getenv("LIMIT_CHASE_STEPS", "1") or 1))
+    if market_fallback_override is not None:
+        market_fallback = bool(market_fallback_override)
+    else:
+        market_fallback = (os.getenv("MARKET_FALLBACK", "1").strip().lower() in ("1","true","yes","on"))
 
     def _place_market() -> Dict[str, Any]:
         payload_mkt = {

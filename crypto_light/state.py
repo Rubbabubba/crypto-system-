@@ -16,6 +16,9 @@ class TradePlan:
     strategy: str
     opened_ts: float
 
+    # Optional time-based exit (0 disables). Used by some mean-reversion / maker modes.
+    max_hold_sec: int = 0
+
 
     breakeven_armed: bool = False
     breakeven_triggered_ts: float = 0.0

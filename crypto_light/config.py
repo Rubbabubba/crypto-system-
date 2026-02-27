@@ -104,6 +104,40 @@ class Settings:
     # Runtime
     log_level: str
 
+    # Strategy mode / optional strategies
+    strategy_mode: str  # 'auto' (default) or 'legacy'
+    enable_cr1: bool
+    enable_mm1: bool
+
+    # Regime filter (quiet vs expansion)
+    regime_filter_enabled: bool
+    regime_benchmark_symbol: str
+    regime_timeframe: str
+    regime_limit_bars: int
+    regime_quiet_max_24h_range_pct: float
+    regime_quiet_atr_lookback: int
+    regime_quiet_atr_now_lt_median_mult: float
+
+    # CR1 (Compression Range Reversion)
+    cr1_range_lookback_bars: int
+    cr1_bottom_pct: float
+    cr1_atr_len: int
+    cr1_atr_falling_lookback: int
+    cr1_atr_now_lt_median_mult: float
+    cr1_stop_atr_mult: float
+    cr1_take_atr_mult: float
+    cr1_max_hold_sec: int
+    cr1_maker_only: bool
+
+    # MM1 (Controlled passive maker capture)
+    mm1_spread_min_pct: float
+    mm1_spread_max_pct: float
+    mm1_take_pct: float
+    mm1_stop_pct: float
+    mm1_maker_only: bool
+    mm1_chase_sec: int
+    mm1_post_only_offset_pct: float
+
 
 def load_settings() -> Settings:
     return Settings(
@@ -182,4 +216,38 @@ def load_settings() -> Settings:
 
         # Runtime
         log_level=_getenv("LOG_LEVEL", "INFO"),
+
+        # Strategy mode / optional strategies
+        strategy_mode=_getenv("STRATEGY_MODE", "auto").strip().lower() or "auto",
+        enable_cr1=_getbool("ENABLE_CR1", "0"),
+        enable_mm1=_getbool("ENABLE_MM1", "0"),
+
+        # Regime filter
+        regime_filter_enabled=_getbool("REGIME_FILTER_ENABLED", "1"),
+        regime_benchmark_symbol=_getenv("REGIME_BENCHMARK_SYMBOL", "BTC/USD").strip().upper() or "BTC/USD",
+        regime_timeframe=_getenv("REGIME_TIMEFRAME", "60").strip() or "60",
+        regime_limit_bars=int(float(_getenv("REGIME_LIMIT_BARS", "220") or 220)),
+        regime_quiet_max_24h_range_pct=float(_getenv("REGIME_QUIET_MAX_24H_RANGE_PCT", "0.04") or 0.04),
+        regime_quiet_atr_lookback=int(float(_getenv("REGIME_QUIET_ATR_LOOKBACK", "14") or 14)),
+        regime_quiet_atr_now_lt_median_mult=float(_getenv("REGIME_QUIET_ATR_NOW_LT_MEDIAN_MULT", "1.0") or 1.0),
+
+        # CR1
+        cr1_range_lookback_bars=int(float(_getenv("CR1_RANGE_LOOKBACK_BARS", "288") or 288)),
+        cr1_bottom_pct=float(_getenv("CR1_BOTTOM_PCT", "0.20") or 0.20),
+        cr1_atr_len=int(float(_getenv("CR1_ATR_LEN", "14") or 14)),
+        cr1_atr_falling_lookback=int(float(_getenv("CR1_ATR_FALLING_LOOKBACK", "50") or 50)),
+        cr1_atr_now_lt_median_mult=float(_getenv("CR1_ATR_NOW_LT_MEDIAN_MULT", "1.0") or 1.0),
+        cr1_stop_atr_mult=float(_getenv("CR1_STOP_ATR_MULT", "1.2") or 1.2),
+        cr1_take_atr_mult=float(_getenv("CR1_TAKE_ATR_MULT", "1.5") or 1.5),
+        cr1_max_hold_sec=int(float(_getenv("CR1_MAX_HOLD_SEC", "2700") or 2700)),
+        cr1_maker_only=_getbool("CR1_MAKER_ONLY", "1"),
+
+        # MM1
+        mm1_spread_min_pct=float(_getenv("MM1_SPREAD_MIN_PCT", "0.0015") or 0.0015),
+        mm1_spread_max_pct=float(_getenv("MM1_SPREAD_MAX_PCT", "0.0035") or 0.0035),
+        mm1_take_pct=float(_getenv("MM1_TAKE_PCT", "0.0025") or 0.0025),
+        mm1_stop_pct=float(_getenv("MM1_STOP_PCT", "0.006") or 0.006),
+        mm1_maker_only=_getbool("MM1_MAKER_ONLY", "1"),
+        mm1_chase_sec=int(float(_getenv("MM1_CHASE_SEC", "12") or 12)),
+        mm1_post_only_offset_pct=float(_getenv("MM1_POST_ONLY_OFFSET_PCT", _getenv("POST_ONLY_OFFSET_PCT", "0.0002")) or 0.0002),
     )
