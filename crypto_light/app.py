@@ -1076,8 +1076,11 @@ def _execute_long_entry(
             take_price=float(take_price),
             notional_usd=float(_notional),
             opened_ts=time.time(),
-            max_hold_sec=_strategy_max_hold_sec(strategy),
-        )
+        entry_order_id=(res.get('txid') or [''])[0] if isinstance(res, dict) else "",
+        exit_order_id="",
+        exit_order_ts=0.0,
+        max_hold_sec=_strategy_max_hold_sec(strategy),
+    )
         return {"ok": True, "executed": True, "symbol": symbol, "strategy": strategy, "price": px, "stop": float(stop_price), "take": float(take_price)}
 
     # Do NOT create a plan or cooldown on failed orders (e.g., insufficient funds).
@@ -1516,6 +1519,13 @@ def worker_exit(payload: WorkerExitPayload):
             if not can_exit_now:
                 continue
 
+            
+# If we already placed an exit order very recently, don't spam cancel/replace.
+exit_cooldown = float(os.getenv("EXIT_RETRY_COOLDOWN_SEC", "90"))
+if getattr(plan, "exit_order_id", "") and (time.time() - float(getattr(plan, "exit_order_ts", 0.0)) < exit_cooldown):
+    continue
+
+
             # Phase 6: execute
             notional_exit = max(float(settings.exit_min_notional_usd), float(plan.notional_usd))
             if dry_run:
@@ -1525,6 +1535,8 @@ def worker_exit(payload: WorkerExitPayload):
                 if bool(res.get("ok")):
                     state.mark_exit(symbol)
                     state.set_pending_exit(symbol, reason=reason, txid=res.get("txid"))
+                    plan.exit_order_id = (res.get('txid') or [''])[0] if isinstance(res.get('txid'), list) else (res.get('txid') or "")
+                    plan.exit_order_ts = time.time()
                 else:
                     # Do not latch exit cooldowns or pending state if the order failed.
                     state.clear_pending_exit(symbol)
@@ -1606,7 +1618,7 @@ def _entry_signals_for_symbol(symbol: str, *, regime_quiet: bool) -> tuple[dict,
 
 
 
-def place_entry(symbol: str, *, strategy: str, req_id: str | None = None, client_ip: str | None = None, notional: float | None = None):
+def place_entry(symbol: str, *, strategy: str, req_id: str | None = None, client_ip: str | None = None, notional: float | None = None, dry_run: bool = False):
     """
     Wrapper used by /worker/scan_entries to execute an entry in live mode.
 
@@ -1626,6 +1638,7 @@ def place_entry(symbol: str, *, strategy: str, req_id: str | None = None, client
         req_id=rid,
         client_ip=client_ip,
         extra={"strategy": strategy},
+        dry_run=dry_run,
     )
     # _execute_long_entry returns a dict like:
     #   {"ok": True, "executed": True|False, "reason": "..."} or {"ok": False, "error": "..."}
@@ -2011,7 +2024,7 @@ def scan_entries(payload: WorkerScanPayload):
             results.append({"symbol": sym, "strategy": strategy, "status": "dry_run"})
             continue
 
-        ok2, reason2, meta2 = place_entry(sym, strategy=strategy)
+        ok2, reason2, meta2 = place_entry(sym, strategy=strategy, dry_run=payload.dry_run)
         results.append(
             {
                 "symbol": sym,

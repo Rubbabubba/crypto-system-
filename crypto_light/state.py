@@ -16,6 +16,11 @@ class TradePlan:
     strategy: str
     opened_ts: float
 
+    # Optional order tracking (best-effort; helps prevent duplicate exits)
+    entry_order_id: str = ""
+    exit_order_id: str = ""
+    exit_order_ts: float = 0.0
+
     # Optional time-based exit (0 disables). Used by some mean-reversion / maker modes.
     max_hold_sec: int = 0
 

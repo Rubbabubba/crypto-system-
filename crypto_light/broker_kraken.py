@@ -112,6 +112,26 @@ import requests
 
 logger = logging.getLogger("broker_kraken")
 
+# --- Kraken private API safety: monotonic nonce + basic retry/backoff ---
+_last_nonce = 0
+_last_priv_ts = 0.0
+
+def _next_nonce() -> int:
+    global _last_nonce
+    n = int(time.time() * 1000)
+    if n <= _last_nonce:
+        n = _last_nonce + 1
+    _last_nonce = n
+    return n
+
+def _sleep_for_priv_rate_limit(min_interval_sec: float) -> None:
+    global _last_priv_ts
+    now = time.time()
+    wait = (_last_priv_ts + min_interval_sec) - now
+    if wait > 0:
+        time.sleep(wait)
+    _last_priv_ts = time.time()
+
 # ---------------------------------------------------------------------------
 # Robust local import of symbol_map helpers (works in flat or packaged repo)
 # ---------------------------------------------------------------------------
@@ -425,26 +445,56 @@ def _priv(path: str, data: Dict[str, Any], timeout: float = 30.0) -> Dict[str, A
 
     # Kraken requires an always-increasing nonce (int). Milliseconds since epoch is fine.
     data = dict(data or {})
-    data["nonce"] = int(time.time() * 1000)
+    data["nonce"] = _next_nonce()
 
     headers = {"User-Agent": "crypto-system-api/kraken"}
     headers.update(_sign(urlpath, data))
     headers["Content-Type"] = "application/x-www-form-urlencoded"
+# Respect Kraken private rate limits + handle nonce collisions.
+min_interval = float(os.getenv("KRAKEN_PRIVATE_MIN_INTERVAL_SEC", "0.35"))
+max_retries = int(os.getenv("KRAKEN_PRIVATE_MAX_RETRIES", "5"))
+
+last_errs = None
+for attempt in range(1, max_retries + 1):
+    _sleep_for_priv_rate_limit(min_interval)
 
     # NOTE: requests encodes dict -> form body by default
     r = requests.post(url, data=data, headers=headers, timeout=timeout)
 
-    # Rate limit
+    # HTTP-level rate limit (rare, but possible)
     if r.status_code == 429:
-        raise RuntimeError(f"Kraken rate limited (HTTP 429) on {path}")
+        time.sleep(min(5.0, 0.5 * attempt))
+        continue
 
     try:
         payload = r.json()
-    except Exception as e:
+    except Exception:
         logger.error("kraken._priv non-json response: path=%s status=%s body=%r", path, r.status_code, r.text[:500])
-        raise
+        time.sleep(min(3.0, 0.25 * attempt))
+        continue
 
-    errors = payload.get("error") or []
+    errs = payload.get("error") or []
+    if not errs:
+        return payload
+
+    last_errs = errs
+    # Common recoverable errors
+    if any("Invalid nonce" in e for e in errs):
+        # bump nonce and retry
+        data["nonce"] = _next_nonce()
+        time.sleep(0.1 * attempt)
+        continue
+    if any("Rate limit exceeded" in e for e in errs):
+        time.sleep(min(5.0, 0.75 * attempt))
+        continue
+
+    # Non-retryable error
+    logger.error("kraken._priv ERROR: path=%s status=%s errors=%s req=%s", path, r.status_code, errs, {})
+    return payload
+
+# Retries exhausted
+logger.error("kraken._priv ERROR: path=%s retries_exhausted errors=%s req=%s", path, last_errs, {})
+return {"error": last_errs or ["EAPI:Unknown"], "result": None}
     if errors:
         # Log full error list; keep request params minimal to avoid leaking secrets
         safe_keys = {k: data.get(k) for k in ("pair","type","ordertype","volume","price","price2","leverage","oflags","timeinforce") if k in data}
