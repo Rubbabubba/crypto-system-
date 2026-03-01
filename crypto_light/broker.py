@@ -16,30 +16,8 @@ def last_price(symbol: str) -> float:
     return float(broker_kraken.last_price(symbol))
 
 
-def market_notional(
-    symbol: str,
-    side: str,
-    notional: float,
-    strategy: str,
-    price: Optional[float] = None,
-    exec_mode_override: Optional[str] = None,
-    post_offset_override: Optional[float] = None,
-    chase_sec_override: Optional[int] = None,
-    chase_steps_override: Optional[int] = None,
-    market_fallback_override: Optional[bool] = None,
-) -> Dict:
-    return broker_kraken.market_notional(
-        symbol=symbol,
-        side=side,
-        notional=float(notional),
-        price=price,
-        strategy=strategy,
-        exec_mode_override=exec_mode_override,
-        post_offset_override=post_offset_override,
-        chase_sec_override=chase_sec_override,
-        chase_steps_override=chase_steps_override,
-        market_fallback_override=market_fallback_override,
-    )
+def market_notional(symbol: str, side: str, notional: float, strategy: str, price: Optional[float] = None) -> Dict:
+    return broker_kraken.market_notional(symbol=symbol, side=side, notional=float(notional), price=price, strategy=strategy)
 
 
 def limit_notional(

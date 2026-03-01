@@ -361,18 +361,6 @@ def _get_kraken_creds():
     return key, sec, key_name, sec_name
 
 SESSION = requests.Session()
-
-# --- Kraken private API nonce guard ---
-_nonce_lock = threading.Lock()
-_last_nonce = 0
-
-def _next_nonce() -> int:
-    global _last_nonce
-    now = int(time.time() * 1000)
-    with _nonce_lock:
-        _last_nonce = max(_last_nonce + 1, now)
-        return _last_nonce
-
 _GATE_LOCK = threading.Lock()
 _LAST_CALL = 0.0
 
@@ -435,68 +423,34 @@ def _priv(path: str, data: Dict[str, Any], timeout: float = 30.0) -> Dict[str, A
     urlpath = f"/0/private/{path}"
     url = API_BASE + urlpath
 
-    # Kraken requires an always-increasing nonce. Time-based nonces can collide under concurrency,
-    # so we use a monotonic nonce generator and basic retries for common transient errors.
+    # Kraken requires an always-increasing nonce (int). Milliseconds since epoch is fine.
     data = dict(data or {})
+    data["nonce"] = int(time.time() * 1000)
+
     headers = {"User-Agent": "crypto-system-api/kraken"}
+    headers.update(_sign(urlpath, data))
     headers["Content-Type"] = "application/x-www-form-urlencoded"
 
-    max_retries = int(os.getenv("KRAKEN_PRIV_MAX_RETRIES", "6"))
-    base_sleep = float(os.getenv("KRAKEN_PRIV_RETRY_BASE_SEC", "0.35"))
-    last_errors: list[str] = []
+    # NOTE: requests encodes dict -> form body by default
+    r = requests.post(url, data=data, headers=headers, timeout=timeout)
 
-    for attempt in range(max_retries):
-        data["nonce"] = _next_nonce()
-        h = dict(headers)
-        h.update(_sign(urlpath, data))
+    # Rate limit
+    if r.status_code == 429:
+        raise RuntimeError(f"Kraken rate limited (HTTP 429) on {path}")
 
-        r = requests.post(url, data=data, headers=h, timeout=timeout)
-        if r.status_code == 429:
-            last_errors = ["HTTP 429"]
-            if attempt < max_retries - 1:
-                time.sleep(base_sleep * (1.7 ** attempt))
-                continue
-            raise RuntimeError(f"Kraken rate limited (HTTP 429) on {path}")
+    try:
+        payload = r.json()
+    except Exception as e:
+        logger.error("kraken._priv non-json response: path=%s status=%s body=%r", path, r.status_code, r.text[:500])
+        raise
 
-        try:
-            payload = r.json()
-        except Exception:
-            logger.error("kraken._priv non-json response: path=%s status=%s body=%r", path, r.status_code, r.text[:500])
-            if attempt < max_retries - 1:
-                time.sleep(base_sleep * (1.7 ** attempt))
-                continue
-            raise
+    errors = payload.get("error") or []
+    if errors:
+        # Log full error list; keep request params minimal to avoid leaking secrets
+        safe_keys = {k: data.get(k) for k in ("pair","type","ordertype","volume","price","price2","leverage","oflags","timeinforce") if k in data}
+        logger.error("kraken._priv ERROR: path=%s status=%s errors=%s req=%s", path, r.status_code, errors, safe_keys)
+        raise RuntimeError(f"Kraken private call failed: {path} errors={errors}")
 
-        errors = payload.get("error") or []
-        if errors:
-            last_errors = errors
-            retryable = any((
-                "EAPI:Invalid nonce" in err
-                or "EAPI:Rate limit exceeded" in err
-                or "EGeneral:Internal error" in err
-                for err in errors
-            ))
-            if retryable and attempt < max_retries - 1:
-                time.sleep(base_sleep * (1.7 ** attempt))
-                continue
-
-            safe_keys = {k: data.get(k) for k in ("pair","type","ordertype","volume","price","price2","leverage","oflags","timeinforce") if k in data}
-            logger.error("kraken._priv ERROR: path=%s status=%s errors=%s req=%s", path, r.status_code, errors, safe_keys)
-            raise RuntimeError(f"Kraken private call failed: {path} errors={errors}")
-
-        result = payload.get("result")
-        if path == "AddOrder":
-            txid = None
-            try:
-                txid = (result or {}).get("txid")
-            except Exception:
-                txid = None
-            logger.info("kraken AddOrder ok: txid=%s pair=%s type=%s ordertype=%s vol=%s",
-                        txid, data.get("pair"), data.get("type"), data.get("ordertype"), data.get("volume"))
-
-        return result or {}
-
-    raise RuntimeError(f"Kraken private call failed: {path} errors={last_errors}")
     result = payload.get("result")
     # Useful for confirming trades are actually being placed:
     if path == "AddOrder":
@@ -693,66 +647,12 @@ def _ensure_price(symbol: str) -> float:
         raise RuntimeError(f"no price available for {symbol}")
     return p
 
-
-def _best_bid_ask(pair: str) -> tuple[float | None, float | None]:
-    """Best-effort best bid/ask for a Kraken pair via public Depth."""
-    try:
-        ob = _pub("Depth", {"pair": str(pair), "count": 1}) or {}
-    except Exception:
-        ob = {}
-    if not isinstance(ob, dict) or not ob:
-        return None, None
-    try:
-        book = next(iter(ob.values()))
-    except Exception:
-        return None, None
-    if not isinstance(book, dict):
-        return None, None
-    bid = None
-    ask = None
-    try:
-        bids = book.get("bids") or []
-        if bids and isinstance(bids[0], (list, tuple)) and bids[0]:
-            bid = float(bids[0][0])
-    except Exception:
-        bid = None
-    try:
-        asks = book.get("asks") or []
-        if asks and isinstance(asks[0], (list, tuple)) and asks[0]:
-            ask = float(asks[0][0])
-    except Exception:
-        ask = None
-    return bid, ask
-
-
-def _query_order(txid: str) -> dict:
-    """Query a single Kraken order (best-effort)."""
-    if not txid:
-        return {}
-    try:
-        res = _priv("QueryOrders", {"txid": str(txid)}) or {}
-    except Exception:
-        return {}
-    if not isinstance(res, dict):
-        return {}
-    # res is mapping txid -> order
-    try:
-        return res.get(str(txid)) or next(iter(res.values()))
-    except Exception:
-        return {}
-
-
 def market_notional(
     symbol: str,
     side: str,
     notional: float,
     price: Optional[float] = None,
     strategy: Optional[str] = None,
-    exec_mode_override: Optional[str] = None,
-    post_offset_override: Optional[float] = None,
-    chase_sec_override: Optional[int] = None,
-    chase_steps_override: Optional[int] = None,
-    market_fallback_override: Optional[bool] = None,
     **kwargs: Any,
 ) -> Dict[str, Any]:
     """
@@ -835,169 +735,41 @@ def market_notional(
         else:
             return {"ok": False, "error": f"market_notional failed: below_min_volume:{volume}<{ordermin} (pair={pair})"}
 
-    
-    exec_mode = (str(exec_mode_override).strip().lower() if exec_mode_override is not None else (os.getenv("EXECUTION_MODE", "market") or "market").strip().lower())
-    post_offset = float(post_offset_override) if post_offset_override is not None else float(os.getenv("POST_ONLY_OFFSET_PCT", "0.0002") or 0.0002)
-    chase_sec = int(chase_sec_override) if chase_sec_override is not None else int(float(os.getenv("LIMIT_CHASE_SEC", "10") or 10))
-    chase_steps = int(chase_steps_override) if chase_steps_override is not None else int(float(os.getenv("LIMIT_CHASE_STEPS", "1") or 1))
-    if market_fallback_override is not None:
-        market_fallback = bool(market_fallback_override)
-    else:
-        market_fallback = (os.getenv("MARKET_FALLBACK", "1").strip().lower() in ("1","true","yes","on"))
+    payload = {
+        "pair": pair,
+        "type": "buy" if side == "buy" else "sell",
+        "ordertype": "market",
+        "volume": _format_volume(volume, lot_decimals),
+        "userref": str(
+            _userref_for_strategy(strategy)
+            if strategy is not None
+            else _userref(ui, side, float(notional))
+        ),
+    }
 
-    def _place_market() -> Dict[str, Any]:
-        payload_mkt = {
-            "pair": pair,
-            "type": "buy" if side == "buy" else "sell",
-            "ordertype": "market",
-            "volume": _format_volume(volume, lot_decimals),
-            "userref": str(_userref_for_strategy(strategy) if strategy is not None else _userref(ui, side, float(notional))),
-        }
-        try:
-            res_m = _priv("AddOrder", payload_mkt)
-        except Exception as e:
-            return {"ok": False, "error": f"market_notional failed: {e}"}
+    try:
+        res = _priv("AddOrder", payload)
+    except Exception as e:
+        return {"ok": False, "error": f"market_notional failed: {e}"}
 
-        txid_m = None
-        descr_m = None
-        try:
-            txid_m = (res_m.get("txid") or [None])[0]
-            descr_m = (res_m.get("descr") or {}).get("order")
-        except Exception:
-            pass
+    txid = None
+    descr = None
+    try:
+        txid = (res.get("txid") or [None])[0]
+        descr = (res.get("descr") or {}).get("order")
+    except Exception:
+        pass
 
-        _cooldown_latch(strat_tag, pair, side)
-        return {
-            "ok": True,
-            "filled": True,  # market orders are expected to fill immediately
-            "execution": "market",
-            "pair": pair,
-            "side": side,
-            "notional": float(notional),
-            "volume": float(volume),
-            "txid": txid_m,
-            "descr": descr_m,
-            "result": res_m,
-        }
-
-    def _place_post_only_once(limit_px: float) -> Dict[str, Any]:
-        payload_lim = {
-            "pair": pair,
-            "type": "buy" if side == "buy" else "sell",
-            "ordertype": "limit",
-            "price": _format_price(float(limit_px), pair_decimals),
-            "volume": _format_volume(volume, lot_decimals),
-            "oflags": "post",
-            "userref": str(_userref_for_strategy(strategy) if strategy is not None else _userref(ui, side, float(notional))),
-        }
-        try:
-            res_l = _priv("AddOrder", payload_lim)
-        except Exception as e:
-            return {"ok": False, "error": f"maker_first failed: {e}"}
-
-        txid_l = None
-        descr_l = None
-        try:
-            txid_l = (res_l.get("txid") or [None])[0]
-            descr_l = (res_l.get("descr") or {}).get("order")
-        except Exception:
-            pass
-
-        # If chase is disabled (<=0), leave the post-only order open and return immediately (maker-only behavior).
-        if chase_sec <= 0:
-            return {"ok": True, "mode": exec_mode, "txid": txid_l, "descr": descr_l, "filled": False, "status": "open"}
-
-        # Wait for fill
-        start = time.time()
-        filled = False
-        status = None
-        vol_exec = 0.0
-        while txid_l and (time.time() - start) < max(1, chase_sec):
-            od = _query_order(str(txid_l)) or {}
-            status = od.get("status")
-            try:
-                vol_exec = float(od.get("vol_exec") or 0.0)
-            except Exception:
-                vol_exec = 0.0
-            if status == "closed" and vol_exec > 0:
-                filled = True
-                break
-            time.sleep(1.0)
-
-        if filled:
-            _cooldown_latch(strat_tag, pair, side)
-            return {
-                "ok": True,
-                "filled": True,
-                "execution": "post_only_limit",
-                "pair": pair,
-                "side": side,
-                "notional": float(notional),
-                "volume": float(volume),
-                "limit_price": float(limit_px),
-                "txid": txid_l,
-                "descr": descr_l,
-                "status": status,
-                "vol_exec": vol_exec,
-                "result": res_l,
-            }
-
-        cancel_on_timeout = os.getenv("LIMIT_CHASE_CANCEL", "1") == "1"
-        if not cancel_on_timeout:
-            # Keep order open; caller will track via txid.
-            return {"ok": True, "mode": exec_mode, "txid": txid_l, "descr": descr_l, "filled": False, "status": "open"}
-
-        # Not filled within chase_sec: cancel the order (chase mode).
-        try:
-            _priv("CancelOrder", {"txid": str(txid_l)})
-        except Exception:
-            pass
-
-        return {
-            "ok": False,
-            "filled": False,
-            "execution": "post_only_limit",
-            "pair": pair,
-            "side": side,
-            "notional": float(notional),
-            "volume": float(volume),
-            "limit_price": float(limit_px),
-            "txid": txid_l,
-            "descr": descr_l,
-            "status": status,
-            "vol_exec": vol_exec,
-            "error": "maker_not_filled",
-        }
-
-    # Maker-first execution: try post-only limit (optionally chase), then fallback to market.
-    if exec_mode == "maker_first":
-        last_err = None
-        for step in range(max(1, chase_steps)):
-            bid, ask = _best_bid_ask(pair)
-            if side == "buy":
-                ref = bid if (bid and bid > 0) else px
-                limit_px = float(ref) * (1.0 - float(post_offset))
-            else:
-                ref = ask if (ask and ask > 0) else px
-                limit_px = float(ref) * (1.0 + float(post_offset))
-
-            out = _place_post_only_once(limit_px=float(limit_px))
-            if out.get("ok"):
-                return out
-            last_err = out
-
-        if market_fallback:
-            mkt = _place_market()
-            # Preserve context about maker attempts
-            if last_err:
-                mkt["maker_first"] = {"attempt_failed": True, "last_error": last_err}
-            return mkt
-
-        # No fallback: return last maker attempt details
-        return last_err or {"ok": False, "error": "maker_first_failed"}
-
-    # Default: market
-    return _place_market()
+    _cooldown_latch(strat_tag, pair, side)
+    return {
+        "pair": pair,
+        "side": side,
+        "notional": float(notional),
+        "volume": volume,
+        "txid": txid,
+        "descr": descr,
+        "result": res,
+    }
 
 
 def limit_notional(
