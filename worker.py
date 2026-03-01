@@ -5,7 +5,7 @@ import requests
 BASE_URL = os.getenv("BASE_URL", "http://localhost:10000").rstrip("/")
 
 EXIT_PATH = os.getenv("EXIT_PATH", "/worker/exit")
-EXIT_INTERVAL_SEC = int(float(os.getenv("EXIT_INTERVAL_SEC", "120") or 30))
+EXIT_INTERVAL_SEC = int(float(os.getenv("EXIT_INTERVAL_SEC", "30") or 30))
 
 # Entry engine tick
 SCAN_PATH = os.getenv("SCAN_PATH", "/worker/scan_entries")
