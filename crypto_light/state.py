@@ -16,6 +16,9 @@ class TradePlan:
     strategy: str
     opened_ts: float
 
+    # Optional time-based exit (0 disables). Used by some mean-reversion / maker modes.
+    max_hold_sec: int = 0
+
 
     breakeven_armed: bool = False
     breakeven_triggered_ts: float = 0.0
@@ -32,7 +35,10 @@ class InMemoryState:
 
         # Entry/exit throttles
         self.last_entry_ts_by_symbol: Dict[str, float] = {}
+        self.last_entry_ts_global: float = 0.0
         self.last_exit_ts_by_symbol: Dict[str, float] = {}
+        # Stopout cooldown latch: symbol -> last stop exit ts
+        self.last_stopout_ts_by_symbol: Dict[str, float] = {}
 
         # Pending exit orders (best-effort): symbol -> {"ts": float, "reason": str, "txid": str|None}
         self.pending_exits: Dict[str, Dict[str, Any]] = {}
@@ -63,6 +69,30 @@ class InMemoryState:
             return True
         last = float(self.last_entry_ts_by_symbol.get(symbol, 0.0) or 0.0)
         return (time.time() - last) >= float(cooldown_sec)
+
+    def can_enter_global(self, cooldown_sec: int) -> bool:
+        if cooldown_sec <= 0:
+            return True
+        last = float(getattr(self, "last_entry_ts_global", 0.0) or 0.0)
+        return (time.time() - last) >= float(cooldown_sec)
+
+    def mark_enter_global(self) -> None:
+        self.last_entry_ts_global = time.time()
+
+    def can_enter_after_stopout(self, symbol: str, cooldown_sec: int) -> bool:
+        if cooldown_sec <= 0:
+            return True
+        last = float(self.last_stopout_ts_by_symbol.get(symbol, 0.0) or 0.0)
+        return (time.time() - last) >= float(cooldown_sec)
+
+    def mark_stopout(self, symbol: str) -> None:
+        self.last_stopout_ts_by_symbol[symbol] = time.time()
+
+    def clear_stopout(self, symbol: str) -> None:
+        try:
+            self.last_stopout_ts_by_symbol.pop(symbol, None)
+        except Exception:
+            pass
 
     def mark_enter(self, symbol: str) -> None:
         self.last_entry_ts_by_symbol[symbol] = time.time()

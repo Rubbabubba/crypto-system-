@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+from . import trades_db
+from .broker_kraken import trades_history
+
 import logging
 import json
 import os
@@ -9,7 +12,7 @@ from typing import Any, Dict, Optional, Set, List, Tuple
 from uuid import uuid4
 
 import requests
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Request, Body
 from fastapi.responses import JSONResponse
 
 log = logging.getLogger("crypto_light")
@@ -19,8 +22,6 @@ from .broker import base_asset as _base_asset
 from .broker import last_price as _last_price
 from .broker import market_notional as _market_notional
 from .broker import get_bars as _get_bars
-from . import broker_kraken
-from . import trade_store
 from .sizing import compute_risk_pct_equity_notional, compute_equity_fraction_notional
 from .config import load_settings
 from .models import WebhookPayload, WorkerExitPayload, WorkerScanPayload, WorkerExitDiagnosticsPayload, WorkerAdoptPositionsPayload
@@ -61,6 +62,41 @@ ENTRY_ENGINE_ENABLED = (os.getenv("ENTRY_ENGINE_ENABLED", "1").strip().lower() i
 ENTRY_ENGINE_STRATEGIES = {s.strip().lower() for s in os.getenv("ENTRY_ENGINE_STRATEGIES", "rb1,tc1").split(",") if s.strip()}
 ENTRY_ENGINE_TIMEFRAME = os.getenv("ENTRY_ENGINE_TIMEFRAME", "5Min").strip() or "5Min"   # must match broker get_bars
 ENTRY_ENGINE_LIMIT_BARS = int(float(os.getenv("ENTRY_ENGINE_LIMIT_BARS", "300") or 300))
+
+# Strategy enablement (legacy strategies RB1/TC1 are always available)
+STRATEGY_MODE = (os.getenv("STRATEGY_MODE", "auto") or "auto").strip().lower()  # auto|legacy
+ENABLE_CR1 = (os.getenv("ENABLE_CR1", "0").strip().lower() in ("1", "true", "yes", "on"))
+ENABLE_MM1 = (os.getenv("ENABLE_MM1", "0").strip().lower() in ("1", "true", "yes", "on"))
+
+# Regime filter (benchmark is typically BTC/USD)
+REGIME_FILTER_ENABLED = (os.getenv("REGIME_FILTER_ENABLED", "1").strip().lower() in ("1", "true", "yes", "on"))
+REGIME_BENCHMARK_SYMBOL = (os.getenv("REGIME_BENCHMARK_SYMBOL", "BTC/USD") or "BTC/USD").strip().upper()
+REGIME_TIMEFRAME = (os.getenv("REGIME_TIMEFRAME", "60") or "60").strip()
+REGIME_LIMIT_BARS = int(float(os.getenv("REGIME_LIMIT_BARS", "220") or 220))
+REGIME_QUIET_MAX_24H_RANGE_PCT = float(os.getenv("REGIME_QUIET_MAX_24H_RANGE_PCT", "0.04") or 0.04)
+REGIME_QUIET_ATR_LOOKBACK = int(float(os.getenv("REGIME_QUIET_ATR_LOOKBACK", "14") or 14))
+REGIME_QUIET_ATR_NOW_LT_MEDIAN_MULT = float(os.getenv("REGIME_QUIET_ATR_NOW_LT_MEDIAN_MULT", "1.0") or 1.0)
+
+# CR1 params (5m)
+CR1_RANGE_LOOKBACK_BARS = int(float(os.getenv("CR1_RANGE_LOOKBACK_BARS", "288") or 288))  # ~24h of 5m
+CR1_BOTTOM_PCT = float(os.getenv("CR1_BOTTOM_PCT", "0.20") or 0.20)
+CR1_ATR_LEN = int(float(os.getenv("CR1_ATR_LEN", "14") or 14))
+CR1_ATR_FALLING_LOOKBACK = int(float(os.getenv("CR1_ATR_FALLING_LOOKBACK", "50") or 50))
+CR1_ATR_NOW_LT_MEDIAN_MULT = float(os.getenv("CR1_ATR_NOW_LT_MEDIAN_MULT", "1.0") or 1.0)
+CR1_STOP_ATR_MULT = float(os.getenv("CR1_STOP_ATR_MULT", "1.2") or 1.2)
+CR1_TAKE_ATR_MULT = float(os.getenv("CR1_TAKE_ATR_MULT", "1.5") or 1.5)
+CR1_MAX_HOLD_SEC = int(float(os.getenv("CR1_MAX_HOLD_SEC", "2700") or 2700))
+CR1_MAKER_ONLY = (os.getenv("CR1_MAKER_ONLY", "1").strip().lower() in ("1", "true", "yes", "on"))
+
+# MM1 params
+MM1_SPREAD_MIN_PCT = float(os.getenv("MM1_SPREAD_MIN_PCT", "0.0015") or 0.0015)
+MM1_SPREAD_MAX_PCT = float(os.getenv("MM1_SPREAD_MAX_PCT", "0.0035") or 0.0035)
+MM1_TAKE_PCT = float(os.getenv("MM1_TAKE_PCT", "0.0025") or 0.0025)
+MM1_STOP_PCT = float(os.getenv("MM1_STOP_PCT", "0.006") or 0.006)
+MM1_MAKER_ONLY = (os.getenv("MM1_MAKER_ONLY", "1").strip().lower() in ("1", "true", "yes", "on"))
+MM1_CHASE_SEC = int(float(os.getenv("MM1_CHASE_SEC", "12") or 12))
+MM1_POST_ONLY_OFFSET_PCT = float(os.getenv("MM1_POST_ONLY_OFFSET_PCT", os.getenv("POST_ONLY_OFFSET_PCT", "0.0002")) or 0.0002)
+MM1_MAX_HOLD_SEC = int(float(os.getenv("MM1_MAX_HOLD_SEC", "1800") or 1800))
 
 # RB1 params (5m)
 RB1_LOOKBACK_BARS = int(float(os.getenv("RB1_LOOKBACK_BARS", "48") or 48))
@@ -216,6 +252,178 @@ def _ema(values: list[float], period: int) -> list[float]:
     return out
 
 
+def _atr_from_bars(bars: list[dict], length: int = 14) -> tuple[float | None, list[float]]:
+    """Return (atr_now, atr_series) using simple moving average of True Range."""
+    if not bars or len(bars) < (length + 2):
+        return None, []
+    trs: list[float] = []
+    prev_c = float(bars[0].get("c") or 0.0)
+    for b in bars[1:]:
+        h = float(b.get("h") or 0.0)
+        l = float(b.get("l") or 0.0)
+        c = float(b.get("c") or 0.0)
+        tr = max(h - l, abs(h - prev_c), abs(l - prev_c))
+        trs.append(float(tr))
+        prev_c = c
+    if len(trs) < length:
+        return None, []
+    atrs: list[float] = []
+    for i in range(length - 1, len(trs)):
+        window = trs[i - (length - 1) : i + 1]
+        atrs.append(sum(window) / float(length))
+    return (float(atrs[-1]) if atrs else None), atrs
+
+
+def _median(xs: list[float]) -> float | None:
+    if not xs:
+        return None
+    s = sorted(float(x) for x in xs)
+    n = len(s)
+    mid = n // 2
+    if n % 2 == 1:
+        return float(s[mid])
+    return float((s[mid - 1] + s[mid]) / 2.0)
+
+
+_regime_cache: dict[str, tuple[float, dict]] = {"quiet": (0.0, {})}
+
+
+def _regime_is_quiet() -> tuple[bool, dict]:
+    """Best-effort regime classifier.
+
+    Quiet means: benchmark 24h range is modest AND ATR is not expanding.
+    Cached briefly to avoid hammering OHLC.
+    """
+    if not REGIME_FILTER_ENABLED:
+        return True, {"enabled": False}
+
+    now = time.time()
+    ttl = 60.0
+    cached_ts, cached_meta = _regime_cache.get("quiet", (0.0, {}))
+    if (now - cached_ts) < ttl and cached_meta:
+        return bool(cached_meta.get("quiet")), cached_meta
+
+    bars = _get_bars(REGIME_BENCHMARK_SYMBOL, timeframe=REGIME_TIMEFRAME, limit=max(120, REGIME_LIMIT_BARS))
+    if not bars or len(bars) < 50:
+        meta = {"quiet": True, "reason": "insufficient_bars", "enabled": True}
+        _regime_cache["quiet"] = (now, meta)
+        return True, meta
+
+    closes = [float(b.get("c") or 0.0) for b in bars]
+    highs = [float(b.get("h") or 0.0) for b in bars]
+    lows = [float(b.get("l") or 0.0) for b in bars]
+    last = float(closes[-1]) if closes else 0.0
+
+    n24 = 24 if REGIME_TIMEFRAME in ("60", "1H", "1h", "1HR") else min(len(bars), 288)
+    recent_high = max(highs[-n24:])
+    recent_low = min(lows[-n24:])
+    range_pct = (recent_high - recent_low) / last if last > 0 else 0.0
+
+    atr_now, atr_series = _atr_from_bars(bars, length=int(REGIME_QUIET_ATR_LOOKBACK))
+    med = _median(atr_series[-60:]) if atr_series else None
+    atr_ok = True
+    if atr_now is not None and med is not None and med > 0:
+        atr_ok = float(atr_now) <= float(med) * float(REGIME_QUIET_ATR_NOW_LT_MEDIAN_MULT)
+
+    quiet = (float(range_pct) <= float(REGIME_QUIET_MAX_24H_RANGE_PCT)) and bool(atr_ok)
+    meta = {
+        "enabled": True,
+        "quiet": bool(quiet),
+        "benchmark": REGIME_BENCHMARK_SYMBOL,
+        "timeframe": REGIME_TIMEFRAME,
+        "range_24h_pct": float(range_pct),
+        "atr_now": float(atr_now) if atr_now is not None else None,
+        "atr_median": float(med) if med is not None else None,
+        "atr_ok": bool(atr_ok),
+        "range_ok": bool(float(range_pct) <= float(REGIME_QUIET_MAX_24H_RANGE_PCT)),
+    }
+    _regime_cache["quiet"] = (now, meta)
+    return bool(quiet), meta
+
+
+def _signal_cr1(symbol: str) -> tuple[bool, dict]:
+    bars = _get_bars(symbol, timeframe=ENTRY_ENGINE_TIMEFRAME, limit=max(ENTRY_ENGINE_LIMIT_BARS, CR1_RANGE_LOOKBACK_BARS + CR1_ATR_LEN + 10))
+    if not bars or len(bars) < (CR1_ATR_LEN + 10):
+        return False, {"reason": "insufficient_bars", "bars": len(bars) if bars else 0}
+
+    closes = [float(b.get("c") or 0.0) for b in bars]
+    highs = [float(b.get("h") or 0.0) for b in bars]
+    lows = [float(b.get("l") or 0.0) for b in bars]
+    cur_close = float(closes[-1])
+    prev_close = float(closes[-2])
+
+    look = min(len(bars) - 1, int(CR1_RANGE_LOOKBACK_BARS))
+    recent_high = max(highs[-look:])
+    recent_low = min(lows[-look:])
+    rng = max(1e-12, recent_high - recent_low)
+    pos = (cur_close - recent_low) / rng
+
+    atr_now, atr_series = _atr_from_bars(bars, length=int(CR1_ATR_LEN))
+    med = _median(atr_series[-int(CR1_ATR_FALLING_LOOKBACK):]) if atr_series else None
+    atr_ok = True
+    if atr_now is not None and med is not None and med > 0:
+        atr_ok = float(atr_now) <= float(med) * float(CR1_ATR_NOW_LT_MEDIAN_MULT)
+
+    bottom_ok = float(pos) <= float(CR1_BOTTOM_PCT)
+    bounce_ok = cur_close > prev_close
+
+    ok = bool(bottom_ok and atr_ok and bounce_ok)
+    dbg = {
+        "range_high": float(recent_high),
+        "range_low": float(recent_low),
+        "pos_in_range": float(pos),
+        "bottom_pct": float(CR1_BOTTOM_PCT),
+        "atr_now": float(atr_now) if atr_now is not None else None,
+        "atr_median": float(med) if med is not None else None,
+        "atr_ok": bool(atr_ok),
+        "prev_close": float(prev_close),
+        "close": float(cur_close),
+        "bounce_ok": bool(bounce_ok),
+        "bar_ts": int(float(bars[-1].get("t") or 0)),
+    }
+    return ok, dbg
+
+
+def _signal_mm1(symbol: str) -> tuple[bool, dict]:
+    """Maker-capture trigger (only valid in quiet regime)."""
+    try:
+        from . import broker_kraken as _bk
+        pair = _bk.to_kraken(symbol)
+        bid, ask = _bk._best_bid_ask(pair)  # type: ignore[attr-defined]
+    except Exception:
+        bid, ask = None, None
+
+    if not bid or not ask or float(bid) <= 0 or float(ask) <= 0:
+        return False, {"reason": "no_bid_ask"}
+
+    mid = (float(bid) + float(ask)) / 2.0
+    spr = (float(ask) - float(bid)) / mid if mid > 0 else 0.0
+    # Use settings (env-driven) rather than module constants so deploy-time env changes
+    # are always reflected in decisions + diagnostics.
+    min_pct = float(getattr(settings, "mm1_spread_min_pct", MM1_SPREAD_MIN_PCT) or MM1_SPREAD_MIN_PCT)
+    max_pct = float(getattr(settings, "mm1_spread_max_pct", MM1_SPREAD_MAX_PCT) or MM1_SPREAD_MAX_PCT)
+    spr_ok = (float(spr) >= float(min_pct)) and (float(spr) <= float(max_pct))
+    dbg = {
+        "bid": float(bid),
+        "ask": float(ask),
+        "mid": float(mid),
+        "spread_pct": float(spr),
+        "spr_ok": bool(spr_ok),
+        "min_spread_pct": float(min_pct),
+        "max_spread_pct": float(max_pct),
+    }
+    return bool(spr_ok), dbg
+
+
+def _strategy_max_hold_sec(strategy: str) -> int:
+    s = (strategy or "").strip().lower()
+    if s == "cr1":
+        return int(CR1_MAX_HOLD_SEC)
+    if s == "mm1":
+        return int(MM1_MAX_HOLD_SEC)
+    return 0
+
+
 def _rb1_long_signal(symbol: str) -> tuple[bool, dict]:
     """True breakout: close crosses above prior N-bar high (edge-trigger)."""
     bars = _get_bars(symbol, timeframe=ENTRY_ENGINE_TIMEFRAME, limit=max(ENTRY_ENGINE_LIMIT_BARS, RB1_LOOKBACK_BARS + 5))
@@ -363,12 +571,18 @@ def _has_position(symbol: str) -> tuple[bool, float]:
     px = float(_last_price(symbol) or 0.0)
     notional = float(qty * px) if px > 0 else 0.0
 
+    # IMPORTANT:
+    # Use the module-level `settings` (loaded from env at startup). A previous refactor
+    # attempted to call `_get_settings()` here, but that function does not exist, which
+    # silently disabled the dust filter (caught by the broad exception handler).
     try:
-        settings = _get_settings()
-        if settings.min_position_notional_usd and notional < settings.min_position_notional_usd:
+        min_pos = float(getattr(settings, "min_position_notional_usd", 0.0) or 0.0)
+        if min_pos and notional < min_pos:
             return False, notional
     except Exception:
-        pass
+        # If anything goes wrong, fail *open* (treat as position) to avoid accidental
+        # double-entry. Callers will still have other safety gates.
+        return True, notional
 
     return True, notional
 
@@ -635,6 +849,64 @@ def health():
     }
 
 
+
+# --- Trades persistence + performance endpoints (SQLite on Render disk) ---
+
+def _refresh_trades_from_kraken(since_hours: float = 24.0, pair: str | None = None, upsert: bool = True) -> dict:
+    # Fetch recent trades from Kraken private TradesHistory.
+    # Note: broker_kraken.trades_history currently returns the most recent page. That's ok for short windows
+    # if you run refresh periodically.
+    since_ts = time.time() - float(since_hours) * 3600.0
+    raw = trades_history()  # {txid: {...}}
+    items = []
+    for txid, t in (raw or {}).items():
+        try:
+            t = dict(t)
+            t["txid"] = txid
+            if pair and t.get("pair") != pair:
+                continue
+            if float(t.get("time") or 0) < since_ts:
+                continue
+            items.append(t)
+        except Exception:
+            continue
+
+    # Sort by time ascending for nicer inserts
+    items.sort(key=lambda x: float(x.get("time") or 0))
+    if upsert:
+        up = trades_db.upsert_trades(items)
+    else:
+        up = {"ok": True, "db_path": trades_db.ensure_db(), "inserted": 0, "updated": 0, "received": len(items), "note": "upsert disabled"}
+    return {"ok": True, "since_hours": float(since_hours), "pair": pair, "count": len(items), "upsert": up}
+
+@app.get("/trades")
+def get_trades(
+    since_hours: float = 24.0,
+    pair: str | None = None,
+    limit: int = 200,
+    refresh: bool = False,
+    refresh_upsert: bool | None = None,
+):
+    if refresh:
+        _refresh_trades_from_kraken(since_hours=since_hours, pair=pair, upsert=True if refresh_upsert is None else bool(refresh_upsert))
+    return trades_db.query_trades(since_hours=since_hours, pair=pair, limit=limit)
+
+@app.post("/trades/refresh")
+def refresh_trades(body: dict | bool | None = Body(default=None)):
+    # Defensive: some clients accidentally send boolean bodies ("true"/"false")
+    payload = body if isinstance(body, dict) else {}
+    since_hours = float(payload.get("since_hours", 24.0))
+    pair = payload.get("pair")
+    upsert = bool(payload.get("upsert", True))
+    return _refresh_trades_from_kraken(since_hours=since_hours, pair=pair, upsert=upsert)
+
+@app.get("/trades/summary")
+def trades_summary(days: float = 7.0, refresh: bool = False, refresh_since_hours: float = 168.0):
+    if refresh:
+        _refresh_trades_from_kraken(since_hours=refresh_since_hours, pair=None, upsert=True)
+    return trades_db.summary(days=days)
+
+
 @app.get("/telemetry")
 def telemetry(limit: int = 100):
     lim = max(1, min(int(limit), 500))
@@ -734,6 +1006,8 @@ def _execute_long_entry(
             max_notional_usd=float(getattr(settings, "max_notional_usd", 0.0) or 0.0),
         )
         sizing_meta = res.to_dict()
+        # Avoid passing duplicate keys into ignored(); sizing meta may include its own 'reason'.
+        sizing_meta.pop("reason", None)
         if not res.ok:
             return ignored(res.reason, symbol=symbol, strategy=strategy, **(sizing_meta or {}))
         _notional = float(res.notional_usd)
@@ -754,6 +1028,8 @@ def _execute_long_entry(
             max_notional_usd=float(getattr(settings, "max_notional_usd", 0.0) or 0.0),
         )
         sizing_meta = res.to_dict()
+        # Avoid passing duplicate keys into ignored(); sizing meta may include its own 'reason'.
+        sizing_meta.pop("reason", None)
         if not res.ok:
             return ignored(res.reason, symbol=symbol, strategy=strategy, **(sizing_meta or {}))
         _notional = float(res.notional_usd)
@@ -786,9 +1062,49 @@ def _execute_long_entry(
 
     # If caller didn't supply brackets, compute them from `px`.
     if stop_price is None or take_price is None:
-        stop_price, take_price = compute_brackets(px, settings.stop_pct, settings.take_pct)
+        s = (strategy or "").strip().lower()
+        if s == "cr1":
+            bars_for_atr = _get_bars(symbol, timeframe=ENTRY_ENGINE_TIMEFRAME, limit=max(ENTRY_ENGINE_LIMIT_BARS, CR1_ATR_LEN + 40))
+            atr_now, _ = _atr_from_bars(bars_for_atr or [], length=int(CR1_ATR_LEN))
+            if atr_now is not None and atr_now > 0:
+                stop_price = float(px) - float(atr_now) * float(CR1_STOP_ATR_MULT)
+                take_price = float(px) + float(atr_now) * float(CR1_TAKE_ATR_MULT)
+            else:
+                stop_price, take_price = compute_brackets(px, settings.stop_pct, settings.take_pct)
+        elif s == "mm1":
+            stop_price, take_price = compute_brackets(px, float(MM1_STOP_PCT), float(MM1_TAKE_PCT))
+        else:
+            stop_price, take_price = compute_brackets(px, settings.stop_pct, settings.take_pct)
 
-    res = _market_notional(symbol=symbol, side="buy", notional=_notional, strategy=strategy, price=px)
+    # Execution profile overrides (e.g., maker-only for CR1/MM1)
+    exec_mode_override = None
+    post_offset_override = None
+    chase_sec_override = None
+    chase_steps_override = None
+    market_fallback_override = None
+    s = (strategy or "").strip().lower()
+    if s == "cr1" and CR1_MAKER_ONLY:
+        exec_mode_override = "maker_first"
+        market_fallback_override = False
+    if s == "mm1" and MM1_MAKER_ONLY:
+        exec_mode_override = "maker_first"
+        market_fallback_override = False
+        chase_sec_override = int(MM1_CHASE_SEC)
+        chase_steps_override = 1
+        post_offset_override = float(MM1_POST_ONLY_OFFSET_PCT)
+
+    res = _market_notional(
+        symbol=symbol,
+        side="buy",
+        notional=_notional,
+        strategy=strategy,
+        price=px,
+        exec_mode_override=exec_mode_override,
+        post_offset_override=post_offset_override,
+        chase_sec_override=chase_sec_override,
+        chase_steps_override=chase_steps_override,
+        market_fallback_override=market_fallback_override,
+    )
     evt = {
         "ts": datetime.now(timezone.utc).isoformat(),
         "req_id": req_id,
@@ -821,6 +1137,7 @@ def _execute_long_entry(
             take_price=float(take_price),
             notional_usd=float(_notional),
             opened_ts=time.time(),
+            max_hold_sec=_strategy_max_hold_sec(strategy),
         )
         return {"ok": True, "executed": True, "symbol": symbol, "strategy": strategy, "price": px, "stop": float(stop_price), "take": float(take_price)}
 
@@ -1045,6 +1362,7 @@ def webhook(payload: WebhookPayload, request: Request):
         take_price=take_price,
         strategy=strategy,
         opened_ts=now.timestamp(),
+        max_hold_sec=_strategy_max_hold_sec(strategy),
     )
     n = state.inc_trade(symbol)
 
@@ -1097,7 +1415,7 @@ def worker_exit(payload: WorkerExitPayload):
             float(getattr(settings, "min_position_notional_usd", 0.0) or 0.0),
             float(getattr(settings, "exit_min_notional_usd", 0.0) or 0.0),
         )
-        max_hold = int(getattr(settings, "max_hold_sec", 0) or 0)
+        max_hold_default = int(getattr(settings, "max_hold_sec", 0) or 0)
         grace = int(getattr(settings, "time_exit_grace_sec", 0) or 0)
         cooldown = int(getattr(settings, "exit_cooldown_sec", 0) or 0)
         dry_run = bool(getattr(settings, "exit_dry_run", False))
@@ -1175,13 +1493,13 @@ def worker_exit(payload: WorkerExitPayload):
                 },
             )
 
-        def _choose_exit_reason(*, px: float, plan: TradePlan, age_sec: float) -> tuple[str | None, dict]:
+        def _choose_exit_reason(*, px: float, plan: TradePlan, age_sec: float, max_hold_sec: int) -> tuple[str | None, dict]:
             """Select a single exit action for this cycle (or None), plus a decision trace."""
             eligible = {
                 "eligible_daily_flatten": bool(did_flatten),
-                "eligible_stop": px <= float(plan.stop_price),
+                "eligible_stop": (px <= float(plan.stop_price)) and (age_sec >= float(getattr(settings, "min_hold_sec_before_stop", 0) or 0)),
                 "eligible_take": px >= float(plan.take_price),
-                "eligible_time": (max_hold > 0 and age_sec >= float(max_hold + grace)),
+                "eligible_time": (max_hold_sec > 0 and age_sec >= float(max_hold_sec + grace)),
             }
             if eligible["eligible_daily_flatten"]:
                 return "daily_flatten", eligible
@@ -1219,6 +1537,8 @@ def worker_exit(payload: WorkerExitPayload):
             entry_px = float(getattr(plan, "entry_price", 0.0) or 0.0) or float(px)
             opened_ts = float(getattr(plan, "opened_ts", 0.0) or 0.0)
             age_sec = (now.timestamp() - opened_ts) if opened_ts > 0 else 0.0
+            plan_max = int(getattr(plan, "max_hold_sec", 0) or 0)
+            max_hold = int(plan_max if plan_max > 0 else max_hold_default)
 
             # Phase 4: lifecycle updates (state mutation only)
             be_before = bool(getattr(plan, "breakeven_armed", False))
@@ -1230,7 +1550,7 @@ def worker_exit(payload: WorkerExitPayload):
             be_after = bool(getattr(plan, "breakeven_armed", False))
 
             # Phase 5: decide action (at most one)
-            reason, trace = _choose_exit_reason(px=px, plan=plan, age_sec=age_sec)
+            reason, trace = _choose_exit_reason(px=px, plan=plan, age_sec=age_sec, max_hold_sec=max_hold)
             # Optional diagnostics per symbol
             if diagnostics:
                 evaluations.append({
@@ -1263,8 +1583,21 @@ def worker_exit(payload: WorkerExitPayload):
                 res = {"ok": True, "dry_run": True, "side": "sell", "symbol": symbol, "notional": notional_exit}
             else:
                 res = _market_notional(symbol=symbol, side="sell", notional=notional_exit, strategy=plan.strategy, price=px)
-                state.mark_exit(symbol)
-                state.set_pending_exit(symbol, reason=reason, txid=None)
+                if bool(res.get("ok")):
+                    state.mark_exit(symbol)
+                    state.set_pending_exit(symbol, reason=reason, txid=res.get("txid"))
+                else:
+                    # Do not latch exit cooldowns or pending state if the order failed.
+                    state.clear_pending_exit(symbol)
+                # Stopout cooldown latch: only on successful orders (anti-churn)
+                try:
+                    if bool(res.get("ok")):
+                        if reason == "stop" and hasattr(state, "mark_stopout"):
+                            state.mark_stopout(symbol)
+                        elif reason == "take" and hasattr(state, "clear_stopout"):
+                            state.clear_stopout(symbol)
+                except Exception:
+                    pass
 
             evt = {
                 "ts": datetime.now(timezone.utc).isoformat(),
@@ -1302,11 +1635,11 @@ def worker_exit(payload: WorkerExitPayload):
 
 
 
-def _entry_signals_for_symbol(symbol: str) -> tuple[dict, dict]:
+def _entry_signals_for_symbol(symbol: str, *, regime_quiet: bool) -> tuple[dict, dict]:
     """Return (signals, debug) for the given symbol.
 
-    signals: {"rb1": bool, "tc1": bool}
-    debug:   {"rb1": {...}, "tc1": {...}}
+    signals: {"rb1": bool, "tc1": bool, "cr1"?: bool, "mm1"?: bool}
+    debug:   {"rb1": {...}, "tc1": {...}, ...}
     """
     signals: dict = {}
     debug: dict = {}
@@ -1318,6 +1651,17 @@ def _entry_signals_for_symbol(symbol: str) -> tuple[dict, dict]:
     tc1_fired, tc1_meta = _tc1_long_signal(symbol)
     signals["tc1"] = bool(tc1_fired)
     debug["tc1"] = tc1_meta
+
+    # Optional strategies for quiet / choppy regimes
+    if STRATEGY_MODE != "legacy" and regime_quiet:
+        if ENABLE_CR1:
+            cr1_fired, cr1_meta = _signal_cr1(symbol)
+            signals["cr1"] = bool(cr1_fired)
+            debug["cr1"] = cr1_meta
+        if ENABLE_MM1:
+            mm1_fired, mm1_meta = _signal_mm1(symbol)
+            signals["mm1"] = bool(mm1_fired)
+            debug["mm1"] = mm1_meta
 
     return signals, debug
 
@@ -1395,10 +1739,24 @@ def _count_open_positions(open_set: set[str]) -> int:
     except Exception:
         pass
 
-    # Cooldown
+    # Cooldown (per-symbol)
     try:
         if not state.can_enter(symbol, getattr(settings, "entry_cooldown_sec", 0)):
             return False, "cooldown_active", {"cooldown_sec": getattr(settings, "entry_cooldown_sec", 0)}
+    except Exception:
+        pass
+
+    # Cooldown (global)
+    try:
+        if hasattr(state, "can_enter_global") and not state.can_enter_global(getattr(settings, "global_entry_cooldown_sec", 0)):
+            return False, "global_cooldown_active", {"global_cooldown_sec": getattr(settings, "global_entry_cooldown_sec", 0)}
+    except Exception:
+        pass
+
+    # Stopout cooldown (per-symbol)
+    try:
+        if hasattr(state, "can_enter_after_stopout") and not state.can_enter_after_stopout(symbol, getattr(settings, "stopout_cooldown_sec", 0)):
+            return False, "stopout_cooldown_active", {"stopout_cooldown_sec": getattr(settings, "stopout_cooldown_sec", 0)}
     except Exception:
         pass
 
@@ -1408,6 +1766,8 @@ def _count_open_positions(open_set: set[str]) -> int:
         if ok:
             try:
                 state.mark_enter(symbol)
+                if hasattr(state, "mark_enter_global"):
+                    state.mark_enter_global()
                 state.inc_trade(symbol)
                 # global counter (added in state.py patch)
                 if hasattr(state, "inc_trade_total"):
@@ -1620,6 +1980,9 @@ def scan_entries(payload: WorkerScanPayload):
     open_set = {p["symbol"] for p in positions if p.get("qty", 0) > 0}
     open_positions_count = _count_open_positions(open_set)
 
+    # Regime (used to optionally enable CR1/MM1 in quiet markets)
+    regime_quiet, regime_meta = _regime_is_quiet()
+
     # 4) Evaluate signals + build diagnostics
     per_symbol: Dict[str, Any] = {}
     candidates: List[Tuple[str, str]] = []  # (symbol, strategy)
@@ -1644,7 +2007,7 @@ def scan_entries(payload: WorkerScanPayload):
             continue
 
         try:
-            fired, sig_debug = _entry_signals_for_symbol(sym)  # (signals, debug)
+            fired, sig_debug = _entry_signals_for_symbol(sym, regime_quiet=bool(regime_quiet))  # (signals, debug)
         except Exception as e:
             d["skip"].append(f"signal_error:{type(e).__name__}")
             d["signal_error"] = str(e)
@@ -1660,18 +2023,47 @@ def scan_entries(payload: WorkerScanPayload):
             per_symbol[sym] = d
             continue
 
-        # If both fire, prefer RB1 (breakout) over TC1 (trend continuation)
-        strategy = "rb1" if fired.get("rb1") else fired_strats[0]
+        # Strategy preference:
+        # - In quiet regime, prefer MM1/CR1 over RB1/TC1 (more frequent, inventory-aware)
+        # - Otherwise, prefer RB1 over TC1 when both fire
+        if STRATEGY_MODE != "legacy" and bool(regime_quiet):
+            if fired.get("mm1"):
+                strategy = "mm1"
+            elif fired.get("cr1"):
+                strategy = "cr1"
+            elif fired.get("rb1"):
+                strategy = "rb1"
+            else:
+                strategy = fired_strats[0]
+        else:
+            strategy = "rb1" if fired.get("rb1") else fired_strats[0]
         d["eligible"] = True
         d["chosen_strategy"] = strategy
-        # per-scan entry cap
-        if MAX_ENTRIES_PER_SCAN > 0 and len(candidates) >= MAX_ENTRIES_PER_SCAN:
-            d["eligible"] = False
-            d["skip"].append("max_entries_per_scan_reached")
-            per_symbol[sym] = d
-            continue
         candidates.append((sym, strategy))
         per_symbol[sym] = d
+
+    # Apply per-scan entry cap *after* we have all candidates so we can prioritize
+    # strategies (especially important in quiet regime where MM1/CR1 should be favored).
+    if MAX_ENTRIES_PER_SCAN > 0 and len(candidates) > MAX_ENTRIES_PER_SCAN:
+        def _pri(s: str) -> int:
+            s = (s or "").lower()
+            if bool(regime_quiet) and STRATEGY_MODE != "legacy":
+                # Quiet regime: prioritize inventory-friendly / maker-capture first.
+                return {"mm1": 0, "cr1": 1, "rb1": 2, "tc1": 3}.get(s, 9)
+            # Non-quiet: prioritize directional edge.
+            return {"rb1": 0, "tc1": 1, "cr1": 2, "mm1": 3}.get(s, 9)
+
+        candidates_sorted = sorted(candidates, key=lambda x: (_pri(x[1]), universe.index(x[0]) if x[0] in universe else 10**9))
+        winners = set(candidates_sorted[:MAX_ENTRIES_PER_SCAN])
+        # Mark losers in diagnostics
+        for sym, strat in candidates_sorted[MAX_ENTRIES_PER_SCAN:]:
+            d = per_symbol.get(sym) or {"symbol": sym, "skip": []}
+            d.setdefault("skip", [])
+            d["eligible"] = False
+            if "max_entries_per_scan_reached" not in d["skip"]:
+                d["skip"].append("max_entries_per_scan_reached")
+            per_symbol[sym] = d
+        candidates = [c for c in candidates_sorted[:MAX_ENTRIES_PER_SCAN]]
 
     # 5) Execute (or dry-run)
     results: List[Dict[str, Any]] = []
@@ -1726,6 +2118,7 @@ def scan_entries(payload: WorkerScanPayload):
                 "max_entries_per_scan": MAX_ENTRIES_PER_SCAN,
                 "max_entries_per_day": MAX_ENTRIES_PER_DAY,
             },
+            "regime": regime_meta,
             "positions_count": len(positions),
             "plans_count": len(getattr(state, "plans", {}) or {}),
             "open_positions_count": open_positions_count,
@@ -1807,86 +2200,3 @@ def performance():
         "open_positions": positions,
         "total_open_notional_usd": total_exposure,
     }
-
-
-@app.get("/worker/trades")
-def worker_trades(
-    worker_secret: str | None = None,
-    refresh: bool = False,
-    since_hours: float | None = None,
-    pair: str | None = None,
-    limit: int = 500,
-):
-    """Return recent trades, optionally refreshing from Kraken and persisting to SQLite.
-
-    - If refresh=false (default), no Kraken API calls are made (safe under rate limits).
-    - If refresh=true, we call broker_kraken.trades_history() once, upsert into SQLite,
-      then return the requested slice.
-
-    Persistence:
-      - Set TRADE_DB_PATH to a path on a Render Persistent Disk to keep history across deploys.
-    """
-    _require_worker_secret(worker_secret)
-
-    trade_store.init_db()
-    since_ts: float | None = None
-    if since_hours is not None:
-        since_ts = time.time() - float(since_hours) * 3600.0
-
-    inserted = updated = 0
-    if refresh:
-        # NOTE: keep this to a single API call to avoid Kraken rate limits.
-        # broker_kraken.trades_history does not support 'since', so it returns the most recent N.
-        # We upsert them all and then filter locally.
-        try:
-            trades = broker_kraken.trades_history(count=min(max(limit, 50), 1000))
-            inserted, updated = trade_store.upsert_trades(trades)
-        except Exception as e:
-            return {
-                "ok": False,
-                "error": f"refresh_failed: {e}",
-            }
-
-    rows = trade_store.list_trades(since=since_ts, pair=pair, limit=limit)
-    return {
-        "ok": True,
-        "time": utc_now_iso(),
-        "db_path": os.getenv("TRADE_DB_PATH", ".data/trades.sqlite3"),
-        "refresh": refresh,
-        "refresh_upsert": {"inserted": inserted, "updated": updated} if refresh else None,
-        "since_hours": since_hours,
-        "pair": pair,
-        "limit": limit,
-        "trades": rows,
-    }
-
-
-@app.get("/worker/performance")
-def worker_performance(
-    worker_secret: str | None = None,
-    refresh: bool = False,
-    days: float = 7.0,
-):
-    """Basic realized cashflow / fees summary from persisted trades.
-
-    This is primarily to help you quickly see whether you're bleeding fees.
-    It's not a full mark-to-market P&L.
-    """
-    _require_worker_secret(worker_secret)
-    since_ts = time.time() - float(days) * 86400.0
-
-    upsert = None
-    if refresh:
-        try:
-            trades = broker_kraken.trades_history(count=1000)
-            ins, upd = trade_store.upsert_trades(trades)
-            upsert = {"inserted": ins, "updated": upd}
-        except Exception as e:
-            return {"ok": False, "error": f"refresh_failed: {e}"}
-
-    out = trade_store.performance_summary(since=since_ts)
-    out["time"] = utc_now_iso()
-    out["days"] = days
-    out["refresh"] = refresh
-    out["refresh_upsert"] = upsert
-    return out
