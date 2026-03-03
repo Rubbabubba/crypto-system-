@@ -991,6 +991,20 @@ def _execute_long_entry(
     elif sizing_mode == "equity_fraction":
         bals = _balances_by_asset()
         usd_cash = float(bals.get("USD", 0.0) or 0.0)
+        stable_cash = float(bals.get("USDC", 0.0) or 0.0) + float(bals.get("USDT", 0.0) or 0.0) + float(bals.get("DAI", 0.0) or 0.0)
+        if usd_cash <= 0.0:
+            # Common failure mode: account has value (e.g., USDC) but no USD cash to trade USD-quoted pairs.
+            # Report this explicitly so we do not mislabel it as "no_equity".
+            if stable_cash > 0.0:
+                return ignored(
+                    "no_usd_cash",
+                    symbol=symbol,
+                    strategy=strategy,
+                    usd_cash=usd_cash,
+                    stable_cash=stable_cash,
+                )
+            return ignored("no_equity", symbol=symbol, strategy=strategy, usd_cash=usd_cash)
+
         # Total account value proxy (cash + value of open positions). For spot, this is a safe
         # and stable basis for "use X% of account value per trade".
         equity_total = float(usd_cash) + float(total_exposure or 0.0)
@@ -1014,6 +1028,20 @@ def _execute_long_entry(
     elif sizing_mode == "risk_pct_equity":
         bals = _balances_by_asset()
         usd_cash = float(bals.get("USD", 0.0) or 0.0)
+        stable_cash = float(bals.get("USDC", 0.0) or 0.0) + float(bals.get("USDT", 0.0) or 0.0) + float(bals.get("DAI", 0.0) or 0.0)
+        if usd_cash <= 0.0:
+            # Common failure mode: account has value (e.g., USDC) but no USD cash to trade USD-quoted pairs.
+            # Report this explicitly so we do not mislabel it as "no_equity".
+            if stable_cash > 0.0:
+                return ignored(
+                    "no_usd_cash",
+                    symbol=symbol,
+                    strategy=strategy,
+                    usd_cash=usd_cash,
+                    stable_cash=stable_cash,
+                )
+            return ignored("no_equity", symbol=symbol, strategy=strategy, usd_cash=usd_cash)
+
         equity_total = float(usd_cash) + float(total_exposure or 0.0)
         res = compute_risk_pct_equity_notional(
             equity_usd=equity_total,
