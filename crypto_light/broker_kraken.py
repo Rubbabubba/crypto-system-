@@ -29,6 +29,7 @@ import hashlib
 import threading
 import json
 import logging
+import fcntl
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -115,6 +116,31 @@ logger = logging.getLogger("broker_kraken")
 
 _NONCE_LOCK = threading.Lock()
 _LAST_NONCE = 0
+
+
+def _next_nonce_cross_process() -> int:
+    """Generate a strictly increasing nonce across processes.
+
+    If multiple Render processes/services share the same Kraken API key,
+    per-process nonces can go out of order and Kraken returns EAPI:Invalid nonce.
+    This function coordinates via a file on the persistent disk.
+    """
+    nonce_path = os.getenv("KRAKEN_NONCE_PATH", "/var/data/kraken_nonce.txt")
+    os.makedirs(os.path.dirname(nonce_path), exist_ok=True)
+    now = time.time_ns() // 1_000  # microseconds
+    with open(nonce_path, "a+") as f:
+        fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+        f.seek(0)
+        raw = f.read().strip()
+        last = int(raw) if raw.isdigit() else 0
+        nxt = now if now > last else last + 1
+        f.seek(0)
+        f.truncate()
+        f.write(str(nxt))
+        f.flush()
+        os.fsync(f.fileno())
+        fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+    return int(nxt)
 
 # ---------------------------------------------------------------------------
 # Robust local import of symbol_map helpers (works in flat or packaged repo)
@@ -430,10 +456,10 @@ def _priv(path: str, data: dict | None = None) -> dict:
     last_err: Exception | None = None
     for attempt in range(1, 6):
         try:
-            # Monotonic nonce (per-process)
+            # Monotonic nonce (cross-process)
             with _NONCE_LOCK:
                 global _LAST_NONCE
-                n = int(time.time() * 1000)
+                n = _next_nonce_cross_process()
                 if n <= _LAST_NONCE:
                     n = _LAST_NONCE + 1
                 _LAST_NONCE = n
@@ -1053,6 +1079,10 @@ def limit_notional(
         ),
     }
 
+    # Maker-first: Kraken supports post-only via oflags=post
+    if bool(kwargs.get("post_only")):
+        payload["oflags"] = "post"
+
     try:
         res = _priv("AddOrder", payload)
     except Exception as e:
@@ -1077,6 +1107,32 @@ def limit_notional(
         "descr": descr,
         "result": res,
     }
+
+
+def maker_limit_notional(
+    pair: str,
+    side: str,
+    notional_usd: float,
+    bid: float,
+    ask: float,
+    validate: bool = False,
+    strat_tag: str = "maker",
+) -> Dict[str, Any]:
+    """Maker-first post-only limit order at top-of-book.
+
+    BUY  -> price=bid
+    SELL -> price=ask
+    """
+    px = float(bid) if side.lower() == "buy" else float(ask)
+    return limit_notional(
+        pair=pair,
+        side=side,
+        notional_usd=notional_usd,
+        limit_price=px,
+        validate=validate,
+        strat_tag=strat_tag,
+        post_only=True,
+    )
 
 
 def cancel_order(txid: str) -> Dict[str, Any]:
@@ -1136,30 +1192,71 @@ def positions() -> List[Dict[str, Any]]:
         out.append({"error": str(e)})
     return out
 
-def trades_history(count: int = 20) -> Dict[str, Any]:
-    """
-    Return recent trades (fills). Pass-through of Kraken's TradesHistory, normalized to a list.
+def trades_history(count: int = 20, start_ts: Optional[float] = None, ofs: int = 0) -> Dict[str, Any]:
+    """Return recent trades (fills).
+
+    Kraken private API response format is {"error": [...], "result": {"trades": {...}}}.
+    The previous implementation incorrectly read res["trades"], which always produced
+    an empty set.
     """
     try:
-        res = _priv("TradesHistory", {"type": "all", "ofs": 0})
-        trades = list((res.get("trades") or {}).items())  # [(txid, {...}), ...]
-        trades.sort(key=lambda kv: float(kv[1].get("time", 0)), reverse=True)
+        req: Dict[str, Any] = {"type": "all", "trades": True, "ofs": int(ofs)}
+        if start_ts is not None:
+            req["start"] = int(start_ts)
+        res = _priv("TradesHistory", req)
+        if res.get("error"):
+            return {"ok": False, "error": str(res.get("error"))}
+        trades_map = ((res.get("result") or {}).get("trades")) or {}
+        trades = list(trades_map.items())  # [(txid, {...}), ...]
+        trades.sort(key=lambda kv: float((kv[1] or {}).get("time", 0) or 0), reverse=True)
         items = []
         for tid, t in trades[: max(1, int(count))]:
-            items.append({
-                "txid": tid,
-                "pair": t.get("pair"),
-                "type": t.get("type"),
-                "ordertype": t.get("ordertype"),
-                "price": float(t.get("price", 0) or 0),
-                "vol": float(t.get("vol", 0) or 0),
-                "time": t.get("time"),
-                "fee": float(t.get("fee", 0) or 0),
-                "cost": float(t.get("cost", 0) or 0),
-            })
+            t = t or {}
+            items.append(
+                {
+                    "txid": tid,
+                    "pair": t.get("pair"),
+                    "type": t.get("type"),
+                    "ordertype": t.get("ordertype"),
+                    "price": float(t.get("price", 0) or 0),
+                    "vol": float(t.get("vol", 0) or 0),
+                    "time": t.get("time"),
+                    "fee": float(t.get("fee", 0) or 0),
+                    "cost": float(t.get("cost", 0) or 0),
+                }
+            )
         return {"ok": True, "trades": items}
     except Exception as e:
         return {"ok": False, "error": str(e)}
+
+
+def trades_history_since(since_ts: float, pair: Optional[str] = None, limit: int = 500) -> List[Dict[str, Any]]:
+    """Fetch trades since a given timestamp (seconds), with pagination."""
+    out: List[Dict[str, Any]] = []
+    ofs = 0
+    while True:
+        res = _priv("TradesHistory", {"type": "all", "trades": True, "start": int(since_ts), "ofs": int(ofs)})
+        if res.get("error"):
+            raise RuntimeError(str(res.get("error")))
+        trades_map = ((res.get("result") or {}).get("trades")) or {}
+        if not isinstance(trades_map, dict) or not trades_map:
+            break
+        for tid, t in trades_map.items():
+            if not isinstance(t, dict):
+                continue
+            row = dict(t)
+            row["txid"] = tid
+            out.append(row)
+        if len(out) >= int(limit):
+            out = out[: int(limit)]
+            break
+        if len(trades_map) < 50:
+            break
+        ofs += len(trades_map)
+    if pair:
+        out = [t for t in out if (t.get("pair") == pair or t.get("pair") == pair.replace("/", ""))]
+    out.sort(key=lambda x: float(x.get("time") or 0))
+    return out
 
 # --- Added helper: trade_details -------------------------------------------------
 def trade_details(ids):

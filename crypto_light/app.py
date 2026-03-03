@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from . import trades_db
-from .broker_kraken import trades_history
+from .broker_kraken import trades_history_since
 
 import logging
 import json
@@ -12,7 +12,7 @@ from typing import Any, Dict, Optional, Set, List, Tuple
 from uuid import uuid4
 
 import requests
-from fastapi import FastAPI, HTTPException, Request, Body
+from fastapi import FastAPI, HTTPException, Request, Body, Query
 from fastapi.responses import JSONResponse
 
 log = logging.getLogger("crypto_light")
@@ -852,25 +852,10 @@ def health():
 
 # --- Trades persistence + performance endpoints (SQLite on Render disk) ---
 
-def _refresh_trades_from_kraken(since_hours: float = 24.0, pair: str | None = None, upsert: bool = True) -> dict:
-    # Fetch recent trades from Kraken private TradesHistory.
-    # Note: broker_kraken.trades_history currently returns the most recent page. That's ok for short windows
-    # if you run refresh periodically.
+def _refresh_trades_from_kraken(since_hours: float = 24.0, pair: str | None = None, upsert: bool = True, limit: int = 500) -> dict:
+    """Fetch recent trades (fills) from Kraken TradesHistory and persist to SQLite."""
     since_ts = time.time() - float(since_hours) * 3600.0
-    raw = trades_history()  # {txid: {...}}
-    items = []
-    for txid, t in (raw or {}).items():
-        try:
-            t = dict(t)
-            t["txid"] = txid
-            if pair and t.get("pair") != pair:
-                continue
-            if float(t.get("time") or 0) < since_ts:
-                continue
-            items.append(t)
-        except Exception:
-            continue
-
+    items = trades_history_since(since_ts=since_ts, pair=pair, limit=max(1, int(limit)))
     # Sort by time ascending for nicer inserts
     items.sort(key=lambda x: float(x.get("time") or 0))
     if upsert:
@@ -892,19 +877,49 @@ def get_trades(
     return trades_db.query_trades(since_hours=since_hours, pair=pair, limit=limit)
 
 @app.post("/trades/refresh")
-def refresh_trades(body: dict | bool | None = Body(default=None)):
-    # Defensive: some clients accidentally send boolean bodies ("true"/"false")
+def refresh_trades(
+    since_hours: float = Query(24.0),
+    pair: str | None = Query(None),
+    limit: int = Query(500),
+    upsert: bool = Query(True),
+    body: dict | bool | None = Body(default=None),
+):
+    """Refresh fills from Kraken into SQLite.
+
+    Accepts either query params (recommended) or JSON body.
+    """
     payload = body if isinstance(body, dict) else {}
-    since_hours = float(payload.get("since_hours", 24.0))
-    pair = payload.get("pair")
-    upsert = bool(payload.get("upsert", True))
-    return _refresh_trades_from_kraken(since_hours=since_hours, pair=pair, upsert=upsert)
+    since_hours = float(payload.get("since_hours", since_hours))
+    pair = payload.get("pair", pair)
+    limit = int(payload.get("limit", limit))
+    upsert_val = payload.get("upsert", upsert)
+    if isinstance(upsert_val, bool):
+        upsert = upsert_val
+    elif isinstance(upsert_val, str):
+        upsert = upsert_val.lower() in ("1", "true", "yes", "y")
+    else:
+        upsert = True
+    return _refresh_trades_from_kraken(since_hours=since_hours, pair=pair, upsert=bool(upsert), limit=limit)
+
+
+@app.get("/trades/refresh")
+def refresh_trades_get(
+    since_hours: float = 24.0,
+    pair: str | None = None,
+    limit: int = 500,
+    upsert: bool = True,
+):
+    return _refresh_trades_from_kraken(since_hours=since_hours, pair=pair, upsert=bool(upsert), limit=limit)
 
 @app.get("/trades/summary")
 def trades_summary(days: float = 7.0, refresh: bool = False, refresh_since_hours: float = 168.0):
-    if refresh:
-        _refresh_trades_from_kraken(since_hours=refresh_since_hours, pair=None, upsert=True)
-    return trades_db.summary(days=days)
+    try:
+        if refresh:
+            _refresh_trades_from_kraken(since_hours=float(refresh_since_hours), pair=None, upsert=True, limit=1000)
+        out = trades_db.summary(days=float(days))
+        return {"ok": True, **out, "time": datetime.utcnow().isoformat() + "+00:00", "days": float(days), "refresh": bool(refresh)}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
 
 
 @app.get("/telemetry")
