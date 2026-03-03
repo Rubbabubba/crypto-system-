@@ -33,11 +33,6 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 
-
-# Base Kraken REST URL (override if needed, e.g. for proxies)
-KRAKEN_API_URL = os.getenv("KRAKEN_API_URL", "https://api.kraken.com").rstrip("/")
-
-
 def _load_strategy_to_userref() -> Dict[str, int]:
     """Load mapping from strategy name -> Kraken userref (int).
 
@@ -334,6 +329,11 @@ def _cooldown_latch(strategy: str, kraken_pair: str, side: str) -> None:
 # Config
 # ---------------------------------------------------------------------------
 API_BASE = os.getenv("KRAKEN_BASE", "https://api.kraken.com")
+
+# Backward-compatible alias.
+# Some parts of the codebase (and older deployments) reference KRAKEN_API_URL.
+# Keep this defined so private/public requests don't crash with NameError.
+KRAKEN_API_URL = API_BASE
 TIMEOUT = float(os.getenv("KRAKEN_TIMEOUT", "10"))        # seconds
 MIN_DELAY = float(os.getenv("KRAKEN_MIN_DELAY", "0.35"))  # seconds between calls (simple gate)
 MAX_RETRIES = int(os.getenv("KRAKEN_MAX_RETRIES", "4"))
@@ -1166,46 +1166,44 @@ def trades_history(count: int = 20) -> Dict[str, Any]:
     except Exception as e:
         return {"ok": False, "error": str(e)}
 
-# --- Added helper: trade_details -------------------------------------------------
 
-def trades_history_since(since_ts: float, pair: str | None = None, limit: int = 1000) -> list[dict]:
-    """Fetch user trades since epoch seconds using Kraken TradesHistory (paged by ofs).
+def trades_history_since(*, since_ts: float, pair: str | None = None, limit: int = 250) -> list[dict]:
+    """Return a flat list of trades from Kraken TradesHistory starting at `since_ts`.
 
-    Returns a list of trade dicts, each with at least: txid, pair, time, type, ordertype, price, vol, fee, cost.
+    Some parts of the app expect this helper (used by /trades/refresh). We keep it
+    in broker_kraken so app.py can call it directly.
     """
+    since_ts_i = int(since_ts)
     out: list[dict] = []
     ofs = 0
-    # Kraken returns up to ~50 trades per page by default.
-    page_size = 50
-    limit = max(1, int(limit))
-    while len(out) < limit:
-        res = _priv(
-            "TradesHistory",
-            {"type": "all", "trades": True, "start": int(since_ts), "ofs": int(ofs)},
-        )
-        result = (res or {}).get("result") or {}
-        trades = result.get("trades") or {}
-        if not trades:
+    # Kraken TradesHistory uses offset-based pagination.
+    while len(out) < max(1, int(limit)):
+        res = _priv("TradesHistory", {"type": "all", "trades": True, "start": since_ts_i, "ofs": int(ofs)})
+        trades = (res.get("trades") or {}) if isinstance(res, dict) else {}
+        if not isinstance(trades, dict) or not trades:
             break
-        items = []
+
+        # trades is dict: {txid: {...}}
+        batch_n = 0
         for txid, t in trades.items():
             if not isinstance(t, dict):
                 continue
-            t2 = dict(t)
-            t2["txid"] = txid
-            items.append(t2)
-        # Optional pair filter (Kraken pair names vary; we match exact)
-        if pair:
-            items = [t for t in items if str(t.get("pair") or "") == pair]
-        # Sort ascending by time for stable paging/processing
-        items.sort(key=lambda x: float(x.get("time") or 0.0))
-        out.extend(items)
-        # Stop if this page was smaller than page_size (likely no more)
-        if len(trades) < page_size:
-            break
-        ofs += page_size
-    return out[:limit]
+            item = dict(t)
+            item.setdefault("txid", txid)
+            if pair and item.get("pair") != pair:
+                continue
+            out.append(item)
+            batch_n += 1
+            if len(out) >= max(1, int(limit)):
+                break
 
+        if batch_n <= 0:
+            break
+        ofs += batch_n
+
+    return out[: max(1, int(limit))]
+
+# --- Added helper: trade_details -------------------------------------------------
 def trade_details(ids):
     """
     Accepts a mixed list of Kraken order ids (start with 'O') and trade ids (start with 'T').

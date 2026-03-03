@@ -35,23 +35,6 @@ settings = load_settings()
 ALLOWED_SYMBOLS = set(getattr(settings, 'allowed_symbols', []) or [])
 
 state = InMemoryState()
-
-def _parse_bool(v, default: bool = False) -> bool:
-    """Parse bool-ish query/body values safely (handles 'true'/'false' strings)."""
-    if v is None:
-        return default
-    if isinstance(v, bool):
-        return v
-    if isinstance(v, (int, float)):
-        return bool(v)
-    if isinstance(v, str):
-        s=v.strip().lower()
-        if s in ("1","true","t","yes","y","on"):
-            return True
-        if s in ("0","false","f","no","n","off","", "none", "null"):
-            return False
-    return default
-
 app = FastAPI(title="Crypto Light", version="1.0.3")
 
 
@@ -869,25 +852,33 @@ def health():
 
 # --- Trades persistence + performance endpoints (SQLite on Render disk) ---
 
-def _refresh_trades_from_kraken(since_hours: float = 24.0, pair: str | None = None, upsert: bool = True, limit: int = 1000) -> dict:
-    # Fetch trades from Kraken private TradesHistory since the window start.
+def _refresh_trades_from_kraken(since_hours: float = 24.0, pair: str | None = None, upsert: bool = True) -> dict:
+    # Fetch recent trades from Kraken private TradesHistory.
+    # Note: broker_kraken.trades_history currently returns the most recent page. That's ok for short windows
+    # if you run refresh periodically.
     since_ts = time.time() - float(since_hours) * 3600.0
-    items = trades_history_since(since_ts=since_ts, pair=pair, limit=max(1, int(limit)))  # list[dict]
+    raw = trades_history()  # {txid: {...}}
+    items = []
+    for txid, t in (raw or {}).items():
+        try:
+            t = dict(t)
+            t["txid"] = txid
+            if pair and t.get("pair") != pair:
+                continue
+            if float(t.get("time") or 0) < since_ts:
+                continue
+            items.append(t)
+        except Exception:
+            continue
 
     # Sort by time ascending for nicer inserts
     items.sort(key=lambda x: float(x.get("time") or 0))
     if upsert:
         up = trades_db.upsert_trades(items)
     else:
-        up = {
-            "ok": True,
-            "db_path": trades_db.ensure_db(),
-            "inserted": 0,
-            "updated": 0,
-            "received": len(items),
-            "note": "upsert disabled",
-        }
+        up = {"ok": True, "db_path": trades_db.ensure_db(), "inserted": 0, "updated": 0, "received": len(items), "note": "upsert disabled"}
     return {"ok": True, "since_hours": float(since_hours), "pair": pair, "count": len(items), "upsert": up}
+
 @app.get("/trades")
 def get_trades(
     since_hours: float = 24.0,
@@ -900,27 +891,13 @@ def get_trades(
         _refresh_trades_from_kraken(since_hours=since_hours, pair=pair, upsert=True if refresh_upsert is None else bool(refresh_upsert))
     return trades_db.query_trades(since_hours=since_hours, pair=pair, limit=limit)
 
-@app.get("/trades/refresh")
-def refresh_trades_get(
-    since_hours: float = 24.0,
-    pair: str | None = None,
-    upsert: bool | str | None = True,
-    limit: int = 1000,
-):
-    return _refresh_trades_from_kraken(
-        since_hours=since_hours,
-        pair=pair,
-        upsert=_parse_bool(upsert, default=True),
-        limit=limit,
-    )
-
 @app.post("/trades/refresh")
 def refresh_trades(body: dict | bool | None = Body(default=None)):
     # Defensive: some clients accidentally send boolean bodies ("true"/"false")
     payload = body if isinstance(body, dict) else {}
     since_hours = float(payload.get("since_hours", 24.0))
     pair = payload.get("pair")
-    upsert = _parse_bool(payload.get("upsert", True), default=True)
+    upsert = bool(payload.get("upsert", True))
     return _refresh_trades_from_kraken(since_hours=since_hours, pair=pair, upsert=upsert)
 
 @app.get("/trades/summary")
