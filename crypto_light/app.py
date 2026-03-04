@@ -2166,12 +2166,12 @@ def scan_entries(payload: WorkerScanPayload):
             }
         )
 
-# --- Equity debug (helps diagnose no_equity quickly) ---
-bal_dbg = _balances_by_asset()
-stable_cash_dbg = _stable_cash_usd(bal_dbg)
-bal_keys_dbg = sorted(list(bal_dbg.keys()))[:20]
-bal_err_dbg = _last_balance_error()
-
+    # --- Equity debug (helps diagnose no_equity quickly) ---
+    bal_dbg = _balances_by_asset()
+    stable_cash_dbg = _stable_cash_usd(bal_dbg)
+    bal_keys_dbg = sorted(list(bal_dbg.keys()))[:20]
+    bal_err_dbg = _last_balance_error()
+    
     # 6) Return diagnostics
     return {
         "ok": True,
