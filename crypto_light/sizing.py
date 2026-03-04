@@ -90,8 +90,43 @@ def compute_equity_fraction_notional(
         capped_by = capped_by or "cash_cap"
 
     # Minimum notional guard.
-    if notional < float(min_order_notional_usd or 0.0):
-        return SizingResult(ok=False, equity_usd=equity, target_notional_usd=target, notional_usd=notional, reason="below_min_notional")
+    min_n = float(min_order_notional_usd or 0.0)
+    if min_n > 0.0 and notional < min_n:
+        # If the computed notional falls below the exchange minimum, try to *bump up* to the minimum
+        # when feasible under caps. This is important for small accounts where equity*fraction
+        # is often slightly below the minimum order size.
+        feasible = True
+
+        # Respect hard max_notional cap.
+        if max_notional_usd and max_notional_usd > 0 and min_n > float(max_notional_usd):
+            feasible = False
+
+        # Respect exposure caps.
+        if feasible and max_total_exposure_usd and max_total_exposure_usd > 0:
+            remaining = float(max_total_exposure_usd) - float(current_total_exposure_usd or 0.0)
+            if min_n > remaining:
+                feasible = False
+
+        if feasible and max_symbol_exposure_usd and max_symbol_exposure_usd > 0:
+            remaining_sym = float(max_symbol_exposure_usd) - float(current_symbol_exposure_usd or 0.0)
+            if min_n > remaining_sym:
+                feasible = False
+
+        # Respect available cash.
+        if feasible and cash < min_n:
+            feasible = False
+
+        if not feasible:
+            return SizingResult(
+                ok=False,
+                equity_usd=equity,
+                target_notional_usd=target,
+                notional_usd=notional,
+                reason="below_min_notional",
+            )
+
+        notional = min_n
+        capped_by = capped_by or "min_notional_bump"
 
     return SizingResult(
         ok=True,
