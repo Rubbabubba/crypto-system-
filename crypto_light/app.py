@@ -34,13 +34,15 @@ settings = load_settings()
 
 
 def _portfolio_exposure_usd_from_balances(balances: dict[str, float]) -> float:
-    """Best-effort mark-to-market exposure for non-USD assets.
+    """Best-effort mark-to-market exposure for non-USD *non-stable* assets.
 
+    We treat USD-like stables as cash elsewhere.
     We price each asset against USD using broker_kraken.last_trade_map().
     Missing prices are ignored (we prefer a scan that runs over a hard fail).
     """
+    stables = {'USD', 'USDC', 'USDT'}
     exposure = 0.0
-    assets = [a for a in balances.keys() if a != 'USD']
+    assets = [a for a in balances.keys() if a not in stables]
     if not assets:
         return 0.0
     pairs = [f"{a}/USD" for a in assets]
@@ -60,6 +62,23 @@ def _portfolio_exposure_usd_from_balances(balances: dict[str, float]) -> float:
         except Exception:
             continue
     return float(exposure)
+
+
+def _stable_cash_usd(balances: dict[str, float]) -> float:
+    """Return USD-like cash from balances.
+
+    Kraken may report USD cash as USD or ZUSD depending on endpoint/account.
+    Some accounts primarily hold stables (USDC/USDT). Treat those as cash-equivalent
+    for sizing and eligibility checks.
+    """
+    keys = ('USD', 'ZUSD', 'USDC', 'ZUSDC', 'USDT', 'ZUSDT')
+    total = 0.0
+    for k in keys:
+        try:
+            total += float(balances.get(k, 0.0) or 0.0)
+        except Exception:
+            continue
+    return float(total)
 
 # Keep a normalized set for fast membership checks.
 ALLOWED_SYMBOLS = set(getattr(settings, 'allowed_symbols', []) or [])
@@ -1052,7 +1071,7 @@ def _execute_long_entry(
         _notional = float(notional)
     elif sizing_mode == "equity_fraction":
         bals = _balances_by_asset()
-        usd_cash = float(bals.get("USD", 0.0) or 0.0)
+        usd_cash = float(_stable_cash_usd(bals) or 0.0)
         # Total account value proxy (cash + value of open positions). For spot, this is a safe
         # and stable basis for "use X% of account value per trade".
         equity_total = float(usd_cash) + float(_portfolio_exposure_usd_from_balances(bals))
@@ -1075,7 +1094,7 @@ def _execute_long_entry(
         _notional = float(res.notional_usd)
     elif sizing_mode == "risk_pct_equity":
         bals = _balances_by_asset()
-        usd_cash = float(bals.get("USD", 0.0) or 0.0)
+        usd_cash = float(_stable_cash_usd(bals) or 0.0)
         equity_total = float(usd_cash) + float(_portfolio_exposure_usd_from_balances(bals))
         res = compute_risk_pct_equity_notional(
             equity_usd=equity_total,
