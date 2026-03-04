@@ -833,6 +833,14 @@ def market_notional(
         market_fallback = bool(market_fallback_override)
     else:
         market_fallback = (os.getenv("MARKET_FALLBACK", "1").strip().lower() in ("1","true","yes","on"))
+    # Guardrail: maker_first without market fallback must allow time/steps for a maker fill.
+    if exec_mode == "maker_first" and not market_fallback:
+        min_wait = int(float(os.getenv("MAKER_MIN_WAIT_SEC", "5") or 5))
+        if chase_sec < min_wait:
+            chase_sec = min_wait
+        if chase_steps < 1:
+            chase_steps = 1
+
 
     def _place_market() -> Dict[str, Any]:
         payload_mkt = {
