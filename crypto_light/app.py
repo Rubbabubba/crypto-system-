@@ -999,24 +999,16 @@ def health():
 
 # --- Trades persistence + performance endpoints (SQLite on Render disk) ---
 
-def _refresh_trades_from_kraken(since_hours: float = 24.0, pair: str | None = None, upsert: bool = True) -> dict:
+def _refresh_trades_from_kraken(
+    since_hours: float = 24.0,
+    pair: str | None = None,
+    upsert: bool = True,
+    limit: int = 250,
+) -> dict:
     # Fetch recent trades from Kraken private TradesHistory.
-    # Note: broker_kraken.trades_history currently returns the most recent page. That's ok for short windows
-    # if you run refresh periodically.
     since_ts = time.time() - float(since_hours) * 3600.0
-    raw = trades_history()  # {txid: {...}}
-    items = []
-    for txid, t in (raw or {}).items():
-        try:
-            t = dict(t)
-            t["txid"] = txid
-            if pair and t.get("pair") != pair:
-                continue
-            if float(t.get("time") or 0) < since_ts:
-                continue
-            items.append(t)
-        except Exception:
-            continue
+    # Use the dedicated since+limit helper to avoid signature mismatches and reduce payload size.
+    items = broker_kraken.trades_history_since(since_ts=since_ts, pair=pair, limit=int(limit)) or []
 
     # Sort by time ascending for nicer inserts
     items.sort(key=lambda x: float(x.get("time") or 0))
@@ -1024,7 +1016,7 @@ def _refresh_trades_from_kraken(since_hours: float = 24.0, pair: str | None = No
         up = trades_db.upsert_trades(items)
     else:
         up = {"ok": True, "db_path": trades_db.ensure_db(), "inserted": 0, "updated": 0, "received": len(items), "note": "upsert disabled"}
-    return {"ok": True, "since_hours": float(since_hours), "pair": pair, "count": len(items), "upsert": up}
+    return {"ok": True, "since_hours": float(since_hours), "pair": pair, "limit": int(limit), "count": len(items), "upsert": up}
 
 @app.get("/trades")
 def get_trades(
@@ -1041,14 +1033,15 @@ def get_trades(
 @app.get("/trades/refresh")
 def refresh_trades_get(
     since_hours: int = 24,
+    pair: str | None = None,
     upsert: bool = True,
-    limit: int = 1000,
+    limit: int = 250,
 ):
     """Back-compat convenience endpoint (GET).
 
     Preferred is POST /trades/refresh with JSON body.
     """
-    return _refresh_trades_from_kraken(since_hours=since_hours, upsert=upsert, limit=limit)
+    return _refresh_trades_from_kraken(since_hours=since_hours, pair=pair, upsert=upsert, limit=limit)
 
 
 @app.post("/trades/refresh")

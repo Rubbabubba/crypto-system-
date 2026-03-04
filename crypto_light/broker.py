@@ -3,7 +3,71 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Dict, Optional
 
+import time
+
 from . import broker_kraken
+
+
+def _maybe_record_trade(
+    resp: Dict,
+    *,
+    exchange: str,
+    side: str,
+    fallback_price: Optional[float],
+    strategy: str,
+) -> None:
+    """Best-effort trade persistence.
+
+    We only record filled orders. This powers /trades and /trades/summary so we
+    can analyze win-rate, avg win/loss, expectancy, and fee drag.
+    """
+    try:
+        if not isinstance(resp, dict) or not resp.get("ok") or resp.get("filled") is not True:
+            return
+
+        from . import trades_db  # local import avoids circular imports
+
+        pair = str(resp.get("pair") or "")
+        qty = float(resp.get("volume") or 0.0)
+        cost = float(resp.get("notional") or 0.0)
+
+        px = resp.get("avg_price")
+        if px is None:
+            px = resp.get("price")
+        if px is None:
+            px = resp.get("limit_price")
+        if px is None:
+            px = fallback_price
+        price = float(px or 0.0)
+
+        if not pair or qty <= 0 or price <= 0:
+            return
+
+        txid = resp.get("txid")
+        if isinstance(txid, list):
+            txid = txid[0] if txid else ""
+        txid = str(txid or "")
+
+        # Persist in the same schema used by /trades and /trades/summary.
+        trades_db.upsert_trades(
+            [
+                {
+                    "txid": txid or f"local-{int(time.time()*1000)}",
+                    "pair": pair,
+                    "type": str(side),
+                    "ordertype": str(resp.get("execution") or "market"),
+                    "price": price,
+                    "vol": qty,
+                    "cost": cost,
+                    "fee": float(resp.get("fee") or 0.0),
+                    "time": time.time(),
+                    "raw": resp,
+                }
+            ]
+        )
+    except Exception:
+        # Never allow trade persistence issues to impact live trading.
+        return
 
 # Last Balance error (for diagnostics)
 LAST_BALANCE_ERROR: str | None = None
@@ -35,7 +99,7 @@ def market_notional(
     chase_steps_override: Optional[int] = None,
     market_fallback_override: Optional[bool] = None,
 ) -> Dict:
-    return broker_kraken.market_notional(
+    resp = broker_kraken.market_notional(
         symbol=symbol,
         side=side,
         notional=float(notional),
@@ -48,6 +112,9 @@ def market_notional(
         market_fallback_override=market_fallback_override,
     )
 
+    _maybe_record_trade(resp, exchange="kraken", side=side, fallback_price=price, strategy=strategy)
+    return resp
+
 
 def limit_notional(
     symbol: str,
@@ -57,7 +124,7 @@ def limit_notional(
     strategy: str,
     price: Optional[float] = None,
 ) -> Dict:
-    return broker_kraken.limit_notional(
+    resp = broker_kraken.limit_notional(
         symbol=symbol,
         side=side,
         notional=float(notional),
@@ -65,6 +132,9 @@ def limit_notional(
         price=price,
         strategy=strategy,
     )
+
+    _maybe_record_trade(resp, exchange="kraken", side=side, fallback_price=limit_price, strategy=strategy)
+    return resp
 
 
 def cancel_order(txid: str) -> Dict:
