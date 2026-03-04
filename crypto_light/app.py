@@ -19,6 +19,7 @@ from fastapi.responses import RedirectResponse
 log = logging.getLogger("crypto_light")
 
 from .broker import balances_by_asset as _balances_by_asset
+from .broker import last_balance_error as _last_balance_error
 from .broker import base_asset as _base_asset
 from .broker import last_price as _last_price
 from .broker import market_notional as _market_notional
@@ -2165,6 +2166,12 @@ def scan_entries(payload: WorkerScanPayload):
             }
         )
 
+# --- Equity debug (helps diagnose no_equity quickly) ---
+bal_dbg = _balances_by_asset()
+stable_cash_dbg = _stable_cash_usd(bal_dbg)
+bal_keys_dbg = sorted(list(bal_dbg.keys()))[:20]
+bal_err_dbg = _last_balance_error()
+
     # 6) Return diagnostics
     return {
         "ok": True,
@@ -2200,6 +2207,7 @@ def scan_entries(payload: WorkerScanPayload):
                 "max_entries_per_day": MAX_ENTRIES_PER_DAY,
             },
             "regime": regime_meta,
+            "equity_debug": {"stable_cash_usd": stable_cash_dbg, "balance_error": bal_err_dbg, "balance_keys": bal_keys_dbg},
             "positions_count": len(positions),
             "plans_count": len(getattr(state, "plans", {}) or {}),
             "open_positions_count": open_positions_count,

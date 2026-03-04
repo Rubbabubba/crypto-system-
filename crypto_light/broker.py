@@ -5,6 +5,13 @@ from typing import Dict, Optional
 
 from . import broker_kraken
 
+# Last Balance error (for diagnostics)
+LAST_BALANCE_ERROR: str | None = None
+
+def last_balance_error() -> str | None:
+    return LAST_BALANCE_ERROR
+
+
 
 @dataclass
 class SpotPosition:
@@ -67,17 +74,19 @@ def cancel_order(txid: str) -> Dict:
 def balances_by_asset() -> Dict[str, float]:
     """Return spot balances by asset code.
 
-    IMPORTANT: We must use the Kraken *Balance* endpoint for cash/stables.
-    The `positions()` helper is for open position-like objects and does not
-    reflect free cash (USD/ZUSD/USDC/USDT), which breaks equity detection and
-    causes `no_equity` skips.
+    Uses Kraken private Balance endpoint (via broker_kraken._fetch_balances()).
 
-    Returns a dict like {"ZUSD": 123.45, "USDC": 50.0, "XXBT": 0.01, ...}.
+    On failure, returns an empty dict but records the error string in
+    LAST_BALANCE_ERROR for surfacing in /worker diagnostics.
     """
+    global LAST_BALANCE_ERROR
+    LAST_BALANCE_ERROR = None
+
     out: Dict[str, float] = {}
     try:
         bal = broker_kraken._fetch_balances()  # internal cached Balance call
-    except Exception:
+    except Exception as e:
+        LAST_BALANCE_ERROR = f"{type(e).__name__}: {e}"
         bal = {}
 
     if isinstance(bal, dict):
@@ -89,6 +98,11 @@ def balances_by_asset() -> Dict[str, float]:
                 qty = 0.0
             if asset and qty > 0:
                 out[asset] = qty
+
+    if not out and isinstance(bal, dict) and bal and LAST_BALANCE_ERROR is None:
+        # Balance returned something but nothing parsed as non-zero
+        LAST_BALANCE_ERROR = "Balance parsed empty (all zero or non-numeric)"
+
     return out
 
 
