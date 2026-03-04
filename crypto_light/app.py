@@ -14,6 +14,7 @@ from uuid import uuid4
 import requests
 from fastapi import FastAPI, HTTPException, Request, Body
 from fastapi.responses import JSONResponse
+from fastapi.responses import RedirectResponse
 
 log = logging.getLogger("crypto_light")
 
@@ -31,11 +32,59 @@ from .symbol_map import normalize_symbol
 
 settings = load_settings()
 
+
+def _portfolio_exposure_usd_from_balances(balances: dict[str, float]) -> float:
+    """Best-effort mark-to-market exposure for non-USD assets.
+
+    We price each asset against USD using broker_kraken.last_trade_map().
+    Missing prices are ignored (we prefer a scan that runs over a hard fail).
+    """
+    exposure = 0.0
+    assets = [a for a in balances.keys() if a != 'USD']
+    if not assets:
+        return 0.0
+    pairs = [f"{a}/USD" for a in assets]
+    try:
+        last_map = broker_kraken.last_trade_map(pairs)
+    except Exception:
+        return 0.0
+    for a in assets:
+        qty = float(balances.get(a, 0.0) or 0.0)
+        if qty <= 0:
+            continue
+        px = last_map.get(f"{a}/USD")
+        if px is None:
+            continue
+        try:
+            exposure += qty * float(px)
+        except Exception:
+            continue
+    return float(exposure)
+
 # Keep a normalized set for fast membership checks.
 ALLOWED_SYMBOLS = set(getattr(settings, 'allowed_symbols', []) or [])
 
 state = InMemoryState()
 app = FastAPI(title="Crypto Light", version="1.0.3")
+
+
+@app.middleware("http")
+async def _normalize_path_slashes(request: Request, call_next):
+    # Render / some clients occasionally send paths with double slashes (//trades/refresh).
+    # FastAPI treats that as a different path, so we 307-redirect to the normalized path.
+    path = request.scope.get('path', '')
+    if '//' in path:
+        while '//' in path:
+            path = path.replace('//', '/')
+        if path and not path.startswith('/'):
+            path = '/' + path
+        # Preserve query string
+        qs = request.scope.get('query_string', b'')
+        url = path
+        if qs:
+            url = url + '?' + qs.decode('utf-8', errors='ignore')
+        return RedirectResponse(url=url, status_code=307)
+    return await call_next(request)
 
 
 def _require_worker_secret(provided: str | None) -> tuple[bool, str | None]:
@@ -891,6 +940,19 @@ def get_trades(
         _refresh_trades_from_kraken(since_hours=since_hours, pair=pair, upsert=True if refresh_upsert is None else bool(refresh_upsert))
     return trades_db.query_trades(since_hours=since_hours, pair=pair, limit=limit)
 
+@app.get("/trades/refresh")
+def refresh_trades_get(
+    since_hours: int = 24,
+    upsert: bool = True,
+    limit: int = 1000,
+):
+    """Back-compat convenience endpoint (GET).
+
+    Preferred is POST /trades/refresh with JSON body.
+    """
+    return _refresh_trades_from_kraken(since_hours=since_hours, upsert=upsert, limit=limit)
+
+
 @app.post("/trades/refresh")
 def refresh_trades(body: dict | bool | None = Body(default=None)):
     # Defensive: some clients accidentally send boolean bodies ("true"/"false")
@@ -991,23 +1053,9 @@ def _execute_long_entry(
     elif sizing_mode == "equity_fraction":
         bals = _balances_by_asset()
         usd_cash = float(bals.get("USD", 0.0) or 0.0)
-        stable_cash = float(bals.get("USDC", 0.0) or 0.0) + float(bals.get("USDT", 0.0) or 0.0) + float(bals.get("DAI", 0.0) or 0.0)
-        if usd_cash <= 0.0:
-            # Common failure mode: account has value (e.g., USDC) but no USD cash to trade USD-quoted pairs.
-            # Report this explicitly so we do not mislabel it as "no_equity".
-            if stable_cash > 0.0:
-                return ignored(
-                    "no_usd_cash",
-                    symbol=symbol,
-                    strategy=strategy,
-                    usd_cash=usd_cash,
-                    stable_cash=stable_cash,
-                )
-            return ignored("no_equity", symbol=symbol, strategy=strategy, usd_cash=usd_cash)
-
         # Total account value proxy (cash + value of open positions). For spot, this is a safe
         # and stable basis for "use X% of account value per trade".
-        equity_total = float(usd_cash) + float(total_exposure or 0.0)
+        equity_total = float(usd_cash) + float(_portfolio_exposure_usd_from_balances(bals))
         res = compute_equity_fraction_notional(
             equity_usd=equity_total,
             fraction=float(getattr(settings, "equity_fraction_per_trade", 0.05) or 0.05),
@@ -1028,21 +1076,7 @@ def _execute_long_entry(
     elif sizing_mode == "risk_pct_equity":
         bals = _balances_by_asset()
         usd_cash = float(bals.get("USD", 0.0) or 0.0)
-        stable_cash = float(bals.get("USDC", 0.0) or 0.0) + float(bals.get("USDT", 0.0) or 0.0) + float(bals.get("DAI", 0.0) or 0.0)
-        if usd_cash <= 0.0:
-            # Common failure mode: account has value (e.g., USDC) but no USD cash to trade USD-quoted pairs.
-            # Report this explicitly so we do not mislabel it as "no_equity".
-            if stable_cash > 0.0:
-                return ignored(
-                    "no_usd_cash",
-                    symbol=symbol,
-                    strategy=strategy,
-                    usd_cash=usd_cash,
-                    stable_cash=stable_cash,
-                )
-            return ignored("no_equity", symbol=symbol, strategy=strategy, usd_cash=usd_cash)
-
-        equity_total = float(usd_cash) + float(total_exposure or 0.0)
+        equity_total = float(usd_cash) + float(_portfolio_exposure_usd_from_balances(bals))
         res = compute_risk_pct_equity_notional(
             equity_usd=equity_total,
             risk_per_trade=float(getattr(settings, "risk_per_trade", 0.03) or 0.03),

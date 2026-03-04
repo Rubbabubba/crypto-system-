@@ -124,6 +124,9 @@ def compute_risk_pct_equity_notional(
     if risk_per_trade <= 0:
         return SizingResult(ok=False, reason="invalid_risk_per_trade", equity_usd=equity_usd)
 
+    if available_cash_usd <= 0:
+        return SizingResult(ok=False, reason="no_cash", equity_usd=equity_usd)
+
     risk_usd = float(equity_usd) * float(risk_per_trade)
     target = risk_usd / float(stop_pct)
 
