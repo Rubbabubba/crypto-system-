@@ -77,6 +77,14 @@ class Settings:
     take_pct: float
     exit_cooldown_sec: int
     max_hold_sec: int  # 0 disables
+    rb1_max_hold_sec: int
+    tc1_max_hold_sec: int
+
+    # Brackets
+    atr_brackets_enabled: bool
+    atr_bracket_len: int
+    atr_stop_mult: float
+    atr_take_mult: float
     time_exit_grace_sec: int
     exit_dry_run: bool
     exit_diagnostics: bool
@@ -193,6 +201,13 @@ def load_settings() -> Settings:
         take_pct=float(_getenv("TAKE_PCT", "0.02") or 0.02),
         exit_cooldown_sec=int(float(_getenv("EXIT_COOLDOWN_SEC", "20") or 20)),
         max_hold_sec=int(float(_getenv("MAX_HOLD_SEC", "0") or 0)),
+        rb1_max_hold_sec=int(float(_getenv("RB1_MAX_HOLD_SEC", "0") or 0)),
+        tc1_max_hold_sec=int(float(_getenv("TC1_MAX_HOLD_SEC", "0") or 0)),
+
+        atr_brackets_enabled=_getbool("ATR_BRACKETS_ENABLED", "0"),
+        atr_bracket_len=int(float(_getenv("ATR_BRACKET_LEN", "14") or 14)),
+        atr_stop_mult=float(_getenv("ATR_STOP_MULT", "2.0") or 2.0),
+        atr_take_mult=float(_getenv("ATR_TAKE_MULT", "4.0") or 4.0),
         time_exit_grace_sec=int(float(_getenv("TIME_EXIT_GRACE_SEC", "60") or 60)),
         exit_dry_run=_getbool("EXIT_DRY_RUN", "0"),
         exit_diagnostics=_getbool("EXIT_DIAGNOSTICS", "0"),

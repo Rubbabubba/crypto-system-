@@ -28,7 +28,7 @@ from .broker import best_bid_ask as _best_bid_ask
 from .sizing import compute_risk_pct_equity_notional, compute_equity_fraction_notional
 from .config import load_settings
 from .models import WebhookPayload, WorkerExitPayload, WorkerScanPayload, WorkerExitDiagnosticsPayload, WorkerAdoptPositionsPayload
-from .risk import compute_brackets
+from .risk import compute_brackets, compute_atr_brackets
 from .state import InMemoryState, TradePlan
 from .symbol_map import normalize_symbol
 
@@ -564,6 +564,10 @@ def _strategy_max_hold_sec(strategy: str) -> int:
         return int(CR1_MAX_HOLD_SEC)
     if s == "mm1":
         return int(MM1_MAX_HOLD_SEC)
+    if s == "rb1":
+        return int(getattr(settings, "rb1_max_hold_sec", 0) or 0)
+    if s == "tc1":
+        return int(getattr(settings, "tc1_max_hold_sec", 0) or 0)
     return 0
 
 
@@ -1231,7 +1235,25 @@ def _execute_long_entry(
         elif s == "mm1":
             stop_price, take_price = compute_brackets(px, float(MM1_STOP_PCT), float(MM1_TAKE_PCT))
         else:
-            stop_price, take_price = compute_brackets(px, settings.stop_pct, settings.take_pct)
+            # Optional ATR-based brackets for RB1/TC1 (and any non-CR1/MM1 strategy).
+            if bool(getattr(settings, "atr_brackets_enabled", False)):
+                try:
+                    atr_len = int(getattr(settings, "atr_bracket_len", 14) or 14)
+                    bars_for_atr = _get_bars(symbol, timeframe=ENTRY_ENGINE_TIMEFRAME, limit=max(ENTRY_ENGINE_LIMIT_BARS, atr_len + 40))
+                    atr_now, _ = _atr_from_bars(bars_for_atr or [], length=int(atr_len))
+                    if atr_now is not None and float(atr_now) > 0:
+                        stop_price, take_price = compute_atr_brackets(
+                            float(px),
+                            float(atr_now),
+                            float(getattr(settings, "atr_stop_mult", 2.0) or 2.0),
+                            float(getattr(settings, "atr_take_mult", 4.0) or 4.0),
+                        )
+                    else:
+                        stop_price, take_price = compute_brackets(px, settings.stop_pct, settings.take_pct)
+                except Exception:
+                    stop_price, take_price = compute_brackets(px, settings.stop_pct, settings.take_pct)
+            else:
+                stop_price, take_price = compute_brackets(px, settings.stop_pct, settings.take_pct)
 
     # Execution profile overrides (e.g., maker-only for CR1/MM1)
     exec_mode_override = None
