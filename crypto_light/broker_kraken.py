@@ -335,6 +335,8 @@ API_BASE = os.getenv("KRAKEN_BASE", "https://api.kraken.com")
 # Keep this defined so private/public requests don't crash with NameError.
 KRAKEN_API_URL = API_BASE
 TIMEOUT = float(os.getenv("KRAKEN_TIMEOUT", "10"))        # seconds
+# Some code paths reference KRAKEN_TIMEOUT_SEC; keep a compatible alias.
+KRAKEN_TIMEOUT_SEC = float(os.getenv("KRAKEN_TIMEOUT_SEC", str(TIMEOUT)))
 MIN_DELAY = float(os.getenv("KRAKEN_MIN_DELAY", "0.35"))  # seconds between calls (simple gate)
 MAX_RETRIES = int(os.getenv("KRAKEN_MAX_RETRIES", "4"))
 BACKOFF_BASE = float(os.getenv("KRAKEN_BACKOFF_BASE", "0.8"))
@@ -414,12 +416,20 @@ def _pub(path: str, params: Dict[str, Any] | None = None) -> Dict[str, Any]:
 
 def _sign(urlpath: str, data: Dict[str, Any]) -> Dict[str, str]:
     api_key, api_secret, _, _ = _get_kraken_creds()
+    if not api_key or not api_secret:
+        raise RuntimeError("Missing Kraken API credentials (KRAKEN_API_KEY/KRAKEN_API_SECRET)")
     postdata = "&".join(f"{k}={data[k]}" for k in data)
     message = (str(data["nonce"]) + postdata).encode()
     sha256 = hashlib.sha256(message).digest()
     mac = hmac.new(base64.b64decode(api_secret), urlpath.encode() + sha256, hashlib.sha512)
     sig = base64.b64encode(mac.digest()).decode()
     return {"API-Key": api_key, "API-Sign": sig}
+
+
+def _headers(path: str, data: Dict[str, Any]) -> Dict[str, str]:
+    """Return Kraken private REST auth headers."""
+    urlpath = f"/0/private/{path}"
+    return _sign(urlpath, data)
 
 def _priv(path: str, data: dict | None = None) -> dict:
     """Kraken private REST call with monotonic nonce + light retries.
