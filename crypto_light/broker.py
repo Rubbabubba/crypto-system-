@@ -65,19 +65,30 @@ def cancel_order(txid: str) -> Dict:
 
 
 def balances_by_asset() -> Dict[str, float]:
+    """Return spot balances by asset code.
+
+    IMPORTANT: We must use the Kraken *Balance* endpoint for cash/stables.
+    The `positions()` helper is for open position-like objects and does not
+    reflect free cash (USD/ZUSD/USDC/USDT), which breaks equity detection and
+    causes `no_equity` skips.
+
+    Returns a dict like {"ZUSD": 123.45, "USDC": 50.0, "XXBT": 0.01, ...}.
+    """
     out: Dict[str, float] = {}
-    for item in broker_kraken.positions():
-        if not isinstance(item, dict):
-            continue
-        if "error" in item:
-            continue
-        asset = str(item.get("asset", "")).upper().strip()
-        try:
-            qty = float(item.get("qty", 0) or 0)
-        except Exception:
-            qty = 0.0
-        if asset and qty > 0:
-            out[asset] = qty
+    try:
+        bal = broker_kraken._fetch_balances()  # internal cached Balance call
+    except Exception:
+        bal = {}
+
+    if isinstance(bal, dict):
+        for k, v in bal.items():
+            asset = str(k or "").upper().strip()
+            try:
+                qty = float(v or 0.0)
+            except Exception:
+                qty = 0.0
+            if asset and qty > 0:
+                out[asset] = qty
     return out
 
 
