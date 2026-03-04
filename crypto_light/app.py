@@ -24,6 +24,7 @@ from .broker import base_asset as _base_asset
 from .broker import last_price as _last_price
 from .broker import market_notional as _market_notional
 from .broker import get_bars as _get_bars
+from .broker import best_bid_ask as _best_bid_ask
 from .sizing import compute_risk_pct_equity_notional, compute_equity_fraction_notional
 from .config import load_settings
 from .models import WebhookPayload, WorkerExitPayload, WorkerScanPayload, WorkerExitDiagnosticsPayload, WorkerAdoptPositionsPayload
@@ -208,6 +209,11 @@ MAX_OPEN_POSITIONS = int(float(os.getenv('MAX_OPEN_POSITIONS', '2') or 2))
 MAX_ENTRIES_PER_SCAN = int(float(os.getenv('MAX_ENTRIES_PER_SCAN', '1') or 1))
 MAX_ENTRIES_PER_DAY = int(float(os.getenv('MAX_ENTRIES_PER_DAY', '5') or 5))
 
+ENABLE_CANDIDATE_RANKING = (os.getenv('ENABLE_CANDIDATE_RANKING', '1').strip().lower() in ('1','true','yes','on'))
+MAX_SPREAD_PCT = float(os.getenv('MAX_SPREAD_PCT', '0.004') or 0.004)  # 0 disables
+RANK_ATR_LEN = int(float(os.getenv('RANK_ATR_LEN', '14') or 14))
+RANK_VOL_AVG_LEN = int(float(os.getenv('RANK_VOL_AVG_LEN', '20') or 20))
+
 _SCANNER_CACHE: Dict[str, Any] = {
     "ts": 0.0,
     "active_symbols": set(),   # type: Set[str]
@@ -355,6 +361,74 @@ def _median(xs: list[float]) -> float | None:
 
 
 _regime_cache: dict[str, tuple[float, dict]] = {"quiet": (0.0, {})}
+
+
+def _rank_candidate(symbol: str, strategy: str, sig_debug: dict) -> dict:
+    """Compute a simple quality score for candidate prioritization (higher is better)."""
+    out = {"score": 0.0, "components": {}}
+    try:
+        bars = _get_bars(symbol, timeframe=ENTRY_ENGINE_TIMEFRAME, limit=max(120, RANK_VOL_AVG_LEN + RANK_ATR_LEN + 5))
+    except Exception:
+        bars = []
+    if not bars or len(bars) < (RANK_VOL_AVG_LEN + 2):
+        return out
+
+    # Volume ratio (current / avg)
+    vols = [float(b.get("v") or 0.0) for b in bars]
+    v_now = float(vols[-1] or 0.0)
+    v_avg = float(sum(vols[-RANK_VOL_AVG_LEN:]) / float(RANK_VOL_AVG_LEN)) if RANK_VOL_AVG_LEN > 0 else 0.0
+    vol_ratio = (v_now / v_avg) if v_avg > 0 else 0.0
+
+    # ATR (not directly scored heavily yet, but recorded)
+    atr_now, _ = _atr_from_bars(bars, length=int(RANK_ATR_LEN or 14))
+
+    score = 0.0
+    components: dict = {
+        "vol_ratio": vol_ratio,
+        "atr_now": atr_now,
+    }
+
+    strat = (strategy or "").lower().strip()
+    if strat == "rb1":
+        meta = (sig_debug or {}).get("rb1") or {}
+        dist = meta.get("dist_to_level_pct")
+        near_pct = float(meta.get("near_pct") or 0.0)
+        prev_close = float(meta.get("prev_close") or 0.0)
+        close = float(meta.get("close") or 0.0)
+        momentum = ((close - prev_close) / prev_close) if prev_close > 0 else 0.0
+
+        # proximity: within near window gets credit; closer to level is better
+        prox = 0.0
+        if isinstance(dist, (int, float)) and near_pct and near_pct > 0:
+            prox = max(0.0, 1.0 - (float(dist) / float(near_pct)))
+        score += 2.0 * prox
+
+        # volume expansion above avg
+        score += max(0.0, vol_ratio - 1.0)
+
+        # gentle momentum bonus
+        score += max(0.0, momentum) * 0.5
+
+        components.update({"prox": prox, "dist_to_level_pct": dist, "near_pct": near_pct, "momentum": momentum})
+
+    elif strat == "tc1":
+        meta = (sig_debug or {}).get("tc1") or {}
+        close = float(meta.get("close") or 0.0)
+        ltf = float(meta.get("ltf_ema") or 0.0)
+        edge = ((close - ltf) / ltf) if ltf > 0 else 0.0
+
+        score += max(0.0, edge) * 2.0
+        score += max(0.0, vol_ratio - 1.0)
+        components.update({"edge": edge})
+
+    else:
+        # quiet-regime strategies may have their own filters; just lightly prefer better volume
+        score += max(0.0, vol_ratio - 1.0)
+
+    out["score"] = float(score)
+    out["components"] = components
+    return out
+
 
 
 def _regime_is_quiet() -> tuple[bool, dict]:
@@ -2068,7 +2142,7 @@ def scan_entries(payload: WorkerScanPayload):
 
     # 4) Evaluate signals + build diagnostics
     per_symbol: Dict[str, Any] = {}
-    candidates: List[Tuple[str, str]] = []  # (symbol, strategy)
+    candidates: List[Dict[str, Any]] = []  # [{symbol,strategy,score,rank}]
     for sym in universe:
         d: Dict[str, Any] = {
             "symbol": sym,
@@ -2122,11 +2196,14 @@ def scan_entries(payload: WorkerScanPayload):
             strategy = "rb1" if fired.get("rb1") else fired_strats[0]
         d["eligible"] = True
         d["chosen_strategy"] = strategy
-        candidates.append((sym, strategy))
+        rank = _rank_candidate(sym, strategy, sig_debug)
+        d["rank"] = rank
+        candidates.append({"symbol": sym, "strategy": strategy, "score": float(rank.get("score") or 0.0), "rank": rank})
         per_symbol[sym] = d
 
-    # Apply per-scan entry cap *after* we have all candidates so we can prioritize
-    # strategies (especially important in quiet regime where MM1/CR1 should be favored).
+    # Apply per-scan entry cap *after* we have all candidates so we can prioritize.
+    # If ENABLE_CANDIDATE_RANKING, we also sort by a simple quality score within the same
+    # strategy-priority bucket (higher score = better).
     if MAX_ENTRIES_PER_SCAN > 0 and len(candidates) > MAX_ENTRIES_PER_SCAN:
         def _pri(s: str) -> int:
             s = (s or "").lower()
@@ -2136,23 +2213,70 @@ def scan_entries(payload: WorkerScanPayload):
             # Non-quiet: prioritize directional edge.
             return {"rb1": 0, "tc1": 1, "cr1": 2, "mm1": 3}.get(s, 9)
 
-        candidates_sorted = sorted(candidates, key=lambda x: (_pri(x[1]), universe.index(x[0]) if x[0] in universe else 10**9))
-        winners = set(candidates_sorted[:MAX_ENTRIES_PER_SCAN])
+        def _uix(sym: str) -> int:
+            try:
+                return universe.index(sym)
+            except Exception:
+                return 10**9
+
+        if ENABLE_CANDIDATE_RANKING:
+            candidates_sorted = sorted(
+                candidates,
+                key=lambda c: (_pri(c.get("strategy")), -(float(c.get("score") or 0.0)), _uix(c.get("symbol"))),
+            )
+        else:
+            candidates_sorted = sorted(
+                candidates,
+                key=lambda c: (_pri(c.get("strategy")), _uix(c.get("symbol"))),
+            )
+
+        winners = candidates_sorted[:MAX_ENTRIES_PER_SCAN]
+        winner_keys = {(w.get("symbol"), w.get("strategy")) for w in winners}
+
         # Mark losers in diagnostics
-        for sym, strat in candidates_sorted[MAX_ENTRIES_PER_SCAN:]:
+        for c in candidates_sorted[MAX_ENTRIES_PER_SCAN:]:
+            sym = c.get("symbol")
             d = per_symbol.get(sym) or {"symbol": sym, "skip": []}
             d.setdefault("skip", [])
             d["eligible"] = False
             if "max_entries_per_scan_reached" not in d["skip"]:
                 d["skip"].append("max_entries_per_scan_reached")
             per_symbol[sym] = d
-        candidates = [c for c in candidates_sorted[:MAX_ENTRIES_PER_SCAN]]
 
+        candidates = winners
+    else:
+        # still attach a stable ordering for diagnostics
+        if ENABLE_CANDIDATE_RANKING and candidates:
+            candidates = sorted(
+                candidates,
+                key=lambda c: (-(float(c.get("score") or 0.0)), universe.index(c.get("symbol")) if c.get("symbol") in universe else 10**9),
+            )
     # 5) Execute (or dry-run)
     results: List[Dict[str, Any]] = []
-    for sym, strategy in candidates:
+    for c in candidates:
+        sym = c.get('symbol')
+        strategy = c.get('strategy')
+        score = float(c.get('score') or 0.0)
         if payload.dry_run:
-            results.append({"symbol": sym, "strategy": strategy, "status": "dry_run"})
+            results.append({"symbol": sym, "strategy": strategy, "status": "dry_run", "score": score})
+            continue
+
+        # Spread protection (skip very wide spreads to avoid bad fills)
+        bid, ask = _best_bid_ask(sym)
+        spread_pct = None
+        if bid and ask and bid > 0 and ask > 0:
+            mid = (bid + ask) / 2.0
+            spread_pct = (ask - bid) / mid if mid else None
+        if MAX_SPREAD_PCT and MAX_SPREAD_PCT > 0 and spread_pct is not None and spread_pct > MAX_SPREAD_PCT:
+            meta2 = {"ok": False, "ignored": True, "reason": "spread_too_wide", "symbol": sym, "strategy": strategy, "bid": bid, "ask": ask, "spread_pct": spread_pct, "max_spread_pct": MAX_SPREAD_PCT, "score": score}
+            results.append({"symbol": sym, "strategy": strategy, "ok": False, "status": "skipped", "reason": "spread_too_wide", "meta": meta2})
+            # Also annotate per_symbol so diagnostics show why it didn't execute.
+            d = per_symbol.get(sym) or {"symbol": sym, "skip": []}
+            d.setdefault("skip", [])
+            if "spread_too_wide" not in d["skip"]:
+                d["skip"].append("spread_too_wide")
+            d["eligible"] = False
+            per_symbol[sym] = d
             continue
 
         ok2, reason2, meta2 = place_entry(sym, strategy=strategy)
@@ -2163,7 +2287,7 @@ def scan_entries(payload: WorkerScanPayload):
                 "ok": ok2,
                 "status": "executed" if ok2 else "skipped",
                 "reason": reason2,
-                "meta": meta2,
+                "meta": (meta2 | {"score": score}) if isinstance(meta2, dict) else meta2,
             }
         )
 
@@ -2213,7 +2337,7 @@ def scan_entries(payload: WorkerScanPayload):
             "plans_count": len(getattr(state, "plans", {}) or {}),
             "open_positions_count": open_positions_count,
             "positions_open": sorted(list(open_set))[:50],
-            "candidates": [{"symbol": s, "strategy": st} for (s, st) in candidates],
+            "candidates": [{"symbol": c.get("symbol"), "strategy": c.get("strategy"), "score": float(c.get("score") or 0.0), "rank": (c.get("rank") or {}).get("components")} for c in candidates],
             "per_symbol": per_symbol,
         },
     }

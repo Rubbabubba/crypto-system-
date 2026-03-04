@@ -111,5 +111,17 @@ def base_asset(symbol: str) -> str:
     return s.split("/", 1)[0] if "/" in s else s
 
 
+
+
+def best_bid_ask(symbol: str) -> tuple[float | None, float | None]:
+    """Return (bid, ask) for a UI symbol like 'ADA/USD' (best-effort).
+
+    Uses Kraken public Depth endpoint under the hood.
+    """
+    ui = str(symbol).upper().strip()
+    pair = broker_kraken.to_kraken(ui)
+    return broker_kraken._best_bid_ask(pair)
+
+
 def get_bars(symbol: str, timeframe: str = "5Min", limit: int = 300):
     return broker_kraken.get_bars(symbol=symbol, timeframe=timeframe, limit=int(limit))
