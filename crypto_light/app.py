@@ -1307,7 +1307,7 @@ def _execute_long_entry(
 
     if res.get("ok"):
         state.mark_enter(symbol)
-        state.plans[symbol] = TradePlan(
+        state.set_plan(TradePlan(
             symbol=symbol,
             strategy=strategy,
             side="buy",
@@ -1317,7 +1317,7 @@ def _execute_long_entry(
             notional_usd=float(_notional),
             opened_ts=time.time(),
             max_hold_sec=_strategy_max_hold_sec(strategy),
-        )
+        ))
         return {"ok": True, "executed": True, "symbol": symbol, "strategy": strategy, "price": px, "stop": float(stop_price), "take": float(take_price)}
 
     # Do NOT create a plan or cooldown on failed orders (e.g., insufficient funds).
@@ -1532,7 +1532,7 @@ def webhook(payload: WebhookPayload, request: Request):
         return {"ok": False, "action": "buy", "symbol": symbol, "error": (res or {}).get("error") or "entry_order_failed", "order": res}
 
     state.mark_enter(symbol)
-    state.plans[symbol] = TradePlan(
+    state.set_plan(TradePlan(
         symbol=symbol,
         side="buy",
         notional_usd=notional,
@@ -1542,7 +1542,7 @@ def webhook(payload: WebhookPayload, request: Request):
         strategy=strategy,
         opened_ts=now.timestamp(),
         max_hold_sec=_strategy_max_hold_sec(strategy),
-    )
+    ))
     n = state.inc_trade(symbol)
 
     return {
@@ -1614,7 +1614,7 @@ def worker_exit(payload: WorkerExitPayload):
             pos_notional = float(qty) * float(px)
             if dust_floor and pos_notional < dust_floor:
                 # Dust holdings: do not track or exit.
-                state.plans.pop(symbol, None)
+                state.remove_plan(symbol)
                 state.clear_pending_exit(symbol)
                 return None
             if pos_notional < adopt_floor:
@@ -1627,14 +1627,17 @@ def worker_exit(payload: WorkerExitPayload):
             plan_new = TradePlan(
                 symbol=symbol,
                 side="buy",
-                notional_usd=float(settings.default_notional_usd),
+                notional_usd=float(pos_notional),
                 entry_price=float(entry_px),
                 stop_price=float(stop_px),
                 take_price=float(take_px),
-                strategy="unknown",
+                strategy="adopted",
                 opened_ts=now.timestamp(),
+                max_hold_sec=int(max_hold_default),
+                breakeven_armed=False,
+                breakeven_triggered_ts=0.0,
             )
-            state.plans[symbol] = plan_new
+            state.set_plan(plan_new)
             return plan_new
 
         def _maybe_apply_breakeven(plan: TradePlan, *, px: float, entry_px: float) -> None:
@@ -1656,6 +1659,8 @@ def worker_exit(payload: WorkerExitPayload):
                 plan.stop_price = float(be_stop)
             plan.breakeven_armed = True
             plan.breakeven_triggered_ts = now.timestamp()
+            # Persist tightened stop / breakeven state
+            state.set_plan(plan)
             _log_event(
                 "info",
                 {
@@ -1703,7 +1708,7 @@ def worker_exit(payload: WorkerExitPayload):
             qty = float(bal.get(base, 0.0) or 0.0)
             if qty <= 0:
                 # No holding: clear stale state.
-                state.plans.pop(symbol, None)
+                state.remove_plan(symbol)
                 state.clear_pending_exit(symbol)
                 continue
 
@@ -2392,10 +2397,10 @@ def dashboard():
         "ok": True,
         "utc": utc_now_iso(),
         "settings": {
-            "max_open_positions": getattr(settings, "max_open_positions", None),
-            "max_entries_per_day": getattr(settings, "max_entries_per_day", None),
-            "max_entries_per_scan": getattr(settings, "max_entries_per_scan", None),
-            "scanner_url": getattr(settings, "scanner_url", None),
+            "max_open_positions": MAX_OPEN_POSITIONS,
+            "max_entries_per_day": MAX_ENTRIES_PER_DAY,
+            "max_entries_per_scan": MAX_ENTRIES_PER_SCAN,
+            "scanner_url": SCANNER_URL,
         },
         "open_positions": positions,
         "open_plans": open_plans,

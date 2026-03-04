@@ -63,6 +63,36 @@ class InMemoryState:
         self.telemetry: List[Dict[str, Any]] = []
         self.telemetry_max: int = 500
 
+        # Reload persisted plans after deploy/restart so exits remain correct
+        self._load_plans_from_db()
+
+    def set_plan(self, plan: TradePlan) -> None:
+        """Set plan in-memory and persist to sqlite."""
+        self.plans[plan.symbol] = plan
+        try:
+            plans_db.upsert_plan(plan.to_dict())
+        except Exception:
+            # persistence should never break trading
+            pass
+
+    def remove_plan(self, symbol: str) -> None:
+        self.plans.pop(symbol, None)
+        try:
+            plans_db.delete_plan(symbol)
+        except Exception:
+            pass
+
+    def _load_plans_from_db(self) -> None:
+        try:
+            rows = plans_db.load_plans()
+        except Exception:
+            return
+        for d in rows:
+            try:
+                self.plans[d["symbol"]] = TradePlan.from_dict(d)
+            except Exception:
+                continue
+
     # --------- Entry guards ---------
     def can_enter(self, symbol: str, cooldown_sec: int) -> bool:
         if cooldown_sec <= 0:
