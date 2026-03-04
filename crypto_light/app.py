@@ -1005,6 +1005,7 @@ def _execute_long_entry(
     notional: float | None,
     source: str,
     req_id: str,
+    dry_run: bool = False,
     client_ip: str | None = None,
     extra: dict | None = None,
     px_override: float | None = None,
