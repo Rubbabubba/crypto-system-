@@ -731,6 +731,251 @@ def _query_order(txid: str) -> dict:
         return {}
 
 
+
+
+def _query_trades(txids: list[str]) -> dict:
+    """Return QueryTrades rows keyed by txid (best-effort)."""
+    ids = [str(x).strip() for x in (txids or []) if str(x).strip()]
+    if not ids:
+        return {}
+    try:
+        res = _priv("QueryTrades", {"txid": ",".join(ids)}) or {}
+        out = res.get("result") or {}
+        return out if isinstance(out, dict) else {}
+    except Exception:
+        return {}
+
+
+def _reconcile_order_fill(txid: str, *, timeout_sec: int = 8) -> dict:
+    """Best-effort reconciliation for an order using QueryOrders + QueryTrades.
+
+    Returns a dict with status, vol_exec, fee, cost, avg_price, trade_ids, filled.
+    """
+    deadline = time.time() + max(1, int(timeout_sec))
+    last_status = None
+    last_row: dict[str, Any] = {}
+    trade_ids: list[str] = []
+    while time.time() <= deadline:
+        od = _query_order(str(txid)) or {}
+        last_row = od if isinstance(od, dict) else {}
+        last_status = str(last_row.get("status") or "").lower()
+        trade_ids = [str(t) for t in (last_row.get("trades") or []) if str(t)]
+        try:
+            vol_exec = float(last_row.get("vol_exec") or 0.0)
+        except Exception:
+            vol_exec = 0.0
+        if last_status in ("closed", "canceled", "cancelled", "expired") or trade_ids or vol_exec > 0:
+            break
+        time.sleep(1.0)
+
+    vol_exec = 0.0
+    fee = 0.0
+    cost = 0.0
+    avg_price = None
+    filled_ts = None
+    trades = _query_trades(trade_ids) if trade_ids else {}
+    if trades:
+        for _, t in trades.items():
+            try:
+                vol_exec += float(t.get("vol") or 0.0)
+            except Exception:
+                pass
+            try:
+                fee += float(t.get("fee") or 0.0)
+            except Exception:
+                pass
+            try:
+                cost += float(t.get("cost") or 0.0)
+            except Exception:
+                pass
+            try:
+                t_ts = float(t.get("time")) if t.get("time") is not None else None
+            except Exception:
+                t_ts = None
+            if t_ts is not None:
+                filled_ts = max(float(filled_ts or 0.0), float(t_ts))
+        if vol_exec > 0:
+            avg_price = cost / vol_exec
+    else:
+        try:
+            vol_exec = float(last_row.get("vol_exec") or 0.0)
+        except Exception:
+            vol_exec = 0.0
+        descr_price = None
+        try:
+            descr_price = float(last_row.get("price") or 0.0)
+        except Exception:
+            descr_price = None
+        avg_price = descr_price if descr_price and descr_price > 0 else None
+        try:
+            fee = float(last_row.get("fee") or 0.0)
+        except Exception:
+            fee = 0.0
+        try:
+            cost = float(last_row.get("cost") or 0.0)
+        except Exception:
+            cost = 0.0
+
+    return {
+        "status": last_status or None,
+        "vol_exec": float(vol_exec),
+        "fee": float(fee),
+        "cost": float(cost),
+        "avg_price": float(avg_price) if avg_price is not None else None,
+        "trade_ids": trade_ids,
+        "filled_ts": filled_ts,
+        "filled": bool((last_status == "closed") or (float(vol_exec) > 0.0)),
+    }
+
+
+def stop_limit_notional(
+    symbol: str,
+    *,
+    notional: float,
+    stop_price: float,
+    strategy: str,
+    limit_buffer_pct: float | None = None,
+    timeout_sec: int | None = None,
+    market_fallback: bool | None = None,
+) -> Dict[str, Any]:
+    """Submit a stop-loss-limit SELL for spot holdings, then reconcile / fallback."""
+    ui = symbol.upper()
+    pair = to_kraken(ui)
+    strat_tag = (strategy or '').strip()
+    if not strat_tag:
+        raise ValueError('missing strategy tag for order (strategy is required)')
+
+    _cooldown_check(strat_tag, pair, 'sell')
+
+    trigger_px = float(stop_price or 0.0)
+    if trigger_px <= 0:
+        return {"ok": False, "error": "stop_limit_notional failed: invalid stop_price"}
+
+    try:
+        bal = _fetch_balances()
+    except Exception as e:
+        return {"ok": False, "error": f"stop_limit_notional failed: balance fetch failed: {e}"}
+
+    base = (ui.split('/', 1)[0] if '/' in ui else ui).strip().upper()
+    avail = float(_get_balance_float(bal, base) or 0.0)
+    if avail <= 0:
+        return {"ok": False, "error": f"stop_limit_notional failed: insufficient {base} balance (avail={avail})"}
+
+    px_for_size = _ensure_price(ui)
+    volume = min(float(notional) / float(px_for_size), float(avail))
+
+    meta = _pair_meta(pair)
+    ordermin = float(meta.get("ordermin") or 0.0)
+    lot_decimals = int(meta.get("lot_decimals") or 8)
+    pair_decimals = int(meta.get("pair_decimals") or 8)
+
+    volume = _truncate_to_decimals(float(volume), lot_decimals)
+    if volume <= 0:
+        return {"ok": False, "error": "stop_limit_notional failed: volume <= 0 after precision truncation"}
+    if ordermin > 0.0 and volume < ordermin:
+        if avail >= ordermin:
+            volume = _truncate_to_decimals(float(ordermin), lot_decimals)
+        else:
+            return {"ok": False, "error": f"stop_limit_notional failed: dust_below_min_volume:{volume}<{ordermin} (pair={pair}) (avail={avail})"}
+
+    buff = float(limit_buffer_pct) if limit_buffer_pct is not None else float(os.getenv("STOP_LIMIT_BUFFER_PCT", "0.01") or 0.01)
+    wait_sec = int(timeout_sec) if timeout_sec is not None else int(float(os.getenv("STOP_LIMIT_TIMEOUT_SEC", "60") or 60))
+    fallback = bool(market_fallback) if market_fallback is not None else (os.getenv("MARKET_FALLBACK", "1").strip().lower() in ("1","true","yes","on"))
+
+    limit_px = max(0.0, float(trigger_px) * (1.0 - max(0.0, float(buff))))
+    if limit_px <= 0:
+        return {"ok": False, "error": "stop_limit_notional failed: invalid limit price"}
+
+    payload = {
+        "pair": pair,
+        "type": "sell",
+        "ordertype": "stop-loss-limit",
+        "price": _format_price(float(trigger_px), pair_decimals),
+        "price2": _format_price(float(limit_px), pair_decimals),
+        "volume": _format_volume(volume, lot_decimals),
+        "userref": str(_userref_for_strategy(strategy)),
+    }
+    try:
+        res = _priv("AddOrder", payload)
+    except Exception as e:
+        return {"ok": False, "error": f"stop_limit_notional failed: {e}"}
+
+    txid = None
+    descr = None
+    try:
+        txid = (res.get("txid") or [None])[0]
+        descr = (res.get("descr") or {}).get("order")
+    except Exception:
+        pass
+
+    recon = _reconcile_order_fill(str(txid), timeout_sec=max(2, wait_sec)) if txid else {}
+    remaining_volume = max(0.0, float(volume) - float(recon.get("vol_exec") or 0.0))
+    remaining_notional = remaining_volume * float(px_for_size)
+
+    status = str(recon.get("status") or "").lower()
+    if status != "closed" and txid:
+        try:
+            _priv("CancelOrder", {"txid": str(txid)})
+        except Exception:
+            pass
+
+    if float(recon.get("vol_exec") or 0.0) > 0.0 and remaining_volume <= 0.0:
+        _cooldown_latch(strat_tag, pair, 'sell')
+        return {
+            "ok": True,
+            "filled": True,
+            "execution": "stop_loss_limit",
+            "pair": pair,
+            "side": "sell",
+            "notional": float(notional),
+            "volume": float(volume),
+            "trigger_price": float(trigger_px),
+            "limit_price": float(limit_px),
+            "txid": txid,
+            "descr": descr,
+            "reconciled": recon,
+            "result": res,
+        }
+
+    if fallback and remaining_volume > 0.0:
+        mkt = market_notional(
+            symbol=symbol,
+            side='sell',
+            notional=max(remaining_notional, 0.0),
+            price=px_for_size,
+            strategy=strategy,
+        )
+        if mkt.get("ok"):
+            try:
+                mkt["stop_limit_first"] = {
+                    "txid": txid,
+                    "trigger_price": float(trigger_px),
+                    "limit_price": float(limit_px),
+                    "reconciled": recon,
+                    "partial_volume": float(recon.get("vol_exec") or 0.0),
+                    "remaining_volume": float(remaining_volume),
+                }
+            except Exception:
+                pass
+        return mkt
+
+    return {
+        "ok": bool(float(recon.get("vol_exec") or 0.0) > 0.0),
+        "filled": bool(float(recon.get("vol_exec") or 0.0) > 0.0),
+        "execution": "stop_loss_limit",
+        "pair": pair,
+        "side": "sell",
+        "notional": float(notional),
+        "volume": float(volume),
+        "trigger_price": float(trigger_px),
+        "limit_price": float(limit_px),
+        "txid": txid,
+        "descr": descr,
+        "reconciled": recon,
+        "result": res,
+        "error": None if float(recon.get("vol_exec") or 0.0) > 0.0 else "stop_limit_not_filled",
+    }
+
 def market_notional(
     symbol: str,
     side: str,
@@ -867,10 +1112,12 @@ def market_notional(
         except Exception:
             pass
 
-        _cooldown_latch(strat_tag, pair, side)
+        recon = _reconcile_order_fill(str(txid_m), timeout_sec=int(float(os.getenv("ORDER_RECONCILE_TIMEOUT_SEC", "8") or 8))) if txid_m else {}
+        if bool(recon.get("filled")):
+            _cooldown_latch(strat_tag, pair, side)
         return {
-            "ok": True,
-            "filled": True,  # market orders are expected to fill immediately
+            "ok": bool(recon.get("filled")) if txid_m else True,
+            "filled": bool(recon.get("filled")) if txid_m else True,
             "execution": "market",
             "pair": pair,
             "side": side,
@@ -878,7 +1125,9 @@ def market_notional(
             "volume": float(volume_to_send),
             "txid": txid_m,
             "descr": descr_m,
+            "reconciled": recon,
             "result": res_m,
+            "error": None if (bool(recon.get("filled")) if txid_m else True) else "market_order_not_filled",
         }
 
     def _place_post_only_once(limit_px: float) -> Dict[str, Any]:
@@ -922,6 +1171,7 @@ def market_notional(
             time.sleep(1.0)
 
         if filled:
+            recon = _reconcile_order_fill(str(txid_l), timeout_sec=int(float(os.getenv("ORDER_RECONCILE_TIMEOUT_SEC", "8") or 8))) if txid_l else {}
             _cooldown_latch(strat_tag, pair, side)
             return {
                 "ok": True,
@@ -936,6 +1186,7 @@ def market_notional(
                 "descr": descr_l,
                 "status": status,
                 "vol_exec": vol_exec,
+                "reconciled": recon,
                 "result": res_l,
             }
 

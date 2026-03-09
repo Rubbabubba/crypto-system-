@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from . import trades_db
+from . import broker_kraken
 from .broker_kraken import trades_history
 
 import logging
@@ -214,6 +215,12 @@ MAX_SPREAD_PCT = float(os.getenv('MAX_SPREAD_PCT', '0.004') or 0.004)  # 0 disab
 RANK_ATR_LEN = int(float(os.getenv('RANK_ATR_LEN', '14') or 14))
 RANK_VOL_AVG_LEN = int(float(os.getenv('RANK_VOL_AVG_LEN', '20') or 20))
 
+ENABLE_STALE_BAR_GUARD = (os.getenv('ENABLE_STALE_BAR_GUARD', '1').strip().lower() in ('1','true','yes','on'))
+BAR_STALE_MULTIPLIER = float(os.getenv('BAR_STALE_MULTIPLIER', '1.8') or 1.8)
+BAR_STALE_EXTRA_SEC = int(float(os.getenv('BAR_STALE_EXTRA_SEC', '15') or 15))
+ORDER_RECONCILE_TIMEOUT_SEC = int(float(os.getenv('ORDER_RECONCILE_TIMEOUT_SEC', '8') or 8))
+STOP_EXIT_MODE = (os.getenv('STOP_EXIT_MODE', 'stop_limit').strip().lower() or 'stop_limit')
+
 _SCANNER_CACHE: Dict[str, Any] = {
     "ts": 0.0,
     "active_symbols": set(),   # type: Set[str]
@@ -300,6 +307,47 @@ def _utc_date_str(now: Optional[datetime] = None) -> str:
     n = now or datetime.now(timezone.utc)
     return n.strftime("%Y-%m-%d")
 
+def _timeframe_seconds(tf: str) -> int:
+    raw = str(tf or '').strip().lower()
+    if raw in ('1', '1m', '1min', '1minute'):
+        return 60
+    if raw in ('5', '5m', '5min', '5minute'):
+        return 300
+    if raw in ('15', '15m', '15min', '15minute'):
+        return 900
+    if raw in ('30', '30m', '30min', '30minute'):
+        return 1800
+    if raw in ('60', '60m', '60min', '1h', '1hr', '60minute'):
+        return 3600
+    return 300
+
+
+def _bars_freshness_meta(bars: list[dict], timeframe: str) -> dict:
+    if not bars:
+        return {"ok": False, "reason": "no_bars", "timeframe": timeframe}
+    try:
+        last_ts = int(float(bars[-1].get('t') or 0))
+    except Exception:
+        last_ts = 0
+    now_ts = int(time.time())
+    tf_sec = _timeframe_seconds(timeframe)
+    max_age = int(tf_sec * float(BAR_STALE_MULTIPLIER)) + int(BAR_STALE_EXTRA_SEC)
+    age = (now_ts - last_ts) if last_ts > 0 else None
+    ok = bool(last_ts > 0 and age is not None and age <= max_age)
+    return {"ok": ok, "timeframe": timeframe, "last_bar_ts": last_ts, "age_sec": age, "max_age_sec": max_age}
+
+
+def _guard_fresh_bars(bars: list[dict], timeframe: str) -> tuple[bool, dict]:
+    meta = _bars_freshness_meta(bars, timeframe)
+    if not ENABLE_STALE_BAR_GUARD:
+        meta['guard_enabled'] = False
+        return True, meta
+    meta['guard_enabled'] = True
+    if meta.get('ok'):
+        return True, meta
+    meta['reason'] = 'stale_bars' if bars else 'no_bars'
+    return False, meta
+
 
 def _is_after_utc_hhmm(now: datetime, hhmm_utc: str) -> bool:
     if not hhmm_utc:
@@ -371,6 +419,10 @@ def _rank_candidate(symbol: str, strategy: str, sig_debug: dict) -> dict:
     except Exception:
         bars = []
     if not bars or len(bars) < (RANK_VOL_AVG_LEN + 2):
+        return out
+    fresh_ok, fresh_meta = _guard_fresh_bars(bars, ENTRY_ENGINE_TIMEFRAME)
+    if not fresh_ok:
+        out["components"] = {**out.get("components", {}), "stale_guard": fresh_meta}
         return out
 
     # Volume ratio (current / avg)
@@ -451,6 +503,11 @@ def _regime_is_quiet() -> tuple[bool, dict]:
         meta = {"quiet": True, "reason": "insufficient_bars", "enabled": True}
         _regime_cache["quiet"] = (now, meta)
         return True, meta
+    fresh_ok, fresh_meta = _guard_fresh_bars(bars, REGIME_TIMEFRAME)
+    if not fresh_ok:
+        meta = {"quiet": True, "reason": "stale_bars", "enabled": True, "freshness": fresh_meta}
+        _regime_cache["quiet"] = (now, meta)
+        return True, meta
 
     closes = [float(b.get("c") or 0.0) for b in bars]
     highs = [float(b.get("h") or 0.0) for b in bars]
@@ -488,6 +545,9 @@ def _signal_cr1(symbol: str) -> tuple[bool, dict]:
     bars = _get_bars(symbol, timeframe=ENTRY_ENGINE_TIMEFRAME, limit=max(ENTRY_ENGINE_LIMIT_BARS, CR1_RANGE_LOOKBACK_BARS + CR1_ATR_LEN + 10))
     if not bars or len(bars) < (CR1_ATR_LEN + 10):
         return False, {"reason": "insufficient_bars", "bars": len(bars) if bars else 0}
+    fresh_ok, fresh_meta = _guard_fresh_bars(bars, ENTRY_ENGINE_TIMEFRAME)
+    if not fresh_ok:
+        return False, {"reason": "stale_bars", "bars": len(bars), "freshness": fresh_meta}
 
     closes = [float(b.get("c") or 0.0) for b in bars]
     highs = [float(b.get("h") or 0.0) for b in bars]
@@ -576,6 +636,9 @@ def _rb1_long_signal(symbol: str) -> tuple[bool, dict]:
     bars = _get_bars(symbol, timeframe=ENTRY_ENGINE_TIMEFRAME, limit=max(ENTRY_ENGINE_LIMIT_BARS, RB1_LOOKBACK_BARS + 5))
     if not bars or len(bars) < (RB1_LOOKBACK_BARS + 3):
         return False, {"reason": "insufficient_bars", "bars": len(bars) if bars else 0}
+    fresh_ok, fresh_meta = _guard_fresh_bars(bars, ENTRY_ENGINE_TIMEFRAME)
+    if not fresh_ok:
+        return False, {"reason": "stale_bars", "bars": len(bars), "freshness": fresh_meta}
 
     highs = [float(b["h"]) for b in bars]
     closes = [float(b["c"]) for b in bars]
@@ -631,6 +694,9 @@ def _tc1_long_signal(symbol: str) -> tuple[bool, dict]:
     htf = _get_bars(symbol, timeframe=TC1_HTF_TIMEFRAME, limit=max(TC1_HTF_LIMIT_BARS, TC1_HTF_SLOW + 5))
     if not htf or len(htf) < (TC1_HTF_SLOW + 3):
         return False, {"reason": "insufficient_htf_bars", "bars": len(htf) if htf else 0}
+    htf_fresh_ok, htf_fresh_meta = _guard_fresh_bars(htf, TC1_HTF_TIMEFRAME)
+    if not htf_fresh_ok:
+        return False, {"reason": "stale_htf_bars", "bars": len(htf), "freshness": htf_fresh_meta}
 
     htf_closes = [float(b["c"]) for b in htf]
     ema_fast = _ema(htf_closes, TC1_HTF_FAST)
@@ -644,6 +710,9 @@ def _tc1_long_signal(symbol: str) -> tuple[bool, dict]:
     ltf = _get_bars(symbol, timeframe=ENTRY_ENGINE_TIMEFRAME, limit=max(ENTRY_ENGINE_LIMIT_BARS, TC1_LTF_EMA + 10))
     if not ltf or len(ltf) < (TC1_LTF_EMA + 5):
         return False, {"reason": "insufficient_ltf_bars", "bars": len(ltf) if ltf else 0, "uptrend": uptrend}
+    ltf_fresh_ok, ltf_fresh_meta = _guard_fresh_bars(ltf, ENTRY_ENGINE_TIMEFRAME)
+    if not ltf_fresh_ok:
+        return False, {"reason": "stale_ltf_bars", "bars": len(ltf), "uptrend": uptrend, "freshness": ltf_fresh_meta}
 
     ltf_closes = [float(b["c"]) for b in ltf]
     ltf_ts = [int(float(b["t"])) for b in ltf]
@@ -1766,9 +1835,19 @@ def worker_exit(payload: WorkerExitPayload):
             # Phase 6: execute
             notional_exit = max(float(settings.exit_min_notional_usd), float(plan.notional_usd))
             if dry_run:
-                res = {"ok": True, "dry_run": True, "side": "sell", "symbol": symbol, "notional": notional_exit}
+                res = {"ok": True, "dry_run": True, "side": "sell", "symbol": symbol, "notional": notional_exit, "reason": reason}
             else:
-                res = _market_notional(symbol=symbol, side="sell", notional=notional_exit, strategy=plan.strategy, price=px)
+                if reason == "stop" and STOP_EXIT_MODE == "stop_limit":
+                    res = broker_kraken.stop_limit_notional(
+                        symbol=symbol,
+                        notional=notional_exit,
+                        stop_price=float(plan.stop_price),
+                        strategy=plan.strategy,
+                        limit_buffer_pct=float(getattr(settings, 'stop_limit_buffer_pct', 0.01) or 0.01),
+                        timeout_sec=int(getattr(settings, 'stop_limit_timeout_sec', 60) or 60),
+                    )
+                else:
+                    res = _market_notional(symbol=symbol, side="sell", notional=notional_exit, strategy=plan.strategy, price=px)
                 if bool(res.get("ok")):
                     state.mark_exit(symbol)
                     state.set_pending_exit(symbol, reason=reason, txid=res.get("txid"))
@@ -2082,6 +2161,72 @@ def worker_reset_plans(payload: WorkerScanPayload):
     cleared = len(state.plans)
     state.plans.clear()
     return {"ok": True, "utc": utc_now_iso(), "cleared_plans": cleared}
+
+@app.get("/diagnostics/runtime")
+def diagnostics_runtime():
+    positions = get_positions()
+    return {
+        "ok": True,
+        "utc": utc_now_iso(),
+        "trading_enabled": bool(settings.trading_enabled),
+        "entry_engine_enabled": bool(ENTRY_ENGINE_ENABLED),
+        "stale_bar_guard_enabled": bool(ENABLE_STALE_BAR_GUARD),
+        "stop_exit_mode": STOP_EXIT_MODE,
+        "order_reconcile_timeout_sec": int(ORDER_RECONCILE_TIMEOUT_SEC),
+        "plans_count": len(getattr(state, 'plans', {}) or {}),
+        "pending_exits": getattr(state, 'pending_exits', {}),
+        "positions_count": len(positions),
+        "positions": positions,
+        "last_balance_error": _last_balance_error(),
+    }
+
+
+@app.post("/test/place_trade")
+def test_place_trade(payload: Dict[str, Any] = Body(default={})):
+    secret = (payload.get('worker_secret') or '').strip()
+    ok, reason = _require_worker_secret(secret)
+    if not ok:
+        raise HTTPException(status_code=401, detail=reason)
+
+    symbol = normalize_symbol(str(payload.get('symbol') or ''))
+    side = str(payload.get('side') or 'buy').strip().lower()
+    strategy = str(payload.get('strategy') or 'manual_test').strip() or 'manual_test'
+    notional = payload.get('notional_usd')
+    dry_run = bool(payload.get('dry_run', False))
+    if not symbol:
+        raise HTTPException(status_code=400, detail='missing symbol')
+    if side not in ('buy', 'sell'):
+        raise HTTPException(status_code=400, detail='side must be buy or sell')
+
+    if dry_run:
+        return {
+            'ok': True,
+            'dry_run': True,
+            'symbol': symbol,
+            'side': side,
+            'strategy': strategy,
+            'notional_usd': float(notional) if notional is not None else None,
+        }
+
+    if side == 'buy':
+        return _execute_long_entry(
+            symbol=symbol,
+            strategy=strategy,
+            signal_name='manual_test',
+            signal_id=f'manual:{symbol}:{int(time.time())}',
+            notional=float(notional) if notional is not None else None,
+            source='manual_test',
+            req_id=str(uuid4()),
+            client_ip='manual_test',
+            extra={'manual_test': True},
+        )
+
+    px = float(_last_price(symbol) or 0.0)
+    if px <= 0:
+        raise HTTPException(status_code=400, detail='no price available')
+    use_notional = float(notional) if notional is not None else float(getattr(settings, 'exit_min_notional_usd', 0.0) or 0.0)
+    return _market_notional(symbol=symbol, side='sell', notional=use_notional, strategy=strategy, price=px)
+
 
 @app.post("/worker/scan_entries")
 def scan_entries(payload: WorkerScanPayload):
