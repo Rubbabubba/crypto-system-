@@ -842,13 +842,17 @@ def market_notional(
             chase_steps = 1
 
 
-    def _place_market() -> Dict[str, Any]:
+    def _place_market(*, volume_override: Optional[float] = None, notional_override: Optional[float] = None) -> Dict[str, Any]:
+        volume_to_send = float(volume_override) if volume_override is not None else float(volume)
+        notional_to_report = float(notional_override) if notional_override is not None else float(notional)
+        if volume_to_send <= 0:
+            return {"ok": False, "error": "market_notional failed: remaining volume <= 0 for market fallback"}
         payload_mkt = {
             "pair": pair,
             "type": "buy" if side == "buy" else "sell",
             "ordertype": "market",
-            "volume": _format_volume(volume, lot_decimals),
-            "userref": str(_userref_for_strategy(strategy) if strategy is not None else _userref(ui, side, float(notional))),
+            "volume": _format_volume(volume_to_send, lot_decimals),
+            "userref": str(_userref_for_strategy(strategy) if strategy is not None else _userref(ui, side, float(notional_to_report))),
         }
         try:
             res_m = _priv("AddOrder", payload_mkt)
@@ -870,8 +874,8 @@ def market_notional(
             "execution": "market",
             "pair": pair,
             "side": side,
-            "notional": float(notional),
-            "volume": float(volume),
+            "notional": float(notional_to_report),
+            "volume": float(volume_to_send),
             "txid": txid_m,
             "descr": descr_m,
             "result": res_m,
@@ -947,8 +951,8 @@ def market_notional(
             "execution": "post_only_limit",
             "pair": pair,
             "side": side,
-            "notional": float(notional),
-            "volume": float(volume),
+            "notional": float(notional_to_report),
+            "volume": float(volume_to_send),
             "limit_price": float(limit_px),
             "txid": txid_l,
             "descr": descr_l,
@@ -975,10 +979,25 @@ def market_notional(
             last_err = out
 
         if market_fallback:
-            mkt = _place_market()
+            remaining_volume = float(volume)
+            remaining_notional = float(notional)
+            if last_err:
+                try:
+                    vol_exec = float(last_err.get("vol_exec") or 0.0)
+                except Exception:
+                    vol_exec = 0.0
+                if vol_exec > 0:
+                    remaining_volume = max(0.0, float(volume) - vol_exec)
+                    remaining_notional = max(0.0, remaining_volume * float(px))
+            mkt = _place_market(volume_override=remaining_volume, notional_override=remaining_notional)
             # Preserve context about maker attempts
             if last_err:
-                mkt["maker_first"] = {"attempt_failed": True, "last_error": last_err}
+                mkt["maker_first"] = {
+                    "attempt_failed": True,
+                    "last_error": last_err,
+                    "fallback_remaining_volume": remaining_volume,
+                    "fallback_remaining_notional": remaining_notional,
+                }
             return mkt
 
         # No fallback: return last maker attempt details

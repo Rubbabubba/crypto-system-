@@ -1105,6 +1105,15 @@ def _execute_long_entry(
     if not bool(settings.trading_enabled):
         return ignored("trading_disabled", symbol=symbol, strategy=strategy, signal=signal_name, signal_id=signal_id)
 
+    # global daily entry cap
+    total_today = int(getattr(state, "trades_today_total", 0) or 0)
+    if MAX_ENTRIES_PER_DAY > 0 and total_today >= int(MAX_ENTRIES_PER_DAY):
+        return ignored("max_entries_per_day_reached", symbol=symbol, strategy=strategy, entries_today=total_today, max_entries_per_day=MAX_ENTRIES_PER_DAY)
+
+    # global entry cooldown
+    if not state.can_enter_global(int(getattr(settings, "global_entry_cooldown_sec", 0) or 0)):
+        return ignored("global_entry_cooldown", symbol=symbol, strategy=strategy, cooldown_sec=int(getattr(settings, "global_entry_cooldown_sec", 0) or 0))
+
     # daily loss cap
     if state.daily_pnl_usd <= -float(settings.max_daily_loss_usd):
         return ignored("max_daily_loss_reached", symbol=symbol, strategy=strategy, daily_pnl_usd=state.daily_pnl_usd)
@@ -1844,6 +1853,16 @@ def _entry_signals_for_symbol(symbol: str, *, regime_quiet: bool) -> tuple[dict,
 
 
 
+def _scanner_signal_id(symbol: str, strategy: str) -> str:
+    """Deterministic idempotency key for scanner-driven entries.
+
+    Bucket by minute so worker retries in the same minute do not submit duplicate
+    entries, while fresh scans later can still place a new trade if allowed.
+    """
+    bucket = int(time.time() // 60)
+    return f"scan:{normalize_symbol(symbol)}:{str(strategy or '').strip().lower()}:{bucket}"
+
+
 def place_entry(symbol: str, *, strategy: str, req_id: str | None = None, client_ip: str | None = None, notional: float | None = None):
     """
     Wrapper used by /worker/scan_entries to execute an entry in live mode.
@@ -1858,7 +1877,7 @@ def place_entry(symbol: str, *, strategy: str, req_id: str | None = None, client
         symbol=symbol,
         strategy=strategy,
         signal_name=strategy,
-        signal_id=None,
+        signal_id=_scanner_signal_id(symbol, strategy),
         notional=notional,
         source="scan_entries",
         req_id=rid,
@@ -1877,83 +1896,13 @@ def place_entry(symbol: str, *, strategy: str, req_id: str | None = None, client
 
 
 def _count_open_positions(open_set: set[str]) -> int:
-    """Count open positions safely.
+    """Count live open positions only.
 
-    IMPORTANT: We should not count in-memory "plans" as open positions when we have a live
-    broker snapshot, or we can deadlock trading after a restart (stale plans).
+    We intentionally ignore in-memory plans here because a stale plan after a
+    restart must not block fresh entries when the broker reports no position.
     """
     return len(open_set or set())
-    utc_date = _utc_date_str(now)
-    try:
-        state.reset_daily_counters_if_needed(utc_date)
-    except Exception:
-        pass
 
-    # Global / config safety checks
-    if not getattr(settings, "trading_enabled", True):
-        return False, "trading_disabled", {}
-
-    # Daily entry cap (global)
-    try:
-        total_today = int(getattr(state, "trades_today_total", 0) or 0)
-        if MAX_ENTRIES_PER_DAY > 0 and total_today >= int(MAX_ENTRIES_PER_DAY):
-            return False, "max_entries_per_day_reached", {"entries_today": total_today, "max_entries_per_day": MAX_ENTRIES_PER_DAY}
-    except Exception:
-        pass
-
-    # Time-of-day discipline
-    try:
-        if _is_after_utc_hhmm(now, getattr(settings, "no_new_entries_after_utc", "") or ""):
-            return False, "blocked_by_time_window", {"no_new_entries_after_utc": getattr(settings, "no_new_entries_after_utc", "")}
-    except Exception:
-        pass
-
-    # Per-symbol trade frequency cap
-    try:
-        count_for_symbol = int(getattr(state, "trades_today_by_symbol", {}).get(symbol, 0) or 0)
-        if getattr(settings, "max_trades_per_symbol_per_day", 999) and count_for_symbol >= int(getattr(settings, "max_trades_per_symbol_per_day", 999)):
-            return False, "max_trades_per_symbol_per_day_reached", {"trades_today": count_for_symbol, "max": getattr(settings, "max_trades_per_symbol_per_day", 999)}
-    except Exception:
-        pass
-
-    # Cooldown (per-symbol)
-    try:
-        if not state.can_enter(symbol, getattr(settings, "entry_cooldown_sec", 0)):
-            return False, "cooldown_active", {"cooldown_sec": getattr(settings, "entry_cooldown_sec", 0)}
-    except Exception:
-        pass
-
-    # Cooldown (global)
-    try:
-        if hasattr(state, "can_enter_global") and not state.can_enter_global(getattr(settings, "global_entry_cooldown_sec", 0)):
-            return False, "global_cooldown_active", {"global_cooldown_sec": getattr(settings, "global_entry_cooldown_sec", 0)}
-    except Exception:
-        pass
-
-    # Stopout cooldown (per-symbol)
-    try:
-        if hasattr(state, "can_enter_after_stopout") and not state.can_enter_after_stopout(symbol, getattr(settings, "stopout_cooldown_sec", 0)):
-            return False, "stopout_cooldown_active", {"stopout_cooldown_sec": getattr(settings, "stopout_cooldown_sec", 0)}
-    except Exception:
-        pass
-
-    # Execute via existing engine
-    try:
-        ok, reason, meta = _execute_long_entry(symbol=symbol, strategy=strategy, signal_name=strategy)
-        if ok:
-            try:
-                state.mark_enter(symbol)
-                if hasattr(state, "mark_enter_global"):
-                    state.mark_enter_global()
-                state.inc_trade(symbol)
-                # global counter (added in state.py patch)
-                if hasattr(state, "inc_trade_total"):
-                    state.inc_trade_total()
-            except Exception:
-                pass
-        return bool(ok), str(reason), meta or {}
-    except Exception as e:
-        return False, f"exception:{type(e).__name__}", {"error": str(e)}
 
 
 

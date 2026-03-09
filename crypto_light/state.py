@@ -4,6 +4,8 @@ import time
 from dataclasses import dataclass
 from typing import Dict, Optional, List, Any
 
+from . import plans_db
+
 
 @dataclass
 class TradePlan:
@@ -22,6 +24,38 @@ class TradePlan:
 
     breakeven_armed: bool = False
     breakeven_triggered_ts: float = 0.0
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "symbol": self.symbol,
+            "side": self.side,
+            "notional_usd": float(self.notional_usd),
+            "entry_price": float(self.entry_price),
+            "stop_price": float(self.stop_price),
+            "take_price": float(self.take_price),
+            "strategy": self.strategy,
+            "opened_ts": float(self.opened_ts),
+            "max_hold_sec": int(self.max_hold_sec),
+            "breakeven_armed": bool(self.breakeven_armed),
+            "breakeven_triggered_ts": float(self.breakeven_triggered_ts),
+        }
+
+    @classmethod
+    def from_dict(cls, d: Dict[str, Any]) -> "TradePlan":
+        return cls(
+            symbol=str(d.get("symbol") or ""),
+            side=str(d.get("side") or "buy"),
+            notional_usd=float(d.get("notional_usd") or 0.0),
+            entry_price=float(d.get("entry_price") or 0.0),
+            stop_price=float(d.get("stop_price") or 0.0),
+            take_price=float(d.get("take_price") or 0.0),
+            strategy=str(d.get("strategy") or "unknown"),
+            opened_ts=float(d.get("opened_ts") or 0.0),
+            max_hold_sec=int(d.get("max_hold_sec") or 0),
+            breakeven_armed=bool(d.get("breakeven_armed") or False),
+            breakeven_triggered_ts=float(d.get("breakeven_triggered_ts") or 0.0),
+        )
+
 class InMemoryState:
     """Best-effort in-memory state.
 
