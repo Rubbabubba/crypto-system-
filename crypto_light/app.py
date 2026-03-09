@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from . import trades_db
 from . import broker_kraken
+from . import trade_journal
 from .broker_kraken import trades_history
 
 import logging
@@ -1136,6 +1137,125 @@ def telemetry(limit: int = 100):
 
 
 
+def _journal_sync_daily_realized_pnl() -> float:
+    """Refresh in-memory daily P&L from the lifecycle journal."""
+    try:
+        pnl = float(trade_journal.today_realized_pnl_utc() or 0.0)
+        state.daily_pnl_usd = pnl
+        return pnl
+    except Exception:
+        return float(getattr(state, "daily_pnl_usd", 0.0) or 0.0)
+
+
+def _extract_execution_metrics(res: dict | None, *, fallback_price: float = 0.0, fallback_qty: float = 0.0) -> dict:
+    """Best-effort normalized fill metrics from broker results.
+
+    Handles:
+    - plain market executions (reconciled)
+    - maker-first partial -> market fallback
+    - stop-limit partial -> market fallback
+    """
+    res = res or {}
+    qty = 0.0
+    cost = 0.0
+    fee = 0.0
+
+    def _acc(rec: dict | None, *, default_price: float = 0.0, default_qty: float = 0.0):
+        nonlocal qty, cost, fee
+        if not rec:
+            if default_qty > 0 and default_price > 0:
+                qty += float(default_qty)
+                cost += float(default_qty) * float(default_price)
+            return
+        q = float(rec.get('vol_exec') or rec.get('volume') or default_qty or 0.0)
+        c = rec.get('cost')
+        f = rec.get('fee')
+        px = rec.get('avg_price') or rec.get('price') or default_price or 0.0
+        qty += float(q or 0.0)
+        if c is not None:
+            cost += float(c or 0.0)
+        elif q and px:
+            cost += float(q) * float(px)
+        fee += float(f or 0.0)
+
+    recon = res.get('reconciled') or {}
+    _acc(recon, default_price=fallback_price, default_qty=float(res.get('volume') or fallback_qty or 0.0))
+
+    maker_first = res.get('maker_first') or {}
+    if maker_first:
+        last_err = maker_first.get('last_error') or {}
+        part_qty = float(last_err.get('vol_exec') or 0.0)
+        part_px = float(last_err.get('limit_price') or fallback_price or 0.0)
+        # Kraken order-query path used here does not expose reliable partial fee/cost.
+        # We approximate cost from the post-only limit price and leave fee at zero.
+        if part_qty > 0:
+            qty += part_qty
+            cost += part_qty * part_px
+
+    stop_limit_first = res.get('stop_limit_first') or {}
+    if stop_limit_first:
+        _acc(stop_limit_first.get('reconciled') or {}, default_price=float(stop_limit_first.get('limit_price') or fallback_price or 0.0))
+
+    avg_price = (cost / qty) if qty > 0 else (float(fallback_price) if fallback_price > 0 else None)
+    if qty <= 0 and fallback_qty > 0:
+        qty = float(fallback_qty)
+        if cost <= 0 and fallback_price > 0:
+            cost = qty * float(fallback_price)
+            avg_price = float(fallback_price)
+
+    return {
+        'qty': float(qty),
+        'cost': float(cost),
+        'fee': float(fee),
+        'avg_price': float(avg_price) if avg_price is not None else None,
+        'execution': str(res.get('execution') or ''),
+        'txid': res.get('txid'),
+    }
+
+
+def _record_open_trade_journal(*, symbol: str, strategy: str, source: str, signal_name: str | None, signal_id: str | None, req_id: str, requested_notional_usd: float, stop_price: float, take_price: float, px_fallback: float, res: dict, opened_ts: float | None = None) -> None:
+    metrics = _extract_execution_metrics(res, fallback_price=float(px_fallback or 0.0), fallback_qty=(float(requested_notional_usd or 0.0) / float(px_fallback or 1.0)) if float(px_fallback or 0.0) > 0 else 0.0)
+    trade_journal.upsert_open_trade({
+        'symbol': symbol,
+        'opened_ts': float(opened_ts or time.time()),
+        'strategy': strategy,
+        'source': source,
+        'signal_name': signal_name,
+        'signal_id': signal_id,
+        'req_id': req_id,
+        'entry_txid': metrics.get('txid'),
+        'entry_execution': metrics.get('execution'),
+        'entry_price': metrics.get('avg_price') or float(px_fallback or 0.0),
+        'entry_qty': metrics.get('qty'),
+        'entry_cost': metrics.get('cost'),
+        'entry_fee': metrics.get('fee'),
+        'requested_notional_usd': float(requested_notional_usd),
+        'stop_price': float(stop_price),
+        'take_price': float(take_price),
+        'meta': {'order_result': res},
+    })
+
+
+def _record_exit_trade_journal(*, symbol: str, reason: str, px_fallback: float, res: dict, closed_ts: float | None = None) -> dict | None:
+    metrics = _extract_execution_metrics(res, fallback_price=float(px_fallback or 0.0))
+    out = trade_journal.close_trade(symbol, {
+        'closed_ts': float(closed_ts or time.time()),
+        'exit_txid': metrics.get('txid'),
+        'exit_execution': metrics.get('execution'),
+        'exit_price': metrics.get('avg_price') or float(px_fallback or 0.0),
+        'exit_qty': metrics.get('qty'),
+        'exit_cost': metrics.get('cost'),
+        'exit_fee': metrics.get('fee'),
+        'exit_reason': reason,
+        'meta': {'order_result': res},
+    })
+    try:
+        _journal_sync_daily_realized_pnl()
+    except Exception:
+        pass
+    return out
+
+
 def _execute_long_entry(
     *,
     symbol: str,
@@ -1183,9 +1303,10 @@ def _execute_long_entry(
     if not state.can_enter_global(int(getattr(settings, "global_entry_cooldown_sec", 0) or 0)):
         return ignored("global_entry_cooldown", symbol=symbol, strategy=strategy, cooldown_sec=int(getattr(settings, "global_entry_cooldown_sec", 0) or 0))
 
-    # daily loss cap
-    if state.daily_pnl_usd <= -float(settings.max_daily_loss_usd):
-        return ignored("max_daily_loss_reached", symbol=symbol, strategy=strategy, daily_pnl_usd=state.daily_pnl_usd)
+    # daily loss cap (journal-backed)
+    realized_today = _journal_sync_daily_realized_pnl()
+    if realized_today <= -float(settings.max_daily_loss_usd):
+        return ignored("max_daily_loss_reached", symbol=symbol, strategy=strategy, daily_pnl_usd=realized_today)
 
     # cooldown
     if not state.can_enter(symbol, int(settings.entry_cooldown_sec)):
@@ -1377,19 +1498,39 @@ def _execute_long_entry(
     _log_event("info", evt)
 
     if res.get("ok"):
+        opened_ts = time.time()
+        try:
+            _record_open_trade_journal(
+                symbol=symbol,
+                strategy=strategy,
+                source=source,
+                signal_name=signal_name,
+                signal_id=signal_id,
+                req_id=req_id,
+                requested_notional_usd=float(_notional),
+                stop_price=float(stop_price),
+                take_price=float(take_price),
+                px_fallback=float(px),
+                res=res,
+                opened_ts=opened_ts,
+            )
+        except Exception:
+            pass
+        metrics = _extract_execution_metrics(res, fallback_price=float(px), fallback_qty=(float(_notional) / float(px)) if float(px) > 0 else 0.0)
+        plan_entry_px = float(metrics.get('avg_price') or px)
         state.mark_enter(symbol)
         state.set_plan(TradePlan(
             symbol=symbol,
             strategy=strategy,
             side="buy",
-            entry_price=float(px),
+            entry_price=float(plan_entry_px),
             stop_price=float(stop_price),
             take_price=float(take_price),
             notional_usd=float(_notional),
-            opened_ts=time.time(),
+            opened_ts=opened_ts,
             max_hold_sec=_strategy_max_hold_sec(strategy),
         ))
-        return {"ok": True, "executed": True, "symbol": symbol, "strategy": strategy, "price": px, "stop": float(stop_price), "take": float(take_price)}
+        return {"ok": True, "executed": True, "symbol": symbol, "strategy": strategy, "price": plan_entry_px, "stop": float(stop_price), "take": float(take_price)}
 
     # Do NOT create a plan or cooldown on failed orders (e.g., insufficient funds).
     return {"ok": False, "executed": False, "symbol": symbol, "strategy": strategy, "price": px, "stop": float(stop_price), "take": float(take_price), "error": res.get("error") or "order_failed"}
@@ -1709,6 +1850,29 @@ def worker_exit(payload: WorkerExitPayload):
                 breakeven_triggered_ts=0.0,
             )
             state.set_plan(plan_new)
+            try:
+                if not trade_journal.get_open_trade(symbol):
+                    trade_journal.upsert_open_trade({
+                        'symbol': symbol,
+                        'opened_ts': now.timestamp(),
+                        'strategy': 'adopted',
+                        'source': 'adopted',
+                        'signal_name': 'adopted',
+                        'signal_id': None,
+                        'req_id': f'adopt:{symbol}:{int(now.timestamp())}',
+                        'entry_txid': None,
+                        'entry_execution': 'adopted',
+                        'entry_price': float(entry_px),
+                        'entry_qty': float(qty),
+                        'entry_cost': float(pos_notional),
+                        'entry_fee': 0.0,
+                        'requested_notional_usd': float(pos_notional),
+                        'stop_price': float(stop_px),
+                        'take_price': float(take_px),
+                        'meta': {'adopted': True},
+                    })
+            except Exception:
+                pass
             return plan_new
 
         def _maybe_apply_breakeven(plan: TradePlan, *, px: float, entry_px: float) -> None:
@@ -1848,9 +2012,14 @@ def worker_exit(payload: WorkerExitPayload):
                     )
                 else:
                     res = _market_notional(symbol=symbol, side="sell", notional=notional_exit, strategy=plan.strategy, price=px)
+                journal_close = None
                 if bool(res.get("ok")):
                     state.mark_exit(symbol)
                     state.set_pending_exit(symbol, reason=reason, txid=res.get("txid"))
+                    try:
+                        journal_close = _record_exit_trade_journal(symbol=symbol, reason=reason, px_fallback=float(px), res=res, closed_ts=now.timestamp())
+                    except Exception:
+                        journal_close = None
                 else:
                     # Do not latch exit cooldowns or pending state if the order failed.
                     state.clear_pending_exit(symbol)
@@ -1875,6 +2044,7 @@ def worker_exit(payload: WorkerExitPayload):
                 "notional_usd": notional_exit,
                 "age_sec": round(age_sec, 3),
                 "max_hold_sec": int(getattr(settings, "max_hold_sec", 0) or 0),
+                "journal": (journal_close if not dry_run else None),
             }
             _log_event("info", evt)
             exits.append({"symbol": symbol, "reason": reason, "price": px, "age_sec": round(age_sec, 3), "dry_run": bool(dry_run), "result": res})
