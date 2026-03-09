@@ -129,6 +129,19 @@ def _require_worker_secret(provided: str | None) -> tuple[bool, str | None]:
     return True, None
 
 
+def _record_blocked_trade(reason: str, **fields) -> None:
+    try:
+        evt = {
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "reason": str(reason or "unknown"),
+            **(fields or {}),
+        }
+        state.record_blocked_trade(evt)
+    except Exception:
+        pass
+
+
+
 # ---------- Entry engine (optional; replaces TradingView) ----------
 ENTRY_ENGINE_ENABLED = (os.getenv("ENTRY_ENGINE_ENABLED", "1").strip().lower() in ("1", "true", "yes", "on"))
 ENTRY_ENGINE_STRATEGIES = {s.strip().lower() for s in os.getenv("ENTRY_ENGINE_STRATEGIES", "rb1,tc1").split(",") if s.strip()}
@@ -1282,6 +1295,7 @@ def _execute_long_entry(
             **(extra_fields or {}),
         }
         _log_event("warning", evt)
+        _record_blocked_trade(reason, req_id=req_id, source=source, **(extra_fields or {}))
         return {"ok": True, "ignored": True, "reason": reason, **(extra_fields or {})}
 
     now = datetime.now(timezone.utc)
@@ -1947,6 +1961,16 @@ def worker_exit(payload: WorkerExitPayload):
                 state.clear_pending_exit(symbol)
                 continue
 
+            if state.has_pending_exit(symbol, PENDING_EXIT_TTL_SEC):
+                if diagnostics:
+                    evaluations.append({
+                        "symbol": symbol,
+                        "decision": None,
+                        "skip_reason": "pending_exit_inflight",
+                        "pending_exit": state.pending_exits.get(symbol),
+                    })
+                continue
+
             # Phase 2: plan resolution / conservative adoption
             plan = _ensure_plan(symbol, qty=qty, px=px)
             if not plan:
@@ -2049,14 +2073,34 @@ def worker_exit(payload: WorkerExitPayload):
             _log_event("info", evt)
             exits.append({"symbol": symbol, "reason": reason, "price": px, "age_sec": round(age_sec, 3), "dry_run": bool(dry_run), "result": res})
 
-        resp = {"ok": True, "utc": now.isoformat(), "did_flatten": did_flatten, "exits": exits}
+        resp = {"ok": True, "utc": now.isoformat(), "did_flatten": did_flatten, "exits": exits, "stale_pending_cleared": int(stale_pending_cleared)}
         if diagnostics:
             resp["evaluations"] = evaluations
+        try:
+            state.set_last_exit_status({
+                "utc": now.isoformat(),
+                "ok": True,
+                "did_flatten": bool(did_flatten),
+                "exits_count": len(exits),
+                "symbols_evaluated": len(symbols),
+                "stale_pending_cleared": int(stale_pending_cleared),
+                "pending_exits": len(getattr(state, 'pending_exits', {}) or {}),
+            })
+        except Exception:
+            pass
         return resp
 
     except HTTPException:
         raise
     except Exception as e:
+        try:
+            state.set_last_exit_status({
+                "utc": utc_now_iso(),
+                "ok": False,
+                "error": str(e),
+            })
+        except Exception:
+            pass
         _log_event(
             "error",
             {
@@ -2350,6 +2394,36 @@ def diagnostics_runtime():
         "last_balance_error": _last_balance_error(),
     }
 
+@app.get("/diagnostics/last_scan")
+def diagnostics_last_scan():
+    return {
+        "ok": True,
+        "utc": utc_now_iso(),
+        "last_scan": getattr(state, 'last_scan_status', {}) or {},
+    }
+
+
+@app.get("/diagnostics/last_exit")
+def diagnostics_last_exit():
+    return {
+        "ok": True,
+        "utc": utc_now_iso(),
+        "last_exit": getattr(state, 'last_exit_status', {}) or {},
+    }
+
+
+@app.get("/diagnostics/blocked_trades")
+def diagnostics_blocked_trades(limit: int = 50):
+    lim = max(1, min(int(limit or 50), int(BLOCKED_TRADES_LIMIT)))
+    items = list(getattr(state, 'blocked_trades', []) or [])[-lim:]
+    return {
+        "ok": True,
+        "utc": utc_now_iso(),
+        "limit": lim,
+        "count": len(items),
+        "items": items,
+    }
+
 
 @app.post("/test/place_trade")
 def test_place_trade(payload: Dict[str, Any] = Body(default={})):
@@ -2408,6 +2482,10 @@ def scan_entries(payload: WorkerScanPayload):
     """
     ok, reason = _require_worker_secret(payload.worker_secret)
     if not ok:
+        try:
+            state.set_last_scan_status({"utc": utc_now_iso(), "ok": False, "error": reason})
+        except Exception:
+            pass
         return JSONResponse(status_code=401, content={"ok": False, "utc": utc_now_iso(), "error": reason})
 
     # 1) Scanner → symbols (soft allowlist) + meta

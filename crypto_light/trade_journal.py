@@ -179,27 +179,38 @@ def close_trade(symbol: str, exit_data: Dict[str, Any]) -> Dict[str, Any]:
         o = dict(open_row)
         now = time.time()
         closed_ts = _to_float(exit_data.get("closed_ts")) or now
-        entry_qty = _to_float(o.get("entry_qty")) or 0.0
+        entry_qty_total = _to_float(o.get("entry_qty")) or 0.0
         exit_qty = _to_float(exit_data.get("exit_qty")) or 0.0
         if exit_qty <= 0.0:
-            exit_qty = entry_qty
+            exit_qty = entry_qty_total
+        exit_qty = max(0.0, min(float(exit_qty), float(entry_qty_total) if entry_qty_total > 0 else float(exit_qty)))
         entry_price = _to_float(o.get("entry_price")) or 0.0
         exit_price = _to_float(exit_data.get("exit_price")) or 0.0
-        entry_cost = _to_float(o.get("entry_cost"))
-        if entry_cost is None:
-            entry_cost = entry_price * entry_qty if entry_price > 0 and entry_qty > 0 else None
+        entry_cost_total = _to_float(o.get("entry_cost"))
+        if entry_cost_total is None:
+            entry_cost_total = entry_price * entry_qty_total if entry_price > 0 and entry_qty_total > 0 else None
         exit_cost = _to_float(exit_data.get("exit_cost"))
         if exit_cost is None:
             exit_cost = exit_price * exit_qty if exit_price > 0 and exit_qty > 0 else None
-        entry_fee = _to_float(o.get("entry_fee")) or 0.0
+        entry_fee_total = _to_float(o.get("entry_fee")) or 0.0
         exit_fee = _to_float(exit_data.get("exit_fee")) or 0.0
+        close_ratio = 1.0
+        if entry_qty_total > 0 and exit_qty > 0:
+            close_ratio = min(1.0, float(exit_qty) / float(entry_qty_total))
+        entry_qty_closed = float(entry_qty_total) * float(close_ratio) if entry_qty_total > 0 else float(exit_qty)
+        entry_cost_closed = (float(entry_cost_total) * float(close_ratio)) if entry_cost_total is not None else None
+        entry_fee_closed = float(entry_fee_total) * float(close_ratio)
         gross = None
-        if entry_cost is not None and exit_cost is not None:
-            gross = float(exit_cost) - float(entry_cost)
-        elif entry_price > 0 and exit_price > 0 and entry_qty > 0:
-            gross = (float(exit_price) - float(entry_price)) * float(min(entry_qty, exit_qty if exit_qty > 0 else entry_qty))
-        net = (float(gross) if gross is not None else 0.0) - float(entry_fee) - float(exit_fee)
+        if entry_cost_closed is not None and exit_cost is not None:
+            gross = float(exit_cost) - float(entry_cost_closed)
+        elif entry_price > 0 and exit_price > 0 and entry_qty_closed > 0:
+            gross = (float(exit_price) - float(entry_price)) * float(entry_qty_closed)
+        net = (float(gross) if gross is not None else 0.0) - float(entry_fee_closed) - float(exit_fee)
         hold_sec = max(0.0, float(closed_ts) - float(o.get("opened_ts") or 0.0)) if o.get("opened_ts") else None
+        meta = exit_data.get("meta") or {}
+        meta = dict(meta)
+        meta["partial_close"] = bool(close_ratio < 0.999)
+        meta["close_ratio"] = float(close_ratio)
         row = {
             "symbol": sym,
             "opened_ts": _to_float(o.get("opened_ts")),
@@ -216,17 +227,17 @@ def close_trade(symbol: str, exit_data: Dict[str, Any]) -> Dict[str, Any]:
             "exit_execution": exit_data.get("exit_execution"),
             "entry_price": _to_float(entry_price),
             "exit_price": _to_float(exit_price),
-            "entry_qty": _to_float(entry_qty),
+            "entry_qty": _to_float(entry_qty_closed),
             "exit_qty": _to_float(exit_qty),
-            "entry_cost": _to_float(entry_cost),
+            "entry_cost": _to_float(entry_cost_closed),
             "exit_cost": _to_float(exit_cost),
-            "entry_fee": _to_float(entry_fee),
+            "entry_fee": _to_float(entry_fee_closed),
             "exit_fee": _to_float(exit_fee),
-            "fees_total": float(entry_fee) + float(exit_fee),
+            "fees_total": float(entry_fee_closed) + float(exit_fee),
             "gross_pnl_usd": _to_float(gross),
             "net_pnl_usd": _to_float(net),
             "exit_reason": exit_data.get("exit_reason"),
-            "meta_json": json.dumps(exit_data.get("meta") or {}, separators=(",", ":"), sort_keys=True),
+            "meta_json": json.dumps(meta, separators=(",", ":"), sort_keys=True),
             "created_utc": now,
         }
         conn.execute(
@@ -245,10 +256,44 @@ def close_trade(symbol: str, exit_data: Dict[str, Any]) -> Dict[str, Any]:
             """,
             row,
         )
-        conn.execute("DELETE FROM open_trades WHERE symbol=?", (sym,))
+        remaining_qty = max(0.0, float(entry_qty_total) - float(exit_qty))
+        if remaining_qty <= max(1e-12, float(entry_qty_total) * 0.001):
+            conn.execute("DELETE FROM open_trades WHERE symbol=?", (sym,))
+        else:
+            remaining_ratio = remaining_qty / float(entry_qty_total) if entry_qty_total > 0 else 0.0
+            remaining_cost = (float(entry_cost_total) * remaining_ratio) if entry_cost_total is not None else None
+            remaining_fee = float(entry_fee_total) * remaining_ratio
+            remaining_notional = _to_float(o.get("requested_notional_usd"))
+            if remaining_notional is not None:
+                remaining_notional = float(remaining_notional) * remaining_ratio
+            rem_meta = {}
+            try:
+                rem_meta = json.loads(o.get("meta_json") or "{}")
+            except Exception:
+                rem_meta = {}
+            rem_meta["remaining_after_partial_exit"] = {
+                "qty": remaining_qty,
+                "close_ratio": float(close_ratio),
+                "closed_ts": float(closed_ts),
+            }
+            conn.execute(
+                """
+                UPDATE open_trades SET
+                  entry_qty=?,
+                  entry_cost=?,
+                  entry_fee=?,
+                  requested_notional_usd=?,
+                  meta_json=?,
+                  updated_utc=?
+                WHERE symbol=?
+                """,
+                (remaining_qty, _to_float(remaining_cost), _to_float(remaining_fee), _to_float(remaining_notional), json.dumps(rem_meta, separators=(",", ":"), sort_keys=True), now, sym),
+            )
         conn.commit()
     row["ok"] = True
     row["db_path"] = _db_path()
+    row["remaining_qty"] = remaining_qty
+    row["partial_close"] = bool(remaining_qty > max(1e-12, float(entry_qty_total) * 0.001))
     return row
 
 

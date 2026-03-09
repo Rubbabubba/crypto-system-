@@ -97,6 +97,12 @@ class InMemoryState:
         self.telemetry: List[Dict[str, Any]] = []
         self.telemetry_max: int = 500
 
+        # Operational status snapshots
+        self.last_scan_status: Dict[str, Any] = {}
+        self.last_exit_status: Dict[str, Any] = {}
+        self.blocked_trades: List[Dict[str, Any]] = []
+        self.blocked_trades_max: int = 500
+
         # Reload persisted plans after deploy/restart so exits remain correct
         self._load_plans_from_db()
 
@@ -244,5 +250,41 @@ class InMemoryState:
             self.telemetry.append(event)
             if len(self.telemetry) > self.telemetry_max:
                 self.telemetry = self.telemetry[-self.telemetry_max :]
+        except Exception:
+            pass
+
+    def clear_stale_pending_exits(self, ttl_sec: int) -> int:
+        if ttl_sec <= 0:
+            return 0
+        now = time.time()
+        cleared = 0
+        for symbol, meta in list(self.pending_exits.items()):
+            ts = float((meta or {}).get("ts", 0.0) or 0.0)
+            if ts <= 0.0 or (now - ts) >= float(ttl_sec):
+                self.pending_exits.pop(symbol, None)
+                cleared += 1
+        return cleared
+
+    def has_pending_exit(self, symbol: str, ttl_sec: int = 0) -> bool:
+        meta = self.pending_exits.get(symbol) or {}
+        if not meta:
+            return False
+        ts = float(meta.get("ts", 0.0) or 0.0)
+        if ttl_sec > 0 and ts > 0.0 and (time.time() - ts) >= float(ttl_sec):
+            self.pending_exits.pop(symbol, None)
+            return False
+        return True
+
+    def set_last_scan_status(self, payload: Dict[str, Any]) -> None:
+        self.last_scan_status = dict(payload or {})
+
+    def set_last_exit_status(self, payload: Dict[str, Any]) -> None:
+        self.last_exit_status = dict(payload or {})
+
+    def record_blocked_trade(self, event: Dict[str, Any]) -> None:
+        try:
+            self.blocked_trades.append(dict(event or {}))
+            if len(self.blocked_trades) > self.blocked_trades_max:
+                self.blocked_trades = self.blocked_trades[-self.blocked_trades_max :]
         except Exception:
             pass
