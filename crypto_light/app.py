@@ -234,6 +234,9 @@ BAR_STALE_MULTIPLIER = float(os.getenv('BAR_STALE_MULTIPLIER', '1.8') or 1.8)
 BAR_STALE_EXTRA_SEC = int(float(os.getenv('BAR_STALE_EXTRA_SEC', '15') or 15))
 ORDER_RECONCILE_TIMEOUT_SEC = int(float(os.getenv('ORDER_RECONCILE_TIMEOUT_SEC', '8') or 8))
 STOP_EXIT_MODE = (os.getenv('STOP_EXIT_MODE', 'stop_limit').strip().lower() or 'stop_limit')
+ENABLE_BROKER_OPEN_ORDER_GUARD = (os.getenv('ENABLE_BROKER_OPEN_ORDER_GUARD', '1').strip().lower() in ('1','true','yes','on'))
+OPEN_ORDER_LOCK_TTL_SEC = int(float(os.getenv('OPEN_ORDER_LOCK_TTL_SEC', '45') or 45))
+WORKER_STALE_AFTER_SEC = int(float(os.getenv('WORKER_STALE_AFTER_SEC', '600') or 600))
 
 _SCANNER_CACHE: Dict[str, Any] = {
     "ts": 0.0,
@@ -1063,9 +1066,157 @@ def _symbol_allowed_by_scanner(symbol: str) -> tuple[bool, str, Dict[str, Any]]:
     return False, "not_in_active_set", meta
 
 
+
+def _worker_status_meta(snapshot: dict | None, *, stale_after_sec: int | None = None) -> dict:
+    snap = dict(snapshot or {})
+    last_ts = None
+    try:
+        utc_raw = snap.get('utc')
+        if utc_raw:
+            last_ts = datetime.fromisoformat(str(utc_raw).replace('Z', '+00:00')).timestamp()
+    except Exception:
+        last_ts = None
+    if last_ts is None:
+        return {"seen": False, "stale": True, "age_sec": None, "stale_after_sec": int(stale_after_sec or WORKER_STALE_AFTER_SEC)}
+    age = max(0.0, time.time() - float(last_ts))
+    lim = int(stale_after_sec or WORKER_STALE_AFTER_SEC)
+    return {"seen": True, "stale": bool(age > lim), "age_sec": round(age, 3), "stale_after_sec": lim}
+
+
+def _broker_open_orders_summary() -> dict:
+    try:
+        raw = broker_kraken.orders() or {}
+    except Exception as e:
+        return {"ok": False, "error": str(e), "buy_symbols": set(), "sell_symbols": set(), "items": []}
+    open_map = (((raw or {}).get('open') or {}) if isinstance(raw, dict) else {})
+    items = []
+    buy_symbols, sell_symbols = set(), set()
+    for txid, row in (open_map or {}).items():
+        descr = (row or {}).get('descr') or {}
+        pair = str(descr.get('pair') or '')
+        side = str(descr.get('type') or '').strip().lower()
+        symbol = normalize_symbol(pair) if pair else None
+        item = {
+            'txid': txid,
+            'symbol': symbol,
+            'side': side,
+            'status': row.get('status'),
+            'vol': float(row.get('vol', 0) or 0.0),
+            'vol_exec': float(row.get('vol_exec', 0) or 0.0),
+            'descr': descr,
+        }
+        items.append(item)
+        if symbol and side == 'buy':
+            buy_symbols.add(symbol)
+        elif symbol and side == 'sell':
+            sell_symbols.add(symbol)
+    return {"ok": True, "buy_symbols": buy_symbols, "sell_symbols": sell_symbols, "items": items}
+
+
+def _has_broker_open_order(symbol: str, side: str) -> tuple[bool, dict]:
+    side_l = str(side or '').strip().lower()
+    summary = _broker_open_orders_summary()
+    if not summary.get('ok'):
+        return False, summary
+    syms = summary.get('buy_symbols') if side_l == 'buy' else summary.get('sell_symbols')
+    matched = [it for it in (summary.get('items') or []) if it.get('symbol') == symbol and it.get('side') == side_l]
+    return bool(symbol in (syms or set())), {
+        'ok': True,
+        'matched_count': len(matched),
+        'matched': matched[:10],
+    }
+
+
+def _reconcile_runtime_state() -> dict:
+    positions = get_positions()
+    live_syms = {p.get('symbol') for p in positions if p.get('symbol')}
+    plan_syms = set((getattr(state, 'plans', {}) or {}).keys())
+    stale_plan_syms = sorted([s for s in plan_syms if s not in live_syms])
+    missing_plan_syms = sorted([s for s in live_syms if s not in plan_syms])
+    cleared_plans = 0
+    cleared_pending = 0
+    adopted = 0
+    now_ts = time.time()
+    for sym in stale_plan_syms:
+        state.remove_plan(sym)
+        state.clear_pending_exit(sym)
+        cleared_plans += 1
+        cleared_pending += 1
+    for pos in positions:
+        sym = pos.get('symbol')
+        if not sym or sym not in missing_plan_syms:
+            continue
+        px = float(pos.get('price') or 0.0)
+        qty = float(pos.get('qty') or 0.0)
+        notional = float(pos.get('notional_usd') or 0.0)
+        if qty <= 0 or px <= 0 or notional <= 0:
+            continue
+        stop_px, take_px = compute_brackets(px, settings.stop_pct, settings.take_pct)
+        state.set_plan(TradePlan(symbol=sym, side='buy', notional_usd=notional, entry_price=px, stop_price=stop_px, take_price=take_px, strategy='adopted', opened_ts=now_ts, max_hold_sec=_strategy_max_hold_sec('adopted')))
+        adopted += 1
+    return {
+        'ok': True,
+        'utc': utc_now_iso(),
+        'live_position_symbols': sorted(list(live_syms)),
+        'plan_symbols_before': sorted(list(plan_syms)),
+        'stale_plan_symbols_cleared': stale_plan_syms,
+        'missing_plan_symbols_adopted': missing_plan_syms,
+        'cleared_plans': cleared_plans,
+        'cleared_pending_exits': cleared_pending,
+        'adopted_plans': adopted,
+    }
+
+
+@app.get("/diagnostics/position_reconcile")
+def diagnostics_position_reconcile(apply: int = 0):
+    if int(apply or 0) == 1:
+        return _reconcile_runtime_state()
+    positions = get_positions()
+    live_syms = {p.get('symbol') for p in positions if p.get('symbol')}
+    plan_syms = set((getattr(state, 'plans', {}) or {}).keys())
+    return {
+        'ok': True,
+        'utc': utc_now_iso(),
+        'live_position_symbols': sorted(list(live_syms)),
+        'plan_symbols': sorted(list(plan_syms)),
+        'stale_plan_symbols': sorted([s for s in plan_syms if s not in live_syms]),
+        'missing_plan_symbols': sorted([s for s in live_syms if s not in plan_syms]),
+    }
+
+
+@app.get("/diagnostics/open_orders")
+def diagnostics_open_orders():
+    summary = _broker_open_orders_summary()
+    return {
+        'ok': bool(summary.get('ok')),
+        'utc': utc_now_iso(),
+        'buy_symbols': sorted(list(summary.get('buy_symbols') or [])),
+        'sell_symbols': sorted(list(summary.get('sell_symbols') or [])),
+        'count': len(summary.get('items') or []),
+        'items': summary.get('items') or [],
+        'error': summary.get('error'),
+    }
+
+
+@app.get("/diagnostics/worker_health")
+def diagnostics_worker_health():
+    scan_meta = _worker_status_meta(getattr(state, 'last_scan_status', {}) or {})
+    exit_meta = _worker_status_meta(getattr(state, 'last_exit_status', {}) or {})
+    return {
+        'ok': True,
+        'utc': utc_now_iso(),
+        'scan': {**scan_meta, 'snapshot': getattr(state, 'last_scan_status', {}) or {}},
+        'exit': {**exit_meta, 'snapshot': getattr(state, 'last_exit_status', {}) or {}},
+        'overall_stale': bool(scan_meta.get('stale') or exit_meta.get('stale')),
+    }
+
+
 @app.get("/health")
 def health():
     scanner_ok, scanner_reason, scanner_meta, scanner_syms = _scanner_fetch_active_symbols_and_meta()
+    open_orders = _broker_open_orders_summary()
+    scan_meta = _worker_status_meta(getattr(state, 'last_scan_status', {}) or {})
+    exit_meta = _worker_status_meta(getattr(state, 'last_exit_status', {}) or {})
     return {
         "ok": True,
         "utc": utc_now_iso(),
@@ -1076,6 +1227,17 @@ def health():
         "scanner_last_refresh_utc": (scanner_meta or {}).get("last_refresh_utc"),
         "scanner_last_error": (scanner_meta or {}).get("last_error"),
         "scanner_soft_allow": SCANNER_SOFT_ALLOW,
+        "worker_health": {
+            "scan": scan_meta,
+            "exit": exit_meta,
+            "overall_stale": bool(scan_meta.get('stale') or exit_meta.get('stale')),
+        },
+        "broker_open_orders": {
+            "ok": bool(open_orders.get('ok')),
+            "count": len(open_orders.get('items') or []),
+            "buy_symbols": sorted(list(open_orders.get('buy_symbols') or []))[:20],
+            "sell_symbols": sorted(list(open_orders.get('sell_symbols') or []))[:20],
+        },
     }
 
 
@@ -1335,6 +1497,13 @@ def _execute_long_entry(
     if has_pos:
         return ignored("position_already_open", symbol=symbol, position_notional_usd=pos_notional, strategy=strategy)
 
+    entry_lock_key = f"buy:{symbol}"
+    if state.has_order_lock(entry_lock_key, OPEN_ORDER_LOCK_TTL_SEC):
+        return ignored("entry_order_lock_active", symbol=symbol, strategy=strategy, ttl_sec=int(OPEN_ORDER_LOCK_TTL_SEC))
+    if ENABLE_BROKER_OPEN_ORDER_GUARD:
+        has_buy_order, buy_meta = _has_broker_open_order(symbol, 'buy')
+        if has_buy_order:
+            return ignored("broker_open_buy_order_exists", symbol=symbol, strategy=strategy, **buy_meta)
 
     # Exposure caps (0 disables). We may need current exposure for sizing.
     max_total = float(getattr(settings, "max_total_exposure_usd", 0.0) or 0.0)
@@ -1478,6 +1647,7 @@ def _execute_long_entry(
         chase_steps_override = 1
         post_offset_override = float(MM1_POST_ONLY_OFFSET_PCT)
 
+    state.set_order_lock(entry_lock_key, meta={"symbol": symbol, "side": "buy", "strategy": strategy, "req_id": req_id})
     res = _market_notional(
         symbol=symbol,
         side="buy",
@@ -1490,6 +1660,8 @@ def _execute_long_entry(
         chase_steps_override=chase_steps_override,
         market_fallback_override=market_fallback_override,
     )
+    if not (res and res.get("ok")):
+        state.clear_order_lock(entry_lock_key)
     evt = {
         "ts": datetime.now(timezone.utc).isoformat(),
         "req_id": req_id,
@@ -1805,6 +1977,7 @@ def worker_exit(payload: WorkerExitPayload):
         exits: list[dict] = []
         evaluations: list[dict] = []
         bal = _balances_by_asset()
+        stale_order_locks_cleared = state.clear_stale_order_locks(OPEN_ORDER_LOCK_TTL_SEC)
 
         # --- Deterministic lifecycle cycle ---
         # Universe = balances-derived holdings + state.open_positions + any planned symbols.
@@ -2022,9 +2195,21 @@ def worker_exit(payload: WorkerExitPayload):
 
             # Phase 6: execute
             notional_exit = max(float(settings.exit_min_notional_usd), float(plan.notional_usd))
+            exit_lock_key = f"sell:{symbol}"
+            if state.has_order_lock(exit_lock_key, OPEN_ORDER_LOCK_TTL_SEC):
+                if diagnostics:
+                    evaluations.append({"symbol": symbol, "decision": reason, "skip_reason": "exit_order_lock_active", "ttl_sec": int(OPEN_ORDER_LOCK_TTL_SEC)})
+                continue
+            if ENABLE_BROKER_OPEN_ORDER_GUARD:
+                has_sell_order, sell_meta = _has_broker_open_order(symbol, 'sell')
+                if has_sell_order:
+                    if diagnostics:
+                        evaluations.append({"symbol": symbol, "decision": reason, "skip_reason": "broker_open_sell_order_exists", "meta": sell_meta})
+                    continue
             if dry_run:
                 res = {"ok": True, "dry_run": True, "side": "sell", "symbol": symbol, "notional": notional_exit, "reason": reason}
             else:
+                state.set_order_lock(exit_lock_key, meta={"symbol": symbol, "side": "sell", "reason": reason})
                 if reason == "stop" and STOP_EXIT_MODE == "stop_limit":
                     res = broker_kraken.stop_limit_notional(
                         symbol=symbol,
@@ -2036,6 +2221,8 @@ def worker_exit(payload: WorkerExitPayload):
                     )
                 else:
                     res = _market_notional(symbol=symbol, side="sell", notional=notional_exit, strategy=plan.strategy, price=px)
+                if not bool(res.get("ok")):
+                    state.clear_order_lock(exit_lock_key)
                 journal_close = None
                 if bool(res.get("ok")):
                     state.mark_exit(symbol)
@@ -2389,6 +2576,7 @@ def diagnostics_runtime():
         "order_reconcile_timeout_sec": int(ORDER_RECONCILE_TIMEOUT_SEC),
         "plans_count": len(getattr(state, 'plans', {}) or {}),
         "pending_exits": getattr(state, 'pending_exits', {}),
+        "order_locks": getattr(state, 'order_locks', {}),
         "positions_count": len(positions),
         "positions": positions,
         "last_balance_error": _last_balance_error(),
@@ -2660,6 +2848,20 @@ def scan_entries(payload: WorkerScanPayload):
     bal_err_dbg = _last_balance_error()
     
     # 6) Return diagnostics
+    strategy_summary: Dict[str, Any] = {}
+    for sym, d in (per_symbol or {}).items():
+        fired = d.get('signals') or {}
+        chosen = d.get('chosen_strategy')
+        for strat, flag in fired.items():
+            bucket = strategy_summary.setdefault(strat, {'signals': 0, 'chosen': 0, 'executed': 0})
+            if flag:
+                bucket['signals'] += 1
+        if chosen:
+            strategy_summary.setdefault(chosen, {'signals': 0, 'chosen': 0, 'executed': 0})['chosen'] += 1
+    for r in (results or []):
+        if r.get('status') == 'executed':
+            strat = str(r.get('strategy') or '')
+            strategy_summary.setdefault(strat, {'signals': 0, 'chosen': 0, 'executed': 0})['executed'] += 1
     return {
         "ok": True,
         "utc": utc_now_iso(),
@@ -2700,6 +2902,7 @@ def scan_entries(payload: WorkerScanPayload):
             "open_positions_count": open_positions_count,
             "positions_open": sorted(list(open_set))[:50],
             "candidates": [{"symbol": c.get("symbol"), "strategy": c.get("strategy"), "score": float(c.get("score") or 0.0), "rank": (c.get("rank") or {}).get("components")} for c in candidates],
+            "strategy_summary": strategy_summary,
             "per_symbol": per_symbol,
         },
     }

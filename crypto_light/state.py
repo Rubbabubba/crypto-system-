@@ -103,6 +103,11 @@ class InMemoryState:
         self.blocked_trades: List[Dict[str, Any]] = []
         self.blocked_trades_max: int = 500
 
+        # Best-effort order locks to reduce duplicate order submission across
+        # rapid retries / slow broker state propagation. Key format is typically
+        # "<side>:<symbol>". This is intentionally in-memory only.
+        self.order_locks: Dict[str, Dict[str, Any]] = {}
+
         # Reload persisted plans after deploy/restart so exits remain correct
         self._load_plans_from_db()
 
@@ -288,3 +293,35 @@ class InMemoryState:
                 self.blocked_trades = self.blocked_trades[-self.blocked_trades_max :]
         except Exception:
             pass
+
+    # --------- Order locks ---------
+    def set_order_lock(self, key: str, *, meta: Dict[str, Any] | None = None) -> None:
+        self.order_locks[str(key)] = {"ts": time.time(), **(dict(meta or {}))}
+
+    def clear_order_lock(self, key: str) -> None:
+        try:
+            self.order_locks.pop(str(key), None)
+        except Exception:
+            pass
+
+    def has_order_lock(self, key: str, ttl_sec: int = 0) -> bool:
+        meta = self.order_locks.get(str(key)) or {}
+        if not meta:
+            return False
+        ts = float(meta.get("ts", 0.0) or 0.0)
+        if ttl_sec > 0 and ts > 0.0 and (time.time() - ts) >= float(ttl_sec):
+            self.order_locks.pop(str(key), None)
+            return False
+        return True
+
+    def clear_stale_order_locks(self, ttl_sec: int) -> int:
+        if ttl_sec <= 0:
+            return 0
+        now = time.time()
+        cleared = 0
+        for key, meta in list(self.order_locks.items()):
+            ts = float((meta or {}).get("ts", 0.0) or 0.0)
+            if ts <= 0.0 or (now - ts) >= float(ttl_sec):
+                self.order_locks.pop(key, None)
+                cleared += 1
+        return cleared
