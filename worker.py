@@ -1,5 +1,6 @@
 import os
 import time
+import json
 import requests
 
 BASE_URL = os.getenv("BASE_URL", "http://localhost:10000").rstrip("/")
@@ -17,15 +18,20 @@ DRY_RUN = os.getenv("SCAN_DRY_RUN", "0").strip().lower() in ("1", "true", "yes",
 
 def _post(path: str, payload: dict, timeout: int = 30):
     url = f"{BASE_URL}{path}"
-    r = requests.post(url, json=payload, timeout=timeout)
-    return r.status_code, r.text
+    headers = {"x-request-id": f"worker-{int(time.time()*1000)}"}
+    r = requests.post(url, json=payload, timeout=timeout, headers=headers)
+    try:
+        body = r.json()
+    except Exception:
+        body = {"raw": r.text[:1000]}
+    return r.status_code, body
 
 
 def tick_exit():
     payload = {"worker_secret": WORKER_SECRET} if WORKER_SECRET else {}
     try:
         code, text = _post(EXIT_PATH, payload, timeout=20)
-        print(f"exit tick {code}: {text[:500]}")
+        print(json.dumps({"kind":"exit_tick","code":code,"body":text}, default=str)[:2000])
     except Exception as e:
         print(f"exit tick error: {e}")
 
@@ -34,7 +40,7 @@ def tick_scan():
     payload = {"worker_secret": WORKER_SECRET, "dry_run": DRY_RUN} if WORKER_SECRET else {"dry_run": DRY_RUN}
     try:
         code, text = _post(SCAN_PATH, payload, timeout=60)
-        print(f"scan tick {code}: {text[:500]}")
+        print(json.dumps({"kind":"scan_tick","code":code,"body":text}, default=str)[:2000])
     except Exception as e:
         print(f"scan tick error: {e}")
 
