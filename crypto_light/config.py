@@ -99,6 +99,12 @@ class Settings:
     # Daily risk
     max_daily_loss_usd: float
 
+    # Broker-truth account guardrails
+    require_broker_balance_ok_for_entry: bool
+    min_cash_buffer_usd: float
+    max_account_utilization_pct: float
+    auto_reconcile_state_on_entry: bool
+    reconcile_cooldown_sec: int
 
     # Stop execution quality
     stop_limit_buffer_pct: float
@@ -219,6 +225,13 @@ def load_settings() -> Settings:
 
         # Daily risk
         max_daily_loss_usd=float(_getenv("MAX_DAILY_LOSS_USD", "25") or 25),
+
+        # Broker-truth account guardrails
+        require_broker_balance_ok_for_entry=_getbool("REQUIRE_BROKER_BALANCE_OK_FOR_ENTRY", "1"),
+        min_cash_buffer_usd=float(_getenv("MIN_CASH_BUFFER_USD", "25") or 25),
+        max_account_utilization_pct=float(_getenv("MAX_ACCOUNT_UTILIZATION_PCT", "0.85") or 0.85),
+        auto_reconcile_state_on_entry=_getbool("AUTO_RECONCILE_STATE_ON_ENTRY", "1"),
+        reconcile_cooldown_sec=int(float(_getenv("RECONCILE_COOLDOWN_SEC", "30") or 30)),
 
         # Stop execution quality
         stop_limit_buffer_pct=float(_getenv("STOP_LIMIT_BUFFER_PCT", "0.15") or 0.15),

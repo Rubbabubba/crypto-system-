@@ -1113,6 +1113,88 @@ def _broker_open_orders_summary() -> dict:
     return {"ok": True, "buy_symbols": buy_symbols, "sell_symbols": sell_symbols, "items": items}
 
 
+
+def _sum_open_order_notional_usd(summary: dict, *, side: str | None = None) -> float:
+    total = 0.0
+    side_l = str(side or '').strip().lower() if side else None
+    for item in (summary.get('items') or []):
+        try:
+            item_side = str(item.get('side') or '').strip().lower()
+            if side_l and item_side != side_l:
+                continue
+            descr = item.get('descr') or {}
+            price = float(descr.get('price') or descr.get('price2') or 0.0)
+            vol = float(item.get('vol', 0.0) or 0.0)
+            vol_exec = float(item.get('vol_exec', 0.0) or 0.0)
+            remaining = max(0.0, vol - vol_exec)
+            if remaining <= 0 or price <= 0:
+                continue
+            total += remaining * price
+        except Exception:
+            continue
+    return float(total)
+
+
+def _account_truth_snapshot() -> dict:
+    balances = {}
+    balance_ok = True
+    balance_error = None
+    try:
+        balances = _balances_by_asset() or {}
+        balance_error = _last_balance_error()
+        if balance_error:
+            balance_ok = False
+    except Exception as e:
+        balance_ok = False
+        balance_error = str(e)
+        balances = {}
+
+    positions = []
+    try:
+        positions = get_positions()
+    except Exception:
+        positions = []
+
+    open_orders = _broker_open_orders_summary()
+    realized_today = _journal_sync_daily_realized_pnl()
+    cash_usd = float(_stable_cash_usd(balances) or 0.0)
+    position_exposure_usd = sum(float(p.get('notional_usd', 0.0) or 0.0) for p in positions)
+    open_buy_order_notional_usd = _sum_open_order_notional_usd(open_orders, side='buy') if open_orders.get('ok') else 0.0
+    equity_usd = float(cash_usd + position_exposure_usd)
+    utilization_pct = (float(position_exposure_usd + open_buy_order_notional_usd) / float(equity_usd)) if equity_usd > 0 else 0.0
+    return {
+        'ok': True,
+        'utc': utc_now_iso(),
+        'balance_ok': bool(balance_ok),
+        'balance_error': balance_error,
+        'cash_usd': float(cash_usd),
+        'position_exposure_usd': float(position_exposure_usd),
+        'open_buy_order_notional_usd': float(open_buy_order_notional_usd),
+        'equity_usd': float(equity_usd),
+        'utilization_pct': float(utilization_pct),
+        'positions_count': len(positions),
+        'open_order_count': len(open_orders.get('items') or []),
+        'buy_order_symbols': sorted(list(open_orders.get('buy_symbols') or [])),
+        'sell_order_symbols': sorted(list(open_orders.get('sell_symbols') or [])),
+        'realized_today_usd': float(realized_today),
+        'last_reconcile': dict(getattr(state, 'last_reconcile_result', {}) or {}),
+    }
+
+
+def _maybe_reconcile_state_before_entry() -> dict | None:
+    if not bool(getattr(settings, 'auto_reconcile_state_on_entry', True)):
+        return None
+    cooldown = int(getattr(settings, 'reconcile_cooldown_sec', 30) or 30)
+    if not state.should_reconcile(cooldown):
+        return getattr(state, 'last_reconcile_result', {}) or None
+    result = _reconcile_runtime_state()
+    try:
+        state.mark_reconcile(result)
+    except Exception:
+        pass
+    return result
+
+
 def _has_broker_open_order(symbol: str, side: str) -> tuple[bool, dict]:
     side_l = str(side or '').strip().lower()
     summary = _broker_open_orders_summary()
@@ -1167,10 +1249,21 @@ def _reconcile_runtime_state() -> dict:
     }
 
 
+
+@app.get("/diagnostics/account_truth")
+def diagnostics_account_truth():
+    return _account_truth_snapshot()
+
+
 @app.get("/diagnostics/position_reconcile")
 def diagnostics_position_reconcile(apply: int = 0):
     if int(apply or 0) == 1:
-        return _reconcile_runtime_state()
+        result = _reconcile_runtime_state()
+        try:
+            state.mark_reconcile(result)
+        except Exception:
+            pass
+        return result
     positions = get_positions()
     live_syms = {p.get('symbol') for p in positions if p.get('symbol')}
     plan_syms = set((getattr(state, 'plans', {}) or {}).keys())
@@ -1217,6 +1310,7 @@ def health():
     open_orders = _broker_open_orders_summary()
     scan_meta = _worker_status_meta(getattr(state, 'last_scan_status', {}) or {})
     exit_meta = _worker_status_meta(getattr(state, 'last_exit_status', {}) or {})
+    account_truth = _account_truth_snapshot()
     return {
         "ok": True,
         "utc": utc_now_iso(),
@@ -1231,6 +1325,13 @@ def health():
             "scan": scan_meta,
             "exit": exit_meta,
             "overall_stale": bool(scan_meta.get('stale') or exit_meta.get('stale')),
+        },
+        "account_truth": {
+            "balance_ok": bool(account_truth.get('balance_ok')),
+            "cash_usd": float(account_truth.get('cash_usd', 0.0) or 0.0),
+            "equity_usd": float(account_truth.get('equity_usd', 0.0) or 0.0),
+            "utilization_pct": float(account_truth.get('utilization_pct', 0.0) or 0.0),
+            "realized_today_usd": float(account_truth.get('realized_today_usd', 0.0) or 0.0),
         },
         "broker_open_orders": {
             "ok": bool(open_orders.get('ok')),
@@ -1505,6 +1606,8 @@ def _execute_long_entry(
         if has_buy_order:
             return ignored("broker_open_buy_order_exists", symbol=symbol, strategy=strategy, **buy_meta)
 
+    reconcile_meta = _maybe_reconcile_state_before_entry()
+
     # Exposure caps (0 disables). We may need current exposure for sizing.
     max_total = float(getattr(settings, "max_total_exposure_usd", 0.0) or 0.0)
     max_symbol = float(getattr(settings, "max_symbol_exposure_usd", 0.0) or 0.0)
@@ -1591,6 +1694,26 @@ def _execute_long_entry(
         if max_symbol and (sym_exposure + _notional) > max_symbol:
             log.info("Skip entry %s: symbol exposure cap (%.2f + %.2f > %.2f)", symbol, sym_exposure, _notional, max_symbol)
             return {"ok": True, "skipped": True, "reason": "max_symbol_exposure_usd", **(sizing_meta or {})}
+
+    account_truth = _account_truth_snapshot()
+    if bool(getattr(settings, 'require_broker_balance_ok_for_entry', True)) and not bool(account_truth.get('balance_ok')):
+        return ignored('broker_balance_unavailable', symbol=symbol, strategy=strategy, balance_error=account_truth.get('balance_error'), reconcile=reconcile_meta)
+
+    cash_usd = float(account_truth.get('cash_usd', 0.0) or 0.0)
+    if cash_usd + 1e-9 < float(_notional):
+        return ignored('insufficient_cash_usd_estimate', symbol=symbol, strategy=strategy, cash_usd=cash_usd, requested_notional_usd=float(_notional), reconcile=reconcile_meta)
+
+    min_cash_buffer_usd = float(getattr(settings, 'min_cash_buffer_usd', 0.0) or 0.0)
+    cash_after = float(cash_usd - float(_notional))
+    if min_cash_buffer_usd > 0 and cash_after < float(min_cash_buffer_usd):
+        return ignored('min_cash_buffer_breach', symbol=symbol, strategy=strategy, cash_usd=cash_usd, cash_after_usd=cash_after, requested_notional_usd=float(_notional), min_cash_buffer_usd=min_cash_buffer_usd, reconcile=reconcile_meta)
+
+    max_util = float(getattr(settings, 'max_account_utilization_pct', 0.0) or 0.0)
+    equity_usd = float(account_truth.get('equity_usd', 0.0) or 0.0)
+    if max_util > 0 and equity_usd > 0:
+        util_after = (float(account_truth.get('position_exposure_usd', 0.0) or 0.0) + float(account_truth.get('open_buy_order_notional_usd', 0.0) or 0.0) + float(_notional)) / float(equity_usd)
+        if util_after > max_util:
+            return ignored('max_account_utilization_pct', symbol=symbol, strategy=strategy, equity_usd=equity_usd, utilization_after_pct=util_after, max_account_utilization_pct=max_util, requested_notional_usd=float(_notional), reconcile=reconcile_meta)
 
     # Determine reference price for fills/brackets.
     # IMPORTANT: `px` is used later for sizing and bracket calc.

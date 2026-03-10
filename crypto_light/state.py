@@ -108,6 +108,10 @@ class InMemoryState:
         # "<side>:<symbol>". This is intentionally in-memory only.
         self.order_locks: Dict[str, Dict[str, Any]] = {}
 
+        # Last broker-truth reconcile snapshot (best-effort).
+        self.last_reconcile_ts: float = 0.0
+        self.last_reconcile_result: Dict[str, Any] = {}
+
         # Reload persisted plans after deploy/restart so exits remain correct
         self._load_plans_from_db()
 
@@ -325,3 +329,16 @@ class InMemoryState:
                 self.order_locks.pop(key, None)
                 cleared += 1
         return cleared
+
+    def should_reconcile(self, cooldown_sec: int) -> bool:
+        try:
+            cd = int(cooldown_sec)
+        except Exception:
+            cd = 0
+        if cd <= 0:
+            return True
+        return (time.time() - float(getattr(self, 'last_reconcile_ts', 0.0) or 0.0)) >= float(cd)
+
+    def mark_reconcile(self, result: Dict[str, Any] | None = None) -> None:
+        self.last_reconcile_ts = time.time()
+        self.last_reconcile_result = dict(result or {})
