@@ -3424,6 +3424,7 @@ def diagnostics_runtime():
         "execution_state": _execution_state_summary(),
         "startup_self_check": _startup_self_check(rerun=False),
         "recovery_reconcile": _recovery_reconcile_summary(apply=False),
+        "pretrade_health_gate": _pretrade_health_gate_summary(rerun_startup_check=False),
         "ops_risk": _ops_risk_snapshot(),
         "risk_admission": {
             "sizing_mode": str(getattr(settings, "sizing_mode", "fixed") or "fixed"),
@@ -3833,6 +3834,19 @@ def scan_entries(payload: WorkerScanPayload):
         if r.get('status') == 'executed':
             strat = str(r.get('strategy') or '')
             strategy_summary.setdefault(strat, {'signals': 0, 'chosen': 0, 'executed': 0})['executed'] += 1
+    try:
+        state.set_last_scan_status({
+            "utc": utc_now_iso(),
+            "ok": True,
+            "scanner_ok": bool(scanner_ok),
+            "scanner_reason": scanner_reason,
+            "universe_count": len(universe),
+            "results_count": len(results),
+            "dry_run": bool(payload.dry_run),
+        })
+    except Exception:
+        pass
+
     return {
         "ok": True,
         "utc": utc_now_iso(),
