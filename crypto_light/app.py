@@ -2392,6 +2392,10 @@ def worker_exit(payload: WorkerExitPayload):
         evaluations: list[dict] = []
         bal = _balances_by_asset()
         stale_order_locks_cleared = state.clear_stale_order_locks(OPEN_ORDER_LOCK_TTL_SEC)
+        try:
+            stale_pending_cleared = int(state.clear_stale_pending_exits(PENDING_EXIT_TTL_SEC))
+        except Exception:
+            stale_pending_cleared = 0
 
         # --- Deterministic lifecycle cycle ---
         # Universe = balances-derived holdings + state.open_positions + any planned symbols.
@@ -3086,6 +3090,17 @@ def diagnostics_ops_risk():
         "ok": True,
         "utc": utc_now_iso(),
         "ops_risk": _ops_risk_snapshot(),
+    }
+
+
+@app.get("/diagnostics/execution_state")
+def diagnostics_execution_state(limit: int = 50):
+    limit = max(1, min(int(limit), 500))
+    return {
+        "ok": True,
+        "utc": utc_now_iso(),
+        "execution_state": _execution_state_summary(),
+        "order_intents": lifecycle_db.list_rows("order_intents", limit=limit, order_by="updated_ts DESC"),
     }
 
 
