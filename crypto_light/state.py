@@ -132,6 +132,12 @@ class InMemoryState:
         self.last_reconcile_ts: float = 0.0
         self.last_reconcile_result: Dict[str, Any] = {}
 
+        # Operational risk counters (best-effort, in-memory).
+        self.consecutive_entry_rejections: int = 0
+        self.consecutive_stopouts: int = 0
+        self.ops_lockout_until_ts: float = 0.0
+        self.last_ops_lock_reason: str = ""
+
         # Reload persisted plans after deploy/restart so exits remain correct
         self._load_plans_from_db()
 
@@ -209,6 +215,34 @@ class InMemoryState:
                 })
         except Exception:
             pass
+
+
+    def note_entry_rejection(self) -> int:
+        self.consecutive_entry_rejections = int(getattr(self, "consecutive_entry_rejections", 0) or 0) + 1
+        return self.consecutive_entry_rejections
+
+    def clear_entry_rejections(self) -> None:
+        self.consecutive_entry_rejections = 0
+
+    def note_stopout(self) -> int:
+        self.consecutive_stopouts = int(getattr(self, "consecutive_stopouts", 0) or 0) + 1
+        return self.consecutive_stopouts
+
+    def clear_stopout_streak(self) -> None:
+        self.consecutive_stopouts = 0
+
+    def set_ops_lockout(self, reason: str, duration_sec: int) -> None:
+        until = time.time() + max(0, int(duration_sec or 0))
+        self.ops_lockout_until_ts = max(float(getattr(self, "ops_lockout_until_ts", 0.0) or 0.0), float(until))
+        self.last_ops_lock_reason = str(reason or "")
+
+    def ops_lockout_remaining_sec(self) -> int:
+        remain = float(getattr(self, "ops_lockout_until_ts", 0.0) or 0.0) - time.time()
+        return int(remain) if remain > 0 else 0
+
+    def clear_ops_lockout(self) -> None:
+        self.ops_lockout_until_ts = 0.0
+        self.last_ops_lock_reason = ""
 
     def _load_plans_from_db(self) -> None:
         try:

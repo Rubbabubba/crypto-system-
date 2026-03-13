@@ -46,6 +46,9 @@ class Settings:
 
     # Execution (fees)
     execution_mode: str  # 'market', 'maker_first', or 'limit_aggressive'
+    entry_fee_bps: float
+    exit_fee_bps: float
+    slippage_bps: float
     post_only_offset_pct: float
     limit_chase_sec: int
     limit_chase_steps: int
@@ -98,6 +101,14 @@ class Settings:
 
     # Daily risk
     max_daily_loss_usd: float
+
+    # Risk admission
+    min_effective_stop_pct: float
+    max_effective_stop_pct: float
+    min_risk_reward_ratio: float
+    max_consecutive_rejections: int
+    max_consecutive_stopouts: int
+    ops_lockout_sec: int
 
     # Broker-truth account guardrails
     require_broker_balance_ok_for_entry: bool
@@ -185,6 +196,9 @@ def load_settings() -> Settings:
 
         # Execution (fees)
         execution_mode=execution_mode,
+        entry_fee_bps=float(_getenv("ENTRY_FEE_BPS", "26") or 26),
+        exit_fee_bps=float(_getenv("EXIT_FEE_BPS", "26") or 26),
+        slippage_bps=float(_getenv("SLIPPAGE_BPS", "8") or 8),
         post_only_offset_pct=float(_getenv("POST_ONLY_OFFSET_PCT", "0.0002") or 0.0002),
         limit_chase_sec=int(float(_getenv("LIMIT_CHASE_SEC", "10") or 10)),
         limit_chase_steps=int(float(_getenv("LIMIT_CHASE_STEPS", "1") or 1)),
@@ -233,6 +247,14 @@ def load_settings() -> Settings:
 
         # Daily risk
         max_daily_loss_usd=float(_getenv("MAX_DAILY_LOSS_USD", "25") or 25),
+
+        # Risk admission
+        min_effective_stop_pct=float(_getenv("MIN_EFFECTIVE_STOP_PCT", "0.003") or 0.003),
+        max_effective_stop_pct=float(_getenv("MAX_EFFECTIVE_STOP_PCT", "0.05") or 0.05),
+        min_risk_reward_ratio=float(_getenv("MIN_RISK_REWARD_RATIO", "1.2") or 1.2),
+        max_consecutive_rejections=int(float(_getenv("MAX_CONSECUTIVE_REJECTIONS", "3") or 3)),
+        max_consecutive_stopouts=int(float(_getenv("MAX_CONSECUTIVE_STOPOUTS", "2") or 2)),
+        ops_lockout_sec=int(float(_getenv("OPS_LOCKOUT_SEC", "900") or 900)),
 
         # Broker-truth account guardrails
         require_broker_balance_ok_for_entry=_getbool("REQUIRE_BROKER_BALANCE_OK_FOR_ENTRY", "1"),

@@ -219,3 +219,76 @@ def compute_risk_pct_equity_notional(
         target_notional_usd=target,
         capped_by=capped_by,
     )
+
+def compute_risk_based_notional_actual(
+    *,
+    equity_usd: float,
+    risk_per_trade: float,
+    effective_stop_pct: float,
+    min_order_notional_usd: float,
+    available_cash_usd: float,
+    max_total_exposure_usd: float,
+    current_total_exposure_usd: float,
+    max_symbol_exposure_usd: float,
+    current_symbol_exposure_usd: float,
+    max_notional_usd: float,
+) -> SizingResult:
+    if equity_usd <= 0:
+        return SizingResult(ok=False, reason="no_equity_usd", equity_usd=float(equity_usd or 0.0))
+    if risk_per_trade <= 0:
+        return SizingResult(ok=False, reason="invalid_risk_per_trade", equity_usd=float(equity_usd or 0.0))
+    if effective_stop_pct <= 0:
+        return SizingResult(ok=False, reason="invalid_effective_stop_pct", equity_usd=float(equity_usd or 0.0))
+    if available_cash_usd <= 0:
+        return SizingResult(ok=False, reason="no_cash", equity_usd=float(equity_usd or 0.0))
+
+    risk_usd = float(equity_usd) * float(risk_per_trade)
+    target = risk_usd / float(effective_stop_pct)
+    final = float(target)
+    capped_by = ""
+
+    caps = [("cash", float(available_cash_usd))]
+    if max_total_exposure_usd > 0:
+        remaining = float(max_total_exposure_usd) - float(current_total_exposure_usd or 0.0)
+        caps.append(("max_total_exposure_usd", max(0.0, remaining)))
+    if max_symbol_exposure_usd > 0:
+        remaining_sym = float(max_symbol_exposure_usd) - float(current_symbol_exposure_usd or 0.0)
+        caps.append(("max_symbol_exposure_usd", max(0.0, remaining_sym)))
+    if max_notional_usd and max_notional_usd > 0:
+        caps.append(("max_notional_usd", float(max_notional_usd)))
+
+    for name, cap in caps:
+        if cap < final:
+            final = cap
+            capped_by = name
+
+    if final <= 0:
+        return SizingResult(
+            ok=False,
+            reason="notional_capped_to_zero",
+            equity_usd=float(equity_usd),
+            risk_usd=float(risk_usd),
+            target_notional_usd=float(target),
+            capped_by=capped_by,
+        )
+
+    if final < float(min_order_notional_usd or 0.0):
+        return SizingResult(
+            ok=False,
+            reason="notional_below_minimum",
+            equity_usd=float(equity_usd),
+            risk_usd=float(risk_usd),
+            target_notional_usd=float(target),
+            notional_usd=float(final),
+            capped_by=capped_by,
+        )
+
+    return SizingResult(
+        ok=True,
+        notional_usd=float(final),
+        equity_usd=float(equity_usd),
+        risk_usd=float(risk_usd),
+        target_notional_usd=float(target),
+        capped_by=capped_by,
+        reason="",
+    )

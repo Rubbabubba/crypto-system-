@@ -28,10 +28,10 @@ from .broker import last_price as _last_price
 from .broker import market_notional as _market_notional
 from .broker import get_bars as _get_bars
 from .broker import best_bid_ask as _best_bid_ask
-from .sizing import compute_risk_pct_equity_notional, compute_equity_fraction_notional
+from .sizing import compute_risk_pct_equity_notional, compute_equity_fraction_notional, compute_risk_based_notional_actual
 from .config import load_settings
 from .models import WebhookPayload, WorkerExitPayload, WorkerScanPayload, WorkerExitDiagnosticsPayload, WorkerAdoptPositionsPayload
-from .risk import compute_brackets, compute_atr_brackets
+from .risk import compute_brackets, compute_atr_brackets, compute_effective_stop_pct, compute_rr_ratio, compute_stop_distance_pct
 from .state import InMemoryState, TradePlan
 from .symbol_map import normalize_symbol
 
@@ -153,9 +153,17 @@ def _risk_snapshot_for_entry(*, symbol: str, strategy: str, px: float, stop_pric
     stable_cash = _stable_cash_usd(balances)
     total_exposure = _portfolio_exposure_usd_from_balances(balances)
     stop_gap = max(0.0, float(px) - float(stop_price))
-    stop_gap_pct = (stop_gap / float(px)) if float(px) > 0 else 0.0
+    stop_gap_pct = compute_stop_distance_pct(float(px), float(stop_price))
+    rr_ratio = compute_rr_ratio(float(px), float(stop_price), float(take_price))
+    effective_stop_pct = compute_effective_stop_pct(
+        entry_price=float(px),
+        stop_price=float(stop_price),
+        entry_fee_bps=float(getattr(settings, "entry_fee_bps", 0.0) or 0.0),
+        exit_fee_bps=float(getattr(settings, "exit_fee_bps", 0.0) or 0.0),
+        slippage_bps=float(getattr(settings, "slippage_bps", 0.0) or 0.0),
+    )
     est_qty = (float(notional) / float(px)) if float(px) > 0 else 0.0
-    est_risk_usd = stop_gap * est_qty
+    est_risk_usd = float(notional) * float(effective_stop_pct)
     return {
         "symbol": symbol,
         "strategy": strategy,
@@ -164,11 +172,17 @@ def _risk_snapshot_for_entry(*, symbol: str, strategy: str, px: float, stop_pric
         "take_price": float(take_price),
         "requested_notional_usd": float(notional),
         "estimated_qty": float(est_qty),
+        "estimated_stop_gap_usd": float(stop_gap),
         "estimated_stop_gap_pct": float(stop_gap_pct),
+        "effective_stop_pct": float(effective_stop_pct),
+        "risk_reward_ratio": float(rr_ratio),
         "estimated_stop_risk_usd": float(est_risk_usd),
         "stable_cash_usd": float(stable_cash),
         "portfolio_exposure_usd": float(total_exposure),
         "max_daily_loss_usd": float(getattr(settings, "max_daily_loss_usd", 0.0) or 0.0),
+        "entry_fee_bps": float(getattr(settings, "entry_fee_bps", 0.0) or 0.0),
+        "exit_fee_bps": float(getattr(settings, "exit_fee_bps", 0.0) or 0.0),
+        "slippage_bps": float(getattr(settings, "slippage_bps", 0.0) or 0.0),
     }
 
 
@@ -184,6 +198,66 @@ def _record_state_model_anomaly(kind: str, severity: str = "warn", **fields: Any
         lifecycle_db.record_anomaly(kind, severity, symbol=fields.get("symbol"), trade_plan_id=fields.get("trade_plan_id"), intent_id=fields.get("intent_id"), details=fields)
     except Exception:
         pass
+
+
+def _ops_risk_snapshot() -> Dict[str, Any]:
+    return {
+        "consecutive_entry_rejections": int(getattr(state, "consecutive_entry_rejections", 0) or 0),
+        "consecutive_stopouts": int(getattr(state, "consecutive_stopouts", 0) or 0),
+        "ops_lockout_remaining_sec": int(state.ops_lockout_remaining_sec() if hasattr(state, "ops_lockout_remaining_sec") else 0),
+        "ops_lockout_reason": str(getattr(state, "last_ops_lock_reason", "") or ""),
+        "max_consecutive_rejections": int(getattr(settings, "max_consecutive_rejections", 0) or 0),
+        "max_consecutive_stopouts": int(getattr(settings, "max_consecutive_stopouts", 0) or 0),
+        "ops_lockout_sec": int(getattr(settings, "ops_lockout_sec", 0) or 0),
+    }
+
+
+def _risk_admission_check(*, symbol: str, strategy: str, px: float, stop_price: float, take_price: float, account_truth: Dict[str, Any]) -> Dict[str, Any]:
+    effective_stop_pct = compute_effective_stop_pct(
+        entry_price=float(px),
+        stop_price=float(stop_price),
+        entry_fee_bps=float(getattr(settings, "entry_fee_bps", 0.0) or 0.0),
+        exit_fee_bps=float(getattr(settings, "exit_fee_bps", 0.0) or 0.0),
+        slippage_bps=float(getattr(settings, "slippage_bps", 0.0) or 0.0),
+    )
+    raw_stop_pct = compute_stop_distance_pct(float(px), float(stop_price))
+    rr_ratio = compute_rr_ratio(float(px), float(stop_price), float(take_price))
+    min_stop = float(getattr(settings, "min_effective_stop_pct", 0.0) or 0.0)
+    max_stop = float(getattr(settings, "max_effective_stop_pct", 0.0) or 0.0)
+    min_rr = float(getattr(settings, "min_risk_reward_ratio", 0.0) or 0.0)
+    checks = {
+        "effective_stop_pct_min": (effective_stop_pct >= min_stop) if min_stop > 0 else True,
+        "effective_stop_pct_max": (effective_stop_pct <= max_stop) if max_stop > 0 else True,
+        "min_risk_reward_ratio": (rr_ratio >= min_rr) if min_rr > 0 else True,
+    }
+    violations = []
+    if not checks["effective_stop_pct_min"]:
+        violations.append("effective_stop_pct_too_tight")
+    if not checks["effective_stop_pct_max"]:
+        violations.append("effective_stop_pct_too_wide")
+    if not checks["min_risk_reward_ratio"]:
+        violations.append("risk_reward_too_low")
+    return {
+        "ok": not violations,
+        "symbol": symbol,
+        "strategy": strategy,
+        "entry_price": float(px),
+        "stop_price": float(stop_price),
+        "take_price": float(take_price),
+        "raw_stop_pct": float(raw_stop_pct),
+        "effective_stop_pct": float(effective_stop_pct),
+        "risk_reward_ratio": float(rr_ratio),
+        "min_effective_stop_pct": float(min_stop),
+        "max_effective_stop_pct": float(max_stop),
+        "min_risk_reward_ratio": float(min_rr),
+        "entry_fee_bps": float(getattr(settings, "entry_fee_bps", 0.0) or 0.0),
+        "exit_fee_bps": float(getattr(settings, "exit_fee_bps", 0.0) or 0.0),
+        "slippage_bps": float(getattr(settings, "slippage_bps", 0.0) or 0.0),
+        "equity_usd": float(account_truth.get("equity_usd", 0.0) or 0.0),
+        "cash_usd": float(account_truth.get("cash_usd", 0.0) or 0.0),
+        "checks": checks,
+        "violations": violations,
+    }
 
 
 # ---------- Entry engine (optional; replaces TradingView) ----------
@@ -1707,6 +1781,55 @@ def _execute_long_entry(
 
     reconcile_meta = _maybe_reconcile_state_before_entry()
 
+    # Determine reference price for fills/brackets early because real risk sizing must use the actual stop distance.
+    px = float(px_override) if px_override is not None else float(_last_price(symbol))
+
+    # If caller didn't supply brackets, compute them from `px`.
+    if stop_price is None or take_price is None:
+        s = (strategy or "").strip().lower()
+        if s == "cr1":
+            bars_for_atr = _get_bars(symbol, timeframe=ENTRY_ENGINE_TIMEFRAME, limit=max(ENTRY_ENGINE_LIMIT_BARS, CR1_ATR_LEN + 40))
+            atr_now, _ = _atr_from_bars(bars_for_atr or [], length=int(CR1_ATR_LEN))
+            if atr_now is not None and atr_now > 0:
+                stop_price = float(px) - float(atr_now) * float(CR1_STOP_ATR_MULT)
+                take_price = float(px) + float(atr_now) * float(CR1_TAKE_ATR_MULT)
+            else:
+                stop_price, take_price = compute_brackets(px, settings.stop_pct, settings.take_pct)
+        elif s == "mm1":
+            stop_price, take_price = compute_brackets(px, float(MM1_STOP_PCT), float(MM1_TAKE_PCT))
+        else:
+            if bool(getattr(settings, "atr_brackets_enabled", False)):
+                try:
+                    atr_len = int(getattr(settings, "atr_bracket_len", 14) or 14)
+                    bars_for_atr = _get_bars(symbol, timeframe=ENTRY_ENGINE_TIMEFRAME, limit=max(ENTRY_ENGINE_LIMIT_BARS, atr_len + 40))
+                    atr_now, _ = _atr_from_bars(bars_for_atr or [], length=int(atr_len))
+                    if atr_now is not None and float(atr_now) > 0:
+                        stop_price, take_price = compute_atr_brackets(
+                            float(px),
+                            float(atr_now),
+                            float(getattr(settings, "atr_stop_mult", 2.0) or 2.0),
+                            float(getattr(settings, "atr_take_mult", 4.0) or 4.0),
+                        )
+                    else:
+                        stop_price, take_price = compute_brackets(px, settings.stop_pct, settings.take_pct)
+                except Exception:
+                    stop_price, take_price = compute_brackets(px, settings.stop_pct, settings.take_pct)
+            else:
+                stop_price, take_price = compute_brackets(px, settings.stop_pct, settings.take_pct)
+
+    account_truth = _account_truth_snapshot()
+    if bool(getattr(settings, 'require_broker_balance_ok_for_entry', True)) and not bool(account_truth.get('balance_ok')):
+        return ignored('broker_balance_unavailable', symbol=symbol, strategy=strategy, balance_error=account_truth.get('balance_error'), reconcile=reconcile_meta)
+
+    ops_remaining = int(state.ops_lockout_remaining_sec() if hasattr(state, 'ops_lockout_remaining_sec') else 0)
+    if ops_remaining > 0:
+        return ignored('ops_risk_lockout_active', symbol=symbol, strategy=strategy, remaining_sec=ops_remaining, lock_reason=getattr(state, 'last_ops_lock_reason', ''))
+
+    risk_admission = _risk_admission_check(symbol=symbol, strategy=strategy, px=float(px), stop_price=float(stop_price), take_price=float(take_price), account_truth=account_truth)
+    if not bool(risk_admission.get('ok')):
+        _record_state_model_anomaly('risk_admission_reject', 'warn', symbol=symbol, strategy=strategy, risk_admission=risk_admission)
+        return ignored(str((risk_admission.get('violations') or ['risk_admission_reject'])[0]), symbol=symbol, strategy=strategy, risk_admission=risk_admission)
+
     # Exposure caps (0 disables). We may need current exposure for sizing.
     max_total = float(getattr(settings, "max_total_exposure_usd", 0.0) or 0.0)
     max_symbol = float(getattr(settings, "max_symbol_exposure_usd", 0.0) or 0.0)
@@ -1731,8 +1854,6 @@ def _execute_long_entry(
     elif sizing_mode == "equity_fraction":
         bals = _balances_by_asset()
         usd_cash = float(_stable_cash_usd(bals) or 0.0)
-        # Total account value proxy (cash + value of open positions). For spot, this is a safe
-        # and stable basis for "use X% of account value per trade".
         equity_total = float(usd_cash) + float(_portfolio_exposure_usd_from_balances(bals))
         res = compute_equity_fraction_notional(
             equity_usd=equity_total,
@@ -1746,19 +1867,18 @@ def _execute_long_entry(
             max_notional_usd=float(getattr(settings, "max_notional_usd", 0.0) or 0.0),
         )
         sizing_meta = res.to_dict()
-        # Avoid passing duplicate keys into ignored(); sizing meta may include its own 'reason'.
         sizing_meta.pop("reason", None)
         if not res.ok:
-            return ignored(res.reason, symbol=symbol, strategy=strategy, **(sizing_meta or {}))
+            return ignored(res.reason, symbol=symbol, strategy=strategy, risk_admission=risk_admission, **(sizing_meta or {}))
         _notional = float(res.notional_usd)
     elif sizing_mode == "risk_pct_equity":
         bals = _balances_by_asset()
         usd_cash = float(_stable_cash_usd(bals) or 0.0)
         equity_total = float(usd_cash) + float(_portfolio_exposure_usd_from_balances(bals))
-        res = compute_risk_pct_equity_notional(
+        res = compute_risk_based_notional_actual(
             equity_usd=equity_total,
             risk_per_trade=float(getattr(settings, "risk_per_trade", 0.03) or 0.03),
-            stop_pct=float(settings.stop_pct),
+            effective_stop_pct=float(risk_admission.get('effective_stop_pct') or 0.0),
             min_order_notional_usd=float(settings.min_order_notional_usd),
             available_cash_usd=usd_cash,
             max_total_exposure_usd=max_total,
@@ -1768,12 +1888,10 @@ def _execute_long_entry(
             max_notional_usd=float(getattr(settings, "max_notional_usd", 0.0) or 0.0),
         )
         sizing_meta = res.to_dict()
-        # Avoid passing duplicate keys into ignored(); sizing meta may include its own 'reason'.
         sizing_meta.pop("reason", None)
         if not res.ok:
-            return ignored(res.reason, symbol=symbol, strategy=strategy, **(sizing_meta or {}))
+            return ignored(res.reason, symbol=symbol, strategy=strategy, risk_admission=risk_admission, **(sizing_meta or {}))
         _notional = float(res.notional_usd)
-
     else:
         _notional = float(settings.default_notional_usd)
 
@@ -1784,6 +1902,7 @@ def _execute_long_entry(
             strategy=strategy,
             notional_usd=_notional,
             min_notional_usd=float(settings.min_order_notional_usd),
+            risk_admission=risk_admission,
             **(sizing_meta or {}),
         )
 
@@ -1796,63 +1915,21 @@ def _execute_long_entry(
             log.info("Skip entry %s: symbol exposure cap (%.2f + %.2f > %.2f)", symbol, sym_exposure, _notional, max_symbol)
             return {"ok": True, "skipped": True, "reason": "max_symbol_exposure_usd", **(sizing_meta or {})}
 
-    account_truth = _account_truth_snapshot()
-    if bool(getattr(settings, 'require_broker_balance_ok_for_entry', True)) and not bool(account_truth.get('balance_ok')):
-        return ignored('broker_balance_unavailable', symbol=symbol, strategy=strategy, balance_error=account_truth.get('balance_error'), reconcile=reconcile_meta)
-
     cash_usd = float(account_truth.get('cash_usd', 0.0) or 0.0)
     if cash_usd + 1e-9 < float(_notional):
-        return ignored('insufficient_cash_usd_estimate', symbol=symbol, strategy=strategy, cash_usd=cash_usd, requested_notional_usd=float(_notional), reconcile=reconcile_meta)
+        return ignored('insufficient_cash_usd_estimate', symbol=symbol, strategy=strategy, cash_usd=cash_usd, requested_notional_usd=float(_notional), reconcile=reconcile_meta, risk_admission=risk_admission)
 
     min_cash_buffer_usd = float(getattr(settings, 'min_cash_buffer_usd', 0.0) or 0.0)
     cash_after = float(cash_usd - float(_notional))
     if min_cash_buffer_usd > 0 and cash_after < float(min_cash_buffer_usd):
-        return ignored('min_cash_buffer_breach', symbol=symbol, strategy=strategy, cash_usd=cash_usd, cash_after_usd=cash_after, requested_notional_usd=float(_notional), min_cash_buffer_usd=min_cash_buffer_usd, reconcile=reconcile_meta)
+        return ignored('min_cash_buffer_breach', symbol=symbol, strategy=strategy, cash_usd=cash_usd, cash_after_usd=cash_after, requested_notional_usd=float(_notional), min_cash_buffer_usd=min_cash_buffer_usd, reconcile=reconcile_meta, risk_admission=risk_admission)
 
     max_util = float(getattr(settings, 'max_account_utilization_pct', 0.0) or 0.0)
     equity_usd = float(account_truth.get('equity_usd', 0.0) or 0.0)
     if max_util > 0 and equity_usd > 0:
         util_after = (float(account_truth.get('position_exposure_usd', 0.0) or 0.0) + float(account_truth.get('open_buy_order_notional_usd', 0.0) or 0.0) + float(_notional)) / float(equity_usd)
         if util_after > max_util:
-            return ignored('max_account_utilization_pct', symbol=symbol, strategy=strategy, equity_usd=equity_usd, utilization_after_pct=util_after, max_account_utilization_pct=max_util, requested_notional_usd=float(_notional), reconcile=reconcile_meta)
-
-    # Determine reference price for fills/brackets.
-    # IMPORTANT: `px` is used later for sizing and bracket calc.
-    px = float(px_override) if px_override is not None else float(_last_price(symbol))
-
-    # If caller didn't supply brackets, compute them from `px`.
-    if stop_price is None or take_price is None:
-        s = (strategy or "").strip().lower()
-        if s == "cr1":
-            bars_for_atr = _get_bars(symbol, timeframe=ENTRY_ENGINE_TIMEFRAME, limit=max(ENTRY_ENGINE_LIMIT_BARS, CR1_ATR_LEN + 40))
-            atr_now, _ = _atr_from_bars(bars_for_atr or [], length=int(CR1_ATR_LEN))
-            if atr_now is not None and atr_now > 0:
-                stop_price = float(px) - float(atr_now) * float(CR1_STOP_ATR_MULT)
-                take_price = float(px) + float(atr_now) * float(CR1_TAKE_ATR_MULT)
-            else:
-                stop_price, take_price = compute_brackets(px, settings.stop_pct, settings.take_pct)
-        elif s == "mm1":
-            stop_price, take_price = compute_brackets(px, float(MM1_STOP_PCT), float(MM1_TAKE_PCT))
-        else:
-            # Optional ATR-based brackets for RB1/TC1 (and any non-CR1/MM1 strategy).
-            if bool(getattr(settings, "atr_brackets_enabled", False)):
-                try:
-                    atr_len = int(getattr(settings, "atr_bracket_len", 14) or 14)
-                    bars_for_atr = _get_bars(symbol, timeframe=ENTRY_ENGINE_TIMEFRAME, limit=max(ENTRY_ENGINE_LIMIT_BARS, atr_len + 40))
-                    atr_now, _ = _atr_from_bars(bars_for_atr or [], length=int(atr_len))
-                    if atr_now is not None and float(atr_now) > 0:
-                        stop_price, take_price = compute_atr_brackets(
-                            float(px),
-                            float(atr_now),
-                            float(getattr(settings, "atr_stop_mult", 2.0) or 2.0),
-                            float(getattr(settings, "atr_take_mult", 4.0) or 4.0),
-                        )
-                    else:
-                        stop_price, take_price = compute_brackets(px, settings.stop_pct, settings.take_pct)
-                except Exception:
-                    stop_price, take_price = compute_brackets(px, settings.stop_pct, settings.take_pct)
-            else:
-                stop_price, take_price = compute_brackets(px, settings.stop_pct, settings.take_pct)
+            return ignored('max_account_utilization_pct', symbol=symbol, strategy=strategy, equity_usd=equity_usd, utilization_after_pct=util_after, max_account_utilization_pct=max_util, requested_notional_usd=float(_notional), reconcile=reconcile_meta, risk_admission=risk_admission)
 
     # Execution profile overrides (e.g., maker-only for CR1/MM1)
     exec_mode_override = None
@@ -1876,6 +1953,8 @@ def _execute_long_entry(
     position_id = str(uuid4())
     signal_key = str(req_id or uuid4())
     risk_snapshot = _risk_snapshot_for_entry(symbol=symbol, strategy=strategy, px=float(px), stop_price=float(stop_price), take_price=float(take_price), notional=float(_notional))
+    risk_snapshot["risk_admission"] = risk_admission
+    risk_snapshot["sizing"] = sizing_meta or {}
     lifecycle_db.upsert_trade_plan({
         "trade_plan_id": trade_plan_id,
         "symbol": symbol,
@@ -1924,7 +2003,10 @@ def _execute_long_entry(
         state.clear_order_lock(entry_lock_key)
         lifecycle_db.update_order_intent(intent_id, state="rejected", reject_reason=str((res or {}).get("error") or "order_failed"), raw_json=res or {})
         lifecycle_db.update_trade_plan_status(trade_plan_id, "rejected")
-        _record_state_model_anomaly("entry_order_rejected", "warn", symbol=symbol, trade_plan_id=trade_plan_id, intent_id=intent_id, response=res or {})
+        rej_count = state.note_entry_rejection() if hasattr(state, "note_entry_rejection") else 0
+        if int(rej_count) >= int(getattr(settings, "max_consecutive_rejections", 0) or 0) and int(getattr(settings, "max_consecutive_rejections", 0) or 0) > 0 and hasattr(state, "set_ops_lockout"):
+            state.set_ops_lockout("consecutive_entry_rejections", int(getattr(settings, "ops_lockout_sec", 0) or 0))
+        _record_state_model_anomaly("entry_order_rejected", "warn", symbol=symbol, trade_plan_id=trade_plan_id, intent_id=intent_id, response=res or {}, consecutive_entry_rejections=int(getattr(state, "consecutive_entry_rejections", 0) or 0))
     evt = {
         "ts": datetime.now(timezone.utc).isoformat(),
         "req_id": req_id,
@@ -1965,6 +2047,8 @@ def _execute_long_entry(
             )
         except Exception:
             pass
+        if hasattr(state, "clear_entry_rejections"):
+            state.clear_entry_rejections()
         metrics = _extract_execution_metrics(res, fallback_price=float(px), fallback_qty=(float(_notional) / float(px)) if float(px) > 0 else 0.0)
         plan_entry_px = float(metrics.get('avg_price') or px)
         fees_usd = float(metrics.get('fee') or 0.0)
@@ -2548,8 +2632,13 @@ def worker_exit(payload: WorkerExitPayload):
                     if bool(res.get("ok")):
                         if reason == "stop" and hasattr(state, "mark_stopout"):
                             state.mark_stopout(symbol)
+                            streak = state.note_stopout() if hasattr(state, "note_stopout") else 0
+                            if int(streak) >= int(getattr(settings, "max_consecutive_stopouts", 0) or 0) and int(getattr(settings, "max_consecutive_stopouts", 0) or 0) > 0 and hasattr(state, "set_ops_lockout"):
+                                state.set_ops_lockout("consecutive_stopouts", int(getattr(settings, "ops_lockout_sec", 0) or 0))
                         elif reason == "take" and hasattr(state, "clear_stopout"):
                             state.clear_stopout(symbol)
+                            if hasattr(state, "clear_stopout_streak"):
+                                state.clear_stopout_streak()
                 except Exception:
                     pass
 
@@ -2878,6 +2967,37 @@ def worker_reset_plans(payload: WorkerScanPayload):
     state.plans.clear()
     return {"ok": True, "utc": utc_now_iso(), "cleared_plans": cleared}
 
+
+@app.get("/diagnostics/risk_admission")
+def diagnostics_risk_admission():
+    return {
+        "ok": True,
+        "utc": utc_now_iso(),
+        "risk_admission": {
+            "sizing_mode": str(getattr(settings, "sizing_mode", "fixed") or "fixed"),
+            "risk_per_trade": float(getattr(settings, "risk_per_trade", 0.0) or 0.0),
+            "entry_fee_bps": float(getattr(settings, "entry_fee_bps", 0.0) or 0.0),
+            "exit_fee_bps": float(getattr(settings, "exit_fee_bps", 0.0) or 0.0),
+            "slippage_bps": float(getattr(settings, "slippage_bps", 0.0) or 0.0),
+            "min_effective_stop_pct": float(getattr(settings, "min_effective_stop_pct", 0.0) or 0.0),
+            "max_effective_stop_pct": float(getattr(settings, "max_effective_stop_pct", 0.0) or 0.0),
+            "min_risk_reward_ratio": float(getattr(settings, "min_risk_reward_ratio", 0.0) or 0.0),
+            "max_notional_usd": float(getattr(settings, "max_notional_usd", 0.0) or 0.0),
+            "min_order_notional_usd": float(getattr(settings, "min_order_notional_usd", 0.0) or 0.0),
+        },
+        "ops_risk": _ops_risk_snapshot(),
+    }
+
+
+@app.get("/diagnostics/ops_risk")
+def diagnostics_ops_risk():
+    return {
+        "ok": True,
+        "utc": utc_now_iso(),
+        "ops_risk": _ops_risk_snapshot(),
+    }
+
+
 @app.get("/diagnostics/runtime")
 def diagnostics_runtime():
     positions = get_positions()
@@ -2897,6 +3017,17 @@ def diagnostics_runtime():
         "last_balance_error": _last_balance_error(),
         "phase1_safety": _phase1_safety_report(),
         "state_model": _state_model_summary(),
+        "ops_risk": _ops_risk_snapshot(),
+        "risk_admission": {
+            "sizing_mode": str(getattr(settings, "sizing_mode", "fixed") or "fixed"),
+            "risk_per_trade": float(getattr(settings, "risk_per_trade", 0.0) or 0.0),
+            "entry_fee_bps": float(getattr(settings, "entry_fee_bps", 0.0) or 0.0),
+            "exit_fee_bps": float(getattr(settings, "exit_fee_bps", 0.0) or 0.0),
+            "slippage_bps": float(getattr(settings, "slippage_bps", 0.0) or 0.0),
+            "min_effective_stop_pct": float(getattr(settings, "min_effective_stop_pct", 0.0) or 0.0),
+            "max_effective_stop_pct": float(getattr(settings, "max_effective_stop_pct", 0.0) or 0.0),
+            "min_risk_reward_ratio": float(getattr(settings, "min_risk_reward_ratio", 0.0) or 0.0),
+        },
     }
 
 @app.get("/diagnostics/phase1_safety")
@@ -2915,6 +3046,17 @@ def diagnostics_state_model_summary():
         "ok": True,
         "utc": utc_now_iso(),
         "state_model": _state_model_summary(),
+        "ops_risk": _ops_risk_snapshot(),
+        "risk_admission": {
+            "sizing_mode": str(getattr(settings, "sizing_mode", "fixed") or "fixed"),
+            "risk_per_trade": float(getattr(settings, "risk_per_trade", 0.0) or 0.0),
+            "entry_fee_bps": float(getattr(settings, "entry_fee_bps", 0.0) or 0.0),
+            "exit_fee_bps": float(getattr(settings, "exit_fee_bps", 0.0) or 0.0),
+            "slippage_bps": float(getattr(settings, "slippage_bps", 0.0) or 0.0),
+            "min_effective_stop_pct": float(getattr(settings, "min_effective_stop_pct", 0.0) or 0.0),
+            "max_effective_stop_pct": float(getattr(settings, "max_effective_stop_pct", 0.0) or 0.0),
+            "min_risk_reward_ratio": float(getattr(settings, "min_risk_reward_ratio", 0.0) or 0.0),
+        },
     }
 
 

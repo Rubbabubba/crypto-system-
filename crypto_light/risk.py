@@ -29,3 +29,40 @@ def compute_atr_brackets(entry_price: float, atr: float, stop_mult: float, take_
     if take <= px:
         take = px * 1.01
     return float(stop), float(take)
+
+
+def compute_stop_distance_pct(entry_price: float, stop_price: float) -> float:
+    px = float(entry_price or 0.0)
+    stop = float(stop_price or 0.0)
+    if px <= 0.0 or stop <= 0.0 or stop >= px:
+        return 0.0
+    return max(0.0, (px - stop) / px)
+
+
+def compute_take_distance_pct(entry_price: float, take_price: float) -> float:
+    px = float(entry_price or 0.0)
+    take = float(take_price or 0.0)
+    if px <= 0.0 or take <= px:
+        return 0.0
+    return max(0.0, (take - px) / px)
+
+
+def compute_rr_ratio(entry_price: float, stop_price: float, take_price: float) -> float:
+    risk_pct = compute_stop_distance_pct(entry_price, stop_price)
+    reward_pct = compute_take_distance_pct(entry_price, take_price)
+    if risk_pct <= 0.0:
+        return 0.0
+    return max(0.0, reward_pct / risk_pct)
+
+
+def compute_effective_stop_pct(
+    *,
+    entry_price: float,
+    stop_price: float,
+    entry_fee_bps: float = 0.0,
+    exit_fee_bps: float = 0.0,
+    slippage_bps: float = 0.0,
+) -> float:
+    stop_pct = compute_stop_distance_pct(entry_price, stop_price)
+    friction_pct = (float(entry_fee_bps or 0.0) + float(exit_fee_bps or 0.0) + float(slippage_bps or 0.0)) / 10000.0
+    return max(0.0, stop_pct + friction_pct)
