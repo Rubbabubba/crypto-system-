@@ -4,6 +4,7 @@ from . import trades_db
 from . import lifecycle_db
 from . import broker_kraken
 from . import trade_journal
+from . import execution_state
 from .broker_kraken import trades_history
 
 import logging
@@ -189,6 +190,13 @@ def _risk_snapshot_for_entry(*, symbol: str, strategy: str, px: float, stop_pric
 def _state_model_summary() -> Dict[str, Any]:
     try:
         return lifecycle_db.summary()
+    except Exception as e:
+        return {"ok": False, "error": f"{type(e).__name__}: {e}"}
+
+
+def _execution_state_summary() -> Dict[str, Any]:
+    try:
+        return lifecycle_db.execution_state_summary(limit=200)
     except Exception as e:
         return {"ok": False, "error": f"{type(e).__name__}: {e}"}
 
@@ -1972,6 +1980,7 @@ def _execute_long_entry(
         "risk_snapshot_json": risk_snapshot,
         "legacy_symbol_key": symbol,
     })
+    client_order_key = f"entry:{signal_key}:{symbol}:{strategy}"
     lifecycle_db.upsert_order_intent({
         "intent_id": intent_id,
         "trade_plan_id": trade_plan_id,
@@ -1979,14 +1988,17 @@ def _execute_long_entry(
         "side": "buy",
         "order_type": exec_mode_override or settings.execution_mode,
         "strategy_id": strategy,
-        "state": "submitted",
+        "state": "validated",
         "desired_qty": (float(_notional) / float(px)) if float(px) > 0 else 0.0,
         "desired_notional_usd": float(_notional),
         "limit_price": float(px),
+        "client_order_key": client_order_key,
         "raw_json": {"req_id": req_id, "source": source, "dry_run": dry_run},
     })
 
     state.set_order_lock(entry_lock_key, meta={"symbol": symbol, "side": "buy", "strategy": strategy, "req_id": req_id, "trade_plan_id": trade_plan_id, "intent_id": intent_id})
+    lifecycle_db.transition_order_intent(intent_id, "submitted", client_order_key=client_order_key, submitted_ts=time.time())
+    lifecycle_db.update_trade_plan_status(trade_plan_id, "submitted")
     res = _market_notional(
         symbol=symbol,
         side="buy",
@@ -2001,12 +2013,25 @@ def _execute_long_entry(
     )
     if not (res and res.get("ok")):
         state.clear_order_lock(entry_lock_key)
-        lifecycle_db.update_order_intent(intent_id, state="rejected", reject_reason=str((res or {}).get("error") or "order_failed"), raw_json=res or {})
-        lifecycle_db.update_trade_plan_status(trade_plan_id, "rejected")
+        classified = execution_state.classify_order_result(res or {})
+        next_state = classified.get("state") or "rejected"
+        lifecycle_db.transition_order_intent(
+            intent_id,
+            str(next_state),
+            broker_txid=classified.get("broker_txid"),
+            filled_qty=classified.get("filled_qty"),
+            avg_fill_price=classified.get("avg_fill_price"),
+            fees_usd=classified.get("fees_usd"),
+            reject_reason=str(classified.get("error") or (res or {}).get("error") or "order_failed"),
+            cancel_reason=str(classified.get("error") or "") if str(next_state) == "cancelled" else None,
+            last_broker_status=str(classified.get("execution") or ""),
+            raw_json=res or {},
+        )
+        lifecycle_db.update_trade_plan_status(trade_plan_id, "rejected" if str(next_state) == "rejected" else "submitted")
         rej_count = state.note_entry_rejection() if hasattr(state, "note_entry_rejection") else 0
         if int(rej_count) >= int(getattr(settings, "max_consecutive_rejections", 0) or 0) and int(getattr(settings, "max_consecutive_rejections", 0) or 0) > 0 and hasattr(state, "set_ops_lockout"):
             state.set_ops_lockout("consecutive_entry_rejections", int(getattr(settings, "ops_lockout_sec", 0) or 0))
-        _record_state_model_anomaly("entry_order_rejected", "warn", symbol=symbol, trade_plan_id=trade_plan_id, intent_id=intent_id, response=res or {}, consecutive_entry_rejections=int(getattr(state, "consecutive_entry_rejections", 0) or 0))
+        _record_state_model_anomaly("entry_order_rejected", "warn", symbol=symbol, trade_plan_id=trade_plan_id, intent_id=intent_id, response=res or {}, classified=classified, consecutive_entry_rejections=int(getattr(state, "consecutive_entry_rejections", 0) or 0))
     evt = {
         "ts": datetime.now(timezone.utc).isoformat(),
         "req_id": req_id,
@@ -2053,14 +2078,10 @@ def _execute_long_entry(
         plan_entry_px = float(metrics.get('avg_price') or px)
         fees_usd = float(metrics.get('fee') or 0.0)
         qty = float(metrics.get('qty') or ((float(_notional) / float(plan_entry_px)) if float(plan_entry_px) > 0 else 0.0))
-        broker_txid = None
-        if isinstance(res, dict):
-            txids = res.get("txids") or res.get("txid") or res.get("order_txid")
-            if isinstance(txids, list) and txids:
-                broker_txid = str(txids[0])
-            elif txids:
-                broker_txid = str(txids)
-        lifecycle_db.update_order_intent(intent_id, state="filled", broker_txid=broker_txid, filled_qty=qty, avg_fill_price=float(plan_entry_px), fees_usd=fees_usd, raw_json=res or {})
+        classified = execution_state.classify_order_result(res or {})
+        broker_txid = classified.get("broker_txid")
+        lifecycle_db.transition_order_intent(intent_id, "acknowledged", broker_txid=broker_txid, last_broker_status=str(classified.get("execution") or ""), raw_json=res or {})
+        lifecycle_db.transition_order_intent(intent_id, "filled", broker_txid=broker_txid, filled_qty=qty, avg_fill_price=float(plan_entry_px), fees_usd=fees_usd, remaining_qty=0.0, last_broker_status=str(classified.get("execution") or ""), raw_json=res or {})
         lifecycle_db.update_trade_plan_status(trade_plan_id, "active", approved_notional_usd=float(_notional))
         lifecycle_db.upsert_position_ledger({
             "position_id": position_id,
@@ -2588,6 +2609,22 @@ def worker_exit(payload: WorkerExitPayload):
 
             # Phase 6: execute
             notional_exit = max(float(settings.exit_min_notional_usd), float(plan.notional_usd))
+            exit_intent_id = str(uuid4())
+            exit_client_order_key = f"exit:{getattr(plan, 'trade_plan_id', '') or symbol}:{reason}"
+            lifecycle_db.upsert_order_intent({
+                "intent_id": exit_intent_id,
+                "trade_plan_id": getattr(plan, "trade_plan_id", "") or None,
+                "symbol": symbol,
+                "side": "sell",
+                "order_type": STOP_EXIT_MODE if reason == "stop" else str(getattr(settings, "execution_mode", "market") or "market"),
+                "strategy_id": plan.strategy,
+                "state": "validated",
+                "desired_qty": float(qty),
+                "desired_notional_usd": float(notional_exit),
+                "limit_price": float(px),
+                "client_order_key": exit_client_order_key,
+                "raw_json": {"reason": reason, "dry_run": dry_run},
+            })
             exit_lock_key = f"sell:{symbol}"
             if state.has_order_lock(exit_lock_key, OPEN_ORDER_LOCK_TTL_SEC):
                 if diagnostics:
@@ -2600,9 +2637,11 @@ def worker_exit(payload: WorkerExitPayload):
                         evaluations.append({"symbol": symbol, "decision": reason, "skip_reason": "broker_open_sell_order_exists", "meta": sell_meta})
                     continue
             if dry_run:
+                lifecycle_db.transition_order_intent(exit_intent_id, "acknowledged", client_order_key=exit_client_order_key, last_broker_status="dry_run")
                 res = {"ok": True, "dry_run": True, "side": "sell", "symbol": symbol, "notional": notional_exit, "reason": reason}
             else:
-                state.set_order_lock(exit_lock_key, meta={"symbol": symbol, "side": "sell", "reason": reason})
+                state.set_order_lock(exit_lock_key, meta={"symbol": symbol, "side": "sell", "reason": reason, "intent_id": exit_intent_id})
+                lifecycle_db.transition_order_intent(exit_intent_id, "submitted", client_order_key=exit_client_order_key, submitted_ts=time.time())
                 if reason == "stop" and STOP_EXIT_MODE == "stop_limit":
                     res = broker_kraken.stop_limit_notional(
                         symbol=symbol,
@@ -2614,8 +2653,22 @@ def worker_exit(payload: WorkerExitPayload):
                     )
                 else:
                     res = _market_notional(symbol=symbol, side="sell", notional=notional_exit, strategy=plan.strategy, price=px)
+                classified_exit = execution_state.classify_order_result(res or {})
                 if not bool(res.get("ok")):
                     state.clear_order_lock(exit_lock_key)
+                    lifecycle_db.transition_order_intent(
+                        exit_intent_id,
+                        str(classified_exit.get("state") or "rejected"),
+                        broker_txid=classified_exit.get("broker_txid"),
+                        filled_qty=classified_exit.get("filled_qty"),
+                        avg_fill_price=classified_exit.get("avg_fill_price"),
+                        fees_usd=classified_exit.get("fees_usd"),
+                        reject_reason=str(classified_exit.get("error") or (res or {}).get("error") or "exit_order_failed"),
+                        cancel_reason=str(classified_exit.get("error") or "") if str(classified_exit.get("state") or "") == "cancelled" else None,
+                        last_broker_status=str(classified_exit.get("execution") or ""),
+                        raw_json=res or {},
+                    )
+                    _record_state_model_anomaly("exit_order_failed", "warn", symbol=symbol, trade_plan_id=getattr(plan, "trade_plan_id", "") or None, intent_id=exit_intent_id, response=res or {}, classified=classified_exit)
                 journal_close = None
                 if bool(res.get("ok")):
                     state.mark_exit(symbol)
@@ -2624,6 +2677,44 @@ def worker_exit(payload: WorkerExitPayload):
                         journal_close = _record_exit_trade_journal(symbol=symbol, reason=reason, px_fallback=float(px), res=res, closed_ts=now.timestamp())
                     except Exception:
                         journal_close = None
+                    metrics_exit = _extract_execution_metrics(res, fallback_price=float(px), fallback_qty=float(qty))
+                    exit_px = float(metrics_exit.get("avg_price") or px)
+                    exit_qty = float(metrics_exit.get("qty") or qty)
+                    exit_fees = float(metrics_exit.get("fee") or 0.0)
+                    lifecycle_db.transition_order_intent(exit_intent_id, "acknowledged", broker_txid=classified_exit.get("broker_txid"), last_broker_status=str(classified_exit.get("execution") or ""), raw_json=res or {})
+                    lifecycle_db.transition_order_intent(exit_intent_id, "filled", broker_txid=classified_exit.get("broker_txid"), filled_qty=exit_qty, avg_fill_price=exit_px, fees_usd=exit_fees, remaining_qty=0.0, last_broker_status=str(classified_exit.get("execution") or ""), raw_json=res or {})
+                    if getattr(plan, "trade_plan_id", ""):
+                        lifecycle_db.update_trade_plan_status(getattr(plan, "trade_plan_id", ""), "closed", closed_ts=now.timestamp())
+                    lifecycle_db.upsert_position_ledger({
+                        "position_id": getattr(plan, "position_id", "") or str(uuid4()),
+                        "trade_plan_id": getattr(plan, "trade_plan_id", "") or None,
+                        "symbol": symbol,
+                        "side": plan.side,
+                        "qty": 0.0,
+                        "avg_entry_price": float(getattr(plan, "entry_price", 0.0) or 0.0),
+                        "notional_usd": float(getattr(plan, "notional_usd", 0.0) or 0.0),
+                        "realized_pnl_usd": float((exit_px - float(getattr(plan, "entry_price", 0.0) or 0.0)) * exit_qty - exit_fees),
+                        "unrealized_pnl_usd": 0.0,
+                        "fees_usd": exit_fees,
+                        "status": "closed",
+                        "broker_position_qty": 0.0,
+                        "opened_ts": float(getattr(plan, "opened_ts", now.timestamp()) or now.timestamp()),
+                        "closed_ts": now.timestamp(),
+                    })
+                    lifecycle_db.insert_fill_event({
+                        "fill_id": f"{exit_intent_id}:exit",
+                        "intent_id": exit_intent_id,
+                        "trade_plan_id": getattr(plan, "trade_plan_id", "") or None,
+                        "symbol": symbol,
+                        "side": "sell",
+                        "price": exit_px,
+                        "qty": exit_qty,
+                        "notional_usd": float(exit_px * exit_qty),
+                        "fee_usd": exit_fees,
+                        "fill_ts": now.timestamp(),
+                        "broker_txid": classified_exit.get("broker_txid"),
+                        "raw_json": metrics_exit,
+                    })
                 else:
                     # Do not latch exit cooldowns or pending state if the order failed.
                     state.clear_pending_exit(symbol)
@@ -3017,6 +3108,7 @@ def diagnostics_runtime():
         "last_balance_error": _last_balance_error(),
         "phase1_safety": _phase1_safety_report(),
         "state_model": _state_model_summary(),
+        "execution_state": _execution_state_summary(),
         "ops_risk": _ops_risk_snapshot(),
         "risk_admission": {
             "sizing_mode": str(getattr(settings, "sizing_mode", "fixed") or "fixed"),
@@ -3046,6 +3138,7 @@ def diagnostics_state_model_summary():
         "ok": True,
         "utc": utc_now_iso(),
         "state_model": _state_model_summary(),
+        "execution_state": _execution_state_summary(),
         "ops_risk": _ops_risk_snapshot(),
         "risk_admission": {
             "sizing_mode": str(getattr(settings, "sizing_mode", "fixed") or "fixed"),

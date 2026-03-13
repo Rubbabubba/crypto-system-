@@ -82,6 +82,12 @@ def ensure_schema() -> str:
                 fees_usd REAL,
                 retry_count INTEGER,
                 reject_reason TEXT,
+                cancel_reason TEXT,
+                client_order_key TEXT,
+                last_broker_status TEXT,
+                remaining_qty REAL,
+                submitted_ts REAL,
+                acknowledged_ts REAL,
                 raw_json TEXT,
                 created_ts REAL,
                 updated_ts REAL
@@ -149,6 +155,14 @@ def ensure_schema() -> str:
             'risk_snapshot_json': 'TEXT',
             'expires_ts': 'REAL',
             'closed_ts': 'REAL',
+        })
+        _ensure_columns(con, 'order_intents', {
+            'cancel_reason': 'TEXT',
+            'client_order_key': 'TEXT',
+            'last_broker_status': 'TEXT',
+            'remaining_qty': 'REAL',
+            'submitted_ts': 'REAL',
+            'acknowledged_ts': 'REAL',
         })
         con.commit()
     finally:
@@ -237,6 +251,9 @@ def upsert_order_intent(intent: Dict[str, Any]) -> None:
     payload.setdefault('created_ts', now)
     payload['updated_ts'] = now
     payload.setdefault('retry_count', 0)
+    payload.setdefault('remaining_qty', payload.get('desired_qty'))
+    payload.setdefault('submitted_ts', now if str(payload.get('state') or '') in {'submitted','acknowledged','filled','partial','cancel_pending','cancelled','failed_reconcile'} else None)
+    payload.setdefault('acknowledged_ts', now if str(payload.get('state') or '') in {'acknowledged','filled','partial','cancel_pending','cancelled','failed_reconcile'} else None)
     payload.setdefault('raw_json', _json(payload.get('raw_json') or payload))
     con = _connect()
     try:
@@ -246,12 +263,14 @@ def upsert_order_intent(intent: Dict[str, Any]) -> None:
                 intent_id, trade_plan_id, symbol, side, order_type, strategy_id, state,
                 desired_qty, desired_notional_usd, limit_price, broker_txid,
                 filled_qty, avg_fill_price, fees_usd, retry_count, reject_reason,
-                raw_json, created_ts, updated_ts
+                cancel_reason, client_order_key, last_broker_status, remaining_qty,
+                submitted_ts, acknowledged_ts, raw_json, created_ts, updated_ts
             ) VALUES (
                 :intent_id, :trade_plan_id, :symbol, :side, :order_type, :strategy_id, :state,
                 :desired_qty, :desired_notional_usd, :limit_price, :broker_txid,
                 :filled_qty, :avg_fill_price, :fees_usd, :retry_count, :reject_reason,
-                :raw_json, :created_ts, :updated_ts
+                :cancel_reason, :client_order_key, :last_broker_status, :remaining_qty,
+                :submitted_ts, :acknowledged_ts, :raw_json, :created_ts, :updated_ts
             )
             ON CONFLICT(intent_id) DO UPDATE SET
                 trade_plan_id=excluded.trade_plan_id,
@@ -269,6 +288,12 @@ def upsert_order_intent(intent: Dict[str, Any]) -> None:
                 fees_usd=excluded.fees_usd,
                 retry_count=excluded.retry_count,
                 reject_reason=excluded.reject_reason,
+                cancel_reason=excluded.cancel_reason,
+                client_order_key=excluded.client_order_key,
+                last_broker_status=excluded.last_broker_status,
+                remaining_qty=excluded.remaining_qty,
+                submitted_ts=excluded.submitted_ts,
+                acknowledged_ts=excluded.acknowledged_ts,
                 raw_json=excluded.raw_json,
                 updated_ts=excluded.updated_ts
             """,
@@ -286,7 +311,8 @@ def update_order_intent(intent_id: str, **fields: Any) -> None:
     allowed = {
         'trade_plan_id', 'symbol', 'side', 'order_type', 'strategy_id', 'state', 'desired_qty',
         'desired_notional_usd', 'limit_price', 'broker_txid', 'filled_qty', 'avg_fill_price',
-        'fees_usd', 'retry_count', 'reject_reason', 'raw_json'
+        'fees_usd', 'retry_count', 'reject_reason', 'cancel_reason', 'client_order_key',
+        'last_broker_status', 'remaining_qty', 'submitted_ts', 'acknowledged_ts', 'raw_json'
     }
     sets = ['updated_ts = ?']
     args: List[Any] = [time.time()]
@@ -305,6 +331,51 @@ def update_order_intent(intent_id: str, **fields: Any) -> None:
         con.commit()
     finally:
         con.close()
+
+
+def get_order_intent(intent_id: str) -> Optional[Dict[str, Any]]:
+    ensure_schema()
+    con = _connect()
+    try:
+        row = con.execute("SELECT * FROM order_intents WHERE intent_id = ?", (intent_id,)).fetchone()
+        return dict(row) if row else None
+    finally:
+        con.close()
+
+
+def transition_order_intent(intent_id: str, new_state: str, **fields: Any) -> None:
+    now = time.time()
+    payload = dict(fields or {})
+    payload['state'] = str(new_state or '')
+    state_l = str(new_state or '').strip().lower()
+    if state_l in {'submitted','acknowledged','filled','partial','cancel_pending','cancelled','failed_reconcile'} and 'submitted_ts' not in payload:
+        payload['submitted_ts'] = now
+    if state_l in {'acknowledged','filled','partial','cancel_pending','cancelled','failed_reconcile'} and 'acknowledged_ts' not in payload:
+        payload['acknowledged_ts'] = now
+    update_order_intent(intent_id, **payload)
+
+
+def execution_state_summary(limit: int = 200) -> Dict[str, Any]:
+    rows = list_rows('order_intents', limit=limit, order_by='updated_ts DESC')
+    counts: Dict[str, int] = {}
+    for row in rows:
+        st = str(row.get('state') or 'unknown')
+        counts[st] = counts.get(st, 0) + 1
+    stale_unfinished = 0
+    now = time.time()
+    for row in rows:
+        st = str(row.get('state') or '')
+        if st in {'submitted','acknowledged','partial','cancel_pending','replace_pending','failed_reconcile'}:
+            upd = float(row.get('updated_ts') or 0.0)
+            if upd > 0 and (now - upd) > 120:
+                stale_unfinished += 1
+    return {
+        'ok': True,
+        'db_path': _db_path(),
+        'recent_intents': len(rows),
+        'state_counts': counts,
+        'stale_unfinished_recent': int(stale_unfinished),
+    }
 
 
 def upsert_position_ledger(position: Dict[str, Any]) -> None:
