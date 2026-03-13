@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import sqlite3
 from typing import Any, Dict
+import json
 
 DEFAULT_PLANS_DB_PATH = "/var/data/plans.sqlite3"
 
@@ -35,10 +36,28 @@ def ensure_schema() -> None:
                 opened_ts REAL NOT NULL,
                 max_hold_sec INTEGER NOT NULL,
                 breakeven_armed INTEGER NOT NULL,
-                breakeven_triggered_ts REAL NOT NULL
+                breakeven_triggered_ts REAL NOT NULL,
+                trade_plan_id TEXT,
+                position_id TEXT,
+                signal_id TEXT,
+                status TEXT,
+                entry_mode TEXT,
+                risk_snapshot_json TEXT
             )
             """
         )
+        cols = {r["name"] for r in con.execute("PRAGMA table_info(plans)").fetchall()}
+        wanted = {
+            "trade_plan_id": "TEXT",
+            "position_id": "TEXT",
+            "signal_id": "TEXT",
+            "status": "TEXT",
+            "entry_mode": "TEXT",
+            "risk_snapshot_json": "TEXT",
+        }
+        for name, ddl in wanted.items():
+            if name not in cols:
+                con.execute(f"ALTER TABLE plans ADD COLUMN {name} {ddl}")
         con.commit()
     finally:
         con.close()
@@ -47,16 +66,21 @@ def ensure_schema() -> None:
 def upsert_plan(plan_dict: Dict[str, Any]) -> None:
     """Persist a TradePlan (as a dict) to sqlite."""
     ensure_schema()
+    plan_dict = dict(plan_dict or {})
+    if not isinstance(plan_dict.get("risk_snapshot_json"), str):
+        plan_dict["risk_snapshot_json"] = json.dumps(plan_dict.get("risk_snapshot_json") or {}, separators=(",", ":"), sort_keys=True)
     con = _connect()
     try:
         con.execute(
             """
             INSERT INTO plans (
                 symbol, side, notional_usd, entry_price, stop_price, take_price,
-                strategy, opened_ts, max_hold_sec, breakeven_armed, breakeven_triggered_ts
+                strategy, opened_ts, max_hold_sec, breakeven_armed, breakeven_triggered_ts,
+                trade_plan_id, position_id, signal_id, status, entry_mode, risk_snapshot_json
             ) VALUES (
                 :symbol, :side, :notional_usd, :entry_price, :stop_price, :take_price,
-                :strategy, :opened_ts, :max_hold_sec, :breakeven_armed, :breakeven_triggered_ts
+                :strategy, :opened_ts, :max_hold_sec, :breakeven_armed, :breakeven_triggered_ts,
+                :trade_plan_id, :position_id, :signal_id, :status, :entry_mode, :risk_snapshot_json
             )
             ON CONFLICT(symbol) DO UPDATE SET
                 side=excluded.side,
@@ -68,7 +92,13 @@ def upsert_plan(plan_dict: Dict[str, Any]) -> None:
                 opened_ts=excluded.opened_ts,
                 max_hold_sec=excluded.max_hold_sec,
                 breakeven_armed=excluded.breakeven_armed,
-                breakeven_triggered_ts=excluded.breakeven_triggered_ts
+                breakeven_triggered_ts=excluded.breakeven_triggered_ts,
+                trade_plan_id=excluded.trade_plan_id,
+                position_id=excluded.position_id,
+                signal_id=excluded.signal_id,
+                status=excluded.status,
+                entry_mode=excluded.entry_mode,
+                risk_snapshot_json=excluded.risk_snapshot_json
             """,
             plan_dict,
         )
@@ -96,6 +126,10 @@ def load_plans() -> list[dict[str, Any]]:
         for r in rows:
             d = dict(r)
             d["breakeven_armed"] = bool(int(d.get("breakeven_armed") or 0))
+            try:
+                d["risk_snapshot_json"] = json.loads(d.get("risk_snapshot_json") or "{}")
+            except Exception:
+                d["risk_snapshot_json"] = {}
             out.append(d)
         return out
     finally:

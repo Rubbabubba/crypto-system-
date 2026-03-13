@@ -11,6 +11,10 @@ class WebhookPayload(BaseModel):
     signal: str | None = Field(None, description="optional signal name")
     signal_id: str | None = Field(None, description="optional idempotency key for this signal")
     notional_usd: float | None = Field(None, description="USD notional to trade")
+    price: float | None = Field(None, description="optional entry/reference price")
+    entry_price: float | None = Field(None, description="optional entry/reference price")
+    stop_price: float | None = Field(None, description="optional stop price")
+    take_price: float | None = Field(None, description="optional take price")
 
 
 class WorkerExitPayload(BaseModel):

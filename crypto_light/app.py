@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from . import trades_db
+from . import lifecycle_db
 from . import broker_kraken
 from . import trade_journal
 from .broker_kraken import trades_history
@@ -88,7 +89,12 @@ def _stable_cash_usd(balances: dict[str, float]) -> float:
 ALLOWED_SYMBOLS = set(getattr(settings, 'allowed_symbols', []) or [])
 
 state = InMemoryState()
-app = FastAPI(title="Crypto Light", version="1.0.3")
+app = FastAPI(title="Crypto Light", version="1.0.4")
+
+try:
+    lifecycle_db.ensure_schema()
+except Exception:
+    pass
 
 
 @app.middleware("http")
@@ -140,6 +146,44 @@ def _record_blocked_trade(reason: str, **fields) -> None:
     except Exception:
         pass
 
+
+
+def _risk_snapshot_for_entry(*, symbol: str, strategy: str, px: float, stop_price: float, take_price: float, notional: float) -> Dict[str, Any]:
+    balances = _balances_by_asset() or {}
+    stable_cash = _stable_cash_usd(balances)
+    total_exposure = _portfolio_exposure_usd_from_balances(balances)
+    stop_gap = max(0.0, float(px) - float(stop_price))
+    stop_gap_pct = (stop_gap / float(px)) if float(px) > 0 else 0.0
+    est_qty = (float(notional) / float(px)) if float(px) > 0 else 0.0
+    est_risk_usd = stop_gap * est_qty
+    return {
+        "symbol": symbol,
+        "strategy": strategy,
+        "entry_price": float(px),
+        "stop_price": float(stop_price),
+        "take_price": float(take_price),
+        "requested_notional_usd": float(notional),
+        "estimated_qty": float(est_qty),
+        "estimated_stop_gap_pct": float(stop_gap_pct),
+        "estimated_stop_risk_usd": float(est_risk_usd),
+        "stable_cash_usd": float(stable_cash),
+        "portfolio_exposure_usd": float(total_exposure),
+        "max_daily_loss_usd": float(getattr(settings, "max_daily_loss_usd", 0.0) or 0.0),
+    }
+
+
+def _state_model_summary() -> Dict[str, Any]:
+    try:
+        return lifecycle_db.summary()
+    except Exception as e:
+        return {"ok": False, "error": f"{type(e).__name__}: {e}"}
+
+
+def _record_state_model_anomaly(kind: str, severity: str = "warn", **fields: Any) -> None:
+    try:
+        lifecycle_db.record_anomaly(kind, severity, symbol=fields.get("symbol"), trade_plan_id=fields.get("trade_plan_id"), intent_id=fields.get("intent_id"), details=fields)
+    except Exception:
+        pass
 
 
 # ---------- Entry engine (optional; replaces TradingView) ----------
@@ -1827,7 +1871,43 @@ def _execute_long_entry(
         chase_steps_override = 1
         post_offset_override = float(MM1_POST_ONLY_OFFSET_PCT)
 
-    state.set_order_lock(entry_lock_key, meta={"symbol": symbol, "side": "buy", "strategy": strategy, "req_id": req_id})
+    trade_plan_id = str(uuid4())
+    intent_id = str(uuid4())
+    position_id = str(uuid4())
+    signal_key = str(req_id or uuid4())
+    risk_snapshot = _risk_snapshot_for_entry(symbol=symbol, strategy=strategy, px=float(px), stop_price=float(stop_price), take_price=float(take_price), notional=float(_notional))
+    lifecycle_db.upsert_trade_plan({
+        "trade_plan_id": trade_plan_id,
+        "symbol": symbol,
+        "strategy_id": strategy,
+        "signal_id": signal_key,
+        "status": "approved",
+        "direction": "buy",
+        "entry_mode": exec_mode_override or settings.execution_mode,
+        "entry_ref_price": float(px),
+        "stop_price": float(stop_price),
+        "target_price": float(take_price),
+        "time_stop_sec": _strategy_max_hold_sec(strategy),
+        "requested_notional_usd": float(_notional),
+        "approved_notional_usd": float(_notional),
+        "risk_snapshot_json": risk_snapshot,
+        "legacy_symbol_key": symbol,
+    })
+    lifecycle_db.upsert_order_intent({
+        "intent_id": intent_id,
+        "trade_plan_id": trade_plan_id,
+        "symbol": symbol,
+        "side": "buy",
+        "order_type": exec_mode_override or settings.execution_mode,
+        "strategy_id": strategy,
+        "state": "submitted",
+        "desired_qty": (float(_notional) / float(px)) if float(px) > 0 else 0.0,
+        "desired_notional_usd": float(_notional),
+        "limit_price": float(px),
+        "raw_json": {"req_id": req_id, "source": source, "dry_run": dry_run},
+    })
+
+    state.set_order_lock(entry_lock_key, meta={"symbol": symbol, "side": "buy", "strategy": strategy, "req_id": req_id, "trade_plan_id": trade_plan_id, "intent_id": intent_id})
     res = _market_notional(
         symbol=symbol,
         side="buy",
@@ -1842,6 +1922,9 @@ def _execute_long_entry(
     )
     if not (res and res.get("ok")):
         state.clear_order_lock(entry_lock_key)
+        lifecycle_db.update_order_intent(intent_id, state="rejected", reject_reason=str((res or {}).get("error") or "order_failed"), raw_json=res or {})
+        lifecycle_db.update_trade_plan_status(trade_plan_id, "rejected")
+        _record_state_model_anomaly("entry_order_rejected", "warn", symbol=symbol, trade_plan_id=trade_plan_id, intent_id=intent_id, response=res or {})
     evt = {
         "ts": datetime.now(timezone.utc).isoformat(),
         "req_id": req_id,
@@ -1884,9 +1967,55 @@ def _execute_long_entry(
             pass
         metrics = _extract_execution_metrics(res, fallback_price=float(px), fallback_qty=(float(_notional) / float(px)) if float(px) > 0 else 0.0)
         plan_entry_px = float(metrics.get('avg_price') or px)
+        fees_usd = float(metrics.get('fee') or 0.0)
+        qty = float(metrics.get('qty') or ((float(_notional) / float(plan_entry_px)) if float(plan_entry_px) > 0 else 0.0))
+        broker_txid = None
+        if isinstance(res, dict):
+            txids = res.get("txids") or res.get("txid") or res.get("order_txid")
+            if isinstance(txids, list) and txids:
+                broker_txid = str(txids[0])
+            elif txids:
+                broker_txid = str(txids)
+        lifecycle_db.update_order_intent(intent_id, state="filled", broker_txid=broker_txid, filled_qty=qty, avg_fill_price=float(plan_entry_px), fees_usd=fees_usd, raw_json=res or {})
+        lifecycle_db.update_trade_plan_status(trade_plan_id, "active", approved_notional_usd=float(_notional))
+        lifecycle_db.upsert_position_ledger({
+            "position_id": position_id,
+            "trade_plan_id": trade_plan_id,
+            "symbol": symbol,
+            "side": "buy",
+            "qty": qty,
+            "avg_entry_price": float(plan_entry_px),
+            "notional_usd": float(_notional),
+            "realized_pnl_usd": 0.0,
+            "unrealized_pnl_usd": 0.0,
+            "fees_usd": fees_usd,
+            "status": "open",
+            "broker_position_qty": qty,
+            "opened_ts": opened_ts,
+        })
+        lifecycle_db.insert_fill_event({
+            "fill_id": f"{intent_id}:entry",
+            "intent_id": intent_id,
+            "trade_plan_id": trade_plan_id,
+            "symbol": symbol,
+            "side": "buy",
+            "price": float(plan_entry_px),
+            "qty": qty,
+            "notional_usd": float(_notional),
+            "fee_usd": fees_usd,
+            "fill_ts": opened_ts,
+            "broker_txid": broker_txid,
+            "raw_json": metrics,
+        })
         state.mark_enter(symbol)
         state.set_plan(TradePlan(
             symbol=symbol,
+            trade_plan_id=trade_plan_id,
+            position_id=position_id,
+            signal_id=signal_key,
+            status="active",
+            entry_mode=str(exec_mode_override or settings.execution_mode),
+            risk_snapshot=risk_snapshot,
             strategy=strategy,
             side="buy",
             entry_price=float(plan_entry_px),
@@ -1896,10 +2025,10 @@ def _execute_long_entry(
             opened_ts=opened_ts,
             max_hold_sec=_strategy_max_hold_sec(strategy),
         ))
-        return {"ok": True, "executed": True, "symbol": symbol, "strategy": strategy, "price": plan_entry_px, "stop": float(stop_price), "take": float(take_price)}
+        return {"ok": True, "executed": True, "symbol": symbol, "strategy": strategy, "price": plan_entry_px, "stop": float(stop_price), "take": float(take_price), "trade_plan_id": trade_plan_id, "intent_id": intent_id, "position_id": position_id}
 
     # Do NOT create a plan or cooldown on failed orders (e.g., insufficient funds).
-    return {"ok": False, "executed": False, "symbol": symbol, "strategy": strategy, "price": px, "stop": float(stop_price), "take": float(take_price), "error": res.get("error") or "order_failed"}
+    return {"ok": False, "executed": False, "symbol": symbol, "strategy": strategy, "price": px, "stop": float(stop_price), "take": float(take_price), "error": res.get("error") or "order_failed", "trade_plan_id": trade_plan_id, "intent_id": intent_id, "position_id": position_id}
 
 
 @app.post("/webhook")
@@ -2767,6 +2896,7 @@ def diagnostics_runtime():
         "positions": positions,
         "last_balance_error": _last_balance_error(),
         "phase1_safety": _phase1_safety_report(),
+        "state_model": _state_model_summary(),
     }
 
 @app.get("/diagnostics/phase1_safety")
@@ -2776,6 +2906,53 @@ def diagnostics_phase1_safety():
         "ok": True,
         "utc": utc_now_iso(),
         "phase1_safety": rep,
+    }
+
+
+@app.get("/diagnostics/state_model_summary")
+def diagnostics_state_model_summary():
+    return {
+        "ok": True,
+        "utc": utc_now_iso(),
+        "state_model": _state_model_summary(),
+    }
+
+
+@app.get("/diagnostics/state_model")
+def diagnostics_state_model(limit: int = 25):
+    limit = max(1, min(int(limit), 200))
+    return {
+        "ok": True,
+        "utc": utc_now_iso(),
+        "summary": _state_model_summary(),
+        "trade_plans": lifecycle_db.list_rows("trade_plans", limit=limit, order_by="updated_ts DESC"),
+        "order_intents": lifecycle_db.list_rows("order_intents", limit=limit, order_by="updated_ts DESC"),
+        "positions": lifecycle_db.list_rows("position_ledger", limit=limit, order_by="updated_ts DESC"),
+        "fills": lifecycle_db.list_rows("fill_events", limit=limit, order_by="created_ts DESC"),
+        "anomalies": lifecycle_db.unresolved_anomalies(limit=limit),
+    }
+
+
+@app.get("/diagnostics/order_intents")
+def diagnostics_order_intents(limit: int = 50, state_filter: str | None = None):
+    where = ''
+    args = []
+    if state_filter:
+        where = 'state = ?'
+        args = [str(state_filter)]
+    return {
+        "ok": True,
+        "utc": utc_now_iso(),
+        "items": lifecycle_db.list_rows("order_intents", limit=limit, where=where, args=args, order_by="updated_ts DESC"),
+    }
+
+
+@app.get("/diagnostics/anomalies")
+def diagnostics_anomalies(limit: int = 50):
+    return {
+        "ok": True,
+        "utc": utc_now_iso(),
+        "items": lifecycle_db.unresolved_anomalies(limit=limit),
     }
 
 

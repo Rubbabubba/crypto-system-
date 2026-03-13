@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass
+from uuid import uuid4
 from typing import Dict, Optional, List, Any
 
 from . import plans_db
+from . import lifecycle_db
 
 
 @dataclass
@@ -17,6 +19,12 @@ class TradePlan:
     take_price: float
     strategy: str
     opened_ts: float
+    trade_plan_id: str = ""
+    position_id: str = ""
+    signal_id: str = ""
+    status: str = "active"
+    entry_mode: str = ""
+    risk_snapshot: Dict[str, Any] | None = None
 
     # Optional time-based exit (0 disables). Used by some mean-reversion / maker modes.
     max_hold_sec: int = 0
@@ -28,6 +36,12 @@ class TradePlan:
     def to_dict(self) -> Dict[str, Any]:
         return {
             "symbol": self.symbol,
+            "trade_plan_id": self.trade_plan_id,
+            "position_id": self.position_id,
+            "signal_id": self.signal_id,
+            "status": self.status,
+            "entry_mode": self.entry_mode,
+            "risk_snapshot_json": self.risk_snapshot or {},
             "side": self.side,
             "notional_usd": float(self.notional_usd),
             "entry_price": float(self.entry_price),
@@ -44,6 +58,12 @@ class TradePlan:
     def from_dict(cls, d: Dict[str, Any]) -> "TradePlan":
         return cls(
             symbol=str(d.get("symbol") or ""),
+            trade_plan_id=str(d.get("trade_plan_id") or ""),
+            position_id=str(d.get("position_id") or ""),
+            signal_id=str(d.get("signal_id") or ""),
+            status=str(d.get("status") or "active"),
+            entry_mode=str(d.get("entry_mode") or ""),
+            risk_snapshot=(d.get("risk_snapshot_json") or d.get("risk_snapshot") or {}),
             side=str(d.get("side") or "buy"),
             notional_usd=float(d.get("notional_usd") or 0.0),
             entry_price=float(d.get("entry_price") or 0.0),
@@ -116,29 +136,117 @@ class InMemoryState:
         self._load_plans_from_db()
 
     def set_plan(self, plan: TradePlan) -> None:
-        """Set plan in-memory and persist to sqlite."""
+        """Set plan in-memory and persist to sqlite + lifecycle store."""
+        if not getattr(plan, "trade_plan_id", ""):
+            plan.trade_plan_id = str(uuid4())
+        if not getattr(plan, "position_id", ""):
+            plan.position_id = str(uuid4())
         self.plans[plan.symbol] = plan
         try:
             plans_db.upsert_plan(plan.to_dict())
         except Exception:
-            # persistence should never break trading
+            pass
+        try:
+            lifecycle_db.upsert_trade_plan({
+                "trade_plan_id": plan.trade_plan_id,
+                "symbol": plan.symbol,
+                "strategy_id": plan.strategy,
+                "signal_id": plan.signal_id,
+                "status": plan.status or "active",
+                "direction": plan.side,
+                "entry_mode": plan.entry_mode,
+                "entry_ref_price": plan.entry_price,
+                "stop_price": plan.stop_price,
+                "target_price": plan.take_price,
+                "time_stop_sec": plan.max_hold_sec,
+                "requested_notional_usd": plan.notional_usd,
+                "approved_notional_usd": plan.notional_usd,
+                "risk_snapshot_json": plan.risk_snapshot or {},
+                "legacy_symbol_key": plan.symbol,
+            })
+            lifecycle_db.upsert_position_ledger({
+                "position_id": plan.position_id,
+                "trade_plan_id": plan.trade_plan_id,
+                "symbol": plan.symbol,
+                "side": plan.side,
+                "qty": 0.0,
+                "avg_entry_price": plan.entry_price,
+                "notional_usd": plan.notional_usd,
+                "realized_pnl_usd": 0.0,
+                "unrealized_pnl_usd": 0.0,
+                "fees_usd": 0.0,
+                "status": "open",
+                "broker_position_qty": 0.0,
+                "opened_ts": plan.opened_ts,
+            })
+        except Exception:
             pass
 
     def remove_plan(self, symbol: str) -> None:
-        self.plans.pop(symbol, None)
+        plan = self.plans.pop(symbol, None)
         try:
             plans_db.delete_plan(symbol)
         except Exception:
             pass
+        try:
+            if plan and getattr(plan, "trade_plan_id", ""):
+                lifecycle_db.update_trade_plan_status(plan.trade_plan_id, "closed", closed_ts=time.time())
+                lifecycle_db.upsert_position_ledger({
+                    "position_id": getattr(plan, "position_id", "") or str(uuid4()),
+                    "trade_plan_id": plan.trade_plan_id,
+                    "symbol": plan.symbol,
+                    "side": plan.side,
+                    "qty": 0.0,
+                    "avg_entry_price": plan.entry_price,
+                    "notional_usd": plan.notional_usd,
+                    "realized_pnl_usd": 0.0,
+                    "unrealized_pnl_usd": 0.0,
+                    "fees_usd": 0.0,
+                    "status": "closed",
+                    "broker_position_qty": 0.0,
+                    "opened_ts": plan.opened_ts,
+                    "closed_ts": time.time(),
+                })
+        except Exception:
+            pass
 
     def _load_plans_from_db(self) -> None:
+        try:
+            lifecycle_db.ensure_schema()
+        except Exception:
+            pass
         try:
             rows = plans_db.load_plans()
         except Exception:
             return
         for d in rows:
             try:
-                self.plans[d["symbol"]] = TradePlan.from_dict(d)
+                plan = TradePlan.from_dict(d)
+                if not getattr(plan, "trade_plan_id", ""):
+                    plan.trade_plan_id = str(uuid4())
+                if not getattr(plan, "position_id", ""):
+                    plan.position_id = str(uuid4())
+                self.plans[d["symbol"]] = plan
+                try:
+                    lifecycle_db.upsert_trade_plan({
+                        "trade_plan_id": plan.trade_plan_id,
+                        "symbol": plan.symbol,
+                        "strategy_id": plan.strategy,
+                        "signal_id": plan.signal_id,
+                        "status": plan.status or "active",
+                        "direction": plan.side,
+                        "entry_mode": plan.entry_mode,
+                        "entry_ref_price": plan.entry_price,
+                        "stop_price": plan.stop_price,
+                        "target_price": plan.take_price,
+                        "time_stop_sec": plan.max_hold_sec,
+                        "requested_notional_usd": plan.notional_usd,
+                        "approved_notional_usd": plan.notional_usd,
+                        "risk_snapshot_json": plan.risk_snapshot or {},
+                        "legacy_symbol_key": plan.symbol,
+                    })
+                except Exception:
+                    pass
             except Exception:
                 continue
 
