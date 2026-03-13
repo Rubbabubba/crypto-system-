@@ -1,38 +1,14 @@
-# Crypto System - Light (Equities-inspired)
+Crypto System Patch 6 — Startup Self-Check + Lockout
 
-This is the minimal, boring crypto automation service:
+Drop-in patch contents for the main crypto system.
 
-- TradingView Alerts -> `/webhook`
-- Background worker -> `/worker/exit` every 30s
-- Kraken spot via `broker_kraken.market_notional()`
-- One position per symbol
-- Deterministic bracket exits (stop/take)
-- Daily forced flatten at `DAILY_FLATTEN_TIME_UTC` (default 23:55 UTC)
+What changed:
+- Added startup self-check on app boot.
+- Added configurable startup lockout if critical reconcile anomalies are detected.
+- Added /diagnostics/startup_self_check.
+- Added startup_self_check block to /diagnostics/runtime.
 
-## Env vars (minimum)
-
-### Required
-- `WEBHOOK_SECRET`
-- `WORKER_SECRET` (recommended)
-- `KRAKEN_API_KEY`, `KRAKEN_API_SECRET` (see broker_kraken.py)
-
-### Suggested
-- `ALLOWED_SYMBOLS=BTC/USD,ETH/USD,SOL/USD`
-- `DEFAULT_NOTIONAL_USD=50`
-- `STOP_PCT=0.01`
-- `TAKE_PCT=0.02`
-- `DAILY_FLATTEN_TIME_UTC=23:55`
-- `MAX_TRADES_PER_SYMBOL_PER_DAY=3`
-
-## TradingView alert payload
-
-```json
-{
-  "secret": "...",
-  "symbol": "BTC/USD",
-  "side": "buy",
-  "strategy": "rb1",
-  "signal": "range_breakout_v1",
-  "notional_usd": 50
-}
-```
+Recommended verification:
+- GET /diagnostics/startup_self_check
+- GET /diagnostics/startup_self_check?rerun=1
+- GET /diagnostics/runtime
