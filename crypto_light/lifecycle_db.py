@@ -513,3 +513,22 @@ def summary() -> Dict[str, Any]:
         }
     finally:
         con.close()
+
+
+def list_openish_order_intents(limit: int = 200) -> List[Dict[str, Any]]:
+    return list_rows(
+        'order_intents',
+        limit=limit,
+        where="state IN ('created','validated','submitted','acknowledged','partial','replace_pending','cancel_pending','failed_reconcile')",
+        order_by='updated_ts DESC',
+    )
+
+
+def resolve_anomaly(anomaly_id: int) -> None:
+    ensure_schema()
+    con = _connect()
+    try:
+        con.execute('UPDATE anomalies SET resolved_ts = ? WHERE id = ? AND resolved_ts IS NULL', (time.time(), int(anomaly_id)))
+        con.commit()
+    finally:
+        con.close()

@@ -1390,6 +1390,121 @@ def _has_broker_open_order(symbol: str, side: str) -> tuple[bool, dict]:
     }
 
 
+
+
+def _recovery_reconcile_summary(*, apply: bool = False) -> dict:
+    base = _reconcile_runtime_state() if apply else diagnostics_position_reconcile(apply=0)
+    try:
+        broker_open = _broker_open_orders_summary()
+    except Exception as e:
+        broker_open = {"ok": False, "error": str(e), "items": []}
+
+    live_positions = get_positions()
+    live_syms = {p.get('symbol') for p in live_positions if p.get('symbol')}
+    openish_states = {'created','validated','submitted','acknowledged','partial','replace_pending','cancel_pending','failed_reconcile'}
+    openish_intents = lifecycle_db.list_openish_order_intents(limit=200)
+    pending_exits = dict(getattr(state, 'pending_exits', {}) or {})
+
+    broker_items = list(broker_open.get('items') or []) if broker_open.get('ok') else []
+    broker_buy = {(str(it.get('symbol') or ''), 'buy'): it for it in broker_items if str(it.get('side') or '').lower() == 'buy' and it.get('symbol')}
+    broker_sell = {(str(it.get('symbol') or ''), 'sell'): it for it in broker_items if str(it.get('side') or '').lower() == 'sell' and it.get('symbol')}
+
+    orphan_broker_orders = []
+    matched_intent_ids = set()
+    for bo in broker_items:
+        bsym = str(bo.get('symbol') or '')
+        bside = str(bo.get('side') or '').lower()
+        btxid = str(bo.get('txid') or '')
+        matched = None
+        for it in openish_intents:
+            if str(it.get('symbol') or '') != bsym or str(it.get('side') or '').lower() != bside:
+                continue
+            if btxid and str(it.get('broker_txid') or '') == btxid:
+                matched = it
+                break
+        if matched is None:
+            for it in openish_intents:
+                if str(it.get('symbol') or '') == bsym and str(it.get('side') or '').lower() == bside:
+                    matched = it
+                    break
+        if matched is not None:
+            if matched.get('intent_id'):
+                matched_intent_ids.add(str(matched.get('intent_id')))
+        else:
+            orphan_broker_orders.append(bo)
+
+    orphan_internal_intents = []
+    marked_failed = []
+    for it in openish_intents:
+        iid = str(it.get('intent_id') or '')
+        sym = str(it.get('symbol') or '')
+        side = str(it.get('side') or '').lower()
+        if iid in matched_intent_ids:
+            continue
+        broker_match = broker_buy.get((sym, side)) if side == 'buy' else broker_sell.get((sym, side))
+        has_live_position = sym in live_syms
+        is_orphan = False
+        if side == 'buy' and (broker_match is None) and (not has_live_position):
+            is_orphan = True
+        elif side == 'sell' and (broker_match is None) and (sym not in pending_exits) and (not has_live_position):
+            is_orphan = True
+        elif side == 'sell' and (broker_match is None) and (sym in pending_exits) and (not has_live_position):
+            is_orphan = True
+        if is_orphan:
+            orphan_internal_intents.append({
+                'intent_id': iid,
+                'symbol': sym,
+                'side': side,
+                'state': str(it.get('state') or ''),
+                'broker_txid': str(it.get('broker_txid') or ''),
+                'trade_plan_id': str(it.get('trade_plan_id') or ''),
+            })
+            if apply and iid:
+                try:
+                    lifecycle_db.transition_order_intent(iid, 'failed_reconcile', reject_reason='reconcile_missing_broker_order', last_broker_status='missing_on_broker')
+                    lifecycle_db.record_anomaly('orphan_internal_intent', 'warn', symbol=sym or None, trade_plan_id=str(it.get('trade_plan_id') or '') or None, intent_id=iid, details={'side': side, 'previous_state': str(it.get('state') or '')})
+                    marked_failed.append(iid)
+                except Exception:
+                    pass
+
+    stale_pending_exit_symbols = []
+    cleared_pending_exit_symbols = []
+    broker_sell_syms = {str(it.get('symbol') or '') for it in broker_items if str(it.get('side') or '').lower() == 'sell' and it.get('symbol')}
+    for sym in list(pending_exits.keys()):
+        if sym not in live_syms and sym not in broker_sell_syms:
+            stale_pending_exit_symbols.append(sym)
+            if apply:
+                try:
+                    state.clear_pending_exit(sym)
+                    cleared_pending_exit_symbols.append(sym)
+                except Exception:
+                    pass
+
+    if apply:
+        for bo in orphan_broker_orders:
+            try:
+                lifecycle_db.record_anomaly('orphan_broker_order', 'warn', symbol=str(bo.get('symbol') or '') or None, details=bo)
+            except Exception:
+                pass
+
+    return {
+        'ok': True,
+        'utc': utc_now_iso(),
+        'base_reconcile': base,
+        'broker_open_orders_ok': bool(broker_open.get('ok')),
+        'broker_open_order_count': len(broker_items),
+        'orphan_broker_orders': orphan_broker_orders,
+        'orphan_broker_order_count': len(orphan_broker_orders),
+        'orphan_internal_intents': orphan_internal_intents,
+        'orphan_internal_intent_count': len(orphan_internal_intents),
+        'stale_pending_exit_symbols': stale_pending_exit_symbols,
+        'stale_pending_exit_count': len(stale_pending_exit_symbols),
+        'apply_changes': bool(apply),
+        'applied': {
+            'marked_failed_reconcile_intents': marked_failed,
+            'cleared_pending_exit_symbols': cleared_pending_exit_symbols,
+        },
+    }
 def _reconcile_runtime_state() -> dict:
     positions = get_positions()
     live_syms = {p.get('symbol') for p in positions if p.get('symbol')}
@@ -3124,6 +3239,7 @@ def diagnostics_runtime():
         "phase1_safety": _phase1_safety_report(),
         "state_model": _state_model_summary(),
         "execution_state": _execution_state_summary(),
+        "recovery_reconcile": _recovery_reconcile_summary(apply=False),
         "ops_risk": _ops_risk_snapshot(),
         "risk_admission": {
             "sizing_mode": str(getattr(settings, "sizing_mode", "fixed") or "fixed"),
@@ -3194,6 +3310,25 @@ def diagnostics_order_intents(limit: int = 50, state_filter: str | None = None):
         "ok": True,
         "utc": utc_now_iso(),
         "items": lifecycle_db.list_rows("order_intents", limit=limit, where=where, args=args, order_by="updated_ts DESC"),
+    }
+
+
+@app.get("/diagnostics/recovery_reconcile")
+def diagnostics_recovery_reconcile(apply: int = 0):
+    return _recovery_reconcile_summary(apply=bool(int(apply or 0)))
+
+
+@app.get("/diagnostics/reconcile_anomalies")
+def diagnostics_reconcile_anomalies(limit: int = 50):
+    limit = max(1, min(int(limit or 50), 200))
+    items = [
+        it for it in lifecycle_db.unresolved_anomalies(limit=limit * 3)
+        if str(it.get('kind') or '') in {'orphan_broker_order', 'orphan_internal_intent', 'entry_order_rejected', 'exit_order_failed'}
+    ][:limit]
+    return {
+        "ok": True,
+        "utc": utc_now_iso(),
+        "items": items,
     }
 
 
