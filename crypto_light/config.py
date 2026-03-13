@@ -119,6 +119,13 @@ class Settings:
     startup_max_orphan_internal_intents: int
     startup_max_stale_pending_exits: int
 
+    # Pre-trade health gate
+    pretrade_health_gate_enabled: bool
+    pretrade_require_startup_self_check_ok: bool
+    pretrade_block_on_worker_stale: bool
+    pretrade_block_on_balance_error: bool
+    pretrade_block_on_reconcile_anomaly: bool
+
     # Broker-truth account guardrails
     require_broker_balance_ok_for_entry: bool
     min_cash_buffer_usd: float
