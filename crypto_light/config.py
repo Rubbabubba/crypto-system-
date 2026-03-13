@@ -265,6 +265,15 @@ def load_settings() -> Settings:
         max_consecutive_stopouts=int(float(_getenv("MAX_CONSECUTIVE_STOPOUTS", "2") or 2)),
         ops_lockout_sec=int(float(_getenv("OPS_LOCKOUT_SEC", "900") or 900)),
 
+        # Startup self-check / lockout
+        startup_self_check_enabled=_getbool("STARTUP_SELF_CHECK_ENABLED", "1"),
+        startup_apply_reconcile=_getbool("STARTUP_APPLY_RECONCILE", "1"),
+        startup_lockout_on_critical_reconcile=_getbool("STARTUP_LOCKOUT_ON_CRITICAL_RECONCILE", "1"),
+        startup_lockout_sec=int(float(_getenv("STARTUP_LOCKOUT_SEC", _getenv("OPS_LOCKOUT_SEC", "900")) or 900)),
+        startup_max_orphan_broker_orders=int(float(_getenv("STARTUP_MAX_ORPHAN_BROKER_ORDERS", "0") or 0)),
+        startup_max_orphan_internal_intents=int(float(_getenv("STARTUP_MAX_ORPHAN_INTERNAL_INTENTS", "0") or 0)),
+        startup_max_stale_pending_exits=int(float(_getenv("STARTUP_MAX_STALE_PENDING_EXITS", "0") or 0)),
+
         # Broker-truth account guardrails
         require_broker_balance_ok_for_entry=_getbool("REQUIRE_BROKER_BALANCE_OK_FOR_ENTRY", "1"),
         min_cash_buffer_usd=float(_getenv("MIN_CASH_BUFFER_USD", "25") or 25),
