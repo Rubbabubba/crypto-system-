@@ -1458,6 +1458,88 @@ def _account_truth_snapshot() -> dict:
     }
 
 
+
+
+def _pretrade_health_gate_summary(*, rerun_startup_check: bool = False) -> dict:
+    enabled = bool(getattr(settings, 'pretrade_health_gate_enabled', True))
+    worker_health = {
+        'scan': _worker_status_meta(getattr(state, 'last_scan_status', {}) or {}),
+        'exit': _worker_status_meta(getattr(state, 'last_exit_status', {}) or {}),
+    }
+    worker_health['overall_stale'] = bool(worker_health['scan'].get('stale') or worker_health['exit'].get('stale'))
+
+    startup = _startup_self_check(rerun=bool(rerun_startup_check), apply=None)
+    account_truth = _account_truth_snapshot()
+    reconcile = _recovery_reconcile_summary(apply=False)
+    ops_remaining = int(state.ops_lockout_remaining_sec() if hasattr(state, 'ops_lockout_remaining_sec') else 0)
+
+    violations: list[str] = []
+    if enabled:
+        if bool(getattr(settings, 'pretrade_require_startup_self_check_ok', True)):
+            if not bool(startup.get('ok')):
+                violations.append('startup_self_check_not_ok')
+            elif bool((startup.get('startup_self_check') or {}).get('critical')):
+                violations.append('startup_self_check_critical')
+
+        if bool(getattr(settings, 'pretrade_block_on_worker_stale', True)) and bool(worker_health.get('overall_stale')):
+            if bool(worker_health['scan'].get('stale')):
+                violations.append('scan_worker_stale')
+            if bool(worker_health['exit'].get('stale')):
+                violations.append('exit_worker_stale')
+
+        if bool(getattr(settings, 'pretrade_block_on_balance_error', True)) and not bool(account_truth.get('balance_ok')):
+            violations.append('broker_balance_unavailable')
+
+        if bool(getattr(settings, 'pretrade_block_on_reconcile_anomaly', True)):
+            if not bool(reconcile.get('broker_open_orders_ok')):
+                violations.append('broker_open_orders_unavailable')
+            if int(reconcile.get('orphan_broker_order_count') or 0) > 0:
+                violations.append('orphan_broker_orders_present')
+            if int(reconcile.get('orphan_internal_intent_count') or 0) > 0:
+                violations.append('orphan_internal_intents_present')
+            if int(reconcile.get('stale_pending_exit_count') or 0) > 0:
+                violations.append('stale_pending_exits_present')
+
+        if ops_remaining > 0:
+            violations.append('ops_risk_lockout_active')
+
+    return {
+        'ok': True,
+        'utc': utc_now_iso(),
+        'enabled': enabled,
+        'gate_open': bool((not enabled) or (len(violations) == 0)),
+        'violations': violations,
+        'worker_health': worker_health,
+        'startup_self_check': startup,
+        'account_truth': {
+            'balance_ok': bool(account_truth.get('balance_ok')),
+            'balance_error': account_truth.get('balance_error'),
+            'cash_usd': float(account_truth.get('cash_usd', 0.0) or 0.0),
+            'equity_usd': float(account_truth.get('equity_usd', 0.0) or 0.0),
+            'utilization_pct': float(account_truth.get('utilization_pct', 0.0) or 0.0),
+            'open_order_count': int(account_truth.get('open_order_count', 0) or 0),
+            'positions_count': int(account_truth.get('positions_count', 0) or 0),
+        },
+        'recovery_reconcile': {
+            'ok': bool(reconcile.get('ok')),
+            'broker_open_orders_ok': bool(reconcile.get('broker_open_orders_ok')),
+            'broker_open_order_count': int(reconcile.get('broker_open_order_count', 0) or 0),
+            'orphan_broker_order_count': int(reconcile.get('orphan_broker_order_count', 0) or 0),
+            'orphan_internal_intent_count': int(reconcile.get('orphan_internal_intent_count', 0) or 0),
+            'stale_pending_exit_count': int(reconcile.get('stale_pending_exit_count', 0) or 0),
+        },
+        'ops_risk': {
+            'ops_lockout_remaining_sec': ops_remaining,
+            'ops_lockout_reason': str(getattr(state, 'last_ops_lock_reason', '') or ''),
+        },
+        'settings': {
+            'pretrade_require_startup_self_check_ok': bool(getattr(settings, 'pretrade_require_startup_self_check_ok', True)),
+            'pretrade_block_on_worker_stale': bool(getattr(settings, 'pretrade_block_on_worker_stale', True)),
+            'pretrade_block_on_balance_error': bool(getattr(settings, 'pretrade_block_on_balance_error', True)),
+            'pretrade_block_on_reconcile_anomaly': bool(getattr(settings, 'pretrade_block_on_reconcile_anomaly', True)),
+        },
+    }
+
 def _maybe_reconcile_state_before_entry() -> dict | None:
     if not bool(getattr(settings, 'auto_reconcile_state_on_entry', True)):
         return None
@@ -2043,6 +2125,11 @@ def _execute_long_entry(
     ops_remaining = int(state.ops_lockout_remaining_sec() if hasattr(state, 'ops_lockout_remaining_sec') else 0)
     if ops_remaining > 0:
         return ignored('ops_risk_lockout_active', symbol=symbol, strategy=strategy, remaining_sec=ops_remaining, lock_reason=getattr(state, 'last_ops_lock_reason', ''))
+
+    pretrade_gate = _pretrade_health_gate_summary(rerun_startup_check=False)
+    if not bool(pretrade_gate.get('gate_open')):
+        violations = list(pretrade_gate.get('violations') or [])
+        return ignored(str(violations[0] if violations else 'pretrade_health_gate_closed'), symbol=symbol, strategy=strategy, pretrade_health_gate=pretrade_gate, reconcile=reconcile_meta)
 
     risk_admission = _risk_admission_check(symbol=symbol, strategy=strategy, px=float(px), stop_price=float(stop_price), take_price=float(take_price), account_truth=account_truth)
     if not bool(risk_admission.get('ok')):
@@ -3407,6 +3494,15 @@ def diagnostics_order_intents(limit: int = 50, state_filter: str | None = None):
         "ok": True,
         "utc": utc_now_iso(),
         "items": lifecycle_db.list_rows("order_intents", limit=limit, where=where, args=args, order_by="updated_ts DESC"),
+    }
+
+
+@app.get("/diagnostics/pretrade_health_gate")
+def diagnostics_pretrade_health_gate(rerun_startup_check: int = 0):
+    return {
+        "ok": True,
+        "utc": utc_now_iso(),
+        "pretrade_health_gate": _pretrade_health_gate_summary(rerun_startup_check=bool(int(rerun_startup_check or 0))),
     }
 
 

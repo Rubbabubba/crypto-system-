@@ -274,6 +274,13 @@ def load_settings() -> Settings:
         startup_max_orphan_internal_intents=int(float(_getenv("STARTUP_MAX_ORPHAN_INTERNAL_INTENTS", "0") or 0)),
         startup_max_stale_pending_exits=int(float(_getenv("STARTUP_MAX_STALE_PENDING_EXITS", "0") or 0)),
 
+        # Pre-trade health gate
+        pretrade_health_gate_enabled=_getbool("PRETRADE_HEALTH_GATE_ENABLED", "1"),
+        pretrade_require_startup_self_check_ok=_getbool("PRETRADE_REQUIRE_STARTUP_SELF_CHECK_OK", "1"),
+        pretrade_block_on_worker_stale=_getbool("PRETRADE_BLOCK_ON_WORKER_STALE", "1"),
+        pretrade_block_on_balance_error=_getbool("PRETRADE_BLOCK_ON_BALANCE_ERROR", "1"),
+        pretrade_block_on_reconcile_anomaly=_getbool("PRETRADE_BLOCK_ON_RECONCILE_ANOMALY", "1"),
+
         # Broker-truth account guardrails
         require_broker_balance_ok_for_entry=_getbool("REQUIRE_BROKER_BALANCE_OK_FOR_ENTRY", "1"),
         min_cash_buffer_usd=float(_getenv("MIN_CASH_BUFFER_USD", "25") or 25),
