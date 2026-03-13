@@ -97,6 +97,102 @@ try:
 except Exception:
     pass
 
+STARTUP_SELF_CHECK_RESULT: dict[str, Any] = {}
+STARTUP_SELF_CHECK_TS: float = 0.0
+
+
+def _startup_self_check(*, rerun: bool = False, apply: bool | None = None) -> dict:
+    global STARTUP_SELF_CHECK_RESULT, STARTUP_SELF_CHECK_TS
+    if apply is None:
+        apply = bool(getattr(settings, 'startup_apply_reconcile', True))
+    if (not rerun) and STARTUP_SELF_CHECK_RESULT:
+        return dict(STARTUP_SELF_CHECK_RESULT)
+
+    enabled = bool(getattr(settings, 'startup_self_check_enabled', True))
+    if not enabled:
+        STARTUP_SELF_CHECK_TS = time.time()
+        STARTUP_SELF_CHECK_RESULT = {
+            'ok': True,
+            'utc': utc_now_iso(),
+            'enabled': False,
+            'apply_changes': False,
+            'critical': False,
+            'critical_reasons': [],
+            'lockout_applied': False,
+            'lockout_reason': '',
+            'recovery_reconcile': None,
+        }
+        return dict(STARTUP_SELF_CHECK_RESULT)
+
+    try:
+        recovery = _recovery_reconcile_summary(apply=bool(apply))
+        critical_reasons: list[str] = []
+        if not bool(recovery.get('ok')):
+            critical_reasons.append('recovery_reconcile_failed')
+        if not bool(recovery.get('broker_open_orders_ok', True)):
+            critical_reasons.append('broker_open_orders_unavailable')
+        if int(recovery.get('orphan_broker_order_count', 0) or 0) > int(getattr(settings, 'startup_max_orphan_broker_orders', 0) or 0):
+            critical_reasons.append('orphan_broker_orders_present')
+        if int(recovery.get('orphan_internal_intent_count', 0) or 0) > int(getattr(settings, 'startup_max_orphan_internal_intents', 0) or 0):
+            critical_reasons.append('orphan_internal_intents_present')
+        if int(recovery.get('stale_pending_exit_count', 0) or 0) > int(getattr(settings, 'startup_max_stale_pending_exits', 0) or 0):
+            critical_reasons.append('stale_pending_exits_present')
+
+        lockout_applied = False
+        lockout_reason = ''
+        if critical_reasons and bool(getattr(settings, 'startup_lockout_on_critical_reconcile', True)) and hasattr(state, 'set_ops_lockout'):
+            lockout_reason = 'startup_' + critical_reasons[0]
+            state.set_ops_lockout(lockout_reason, int(getattr(settings, 'startup_lockout_sec', 0) or 0))
+            lockout_applied = True
+            try:
+                lifecycle_db.record_anomaly('startup_self_check_lockout', 'error', details={
+                    'critical_reasons': critical_reasons,
+                    'recovery_reconcile': recovery,
+                })
+            except Exception:
+                pass
+
+        STARTUP_SELF_CHECK_TS = time.time()
+        STARTUP_SELF_CHECK_RESULT = {
+            'ok': len(critical_reasons) == 0,
+            'utc': utc_now_iso(),
+            'enabled': True,
+            'apply_changes': bool(apply),
+            'critical': len(critical_reasons) > 0,
+            'critical_reasons': critical_reasons,
+            'lockout_applied': lockout_applied,
+            'lockout_reason': lockout_reason,
+            'lockout_remaining_sec': int(state.ops_lockout_remaining_sec() if hasattr(state, 'ops_lockout_remaining_sec') else 0),
+            'recovery_reconcile': recovery,
+        }
+    except Exception as e:
+        lockout_applied = False
+        lockout_reason = ''
+        if bool(getattr(settings, 'startup_lockout_on_critical_reconcile', True)) and hasattr(state, 'set_ops_lockout'):
+            lockout_reason = 'startup_self_check_exception'
+            state.set_ops_lockout(lockout_reason, int(getattr(settings, 'startup_lockout_sec', 0) or 0))
+            lockout_applied = True
+        STARTUP_SELF_CHECK_TS = time.time()
+        STARTUP_SELF_CHECK_RESULT = {
+            'ok': False,
+            'utc': utc_now_iso(),
+            'enabled': True,
+            'apply_changes': bool(apply),
+            'critical': True,
+            'critical_reasons': ['startup_self_check_exception'],
+            'lockout_applied': lockout_applied,
+            'lockout_reason': lockout_reason,
+            'lockout_remaining_sec': int(state.ops_lockout_remaining_sec() if hasattr(state, 'ops_lockout_remaining_sec') else 0),
+            'error': str(e),
+            'recovery_reconcile': None,
+        }
+    return dict(STARTUP_SELF_CHECK_RESULT)
+
+
+@app.on_event("startup")
+def _run_startup_self_check():
+    _startup_self_check(rerun=True)
+
 
 @app.middleware("http")
 async def _normalize_path_slashes(request: Request, call_next):
@@ -3239,6 +3335,7 @@ def diagnostics_runtime():
         "phase1_safety": _phase1_safety_report(),
         "state_model": _state_model_summary(),
         "execution_state": _execution_state_summary(),
+        "startup_self_check": _startup_self_check(rerun=False),
         "recovery_reconcile": _recovery_reconcile_summary(apply=False),
         "ops_risk": _ops_risk_snapshot(),
         "risk_admission": {
@@ -3310,6 +3407,16 @@ def diagnostics_order_intents(limit: int = 50, state_filter: str | None = None):
         "ok": True,
         "utc": utc_now_iso(),
         "items": lifecycle_db.list_rows("order_intents", limit=limit, where=where, args=args, order_by="updated_ts DESC"),
+    }
+
+
+@app.get("/diagnostics/startup_self_check")
+def diagnostics_startup_self_check(rerun: int = 0, apply: int = -1):
+    apply_flag = None if int(apply) < 0 else bool(int(apply or 0))
+    return {
+        "ok": True,
+        "utc": utc_now_iso(),
+        "startup_self_check": _startup_self_check(rerun=bool(int(rerun or 0)), apply=apply_flag),
     }
 
 

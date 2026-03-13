@@ -110,6 +110,15 @@ class Settings:
     max_consecutive_stopouts: int
     ops_lockout_sec: int
 
+    # Startup self-check / lockout
+    startup_self_check_enabled: bool
+    startup_apply_reconcile: bool
+    startup_lockout_on_critical_reconcile: bool
+    startup_lockout_sec: int
+    startup_max_orphan_broker_orders: int
+    startup_max_orphan_internal_intents: int
+    startup_max_stale_pending_exits: int
+
     # Broker-truth account guardrails
     require_broker_balance_ok_for_entry: bool
     min_cash_buffer_usd: float
