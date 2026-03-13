@@ -144,14 +144,25 @@ def _record_blocked_trade(reason: str, **fields) -> None:
 
 # ---------- Entry engine (optional; replaces TradingView) ----------
 ENTRY_ENGINE_ENABLED = (os.getenv("ENTRY_ENGINE_ENABLED", "1").strip().lower() in ("1", "true", "yes", "on"))
-ENTRY_ENGINE_STRATEGIES = {s.strip().lower() for s in os.getenv("ENTRY_ENGINE_STRATEGIES", "rb1,tc1").split(",") if s.strip()}
+ENTRY_ENGINE_STRATEGIES_LIST = [s.strip().lower() for s in os.getenv("ENTRY_ENGINE_STRATEGIES", "rb1,tc1").split(",") if s.strip()]
+ENTRY_ENGINE_STRATEGIES = set(ENTRY_ENGINE_STRATEGIES_LIST)
 ENTRY_ENGINE_TIMEFRAME = os.getenv("ENTRY_ENGINE_TIMEFRAME", "5Min").strip() or "5Min"   # must match broker get_bars
 ENTRY_ENGINE_LIMIT_BARS = int(float(os.getenv("ENTRY_ENGINE_LIMIT_BARS", "300") or 300))
 
-# Strategy enablement (legacy strategies RB1/TC1 are always available)
-STRATEGY_MODE = (os.getenv("STRATEGY_MODE", "auto") or "auto").strip().lower()  # auto|legacy
+# Strategy enablement / mode
+# fixed: only consider strategies listed in ENTRY_ENGINE_STRATEGIES, preserving env order
+# auto:  preserve legacy preference ordering across eligible strategies
+# legacy: rb1/tc1 only, old preference behavior
+STRATEGY_MODE = (os.getenv("STRATEGY_MODE", "auto") or "auto").strip().lower()  # fixed|auto|legacy
+ENABLE_RB1 = (os.getenv("ENABLE_RB1", "1").strip().lower() in ("1", "true", "yes", "on"))
+ENABLE_TC1 = (os.getenv("ENABLE_TC1", "1").strip().lower() in ("1", "true", "yes", "on"))
 ENABLE_CR1 = (os.getenv("ENABLE_CR1", "0").strip().lower() in ("1", "true", "yes", "on"))
 ENABLE_MM1 = (os.getenv("ENABLE_MM1", "0").strip().lower() in ("1", "true", "yes", "on"))
+_ALLOWED_STRATEGY_NAMES = ("rb1", "tc1", "cr1", "mm1")
+if not ENTRY_ENGINE_STRATEGIES_LIST:
+    ENTRY_ENGINE_STRATEGIES_LIST = ["rb1", "tc1"]
+ENTRY_ENGINE_STRATEGIES_LIST = [s for s in ENTRY_ENGINE_STRATEGIES_LIST if s in _ALLOWED_STRATEGY_NAMES]
+ENTRY_ENGINE_STRATEGIES = set(ENTRY_ENGINE_STRATEGIES_LIST)
 
 # Regime filter (benchmark is typically BTC/USD)
 REGIME_FILTER_ENABLED = (os.getenv("REGIME_FILTER_ENABLED", "1").strip().lower() in ("1", "true", "yes", "on"))
@@ -1031,6 +1042,50 @@ def _scanner_refresh() -> None:
         _SCANNER_CACHE["last_error"] = str(e)
 
 
+def _phase1_safety_report() -> Dict[str, Any]:
+    strategy_mode_ok = STRATEGY_MODE == "fixed"
+    strategy_count = len(ENTRY_ENGINE_STRATEGIES_LIST)
+    allowed_symbols_sorted = sorted(list(ALLOWED_SYMBOLS))
+    active_strategy_flags = {
+        "rb1": bool(ENABLE_RB1),
+        "tc1": bool(ENABLE_TC1),
+        "cr1": bool(ENABLE_CR1),
+        "mm1": bool(ENABLE_MM1),
+    }
+    active_enabled = [k for k, v in active_strategy_flags.items() if v]
+
+    checks = {
+        "allowed_symbols_locked": allowed_symbols_sorted == ["BTC/USD", "ETH/USD"],
+        "filter_universe_by_allowed_symbols": bool(FILTER_UNIVERSE_BY_ALLOWED_SYMBOLS),
+        "scanner_new_symbols_disabled": not (os.getenv("ALLOW_SCANNER_NEW_SYMBOLS", "0").strip().lower() in ("1", "true", "yes", "on")),
+        "scanner_driven_universe_disabled": not bool(SCANNER_DRIVEN_UNIVERSE),
+        "scanner_soft_allow_disabled": not bool(SCANNER_SOFT_ALLOW),
+        "strategy_mode_fixed": strategy_mode_ok,
+        "single_strategy_requested": strategy_count == 1,
+        "single_strategy_enabled": len(active_enabled) == 1,
+        "mm1_disabled": not bool(ENABLE_MM1),
+        "max_open_positions_safe": int(MAX_OPEN_POSITIONS) <= 1,
+        "max_entries_per_day_safe": int(MAX_ENTRIES_PER_DAY) <= 3,
+    }
+    violations = [k for k, v in checks.items() if not v]
+    return {
+        "ok": len(violations) == 0,
+        "checks": checks,
+        "violations": violations,
+        "details": {
+            "allowed_symbols": allowed_symbols_sorted,
+            "entry_engine_strategies": ENTRY_ENGINE_STRATEGIES_LIST,
+            "strategy_mode": STRATEGY_MODE,
+            "enabled_strategies": active_enabled,
+            "scanner_driven_universe": bool(SCANNER_DRIVEN_UNIVERSE),
+            "scanner_soft_allow": bool(SCANNER_SOFT_ALLOW),
+            "filter_universe_by_allowed_symbols": bool(FILTER_UNIVERSE_BY_ALLOWED_SYMBOLS),
+            "max_open_positions": int(MAX_OPEN_POSITIONS),
+            "max_entries_per_day": int(MAX_ENTRIES_PER_DAY),
+        },
+    }
+
+
 def _symbol_allowed_by_scanner(symbol: str) -> tuple[bool, str, Dict[str, Any]]:
     """
     Returns (allowed, reason, meta)
@@ -1617,6 +1672,8 @@ def _execute_long_entry(
     sym_exposure = 0.0
 
     sizing_mode = str(getattr(settings, "sizing_mode", "fixed") or "fixed").strip().lower()
+    if sizing_mode == "risk_pct":
+        sizing_mode = "risk_pct_equity"
 
     if max_total or max_symbol or (notional is None and sizing_mode in ("risk_pct_equity", "equity_fraction")):
         positions = get_positions()
@@ -2433,24 +2490,30 @@ def _entry_signals_for_symbol(symbol: str, *, regime_quiet: bool) -> tuple[dict,
     signals: dict = {}
     debug: dict = {}
 
-    rb1_fired, rb1_meta = _rb1_long_signal(symbol)
-    signals["rb1"] = bool(rb1_fired)
-    debug["rb1"] = rb1_meta
+    wants_rb1 = ENABLE_RB1 and (STRATEGY_MODE != "fixed" or "rb1" in ENTRY_ENGINE_STRATEGIES)
+    wants_tc1 = ENABLE_TC1 and (STRATEGY_MODE != "fixed" or "tc1" in ENTRY_ENGINE_STRATEGIES)
+    wants_cr1 = ENABLE_CR1 and (STRATEGY_MODE != "fixed" or "cr1" in ENTRY_ENGINE_STRATEGIES)
+    wants_mm1 = ENABLE_MM1 and (STRATEGY_MODE != "fixed" or "mm1" in ENTRY_ENGINE_STRATEGIES)
 
-    tc1_fired, tc1_meta = _tc1_long_signal(symbol)
-    signals["tc1"] = bool(tc1_fired)
-    debug["tc1"] = tc1_meta
+    if wants_rb1:
+        rb1_fired, rb1_meta = _rb1_long_signal(symbol)
+        signals["rb1"] = bool(rb1_fired)
+        debug["rb1"] = rb1_meta
 
-    # Optional strategies for quiet / choppy regimes
-    if STRATEGY_MODE != "legacy" and regime_quiet:
-        if ENABLE_CR1:
-            cr1_fired, cr1_meta = _signal_cr1(symbol)
-            signals["cr1"] = bool(cr1_fired)
-            debug["cr1"] = cr1_meta
-        if ENABLE_MM1:
-            mm1_fired, mm1_meta = _signal_mm1(symbol)
-            signals["mm1"] = bool(mm1_fired)
-            debug["mm1"] = mm1_meta
+    if wants_tc1:
+        tc1_fired, tc1_meta = _tc1_long_signal(symbol)
+        signals["tc1"] = bool(tc1_fired)
+        debug["tc1"] = tc1_meta
+
+    # Optional strategies for quiet / choppy regimes unless fixed mode explicitly requests them.
+    if wants_cr1 and (STRATEGY_MODE == "fixed" or (STRATEGY_MODE != "legacy" and regime_quiet)):
+        cr1_fired, cr1_meta = _signal_cr1(symbol)
+        signals["cr1"] = bool(cr1_fired)
+        debug["cr1"] = cr1_meta
+    if wants_mm1 and (STRATEGY_MODE == "fixed" or (STRATEGY_MODE != "legacy" and regime_quiet)):
+        mm1_fired, mm1_meta = _signal_mm1(symbol)
+        signals["mm1"] = bool(mm1_fired)
+        debug["mm1"] = mm1_meta
 
     return signals, debug
 
@@ -2703,7 +2766,18 @@ def diagnostics_runtime():
         "positions_count": len(positions),
         "positions": positions,
         "last_balance_error": _last_balance_error(),
+        "phase1_safety": _phase1_safety_report(),
     }
+
+@app.get("/diagnostics/phase1_safety")
+def diagnostics_phase1_safety():
+    rep = _phase1_safety_report()
+    return {
+        "ok": True,
+        "utc": utc_now_iso(),
+        "phase1_safety": rep,
+    }
+
 
 @app.get("/diagnostics/last_scan")
 def diagnostics_last_scan():
@@ -2854,9 +2928,18 @@ def scan_entries(payload: WorkerScanPayload):
             continue
 
         # Strategy preference:
-        # - In quiet regime, prefer MM1/CR1 over RB1/TC1 (more frequent, inventory-aware)
-        # - Otherwise, prefer RB1 over TC1 when both fire
-        if STRATEGY_MODE != "legacy" and bool(regime_quiet):
+        # - fixed: preserve ENTRY_ENGINE_STRATEGIES env order and ignore all others
+        # - auto: in quiet regime, prefer MM1/CR1 over RB1/TC1; otherwise RB1 over TC1
+        # - legacy: RB1 over TC1 only
+        if STRATEGY_MODE == "fixed":
+            strategy = None
+            for s in ENTRY_ENGINE_STRATEGIES_LIST:
+                if fired.get(s):
+                    strategy = s
+                    break
+            if not strategy:
+                strategy = fired_strats[0]
+        elif STRATEGY_MODE != "legacy" and bool(regime_quiet):
             if fired.get("mm1"):
                 strategy = "mm1"
             elif fired.get("cr1"):
@@ -3014,6 +3097,12 @@ def scan_entries(payload: WorkerScanPayload):
                 "universe_usd_only": UNIVERSE_USD_ONLY,
                 "prefer_usd_for_stables": UNIVERSE_PREFER_USD_FOR_STABLES,
                 "filter_universe_by_allowed_symbols": FILTER_UNIVERSE_BY_ALLOWED_SYMBOLS,
+                "strategy_mode": STRATEGY_MODE,
+                "entry_engine_strategies": ENTRY_ENGINE_STRATEGIES_LIST,
+                "enable_rb1": ENABLE_RB1,
+                "enable_tc1": ENABLE_TC1,
+                "enable_cr1": ENABLE_CR1,
+                "enable_mm1": ENABLE_MM1,
                 "max_open_positions": MAX_OPEN_POSITIONS,
                 "max_entries_per_scan": MAX_ENTRIES_PER_SCAN,
                 "max_entries_per_day": MAX_ENTRIES_PER_DAY,

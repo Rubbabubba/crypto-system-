@@ -37,7 +37,7 @@ class Settings:
     exit_min_notional_usd: float
 
     # Sizing
-    sizing_mode: str  # 'fixed', 'equity_fraction', or 'risk_pct_equity'
+    sizing_mode: str  # 'fixed', 'equity_fraction', 'risk_pct', or 'risk_pct_equity'
     risk_per_trade: float
     equity_fraction_per_trade: float
     max_notional_usd: float  # 0 disables
@@ -45,7 +45,7 @@ class Settings:
 
 
     # Execution (fees)
-    execution_mode: str  # 'market' or 'maker_first'
+    execution_mode: str  # 'market', 'maker_first', or 'limit_aggressive'
     post_only_offset_pct: float
     limit_chase_sec: int
     limit_chase_steps: int
@@ -154,6 +154,14 @@ class Settings:
 
 
 def load_settings() -> Settings:
+    sizing_mode = (_getenv("SIZING_MODE", "fixed").strip().lower() or "fixed")
+    if sizing_mode == "risk_pct":
+        sizing_mode = "risk_pct_equity"
+
+    execution_mode = (_getenv("EXECUTION_MODE", "market").strip().lower() or "market")
+    if execution_mode == "limit_aggressive":
+        execution_mode = "limit_aggressive"
+
     return Settings(
         # Security
         webhook_secret=_getenv("WEBHOOK_SECRET", ""),
@@ -168,7 +176,7 @@ def load_settings() -> Settings:
         min_order_notional_usd=float(_getenv("MIN_ORDER_NOTIONAL_USD", "5") or 5),
         exit_min_notional_usd=float(_getenv("EXIT_MIN_NOTIONAL_USD", "6") or 6),
         # Sizing
-        sizing_mode=_getenv("SIZING_MODE", "fixed").strip().lower() or "fixed",
+        sizing_mode=sizing_mode,
         risk_per_trade=float(_getenv("RISK_PER_TRADE", "0.03") or 0.03),
         equity_fraction_per_trade=float(_getenv("EQUITY_FRACTION_PER_TRADE", "0.05") or 0.05),
         max_notional_usd=float(_getenv("MAX_NOTIONAL_USD", "0") or 0),
@@ -176,7 +184,7 @@ def load_settings() -> Settings:
 
 
         # Execution (fees)
-        execution_mode=_getenv("EXECUTION_MODE", "market").strip().lower() or "market",
+        execution_mode=execution_mode,
         post_only_offset_pct=float(_getenv("POST_ONLY_OFFSET_PCT", "0.0002") or 0.0002),
         limit_chase_sec=int(float(_getenv("LIMIT_CHASE_SEC", "10") or 10)),
         limit_chase_steps=int(float(_getenv("LIMIT_CHASE_STEPS", "1") or 1)),

@@ -1072,6 +1072,10 @@ def market_notional(
     
     exec_mode = (str(exec_mode_override).strip().lower() if exec_mode_override is not None else (os.getenv("EXECUTION_MODE", "market") or "market").strip().lower())
     post_offset = float(post_offset_override) if post_offset_override is not None else float(os.getenv("POST_ONLY_OFFSET_PCT", "0.0002") or 0.0002)
+    if exec_mode == "limit_aggressive":
+        exec_mode = "maker_first"
+        if post_offset_override is None:
+            post_offset = 0.0
     chase_sec = int(chase_sec_override) if chase_sec_override is not None else int(float(os.getenv("LIMIT_CHASE_SEC", "10") or 10))
     chase_steps = int(chase_steps_override) if chase_steps_override is not None else int(float(os.getenv("LIMIT_CHASE_STEPS", "1") or 1))
     if market_fallback_override is not None:
