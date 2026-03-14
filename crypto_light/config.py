@@ -126,6 +126,18 @@ class Settings:
     pretrade_block_on_balance_error: bool
     pretrade_block_on_reconcile_anomaly: bool
 
+    # Live validation / telemetry
+    live_validation_mode: bool
+    live_validation_require_scanner_ok: bool
+    promotion_enable_eth_after_clean_trades: int
+    promotion_enable_size_up_after_clean_trades: int
+    telemetry_db_path: str
+    telemetry_max_recent_trades: int
+    expected_slippage_bps: float
+    max_realized_slippage_bps_alert: float
+    max_entry_fee_bps_alert: float
+    max_exit_fee_bps_alert: float
+
     # Broker-truth account guardrails
     require_broker_balance_ok_for_entry: bool
     min_cash_buffer_usd: float
@@ -287,6 +299,18 @@ def load_settings() -> Settings:
         pretrade_block_on_worker_stale=_getbool("PRETRADE_BLOCK_ON_WORKER_STALE", "1"),
         pretrade_block_on_balance_error=_getbool("PRETRADE_BLOCK_ON_BALANCE_ERROR", "1"),
         pretrade_block_on_reconcile_anomaly=_getbool("PRETRADE_BLOCK_ON_RECONCILE_ANOMALY", "1"),
+
+        # Live validation / telemetry
+        live_validation_mode=_getbool("LIVE_VALIDATION_MODE", "1"),
+        live_validation_require_scanner_ok=_getbool("LIVE_VALIDATION_REQUIRE_SCANNER_OK", "0"),
+        promotion_enable_eth_after_clean_trades=int(float(_getenv("PROMOTION_ENABLE_ETH_AFTER_CLEAN_TRADES", "10") or 10)),
+        promotion_enable_size_up_after_clean_trades=int(float(_getenv("PROMOTION_ENABLE_SIZE_UP_AFTER_CLEAN_TRADES", "30") or 30)),
+        telemetry_db_path=_getenv("TELEMETRY_DB_PATH", "/var/data/telemetry.sqlite3"),
+        telemetry_max_recent_trades=int(float(_getenv("TELEMETRY_MAX_RECENT_TRADES", "100") or 100)),
+        expected_slippage_bps=float(_getenv("EXPECTED_SLIPPAGE_BPS", _getenv("SLIPPAGE_BPS", "8")) or 8),
+        max_realized_slippage_bps_alert=float(_getenv("MAX_REALIZED_SLIPPAGE_BPS_ALERT", "35") or 35),
+        max_entry_fee_bps_alert=float(_getenv("MAX_ENTRY_FEE_BPS_ALERT", "40") or 40),
+        max_exit_fee_bps_alert=float(_getenv("MAX_EXIT_FEE_BPS_ALERT", "40") or 40),
 
         # Broker-truth account guardrails
         require_broker_balance_ok_for_entry=_getbool("REQUIRE_BROKER_BALANCE_OK_FOR_ENTRY", "1"),

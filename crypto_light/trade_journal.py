@@ -209,6 +209,15 @@ def close_trade(symbol: str, exit_data: Dict[str, Any]) -> Dict[str, Any]:
         hold_sec = max(0.0, float(closed_ts) - float(o.get("opened_ts") or 0.0)) if o.get("opened_ts") else None
         meta = exit_data.get("meta") or {}
         meta = dict(meta)
+        open_meta = {}
+        try:
+            open_meta = json.loads(o.get("meta_json") or "{}")
+            if not isinstance(open_meta, dict):
+                open_meta = {}
+        except Exception:
+            open_meta = {}
+        if open_meta:
+            meta["entry_context"] = open_meta
         meta["partial_close"] = bool(close_ratio < 0.999)
         meta["close_ratio"] = float(close_ratio)
         row = {
