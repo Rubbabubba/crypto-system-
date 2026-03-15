@@ -8,6 +8,11 @@ from typing import Any, Dict, List, Optional
 
 DEFAULT_DB_PATH = "/var/data/lifecycle.sqlite3"
 
+OPENISH_TRADE_PLAN_STATUSES = {'approved', 'submitted', 'active'}
+TERMINAL_TRADE_PLAN_STATUSES = {'closed', 'cancelled', 'rejected', 'failed', 'failed_reconcile', 'expired', 'abandoned'}
+OPENISH_ORDER_INTENT_STATES = {'created','validated','submitted','acknowledged','partial','replace_pending','cancel_pending','failed_reconcile'}
+
+
 
 def _db_path() -> str:
     return (os.getenv("LIFECYCLE_DB_PATH") or DEFAULT_DB_PATH).strip() or DEFAULT_DB_PATH
@@ -538,8 +543,14 @@ def summary() -> Dict[str, Any]:
             row = con.execute(q, args).fetchone()
             return dict(row) if row else {}
         plans_total = one('SELECT COUNT(*) AS n FROM trade_plans').get('n', 0)
-        plans_open = one("SELECT COUNT(*) AS n FROM trade_plans WHERE status IN ('approved','submitted','active')").get('n', 0)
-        intents_open = one("SELECT COUNT(*) AS n FROM order_intents WHERE state IN ('created','validated','submitted','acknowledged','partial','replace_pending','cancel_pending')").get('n', 0)
+        plans_open = one(
+            f"SELECT COUNT(*) AS n FROM trade_plans WHERE status IN ({','.join('?' for _ in OPENISH_TRADE_PLAN_STATUSES)}) AND closed_ts IS NULL",
+            tuple(sorted(OPENISH_TRADE_PLAN_STATUSES)),
+        ).get('n', 0)
+        intents_open = one(
+            f"SELECT COUNT(*) AS n FROM order_intents WHERE state IN ({','.join('?' for _ in OPENISH_ORDER_INTENT_STATES)})",
+            tuple(sorted(OPENISH_ORDER_INTENT_STATES)),
+        ).get('n', 0)
         positions_open = one("SELECT COUNT(*) AS n FROM position_ledger WHERE status = 'open'").get('n', 0)
         fills_total = one('SELECT COUNT(*) AS n FROM fill_events').get('n', 0)
         anomalies_open = one('SELECT COUNT(*) AS n FROM anomalies WHERE resolved_ts IS NULL').get('n', 0)
@@ -557,11 +568,32 @@ def summary() -> Dict[str, Any]:
         con.close()
 
 
+def list_openish_trade_plans(limit: int = 200) -> List[Dict[str, Any]]:
+    where = f"status IN ({','.join('?' for _ in OPENISH_TRADE_PLAN_STATUSES)}) AND closed_ts IS NULL"
+    return list_rows(
+        'trade_plans',
+        limit=limit,
+        where=where,
+        args=list(sorted(OPENISH_TRADE_PLAN_STATUSES)),
+        order_by='updated_ts DESC',
+    )
+
+
+def close_trade_plan(trade_plan_id: str, status: str = 'failed_reconcile', **fields: Any) -> None:
+    payload = dict(fields or {})
+    payload.setdefault('closed_ts', time.time())
+    if status in OPENISH_TRADE_PLAN_STATUSES and status not in TERMINAL_TRADE_PLAN_STATUSES:
+        status = 'failed_reconcile'
+    update_trade_plan_status(trade_plan_id, status, **payload)
+
+
 def list_openish_order_intents(limit: int = 200) -> List[Dict[str, Any]]:
+    where = f"state IN ({','.join('?' for _ in OPENISH_ORDER_INTENT_STATES)})"
     return list_rows(
         'order_intents',
         limit=limit,
-        where="state IN ('created','validated','submitted','acknowledged','partial','replace_pending','cancel_pending','failed_reconcile')",
+        where=where,
+        args=list(sorted(OPENISH_ORDER_INTENT_STATES)),
         order_by='updated_ts DESC',
     )
 

@@ -1581,6 +1581,7 @@ def _recovery_reconcile_summary(*, apply: bool = False) -> dict:
     live_syms = {p.get('symbol') for p in live_positions if p.get('symbol')}
     openish_states = {'created','validated','submitted','acknowledged','partial','replace_pending','cancel_pending','failed_reconcile'}
     openish_intents = lifecycle_db.list_openish_order_intents(limit=200)
+    openish_trade_plans = lifecycle_db.list_openish_trade_plans(limit=200)
     pending_exits = dict(getattr(state, 'pending_exits', {}) or {})
 
     broker_items = list(broker_open.get('items') or []) if broker_open.get('ok') else []
@@ -1645,6 +1646,38 @@ def _recovery_reconcile_summary(*, apply: bool = False) -> dict:
                 except Exception:
                     pass
 
+    orphan_trade_plans = []
+    closed_trade_plans = []
+    live_runtime_plan_syms = set((getattr(state, 'plans', {}) or {}).keys())
+    intent_plan_ids = {str(it.get('trade_plan_id') or '') for it in openish_intents if str(it.get('trade_plan_id') or '')}
+    now_ts = time.time()
+    orphan_plan_age_sec = max(int(ORDER_RECONCILE_TIMEOUT_SEC or 10) * 6, 120)
+    for tp in openish_trade_plans:
+        trade_plan_id = str(tp.get('trade_plan_id') or '')
+        sym = str(tp.get('symbol') or '')
+        status = str(tp.get('status') or '')
+        updated_ts = float(tp.get('updated_ts') or tp.get('created_ts') or 0.0)
+        age_sec = (now_ts - updated_ts) if updated_ts > 0 else None
+        has_open_intent = trade_plan_id in intent_plan_ids
+        has_live_position = bool(sym) and (sym in live_syms)
+        has_runtime_plan = bool(sym) and (sym in live_runtime_plan_syms)
+        is_orphan_plan = (not has_open_intent) and (not has_live_position) and (not has_runtime_plan)
+        if is_orphan_plan:
+            orphan_trade_plans.append({
+                'trade_plan_id': trade_plan_id,
+                'symbol': sym,
+                'status': status,
+                'updated_ts': updated_ts,
+                'age_sec': age_sec,
+            })
+            if apply and age_sec is not None and age_sec >= orphan_plan_age_sec and trade_plan_id:
+                try:
+                    lifecycle_db.close_trade_plan(trade_plan_id, 'failed_reconcile')
+                    lifecycle_db.record_anomaly('orphan_trade_plan', 'warn', symbol=sym or None, trade_plan_id=trade_plan_id, details={'previous_status': status, 'age_sec': age_sec})
+                    closed_trade_plans.append(trade_plan_id)
+                except Exception:
+                    pass
+
     stale_pending_exit_symbols = []
     cleared_pending_exit_symbols = []
     broker_sell_syms = {str(it.get('symbol') or '') for it in broker_items if str(it.get('side') or '').lower() == 'sell' and it.get('symbol')}
@@ -1675,14 +1708,19 @@ def _recovery_reconcile_summary(*, apply: bool = False) -> dict:
         'orphan_broker_order_count': len(orphan_broker_orders),
         'orphan_internal_intents': orphan_internal_intents,
         'orphan_internal_intent_count': len(orphan_internal_intents),
+        'orphan_trade_plans': orphan_trade_plans,
+        'orphan_trade_plan_count': len(orphan_trade_plans),
         'stale_pending_exit_symbols': stale_pending_exit_symbols,
         'stale_pending_exit_count': len(stale_pending_exit_symbols),
         'apply_changes': bool(apply),
         'applied': {
             'marked_failed_reconcile_intents': marked_failed,
+            'closed_orphan_trade_plans': closed_trade_plans,
             'cleared_pending_exit_symbols': cleared_pending_exit_symbols,
         },
     }
+
+
 def _reconcile_runtime_state() -> dict:
     positions = get_positions()
     live_syms = {p.get('symbol') for p in positions if p.get('symbol')}
@@ -3472,6 +3510,22 @@ def diagnostics_state_model_summary():
             "max_effective_stop_pct": float(getattr(settings, "max_effective_stop_pct", 0.0) or 0.0),
             "min_risk_reward_ratio": float(getattr(settings, "min_risk_reward_ratio", 0.0) or 0.0),
         },
+    }
+
+
+@app.get("/diagnostics/summary")
+def diagnostics_summary(limit: int = 25):
+    limit = max(1, min(int(limit), 200))
+    return {
+        "ok": True,
+        "utc": utc_now_iso(),
+        "summary": _state_model_summary(),
+        "execution_state": _execution_state_summary(),
+        "trade_plans": lifecycle_db.list_rows("trade_plans", limit=limit, order_by="updated_ts DESC"),
+        "order_intents": lifecycle_db.list_rows("order_intents", limit=limit, order_by="updated_ts DESC"),
+        "positions": lifecycle_db.list_rows("position_ledger", limit=limit, order_by="updated_ts DESC"),
+        "fills": lifecycle_db.list_rows("fill_events", limit=limit, order_by="created_ts DESC"),
+        "anomalies": lifecycle_db.unresolved_anomalies(limit=limit),
     }
 
 
