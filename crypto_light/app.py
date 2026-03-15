@@ -1691,6 +1691,37 @@ def _recovery_reconcile_summary(*, apply: bool = False) -> dict:
                 except Exception:
                     pass
 
+    resolved_anomaly_ids = []
+    resolved_anomaly_count = 0
+    if apply:
+        try:
+            unresolved = lifecycle_db.unresolved_anomalies(limit=500)
+        except Exception:
+            unresolved = []
+        for an in unresolved:
+            try:
+                kind = str(an.get('kind') or '')
+                aid = int(an.get('id') or 0)
+                if not aid:
+                    continue
+                if kind == 'orphan_trade_plan':
+                    tp_id = str(an.get('trade_plan_id') or '')
+                    tp = lifecycle_db.get_trade_plan(tp_id) if tp_id else None
+                    if (not tp) or tp.get('closed_ts') is not None or str(tp.get('status') or '') not in lifecycle_db.OPENISH_TRADE_PLAN_STATUSES:
+                        lifecycle_db.resolve_anomaly(aid)
+                        resolved_anomaly_ids.append(aid)
+                elif kind == 'orphan_internal_intent':
+                    iid = str(an.get('intent_id') or '')
+                    if iid:
+                        rows = lifecycle_db.list_rows('order_intents', limit=1, where='intent_id = ?', args=[iid], order_by='updated_ts DESC')
+                        it = rows[0] if rows else None
+                        if (not it) or str(it.get('state') or '') not in openish_states:
+                            lifecycle_db.resolve_anomaly(aid)
+                            resolved_anomaly_ids.append(aid)
+            except Exception:
+                pass
+        resolved_anomaly_count = len(resolved_anomaly_ids)
+
     if apply:
         for bo in orphan_broker_orders:
             try:
@@ -1717,6 +1748,8 @@ def _recovery_reconcile_summary(*, apply: bool = False) -> dict:
             'marked_failed_reconcile_intents': marked_failed,
             'closed_orphan_trade_plans': closed_trade_plans,
             'cleared_pending_exit_symbols': cleared_pending_exit_symbols,
+            'resolved_anomaly_ids': resolved_anomaly_ids,
+            'resolved_anomaly_count': resolved_anomaly_count,
         },
     }
 

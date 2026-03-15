@@ -524,6 +524,20 @@ def record_anomaly(kind: str, severity: str = 'warn', *, symbol: str | None = No
     ensure_schema()
     con = _connect()
     try:
+        if trade_plan_id:
+            row = con.execute(
+                'SELECT id FROM anomalies WHERE kind = ? AND trade_plan_id = ? AND resolved_ts IS NULL ORDER BY id DESC LIMIT 1',
+                (kind, trade_plan_id),
+            ).fetchone()
+            if row:
+                return int(row['id'] or 0)
+        if intent_id:
+            row = con.execute(
+                'SELECT id FROM anomalies WHERE kind = ? AND intent_id = ? AND resolved_ts IS NULL ORDER BY id DESC LIMIT 1',
+                (kind, intent_id),
+            ).fetchone()
+            if row:
+                return int(row['id'] or 0)
         cur = con.execute(
             """
             INSERT INTO anomalies(kind, severity, symbol, trade_plan_id, intent_id, details_json, created_ts, resolved_ts)
@@ -533,6 +547,38 @@ def record_anomaly(kind: str, severity: str = 'warn', *, symbol: str | None = No
         )
         con.commit()
         return int(cur.lastrowid or 0)
+    finally:
+        con.close()
+
+
+def get_trade_plan(trade_plan_id: str) -> Optional[Dict[str, Any]]:
+    rows = list_rows('trade_plans', limit=1, where='trade_plan_id = ?', args=[trade_plan_id], order_by='updated_ts DESC')
+    return rows[0] if rows else None
+
+
+def resolve_anomalies(*, kind: str | None = None, trade_plan_id: str | None = None,
+                     intent_id: str | None = None, symbol: str | None = None) -> int:
+    ensure_schema()
+    clauses = ['resolved_ts IS NULL']
+    args: List[Any] = []
+    if kind is not None:
+        clauses.append('kind = ?')
+        args.append(kind)
+    if trade_plan_id is not None:
+        clauses.append('trade_plan_id = ?')
+        args.append(trade_plan_id)
+    if intent_id is not None:
+        clauses.append('intent_id = ?')
+        args.append(intent_id)
+    if symbol is not None:
+        clauses.append('symbol = ?')
+        args.append(symbol)
+    where = ' AND '.join(clauses)
+    con = _connect()
+    try:
+        cur = con.execute(f'UPDATE anomalies SET resolved_ts = ? WHERE {where}', [time.time(), *args])
+        con.commit()
+        return int(cur.rowcount or 0)
     finally:
         con.close()
 
