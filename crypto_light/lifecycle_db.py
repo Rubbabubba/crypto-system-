@@ -177,7 +177,10 @@ def upsert_trade_plan(plan: Dict[str, Any]) -> None:
     payload.setdefault('status', 'created')
     payload.setdefault('created_ts', now)
     payload['updated_ts'] = now
-    payload.setdefault('risk_snapshot_json', _json(payload.get('risk_snapshot_json') or payload.get('risk_snapshot') or {}))
+    # Always coerce risk_snapshot_json to a TEXT payload for sqlite.
+    # setdefault() is not enough here because callers may pass an existing dict under
+    # risk_snapshot_json, which sqlite cannot bind directly.
+    payload['risk_snapshot_json'] = _json(payload.get('risk_snapshot_json') or payload.get('risk_snapshot') or {})
     con = _connect()
     try:
         con.execute(

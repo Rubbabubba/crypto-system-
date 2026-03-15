@@ -4,7 +4,6 @@ from . import trades_db
 from . import lifecycle_db
 from . import broker_kraken
 from . import trade_journal
-from . import telemetry_db
 from . import execution_state
 from .broker_kraken import trades_history
 
@@ -1983,7 +1982,7 @@ def _record_open_trade_journal(*, symbol: str, strategy: str, source: str, signa
         'requested_notional_usd': float(requested_notional_usd),
         'stop_price': float(stop_price),
         'take_price': float(take_price),
-        'meta': {'order_result': res, 'entry_ref_price': float(px_fallback or 0.0), 'requested_notional_usd': float(requested_notional_usd or 0.0)},
+        'meta': {'order_result': res},
     })
 
 
@@ -1998,12 +1997,8 @@ def _record_exit_trade_journal(*, symbol: str, reason: str, px_fallback: float, 
         'exit_cost': metrics.get('cost'),
         'exit_fee': metrics.get('fee'),
         'exit_reason': reason,
-        'meta': {'order_result': res, 'exit_ref_price': float(px_fallback or 0.0)},
+        'meta': {'order_result': res},
     })
-    try:
-        telemetry_db.sync_from_trade_journal(limit=max(200, int(getattr(settings, 'telemetry_max_recent_trades', 100) or 100)))
-    except Exception:
-        pass
     try:
         _journal_sync_daily_realized_pnl()
     except Exception:
@@ -3407,31 +3402,6 @@ def diagnostics_execution_state(limit: int = 50):
     }
 
 
-
-
-def _live_validation_summary() -> dict:
-    try:
-        return telemetry_db.live_validation_summary()
-    except Exception as e:
-        return {
-            'ok': False,
-            'error': str(e),
-            'mode_enabled': bool(getattr(settings, 'live_validation_mode', True)),
-            'require_scanner_ok': bool(getattr(settings, 'live_validation_require_scanner_ok', False)),
-        }
-
-
-def _trade_telemetry_summary(limit: int = 100) -> dict:
-    try:
-        telemetry_db.sync_from_trade_journal(limit=max(200, int(limit)))
-        return {
-            'ok': True,
-            'summary': telemetry_db.summary(days=30.0),
-            'recent_trades': telemetry_db.recent_trades(limit=min(max(1, int(limit)), 200)),
-        }
-    except Exception as e:
-        return {'ok': False, 'error': str(e), 'summary': {}, 'recent_trades': []}
-
 @app.get("/diagnostics/runtime")
 def diagnostics_runtime():
     positions = get_positions()
@@ -3455,7 +3425,6 @@ def diagnostics_runtime():
         "startup_self_check": _startup_self_check(rerun=False),
         "recovery_reconcile": _recovery_reconcile_summary(apply=False),
         "pretrade_health_gate": _pretrade_health_gate_summary(rerun_startup_check=False),
-        "live_validation": _live_validation_summary(),
         "ops_risk": _ops_risk_snapshot(),
         "risk_admission": {
             "sizing_mode": str(getattr(settings, "sizing_mode", "fixed") or "fixed"),
@@ -3537,28 +3506,6 @@ def diagnostics_pretrade_health_gate(rerun_startup_check: int = 0):
         "pretrade_health_gate": _pretrade_health_gate_summary(rerun_startup_check=bool(int(rerun_startup_check or 0))),
     }
 
-
-
-
-@app.get("/diagnostics/trade_telemetry")
-def diagnostics_trade_telemetry(limit: int = 100):
-    limit = max(1, min(int(limit), 200))
-    out = _trade_telemetry_summary(limit=limit)
-    return {
-        "ok": bool(out.get("ok", False)),
-        "utc": utc_now_iso(),
-        "trade_telemetry": out.get("summary", {}),
-        "recent_trades": out.get("recent_trades", []),
-    }
-
-
-@app.get("/diagnostics/live_validation")
-def diagnostics_live_validation():
-    return {
-        "ok": True,
-        "utc": utc_now_iso(),
-        "live_validation": _live_validation_summary(),
-    }
 
 @app.get("/diagnostics/startup_self_check")
 def diagnostics_startup_self_check(rerun: int = 0, apply: int = -1):
