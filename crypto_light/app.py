@@ -2261,6 +2261,9 @@ def _execute_long_entry(
     risk_snapshot = _risk_snapshot_for_entry(symbol=symbol, strategy=strategy, px=float(px), stop_price=float(stop_price), take_price=float(take_price), notional=float(_notional))
     risk_snapshot["risk_admission"] = risk_admission
     risk_snapshot["sizing"] = sizing_meta or {}
+    plan_created_ts = time.time()
+    plan_time_stop_sec = int(_strategy_max_hold_sec(strategy) or 0)
+    plan_expires_ts = plan_created_ts + float(plan_time_stop_sec if plan_time_stop_sec > 0 else 3600)
     lifecycle_db.upsert_trade_plan({
         "trade_plan_id": trade_plan_id,
         "symbol": symbol,
@@ -2272,11 +2275,14 @@ def _execute_long_entry(
         "entry_ref_price": float(px),
         "stop_price": float(stop_price),
         "target_price": float(take_price),
-        "time_stop_sec": _strategy_max_hold_sec(strategy),
+        "time_stop_sec": plan_time_stop_sec,
         "requested_notional_usd": float(_notional),
         "approved_notional_usd": float(_notional),
         "risk_snapshot_json": risk_snapshot,
         "legacy_symbol_key": symbol,
+        "created_ts": plan_created_ts,
+        "expires_ts": plan_expires_ts,
+        "closed_ts": None,
     })
     client_order_key = f"entry:{signal_key}:{symbol}:{strategy}"
     lifecycle_db.upsert_order_intent({

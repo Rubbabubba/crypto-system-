@@ -177,10 +177,28 @@ def upsert_trade_plan(plan: Dict[str, Any]) -> None:
     payload.setdefault('status', 'created')
     payload.setdefault('created_ts', now)
     payload['updated_ts'] = now
-    # Always coerce risk_snapshot_json to a TEXT payload for sqlite.
-    # setdefault() is not enough here because callers may pass an existing dict under
-    # risk_snapshot_json, which sqlite cannot bind directly.
-    payload['risk_snapshot_json'] = _json(payload.get('risk_snapshot_json') or payload.get('risk_snapshot') or {})
+    payload.setdefault('risk_snapshot_json', _json(payload.get('risk_snapshot_json') or payload.get('risk_snapshot') or {}))
+
+    # Make trade-plan persistence resilient when newer schema fields are missing
+    # from older callers. This prevents runtime failures during entry creation.
+    created_ts = payload.get('created_ts', now)
+    try:
+        created_ts_f = float(created_ts)
+    except Exception:
+        created_ts_f = now
+        payload['created_ts'] = now
+
+    time_stop_raw = payload.get('time_stop_sec', 0)
+    try:
+        time_stop_sec = int(float(time_stop_raw or 0))
+    except Exception:
+        time_stop_sec = 0
+
+    default_expiry = created_ts_f + float(time_stop_sec if time_stop_sec > 0 else 3600)
+    payload.setdefault('expires_ts', default_expiry)
+    payload.setdefault('closed_ts', None)
+    payload.setdefault('legacy_symbol_key', payload.get('symbol'))
+
     con = _connect()
     try:
         con.execute(
