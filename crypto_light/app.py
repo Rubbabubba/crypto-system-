@@ -2335,46 +2335,48 @@ def _execute_long_entry(
     plan_created_ts = time.time()
     plan_time_stop_sec = int(_strategy_max_hold_sec(strategy) or 0)
     plan_expires_ts = plan_created_ts + float(plan_time_stop_sec if plan_time_stop_sec > 0 else 3600)
-    lifecycle_db.upsert_trade_plan({
-        "trade_plan_id": trade_plan_id,
-        "symbol": symbol,
-        "strategy_id": strategy,
-        "signal_id": signal_key,
-        "status": "approved",
-        "direction": "buy",
-        "entry_mode": exec_mode_override or settings.execution_mode,
-        "entry_ref_price": float(px),
-        "stop_price": float(stop_price),
-        "target_price": float(take_price),
-        "time_stop_sec": plan_time_stop_sec,
-        "requested_notional_usd": float(_notional),
-        "approved_notional_usd": float(_notional),
-        "risk_snapshot_json": risk_snapshot,
-        "legacy_symbol_key": symbol,
-        "created_ts": plan_created_ts,
-        "expires_ts": plan_expires_ts,
-        "closed_ts": None,
-    })
     client_order_key = f"entry:{signal_key}:{symbol}:{strategy}"
-    lifecycle_db.upsert_order_intent({
-        "intent_id": intent_id,
-        "trade_plan_id": trade_plan_id,
-        "symbol": symbol,
-        "side": "buy",
-        "order_type": exec_mode_override or settings.execution_mode,
-        "strategy_id": strategy,
-        "state": "validated",
-        "desired_qty": (float(_notional) / float(px)) if float(px) > 0 else 0.0,
-        "desired_notional_usd": float(_notional),
-        "limit_price": float(px),
-        "client_order_key": client_order_key,
-        "raw_json": {"req_id": req_id, "source": source, "dry_run": dry_run},
-    })
+    lifecycle_db.create_entry_records_atomic(
+        {
+            "trade_plan_id": trade_plan_id,
+            "symbol": symbol,
+            "strategy_id": strategy,
+            "signal_id": signal_key,
+            "status": "submitted",
+            "direction": "buy",
+            "entry_mode": exec_mode_override or settings.execution_mode,
+            "entry_ref_price": float(px),
+            "stop_price": float(stop_price),
+            "target_price": float(take_price),
+            "time_stop_sec": plan_time_stop_sec,
+            "requested_notional_usd": float(_notional),
+            "approved_notional_usd": float(_notional),
+            "risk_snapshot_json": risk_snapshot,
+            "legacy_symbol_key": symbol,
+            "created_ts": plan_created_ts,
+            "expires_ts": plan_expires_ts,
+            "closed_ts": None,
+        },
+        {
+            "intent_id": intent_id,
+            "trade_plan_id": trade_plan_id,
+            "symbol": symbol,
+            "side": "buy",
+            "order_type": exec_mode_override or settings.execution_mode,
+            "strategy_id": strategy,
+            "state": "submitted",
+            "desired_qty": (float(_notional) / float(px)) if float(px) > 0 else 0.0,
+            "desired_notional_usd": float(_notional),
+            "limit_price": float(px),
+            "client_order_key": client_order_key,
+            "submitted_ts": time.time(),
+            "raw_json": {"req_id": req_id, "source": source, "dry_run": dry_run},
+        },
+    )
 
-    state.set_order_lock(entry_lock_key, meta={"symbol": symbol, "side": "buy", "strategy": strategy, "req_id": req_id, "trade_plan_id": trade_plan_id, "intent_id": intent_id})
-    lifecycle_db.transition_order_intent(intent_id, "submitted", client_order_key=client_order_key, submitted_ts=time.time())
-    lifecycle_db.update_trade_plan_status(trade_plan_id, "submitted")
-    res = _market_notional(
+    try:
+        state.set_order_lock(entry_lock_key, meta={"symbol": symbol, "side": "buy", "strategy": strategy, "req_id": req_id, "trade_plan_id": trade_plan_id, "intent_id": intent_id})
+        res = _market_notional(
         symbol=symbol,
         side="buy",
         notional=_notional,
@@ -2386,23 +2388,51 @@ def _execute_long_entry(
         chase_steps_override=chase_steps_override,
         market_fallback_override=market_fallback_override,
     )
+    except Exception as e:
+        try:
+            state.clear_order_lock(entry_lock_key)
+        except Exception:
+            pass
+        try:
+            lifecycle_db.transition_order_intent(
+                intent_id,
+                "failed_reconcile",
+                reject_reason=str(e),
+                last_broker_status="entry_exception_before_ack",
+                raw_json={"error": str(e), "symbol": symbol, "strategy": strategy, "stage": "entry_submit"},
+            )
+        except Exception:
+            pass
+        try:
+            lifecycle_db.close_trade_plan(trade_plan_id, "failed_reconcile")
+        except Exception:
+            pass
+        raise
+
     if not (res and res.get("ok")):
         state.clear_order_lock(entry_lock_key)
         classified = execution_state.classify_order_result(res or {})
-        next_state = classified.get("state") or "rejected"
+        next_state = str(classified.get("state") or "rejected")
+        terminal_plan_status = "rejected"
+        if next_state == "cancelled":
+            terminal_plan_status = "cancelled"
+        elif next_state == "failed_reconcile":
+            terminal_plan_status = "failed_reconcile"
+        elif next_state not in {"rejected", "cancelled"}:
+            terminal_plan_status = "failed"
         lifecycle_db.transition_order_intent(
             intent_id,
-            str(next_state),
+            next_state,
             broker_txid=classified.get("broker_txid"),
             filled_qty=classified.get("filled_qty"),
             avg_fill_price=classified.get("avg_fill_price"),
             fees_usd=classified.get("fees_usd"),
             reject_reason=str(classified.get("error") or (res or {}).get("error") or "order_failed"),
-            cancel_reason=str(classified.get("error") or "") if str(next_state) == "cancelled" else None,
+            cancel_reason=str(classified.get("error") or "") if next_state == "cancelled" else None,
             last_broker_status=str(classified.get("execution") or ""),
             raw_json=res or {},
         )
-        lifecycle_db.update_trade_plan_status(trade_plan_id, "rejected" if str(next_state) == "rejected" else "submitted")
+        lifecycle_db.close_trade_plan(trade_plan_id, terminal_plan_status)
         rej_count = state.note_entry_rejection() if hasattr(state, "note_entry_rejection") else 0
         if int(rej_count) >= int(getattr(settings, "max_consecutive_rejections", 0) or 0) and int(getattr(settings, "max_consecutive_rejections", 0) or 0) > 0 and hasattr(state, "set_ops_lockout"):
             state.set_ops_lockout("consecutive_entry_rejections", int(getattr(settings, "ops_lockout_sec", 0) or 0))

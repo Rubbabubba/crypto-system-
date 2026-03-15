@@ -194,8 +194,7 @@ def ensure_schema() -> str:
     return _db_path()
 
 
-def upsert_trade_plan(plan: Dict[str, Any]) -> None:
-    ensure_schema()
+def _prepare_trade_plan_payload(plan: Dict[str, Any]) -> Dict[str, Any]:
     now = time.time()
     payload = dict(plan or {})
     payload.setdefault('status', 'created')
@@ -203,8 +202,6 @@ def upsert_trade_plan(plan: Dict[str, Any]) -> None:
     payload['updated_ts'] = now
     payload.setdefault('risk_snapshot_json', _json(payload.get('risk_snapshot_json') or payload.get('risk_snapshot') or {}))
 
-    # Make trade-plan persistence resilient when newer schema fields are missing
-    # from older callers. This prevents runtime failures during entry creation.
     created_ts = payload.get('created_ts', now)
     try:
         created_ts_f = float(created_ts)
@@ -222,9 +219,6 @@ def upsert_trade_plan(plan: Dict[str, Any]) -> None:
     payload.setdefault('expires_ts', default_expiry)
     payload.setdefault('closed_ts', None)
     payload.setdefault('legacy_symbol_key', payload.get('symbol'))
-
-    # Defensive coercion for older callers and mixed payload shapes.
-    # This prevents sqlite binding errors when dict/list payloads leak through.
     payload['risk_snapshot_json'] = _json(payload.get('risk_snapshot_json') or payload.get('risk_snapshot') or {})
     for numeric_key in (
         'entry_ref_price', 'stop_price', 'target_price', 'requested_notional_usd',
@@ -244,43 +238,128 @@ def upsert_trade_plan(plan: Dict[str, Any]) -> None:
         payload['time_stop_sec'] = 0
     payload = _sanitize_payload(payload, json_fields={'risk_snapshot_json'})
     payload['risk_snapshot_json'] = _json(payload.get('risk_snapshot_json') if isinstance(payload.get('risk_snapshot_json'), (dict, list, tuple)) else payload.get('risk_snapshot_json') or {}) if not isinstance(payload.get('risk_snapshot_json'), str) else payload.get('risk_snapshot_json')
+    return payload
 
+
+def _execute_trade_plan_upsert(con: sqlite3.Connection, payload: Dict[str, Any]) -> None:
+    con.execute(
+        """
+        INSERT INTO trade_plans (
+            trade_plan_id, symbol, strategy_id, signal_id, status, direction, entry_mode,
+            entry_ref_price, stop_price, target_price, time_stop_sec,
+            requested_notional_usd, approved_notional_usd, risk_snapshot_json,
+            legacy_symbol_key, created_ts, updated_ts, expires_ts, closed_ts
+        ) VALUES (
+            :trade_plan_id, :symbol, :strategy_id, :signal_id, :status, :direction, :entry_mode,
+            :entry_ref_price, :stop_price, :target_price, :time_stop_sec,
+            :requested_notional_usd, :approved_notional_usd, :risk_snapshot_json,
+            :legacy_symbol_key, :created_ts, :updated_ts, :expires_ts, :closed_ts
+        )
+        ON CONFLICT(trade_plan_id) DO UPDATE SET
+            symbol=excluded.symbol,
+            strategy_id=excluded.strategy_id,
+            signal_id=excluded.signal_id,
+            status=excluded.status,
+            direction=excluded.direction,
+            entry_mode=excluded.entry_mode,
+            entry_ref_price=excluded.entry_ref_price,
+            stop_price=excluded.stop_price,
+            target_price=excluded.target_price,
+            time_stop_sec=excluded.time_stop_sec,
+            requested_notional_usd=excluded.requested_notional_usd,
+            approved_notional_usd=excluded.approved_notional_usd,
+            risk_snapshot_json=excluded.risk_snapshot_json,
+            legacy_symbol_key=excluded.legacy_symbol_key,
+            updated_ts=excluded.updated_ts,
+            expires_ts=excluded.expires_ts,
+            closed_ts=excluded.closed_ts
+        """,
+        payload,
+    )
+
+
+def _prepare_order_intent_payload(intent: Dict[str, Any]) -> Dict[str, Any]:
+    now = time.time()
+    payload = dict(intent or {})
+    payload.setdefault('state', 'created')
+    payload.setdefault('created_ts', now)
+    payload['updated_ts'] = now
+    payload.setdefault('retry_count', 0)
+    payload.setdefault('remaining_qty', payload.get('desired_qty'))
+    payload.setdefault('submitted_ts', now if str(payload.get('state') or '') in {'submitted','acknowledged','filled','partial','cancel_pending','cancelled','failed_reconcile'} else None)
+    payload.setdefault('acknowledged_ts', now if str(payload.get('state') or '') in {'acknowledged','filled','partial','cancel_pending','cancelled','failed_reconcile'} else None)
+    payload.setdefault('raw_json', _json(payload.get('raw_json') or payload))
+    payload = _sanitize_payload(payload, json_fields={'raw_json'})
+    return payload
+
+
+def _execute_order_intent_upsert(con: sqlite3.Connection, payload: Dict[str, Any]) -> None:
+    con.execute(
+        """
+        INSERT INTO order_intents (
+            intent_id, trade_plan_id, symbol, side, order_type, strategy_id, state,
+            desired_qty, desired_notional_usd, limit_price, broker_txid,
+            filled_qty, avg_fill_price, fees_usd, retry_count, reject_reason,
+            cancel_reason, client_order_key, last_broker_status, remaining_qty,
+            submitted_ts, acknowledged_ts, raw_json, created_ts, updated_ts
+        ) VALUES (
+            :intent_id, :trade_plan_id, :symbol, :side, :order_type, :strategy_id, :state,
+            :desired_qty, :desired_notional_usd, :limit_price, :broker_txid,
+            :filled_qty, :avg_fill_price, :fees_usd, :retry_count, :reject_reason,
+            :cancel_reason, :client_order_key, :last_broker_status, :remaining_qty,
+            :submitted_ts, :acknowledged_ts, :raw_json, :created_ts, :updated_ts
+        )
+        ON CONFLICT(intent_id) DO UPDATE SET
+            trade_plan_id=excluded.trade_plan_id,
+            symbol=excluded.symbol,
+            side=excluded.side,
+            order_type=excluded.order_type,
+            strategy_id=excluded.strategy_id,
+            state=excluded.state,
+            desired_qty=excluded.desired_qty,
+            desired_notional_usd=excluded.desired_notional_usd,
+            limit_price=excluded.limit_price,
+            broker_txid=excluded.broker_txid,
+            filled_qty=excluded.filled_qty,
+            avg_fill_price=excluded.avg_fill_price,
+            fees_usd=excluded.fees_usd,
+            retry_count=excluded.retry_count,
+            reject_reason=excluded.reject_reason,
+            cancel_reason=excluded.cancel_reason,
+            client_order_key=excluded.client_order_key,
+            last_broker_status=excluded.last_broker_status,
+            remaining_qty=excluded.remaining_qty,
+            submitted_ts=excluded.submitted_ts,
+            acknowledged_ts=excluded.acknowledged_ts,
+            raw_json=excluded.raw_json,
+            updated_ts=excluded.updated_ts
+        """,
+        payload,
+    )
+
+
+def create_entry_records_atomic(plan: Dict[str, Any], intent: Dict[str, Any]) -> None:
+    ensure_schema()
+    plan_payload = _prepare_trade_plan_payload(plan)
+    intent_payload = _prepare_order_intent_payload(intent)
     con = _connect()
     try:
-        con.execute(
-            """
-            INSERT INTO trade_plans (
-                trade_plan_id, symbol, strategy_id, signal_id, status, direction, entry_mode,
-                entry_ref_price, stop_price, target_price, time_stop_sec,
-                requested_notional_usd, approved_notional_usd, risk_snapshot_json,
-                legacy_symbol_key, created_ts, updated_ts, expires_ts, closed_ts
-            ) VALUES (
-                :trade_plan_id, :symbol, :strategy_id, :signal_id, :status, :direction, :entry_mode,
-                :entry_ref_price, :stop_price, :target_price, :time_stop_sec,
-                :requested_notional_usd, :approved_notional_usd, :risk_snapshot_json,
-                :legacy_symbol_key, :created_ts, :updated_ts, :expires_ts, :closed_ts
-            )
-            ON CONFLICT(trade_plan_id) DO UPDATE SET
-                symbol=excluded.symbol,
-                strategy_id=excluded.strategy_id,
-                signal_id=excluded.signal_id,
-                status=excluded.status,
-                direction=excluded.direction,
-                entry_mode=excluded.entry_mode,
-                entry_ref_price=excluded.entry_ref_price,
-                stop_price=excluded.stop_price,
-                target_price=excluded.target_price,
-                time_stop_sec=excluded.time_stop_sec,
-                requested_notional_usd=excluded.requested_notional_usd,
-                approved_notional_usd=excluded.approved_notional_usd,
-                risk_snapshot_json=excluded.risk_snapshot_json,
-                legacy_symbol_key=excluded.legacy_symbol_key,
-                updated_ts=excluded.updated_ts,
-                expires_ts=excluded.expires_ts,
-                closed_ts=excluded.closed_ts
-            """,
-            payload,
-        )
+        _execute_trade_plan_upsert(con, plan_payload)
+        _execute_order_intent_upsert(con, intent_payload)
+        con.commit()
+    except Exception:
+        con.rollback()
+        raise
+    finally:
+        con.close()
+
+
+def upsert_trade_plan(plan: Dict[str, Any]) -> None:
+    ensure_schema()
+    payload = _prepare_trade_plan_payload(plan)
+    con = _connect()
+    try:
+        _execute_trade_plan_upsert(con, payload)
         con.commit()
     finally:
         con.close()
@@ -314,61 +393,10 @@ def update_trade_plan_status(trade_plan_id: str, status: str, **fields: Any) -> 
 
 def upsert_order_intent(intent: Dict[str, Any]) -> None:
     ensure_schema()
-    now = time.time()
-    payload = dict(intent or {})
-    payload.setdefault('state', 'created')
-    payload.setdefault('created_ts', now)
-    payload['updated_ts'] = now
-    payload.setdefault('retry_count', 0)
-    payload.setdefault('remaining_qty', payload.get('desired_qty'))
-    payload.setdefault('submitted_ts', now if str(payload.get('state') or '') in {'submitted','acknowledged','filled','partial','cancel_pending','cancelled','failed_reconcile'} else None)
-    payload.setdefault('acknowledged_ts', now if str(payload.get('state') or '') in {'acknowledged','filled','partial','cancel_pending','cancelled','failed_reconcile'} else None)
-    payload.setdefault('raw_json', _json(payload.get('raw_json') or payload))
-    payload = _sanitize_payload(payload, json_fields={'raw_json'})
+    payload = _prepare_order_intent_payload(intent)
     con = _connect()
     try:
-        con.execute(
-            """
-            INSERT INTO order_intents (
-                intent_id, trade_plan_id, symbol, side, order_type, strategy_id, state,
-                desired_qty, desired_notional_usd, limit_price, broker_txid,
-                filled_qty, avg_fill_price, fees_usd, retry_count, reject_reason,
-                cancel_reason, client_order_key, last_broker_status, remaining_qty,
-                submitted_ts, acknowledged_ts, raw_json, created_ts, updated_ts
-            ) VALUES (
-                :intent_id, :trade_plan_id, :symbol, :side, :order_type, :strategy_id, :state,
-                :desired_qty, :desired_notional_usd, :limit_price, :broker_txid,
-                :filled_qty, :avg_fill_price, :fees_usd, :retry_count, :reject_reason,
-                :cancel_reason, :client_order_key, :last_broker_status, :remaining_qty,
-                :submitted_ts, :acknowledged_ts, :raw_json, :created_ts, :updated_ts
-            )
-            ON CONFLICT(intent_id) DO UPDATE SET
-                trade_plan_id=excluded.trade_plan_id,
-                symbol=excluded.symbol,
-                side=excluded.side,
-                order_type=excluded.order_type,
-                strategy_id=excluded.strategy_id,
-                state=excluded.state,
-                desired_qty=excluded.desired_qty,
-                desired_notional_usd=excluded.desired_notional_usd,
-                limit_price=excluded.limit_price,
-                broker_txid=excluded.broker_txid,
-                filled_qty=excluded.filled_qty,
-                avg_fill_price=excluded.avg_fill_price,
-                fees_usd=excluded.fees_usd,
-                retry_count=excluded.retry_count,
-                reject_reason=excluded.reject_reason,
-                cancel_reason=excluded.cancel_reason,
-                client_order_key=excluded.client_order_key,
-                last_broker_status=excluded.last_broker_status,
-                remaining_qty=excluded.remaining_qty,
-                submitted_ts=excluded.submitted_ts,
-                acknowledged_ts=excluded.acknowledged_ts,
-                raw_json=excluded.raw_json,
-                updated_ts=excluded.updated_ts
-            """,
-            payload,
-        )
+        _execute_order_intent_upsert(con, payload)
         con.commit()
     finally:
         con.close()
