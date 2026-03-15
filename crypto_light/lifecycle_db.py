@@ -83,7 +83,7 @@ def ensure_schema() -> str:
                 expires_ts REAL,
                 closed_ts REAL
             );
-            CREATE UNIQUE INDEX IF NOT EXISTS idx_trade_plans_legacy_symbol_key ON trade_plans(legacy_symbol_key);
+            CREATE INDEX IF NOT EXISTS idx_trade_plans_legacy_symbol_key ON trade_plans(legacy_symbol_key);
             CREATE INDEX IF NOT EXISTS idx_trade_plans_symbol_status ON trade_plans(symbol, status);
             CREATE INDEX IF NOT EXISTS idx_trade_plans_created_ts ON trade_plans(created_ts);
 
@@ -178,6 +178,8 @@ def ensure_schema() -> str:
             'expires_ts': 'REAL',
             'closed_ts': 'REAL',
         })
+        con.execute('DROP INDEX IF EXISTS idx_trade_plans_legacy_symbol_key')
+        con.execute('CREATE INDEX IF NOT EXISTS idx_trade_plans_legacy_symbol_key ON trade_plans(legacy_symbol_key)')
         _ensure_columns(con, 'order_intents', {
             'cancel_reason': 'TEXT',
             'client_order_key': 'TEXT',
@@ -220,7 +222,28 @@ def upsert_trade_plan(plan: Dict[str, Any]) -> None:
     payload.setdefault('expires_ts', default_expiry)
     payload.setdefault('closed_ts', None)
     payload.setdefault('legacy_symbol_key', payload.get('symbol'))
+
+    # Defensive coercion for older callers and mixed payload shapes.
+    # This prevents sqlite binding errors when dict/list payloads leak through.
+    payload['risk_snapshot_json'] = _json(payload.get('risk_snapshot_json') or payload.get('risk_snapshot') or {})
+    for numeric_key in (
+        'entry_ref_price', 'stop_price', 'target_price', 'requested_notional_usd',
+        'approved_notional_usd', 'created_ts', 'expires_ts', 'closed_ts'
+    ):
+        if numeric_key in payload and payload.get(numeric_key) is not None:
+            try:
+                payload[numeric_key] = float(payload.get(numeric_key))
+            except Exception:
+                if numeric_key in ('created_ts', 'expires_ts'):
+                    payload[numeric_key] = float(default_expiry if numeric_key == 'expires_ts' else created_ts_f)
+                else:
+                    payload[numeric_key] = None
+    try:
+        payload['time_stop_sec'] = int(float(payload.get('time_stop_sec') or 0))
+    except Exception:
+        payload['time_stop_sec'] = 0
     payload = _sanitize_payload(payload, json_fields={'risk_snapshot_json'})
+    payload['risk_snapshot_json'] = _json(payload.get('risk_snapshot_json') if isinstance(payload.get('risk_snapshot_json'), (dict, list, tuple)) else payload.get('risk_snapshot_json') or {}) if not isinstance(payload.get('risk_snapshot_json'), str) else payload.get('risk_snapshot_json')
 
     con = _connect()
     try:
@@ -276,6 +299,8 @@ def update_trade_plan_status(trade_plan_id: str, status: str, **fields: Any) -> 
         if k in allowed:
             sets.append(f"{k} = ?")
             if k == 'risk_snapshot_json' and not isinstance(v, str):
+                v = _json(v)
+            elif isinstance(v, (dict, list, tuple)):
                 v = _json(v)
             args.append(v)
     args.append(trade_plan_id)

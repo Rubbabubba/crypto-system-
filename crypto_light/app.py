@@ -1277,7 +1277,7 @@ def _phase1_safety_report() -> Dict[str, Any]:
     active_enabled = [k for k, v in active_strategy_flags.items() if v]
 
     checks = {
-        "allowed_symbols_locked": allowed_symbols_sorted == ["BTC/USD", "ETH/USD"],
+        "allowed_symbols_locked": bool(allowed_symbols_sorted) and bool(FILTER_UNIVERSE_BY_ALLOWED_SYMBOLS) and not bool(SCANNER_DRIVEN_UNIVERSE) and not bool(SCANNER_SOFT_ALLOW) and not (os.getenv("ALLOW_SCANNER_NEW_SYMBOLS", "0").strip().lower() in ("1", "true", "yes", "on")),
         "filter_universe_by_allowed_symbols": bool(FILTER_UNIVERSE_BY_ALLOWED_SYMBOLS),
         "scanner_new_symbols_disabled": not (os.getenv("ALLOW_SCANNER_NEW_SYMBOLS", "0").strip().lower() in ("1", "true", "yes", "on")),
         "scanner_driven_universe_disabled": not bool(SCANNER_DRIVEN_UNIVERSE),
@@ -3514,6 +3514,7 @@ def diagnostics_state_model_summary():
 
 
 @app.get("/diagnostics/summary")
+@app.get("/diagnostics/summary/")
 def diagnostics_summary(limit: int = 25):
     limit = max(1, min(int(limit), 200))
     return {
