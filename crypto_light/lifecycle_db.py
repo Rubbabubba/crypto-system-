@@ -28,6 +28,23 @@ def _json(x: Any) -> str:
         return "{}"
 
 
+def _sqlite_scalar(x: Any) -> Any:
+    if isinstance(x, (dict, list, tuple)):
+        return _json(x)
+    return x
+
+
+def _sanitize_payload(payload: Dict[str, Any], *, json_fields: Optional[set[str]] = None) -> Dict[str, Any]:
+    out: Dict[str, Any] = {}
+    jf = set(json_fields or set())
+    for k, v in dict(payload or {}).items():
+        if k in jf and not isinstance(v, str):
+            out[k] = _json(v)
+        else:
+            out[k] = _sqlite_scalar(v)
+    return out
+
+
 def _ensure_columns(con: sqlite3.Connection, table: str, cols: Dict[str, str]) -> None:
     existing = {r['name'] for r in con.execute(f"PRAGMA table_info({table})").fetchall()}
     for name, ddl in cols.items():
@@ -198,6 +215,7 @@ def upsert_trade_plan(plan: Dict[str, Any]) -> None:
     payload.setdefault('expires_ts', default_expiry)
     payload.setdefault('closed_ts', None)
     payload.setdefault('legacy_symbol_key', payload.get('symbol'))
+    payload = _sanitize_payload(payload, json_fields={'risk_snapshot_json'})
 
     con = _connect()
     try:
@@ -276,6 +294,7 @@ def upsert_order_intent(intent: Dict[str, Any]) -> None:
     payload.setdefault('submitted_ts', now if str(payload.get('state') or '') in {'submitted','acknowledged','filled','partial','cancel_pending','cancelled','failed_reconcile'} else None)
     payload.setdefault('acknowledged_ts', now if str(payload.get('state') or '') in {'acknowledged','filled','partial','cancel_pending','cancelled','failed_reconcile'} else None)
     payload.setdefault('raw_json', _json(payload.get('raw_json') or payload))
+    payload = _sanitize_payload(payload, json_fields={'raw_json'})
     con = _connect()
     try:
         con.execute(
@@ -407,6 +426,7 @@ def upsert_position_ledger(position: Dict[str, Any]) -> None:
     payload.setdefault('opened_ts', now)
     payload['updated_ts'] = now
     payload.setdefault('raw_json', _json(payload.get('raw_json') or payload))
+    payload = _sanitize_payload(payload, json_fields={'raw_json'})
     con = _connect()
     try:
         con.execute(
@@ -448,6 +468,7 @@ def insert_fill_event(fill: Dict[str, Any]) -> None:
     payload = dict(fill or {})
     payload.setdefault('created_ts', time.time())
     payload.setdefault('raw_json', _json(payload.get('raw_json') or fill))
+    payload = _sanitize_payload(payload, json_fields={'raw_json'})
     con = _connect()
     try:
         con.execute(
