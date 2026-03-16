@@ -13,6 +13,79 @@ TERMINAL_TRADE_PLAN_STATUSES = {'closed', 'cancelled', 'rejected', 'failed', 'fa
 OPENISH_ORDER_INTENT_STATES = {'created','validated','submitted','acknowledged','partial','replace_pending','cancel_pending'}
 ADMISSION_RESULT_FINAL = {'accepted', 'rejected', 'duplicate'}
 
+TERMINAL_REASON_ALIASES = {
+    'duplicate_signal_id': 'rejected_duplicate_signal',
+    'duplicate_signal_fingerprint': 'rejected_duplicate_signal',
+    'trading_disabled': 'rejected_trading_disabled',
+    'max_entries_per_day_reached': 'rejected_max_entries_per_day',
+    'global_entry_cooldown': 'rejected_global_entry_cooldown',
+    'max_daily_loss_reached': 'rejected_max_daily_loss',
+    'entry_cooldown': 'rejected_entry_cooldown',
+    'entry_failure_cooldown': 'rejected_cooldown_active',
+    'max_trades_per_symbol_per_day': 'rejected_max_trades_per_symbol_per_day',
+    'position_already_open': 'rejected_position_exists',
+    'open_position_exists': 'rejected_position_exists',
+    'entry_order_lock_active': 'rejected_order_lock_active',
+    'broker_open_buy_order_exists': 'rejected_broker_open_order_exists',
+    'active_workflow_lock': 'rejected_symbol_locked',
+    'open_trade_plan_exists': 'rejected_open_trade_plan_exists',
+    'open_order_intent_exists': 'rejected_open_intent_exists',
+    'broker_balance_unavailable': 'rejected_broker_balance_unavailable',
+    'ops_risk_lockout_active': 'rejected_ops_risk_lockout',
+    'spread_too_wide': 'rejected_spread_too_wide',
+    'scanner_symbol_not_allowed': 'rejected_scanner_symbol_not_allowed',
+    'signal_rejected_by_scanner': 'rejected_scanner_symbol_not_allowed',
+    'min_cash_buffer_breach': 'rejected_min_cash_buffer_breach',
+    'insufficient_cash_usd_estimate': 'rejected_insufficient_cash',
+    'risk_admission_reject': 'rejected_risk_admission',
+    'pretrade_health_gate_closed': 'rejected_pretrade_health_gate',
+    'submit_failed_pre_ack': 'submit_failed_pre_ack',
+    'broker_rejected': 'broker_rejected',
+    'intent_timeout': 'intent_timeout',
+    'reconcile_cleanup': 'reconcile_cleanup',
+    'reconcile_missing_broker_order': 'reconcile_cleanup',
+    'exit_order_failed': 'broker_rejected',
+    'insufficient funds': 'broker_rejected_insufficient_funds',
+    'insufficient_funds': 'broker_rejected_insufficient_funds',
+    'not enough': 'broker_rejected_insufficient_funds',
+    'post only': 'broker_rejected_post_only',
+    'post-only': 'broker_rejected_post_only',
+    'would take liquidity': 'broker_rejected_post_only',
+    'rate limit': 'broker_rejected_rate_limited',
+    'throttle': 'broker_rejected_rate_limited',
+    'timeout': 'intent_timeout',
+    'timed out': 'intent_timeout',
+    'cancelled': 'broker_cancelled',
+    'canceled': 'broker_cancelled',
+    'stop_loss': 'exit_stop_loss',
+    'take_profit': 'exit_take_profit',
+    'time_stop': 'exit_time_stop',
+}
+
+
+def normalize_terminal_reason(reason: str | None, *, default: str | None = None) -> str | None:
+    raw = str(reason or '').strip()
+    if not raw:
+        return default
+    if raw.startswith('rejected_') or raw.startswith('exit_') or raw.startswith('broker_') or raw in {'submit_failed_pre_ack', 'intent_timeout', 'reconcile_cleanup'}:
+        return raw
+    lowered = raw.lower()
+    if raw in TERMINAL_REASON_ALIASES:
+        return TERMINAL_REASON_ALIASES[raw]
+    if lowered in TERMINAL_REASON_ALIASES:
+        return TERMINAL_REASON_ALIASES[lowered]
+    for needle, normalized in TERMINAL_REASON_ALIASES.items():
+        if needle in lowered:
+            return normalized
+    return raw
+
+
+def _nonempty(v: Any) -> Any:
+    if v is None:
+        return None
+    s = str(v).strip()
+    return s or None
+
 
 def _db_path() -> str:
     return (os.getenv("LIFECYCLE_DB_PATH") or DEFAULT_DB_PATH).strip() or DEFAULT_DB_PATH
@@ -58,6 +131,7 @@ def _ensure_columns(con: sqlite3.Connection, table: str, cols: Dict[str, str]) -
 
 
 def ensure_schema() -> str:
+    reason = normalize_terminal_reason(reason)
     con = _connect()
     try:
         con.executescript(
@@ -373,6 +447,7 @@ def _prepare_trade_plan_payload(plan: Dict[str, Any]) -> Dict[str, Any]:
     payload.setdefault('status', 'created')
     payload.setdefault('created_ts', now)
     payload['updated_ts'] = now
+    payload['reject_reason'] = normalize_terminal_reason(payload.get('reject_reason'))
     payload.setdefault('risk_snapshot_json', _json(payload.get('risk_snapshot_json') or payload.get('risk_snapshot') or {}))
 
     created_ts = payload.get('created_ts', now)
@@ -590,6 +665,8 @@ def update_order_intent(intent_id: str, **fields: Any) -> None:
     for k, v in fields.items():
         if k in allowed:
             sets.append(f"{k} = ?")
+            if k in {'reject_reason','cancel_reason'}:
+                v = normalize_terminal_reason(v)
             if k == 'raw_json' and not isinstance(v, str):
                 v = _json(v)
             args.append(v)
@@ -843,6 +920,7 @@ def upsert_broker_order(order: Dict[str, Any]) -> None:
     payload.setdefault('status', 'created')
     payload.setdefault('created_ts', now)
     payload['updated_ts'] = now
+    payload['reject_reason'] = normalize_terminal_reason(payload.get('reject_reason'))
     payload.setdefault('raw_json', _json(payload.get('raw_json') or order))
     payload = _sanitize_payload(payload, json_fields={'raw_json'})
     con = _connect()
@@ -1009,8 +1087,9 @@ def summarize_trade_lifecycle(*, since_ts: float | None = None) -> Dict[str, Any
 
 def record_ops_event(event_type: str, *, symbol: str | None = None, strategy_id: str | None = None, signal_id: str | None = None, fingerprint: str | None = None, reason: str | None = None, payload: Optional[Dict[str, Any]] = None, event_id: str | None = None) -> str:
     ensure_schema()
+    reason = normalize_terminal_reason(reason)
     payload_obj = dict(payload or {})
-    payload_obj.setdefault('reason', reason)
+    payload_obj['reason'] = reason
     event_id = str(event_id or f"{int(time.time()*1000)}:{event_type}:{symbol or ''}:{strategy_id or ''}")
     con = _connect()
     try:
@@ -1250,7 +1329,10 @@ def record_admission_event(*, symbol: str, strategy_id: str | None = None, signa
     ensure_schema()
     ts = time.time()
     event_id = str(event_id or f"{int(ts*1000)}:adm:{symbol}:{strategy_id or ''}")
+    reject_reason = normalize_terminal_reason(reject_reason)
     payload_obj = dict(payload or {})
+    if reject_reason:
+        payload_obj['reject_reason'] = reject_reason
     con = _connect()
     try:
         con.execute(
@@ -1340,6 +1422,87 @@ def summarize_ops_events(*, since_ts: float | None = None) -> Dict[str, Any]:
         return {'total': total, 'by_type': by_type}
     finally:
         con.close()
+
+
+def summarize_terminal_reasons(*, since_ts: float | None = None) -> Dict[str, Any]:
+    ensure_schema()
+    con = _connect()
+    try:
+        sources = {
+            'order_intents': ('SELECT COALESCE(reject_reason, cancel_reason, "") AS reason, COUNT(*) AS n FROM order_intents WHERE COALESCE(reject_reason, cancel_reason, "") <> "" {where} GROUP BY COALESCE(reject_reason, cancel_reason, "")', 'updated_ts'),
+            'broker_orders': ('SELECT COALESCE(reject_reason, "") AS reason, COUNT(*) AS n FROM broker_orders WHERE COALESCE(reject_reason, "") <> "" {where} GROUP BY COALESCE(reject_reason, "")', 'updated_ts'),
+            'trade_lifecycle_events': ('SELECT COALESCE(reason, "") AS reason, COUNT(*) AS n FROM trade_lifecycle_events WHERE COALESCE(reason, "") <> "" {where} GROUP BY COALESCE(reason, "")', 'created_ts'),
+            'ops_events': ('SELECT COALESCE(reason, "") AS reason, COUNT(*) AS n FROM ops_events WHERE COALESCE(reason, "") <> "" {where} GROUP BY COALESCE(reason, "")', 'created_ts'),
+            'admission_events': ('SELECT COALESCE(reject_reason, "") AS reason, COUNT(*) AS n FROM admission_events WHERE COALESCE(reject_reason, "") <> "" {where} GROUP BY COALESCE(reject_reason, "")', 'created_ts'),
+        }
+        overall: Dict[str, int] = {}
+        by_source: Dict[str, Dict[str, int]] = {}
+        for name, (sql, ts_col) in sources.items():
+            args: List[Any] = []
+            where = ''
+            if since_ts is not None:
+                where = f' AND {ts_col} >= ?'
+                args.append(float(since_ts))
+            rows = con.execute(sql.format(where=where), tuple(args)).fetchall()
+            src: Dict[str, int] = {}
+            for row in rows:
+                reason = normalize_terminal_reason(row['reason']) or ''
+                n = int(row['n'] or 0)
+                if not reason:
+                    continue
+                src[reason] = src.get(reason, 0) + n
+                overall[reason] = overall.get(reason, 0) + n
+            by_source[name] = src
+        return {'overall': overall, 'by_source': by_source}
+    finally:
+        con.close()
+
+
+def lifecycle_integrity_report(*, limit: int = 100, stale_age_sec: int = 900) -> Dict[str, Any]:
+    ensure_schema()
+    now = time.time()
+    con = _connect()
+    try:
+        report: Dict[str, Any] = {'ok': True, 'checked_ts': now, 'stale_age_sec': int(stale_age_sec), 'counts': {}, 'samples': {}}
+        checks = {
+            'broker_orders_missing_intent': "SELECT bo.* FROM broker_orders bo LEFT JOIN order_intents oi ON oi.intent_id = bo.intent_id WHERE COALESCE(bo.intent_id, '') <> '' AND oi.intent_id IS NULL ORDER BY bo.updated_ts DESC LIMIT ?",
+            'trade_plans_missing_lifecycle': "SELECT tp.* FROM trade_plans tp LEFT JOIN trade_lifecycle_events tle ON tle.trade_plan_id = tp.trade_plan_id WHERE tle.event_id IS NULL ORDER BY tp.updated_ts DESC LIMIT ?",
+            'open_positions_missing_trade_plan': "SELECT pl.* FROM position_ledger pl LEFT JOIN trade_plans tp ON tp.trade_plan_id = pl.trade_plan_id WHERE pl.status = 'open' AND (COALESCE(pl.trade_plan_id, '') = '' OR tp.trade_plan_id IS NULL) ORDER BY pl.updated_ts DESC LIMIT ?",
+            'terminal_trade_plans_missing_closed_ts': "SELECT * FROM trade_plans WHERE status IN ({statuses}) AND closed_ts IS NULL ORDER BY updated_ts DESC LIMIT ?".format(statuses=','.join('?' for _ in TERMINAL_TRADE_PLAN_STATUSES)),
+            'openish_trade_plans_expired': "SELECT * FROM trade_plans WHERE status IN ({statuses}) AND closed_ts IS NULL AND expires_ts IS NOT NULL AND expires_ts < ? ORDER BY updated_ts DESC LIMIT ?".format(statuses=','.join('?' for _ in OPENISH_TRADE_PLAN_STATUSES)),
+            'stale_openish_order_intents': "SELECT * FROM order_intents WHERE state IN ({states}) AND updated_ts < ? ORDER BY updated_ts DESC LIMIT ?".format(states=','.join('?' for _ in OPENISH_ORDER_INTENT_STATES)),
+            'active_workflow_locks_expired': "SELECT * FROM workflow_locks WHERE released_ts IS NULL AND expires_ts <= ? ORDER BY created_ts DESC LIMIT ?",
+        }
+        # simple checks
+        rows = con.execute(checks['broker_orders_missing_intent'], (limit,)).fetchall()
+        report['counts']['broker_orders_missing_intent'] = len(rows)
+        report['samples']['broker_orders_missing_intent'] = [dict(r) for r in rows]
+        rows = con.execute(checks['trade_plans_missing_lifecycle'], (limit,)).fetchall()
+        report['counts']['trade_plans_missing_lifecycle'] = len(rows)
+        report['samples']['trade_plans_missing_lifecycle'] = [dict(r) for r in rows]
+        rows = con.execute(checks['open_positions_missing_trade_plan'], (limit,)).fetchall()
+        report['counts']['open_positions_missing_trade_plan'] = len(rows)
+        report['samples']['open_positions_missing_trade_plan'] = [dict(r) for r in rows]
+        args = list(sorted(TERMINAL_TRADE_PLAN_STATUSES)) + [limit]
+        rows = con.execute(checks['terminal_trade_plans_missing_closed_ts'], tuple(args)).fetchall()
+        report['counts']['terminal_trade_plans_missing_closed_ts'] = len(rows)
+        report['samples']['terminal_trade_plans_missing_closed_ts'] = [dict(r) for r in rows]
+        args = list(sorted(OPENISH_TRADE_PLAN_STATUSES)) + [now, limit]
+        rows = con.execute(checks['openish_trade_plans_expired'], tuple(args)).fetchall()
+        report['counts']['openish_trade_plans_expired'] = len(rows)
+        report['samples']['openish_trade_plans_expired'] = [dict(r) for r in rows]
+        args = list(sorted(OPENISH_ORDER_INTENT_STATES)) + [now - float(stale_age_sec), limit]
+        rows = con.execute(checks['stale_openish_order_intents'], tuple(args)).fetchall()
+        report['counts']['stale_openish_order_intents'] = len(rows)
+        report['samples']['stale_openish_order_intents'] = [dict(r) for r in rows]
+        rows = con.execute(checks['active_workflow_locks_expired'], (now, limit)).fetchall()
+        report['counts']['active_workflow_locks_expired'] = len(rows)
+        report['samples']['active_workflow_locks_expired'] = [dict(r) for r in rows]
+        report['ok'] = all(int(v or 0) == 0 for v in report['counts'].values())
+        return report
+    finally:
+        con.close()
+
 
 def summary() -> Dict[str, Any]:
     ensure_schema()

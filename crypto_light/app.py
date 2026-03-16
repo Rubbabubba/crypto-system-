@@ -2086,43 +2086,7 @@ def _fingerprint_ttl_sec() -> int:
 
 
 def _structured_reason(reason: str) -> str:
-    raw = str(reason or '').strip()
-    mapping = {
-        'duplicate_signal_id': 'rejected_duplicate_signal',
-        'duplicate_signal_fingerprint': 'rejected_duplicate_signal',
-        'trading_disabled': 'rejected_trading_disabled',
-        'max_entries_per_day_reached': 'rejected_max_entries_per_day',
-        'global_entry_cooldown': 'rejected_global_entry_cooldown',
-        'max_daily_loss_reached': 'rejected_max_daily_loss',
-        'entry_cooldown': 'rejected_entry_cooldown',
-        'entry_failure_cooldown': 'rejected_cooldown_active',
-        'max_trades_per_symbol_per_day': 'rejected_max_trades_per_symbol_per_day',
-        'position_already_open': 'rejected_position_exists',
-        'open_position_exists': 'rejected_position_exists',
-        'entry_order_lock_active': 'rejected_order_lock_active',
-        'broker_open_buy_order_exists': 'rejected_broker_open_order_exists',
-        'active_workflow_lock': 'rejected_symbol_locked',
-        'open_trade_plan_exists': 'rejected_open_trade_plan_exists',
-        'open_order_intent_exists': 'rejected_open_intent_exists',
-        'broker_balance_unavailable': 'rejected_broker_balance_unavailable',
-        'ops_risk_lockout_active': 'rejected_ops_risk_lockout',
-        'spread_too_wide': 'rejected_spread_too_wide',
-        'scanner_symbol_not_allowed': 'rejected_scanner_symbol_not_allowed',
-        'signal_rejected_by_scanner': 'rejected_scanner_symbol_not_allowed',
-        'min_cash_buffer_breach': 'rejected_min_cash_buffer_breach',
-        'insufficient_cash_usd_estimate': 'rejected_insufficient_cash',
-        'risk_admission_reject': 'rejected_risk_admission',
-        'pretrade_health_gate_closed': 'rejected_pretrade_health_gate',
-        'submit_failed_pre_ack': 'submit_failed_pre_ack',
-        'broker_rejected': 'broker_rejected',
-        'intent_timeout': 'intent_timeout',
-        'reconcile_cleanup': 'reconcile_cleanup',
-    }
-    if raw in mapping:
-        return mapping[raw]
-    if raw.startswith('rejected_') or raw in {'submit_failed_pre_ack', 'broker_rejected', 'intent_timeout', 'reconcile_cleanup'}:
-        return raw
-    return raw
+    return str(lifecycle_db.normalize_terminal_reason(reason) or str(reason or '').strip())
 
 
 def _float_or_none(v: Any) -> float | None:
@@ -3925,6 +3889,8 @@ def diagnostics_entry_pipeline(limit: int = 100, lookback_hours: int = 24):
         'recent_ops_events': lifecycle_db.list_recent_ops_events(since_ts=since_ts, limit=limit),
         'recent_admission_events': lifecycle_db.list_recent_admission_events(since_ts=since_ts, limit=limit),
         'active_workflow_locks': lifecycle_db.list_active_workflow_locks(limit=limit),
+        'terminal_reasons': lifecycle_db.summarize_terminal_reasons(since_ts=since_ts),
+        'integrity': lifecycle_db.lifecycle_integrity_report(limit=min(limit, 50), stale_age_sec=max(300, int(lookback_hours * 300))),
     }
 
 
@@ -3953,6 +3919,30 @@ def diagnostics_trade_lifecycle(limit: int = 100, lookback_hours: int = 24):
         'lookback_hours': lookback_hours,
         'summary': lifecycle_db.summarize_trade_lifecycle(since_ts=since_ts),
         'events': lifecycle_db.list_recent_trade_lifecycle_events(since_ts=since_ts, limit=limit),
+    }
+
+
+
+@app.get("/diagnostics/terminal_reasons")
+def diagnostics_terminal_reasons(lookback_hours: int = 24):
+    lookback_hours = max(1, min(int(lookback_hours), 24 * 30))
+    since_ts = time.time() - (float(lookback_hours) * 3600.0)
+    return {
+        'ok': True,
+        'utc': utc_now_iso(),
+        'lookback_hours': lookback_hours,
+        'summary': lifecycle_db.summarize_terminal_reasons(since_ts=since_ts),
+    }
+
+
+@app.get("/diagnostics/lifecycle_integrity")
+def diagnostics_lifecycle_integrity(limit: int = 100, stale_age_sec: int = 900):
+    limit = max(1, min(int(limit), 500))
+    stale_age_sec = max(60, min(int(stale_age_sec), 24 * 3600))
+    return {
+        'ok': True,
+        'utc': utc_now_iso(),
+        'report': lifecycle_db.lifecycle_integrity_report(limit=limit, stale_age_sec=stale_age_sec),
     }
 
 
