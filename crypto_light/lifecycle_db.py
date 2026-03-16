@@ -131,7 +131,6 @@ def _ensure_columns(con: sqlite3.Connection, table: str, cols: Dict[str, str]) -
 
 
 def ensure_schema() -> str:
-    reason = normalize_terminal_reason(reason)
     con = _connect()
     try:
         con.executescript(
