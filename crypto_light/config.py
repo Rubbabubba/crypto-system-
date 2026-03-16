@@ -69,6 +69,9 @@ class Settings:
 
     # Entries / discipline
     entry_cooldown_sec: int
+    entry_failure_cooldown_bars: int
+    entry_engine_timeframe_min: int
+    workflow_lock_ttl_sec: int
     no_new_entries_after_utc: str  # HH:MM or "" for 24/7
     max_trades_per_symbol_per_day: int
 
@@ -234,6 +237,9 @@ def load_settings() -> Settings:
 
         # Entries / discipline
         entry_cooldown_sec=int(float(_getenv("ENTRY_COOLDOWN_SEC", "0") or 0)),
+        entry_failure_cooldown_bars=int(float(_getenv("ENTRY_FAILURE_COOLDOWN_BARS", "2") or 2)),
+        entry_engine_timeframe_min=int(float(_getenv("ENTRY_ENGINE_TIMEFRAME_MIN", "5") or 5)),
+        workflow_lock_ttl_sec=int(float(_getenv("WORKFLOW_LOCK_TTL_SEC", "300") or 300)),
         no_new_entries_after_utc=_getenv("NO_NEW_ENTRIES_AFTER_UTC", ""),  # "" = 24/7
         max_trades_per_symbol_per_day=int(float(_getenv("MAX_TRADES_PER_SYMBOL_PER_DAY", "999") or 999)),
 

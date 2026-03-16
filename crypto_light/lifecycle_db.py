@@ -10,7 +10,7 @@ DEFAULT_DB_PATH = "/var/data/lifecycle.sqlite3"
 
 OPENISH_TRADE_PLAN_STATUSES = {'approved', 'submitted', 'active'}
 TERMINAL_TRADE_PLAN_STATUSES = {'closed', 'cancelled', 'rejected', 'failed', 'failed_reconcile', 'expired', 'abandoned'}
-OPENISH_ORDER_INTENT_STATES = {'created','validated','submitted','acknowledged','partial','replace_pending','cancel_pending','failed_reconcile'}
+OPENISH_ORDER_INTENT_STATES = {'created','validated','submitted','acknowledged','partial','replace_pending','cancel_pending'}
 
 
 
@@ -167,7 +167,35 @@ def ensure_schema() -> str:
                 created_ts REAL,
                 resolved_ts REAL
             );
+
             CREATE INDEX IF NOT EXISTS idx_anomalies_open ON anomalies(resolved_ts, severity, created_ts);
+
+            CREATE TABLE IF NOT EXISTS ops_events (
+                event_id TEXT PRIMARY KEY,
+                event_type TEXT NOT NULL,
+                symbol TEXT,
+                strategy_id TEXT,
+                signal_id TEXT,
+                fingerprint TEXT,
+                reason TEXT,
+                payload_json TEXT,
+                created_ts REAL
+            );
+            CREATE INDEX IF NOT EXISTS idx_ops_events_symbol_created ON ops_events(symbol, created_ts);
+            CREATE INDEX IF NOT EXISTS idx_ops_events_type_created ON ops_events(event_type, created_ts);
+
+            CREATE TABLE IF NOT EXISTS workflow_locks (
+                lock_key TEXT PRIMARY KEY,
+                symbol TEXT NOT NULL,
+                strategy_id TEXT,
+                stage TEXT,
+                owner_req_id TEXT,
+                created_ts REAL,
+                expires_ts REAL,
+                released_ts REAL,
+                metadata_json TEXT
+            );
+            CREATE INDEX IF NOT EXISTS idx_workflow_locks_symbol_active ON workflow_locks(symbol, released_ts, expires_ts);
             """
         )
         _ensure_columns(con, 'trade_plans', {
@@ -187,6 +215,28 @@ def ensure_schema() -> str:
             'remaining_qty': 'REAL',
             'submitted_ts': 'REAL',
             'acknowledged_ts': 'REAL',
+        })
+        _ensure_columns(con, 'ops_events', {
+            'event_id': 'TEXT',
+            'event_type': 'TEXT',
+            'symbol': 'TEXT',
+            'strategy_id': 'TEXT',
+            'signal_id': 'TEXT',
+            'fingerprint': 'TEXT',
+            'reason': 'TEXT',
+            'payload_json': 'TEXT',
+            'created_ts': 'REAL',
+        })
+        _ensure_columns(con, 'workflow_locks', {
+            'lock_key': 'TEXT',
+            'symbol': 'TEXT',
+            'strategy_id': 'TEXT',
+            'stage': 'TEXT',
+            'owner_req_id': 'TEXT',
+            'created_ts': 'REAL',
+            'expires_ts': 'REAL',
+            'released_ts': 'REAL',
+            'metadata_json': 'TEXT',
         })
         con.commit()
     finally:
@@ -632,6 +682,197 @@ def list_rows(table: str, *, limit: int = 50, where: str = '', args: Optional[Li
 
 def unresolved_anomalies(limit: int = 50) -> List[Dict[str, Any]]:
     return list_rows('anomalies', limit=limit, where='resolved_ts IS NULL', order_by='created_ts DESC')
+
+
+def link_trade_plan_to_intent_atomic(intent_id: str, trade_plan: Dict[str, Any], *, intent_fields: Optional[Dict[str, Any]] = None) -> None:
+    ensure_schema()
+    plan_payload = _prepare_trade_plan_payload(trade_plan)
+    intent_updates = dict(intent_fields or {})
+    intent_updates['trade_plan_id'] = str(plan_payload.get('trade_plan_id') or '')
+    intent_updates['updated_ts'] = time.time()
+    con = _connect()
+    try:
+        _execute_trade_plan_upsert(con, plan_payload)
+        sets = []
+        args: List[Any] = []
+        for k, v in intent_updates.items():
+            if k in {'trade_plan_id','state','broker_txid','filled_qty','avg_fill_price','fees_usd','retry_count','reject_reason','cancel_reason','last_broker_status','remaining_qty','submitted_ts','acknowledged_ts','raw_json','updated_ts'}:
+                sets.append(f"{k} = ?")
+                if k == 'raw_json' and not isinstance(v, str):
+                    v = _json(v)
+                args.append(v)
+        if sets:
+            args.append(intent_id)
+            con.execute(f"UPDATE order_intents SET {', '.join(sets)} WHERE intent_id = ?", args)
+        con.commit()
+    except Exception:
+        con.rollback()
+        raise
+    finally:
+        con.close()
+
+
+def record_ops_event(event_type: str, *, symbol: str | None = None, strategy_id: str | None = None, signal_id: str | None = None, fingerprint: str | None = None, reason: str | None = None, payload: Optional[Dict[str, Any]] = None, event_id: str | None = None) -> str:
+    ensure_schema()
+    payload_obj = dict(payload or {})
+    payload_obj.setdefault('reason', reason)
+    event_id = str(event_id or f"{int(time.time()*1000)}:{event_type}:{symbol or ''}:{strategy_id or ''}")
+    con = _connect()
+    try:
+        con.execute(
+            """
+            INSERT OR REPLACE INTO ops_events(event_id, event_type, symbol, strategy_id, signal_id, fingerprint, reason, payload_json, created_ts)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (event_id, str(event_type or ''), symbol, strategy_id, signal_id, fingerprint, reason, _json(payload_obj), time.time()),
+        )
+        con.commit()
+        return event_id
+    finally:
+        con.close()
+
+
+def list_recent_ops_events(*, symbol: str | None = None, strategy_id: str | None = None, event_types: Optional[List[str]] = None, since_ts: float | None = None, limit: int = 100) -> List[Dict[str, Any]]:
+    ensure_schema()
+    clauses = []
+    args: List[Any] = []
+    if symbol is not None:
+        clauses.append('symbol = ?')
+        args.append(symbol)
+    if strategy_id is not None:
+        clauses.append('strategy_id = ?')
+        args.append(strategy_id)
+    if event_types:
+        clauses.append(f"event_type IN ({','.join('?' for _ in event_types)})")
+        args.extend(list(event_types))
+    if since_ts is not None:
+        clauses.append('created_ts >= ?')
+        args.append(float(since_ts))
+    where = ' AND '.join(clauses)
+    return list_rows('ops_events', limit=limit, where=where, args=args, order_by='created_ts DESC')
+
+
+def acquire_workflow_lock(lock_key: str, *, symbol: str, strategy_id: str | None = None, stage: str | None = None, owner_req_id: str | None = None, ttl_sec: int = 300, metadata: Optional[Dict[str, Any]] = None) -> bool:
+    ensure_schema()
+    now = time.time()
+    ttl = max(1, int(ttl_sec or 300))
+    expires_ts = now + float(ttl)
+    con = _connect()
+    try:
+        row = con.execute('SELECT * FROM workflow_locks WHERE lock_key = ?', (lock_key,)).fetchone()
+        if row:
+            released_ts = float(row['released_ts'] or 0.0) if row['released_ts'] is not None else 0.0
+            existing_expires = float(row['expires_ts'] or 0.0) if row['expires_ts'] is not None else 0.0
+            if released_ts <= 0.0 and existing_expires > now:
+                return False
+        con.execute(
+            """
+            INSERT INTO workflow_locks(lock_key, symbol, strategy_id, stage, owner_req_id, created_ts, expires_ts, released_ts, metadata_json)
+            VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?)
+            ON CONFLICT(lock_key) DO UPDATE SET
+                symbol=excluded.symbol,
+                strategy_id=excluded.strategy_id,
+                stage=excluded.stage,
+                owner_req_id=excluded.owner_req_id,
+                created_ts=excluded.created_ts,
+                expires_ts=excluded.expires_ts,
+                released_ts=NULL,
+                metadata_json=excluded.metadata_json
+            """,
+            (lock_key, symbol, strategy_id, stage, owner_req_id, now, expires_ts, _json(metadata or {})),
+        )
+        con.commit()
+        return True
+    finally:
+        con.close()
+
+
+def release_workflow_lock(lock_key: str) -> None:
+    ensure_schema()
+    con = _connect()
+    try:
+        con.execute('UPDATE workflow_locks SET released_ts = ? WHERE lock_key = ? AND released_ts IS NULL', (time.time(), lock_key))
+        con.commit()
+    finally:
+        con.close()
+
+
+def get_active_workflow_lock(lock_key: str) -> Optional[Dict[str, Any]]:
+    ensure_schema()
+    now = time.time()
+    con = _connect()
+    try:
+        row = con.execute(
+            'SELECT * FROM workflow_locks WHERE lock_key = ? AND released_ts IS NULL AND expires_ts > ? LIMIT 1',
+            (lock_key, now),
+        ).fetchone()
+        return dict(row) if row else None
+    finally:
+        con.close()
+
+
+def count_open_positions_for_symbol(symbol: str) -> int:
+    ensure_schema()
+    con = _connect()
+    try:
+        row = con.execute("SELECT COUNT(*) AS n FROM position_ledger WHERE symbol = ? AND status = 'open'", (symbol,)).fetchone()
+        return int((row['n'] if row else 0) or 0)
+    finally:
+        con.close()
+
+
+def count_openish_trade_plans_for_symbol(symbol: str, strategy_id: str | None = None) -> int:
+    ensure_schema()
+    args: List[Any] = [symbol, *sorted(OPENISH_TRADE_PLAN_STATUSES)]
+    where = f"symbol = ? AND status IN ({','.join('?' for _ in OPENISH_TRADE_PLAN_STATUSES)}) AND closed_ts IS NULL"
+    if strategy_id:
+        where += ' AND strategy_id = ?'
+        args.append(strategy_id)
+    con = _connect()
+    try:
+        row = con.execute(f"SELECT COUNT(*) AS n FROM trade_plans WHERE {where}", tuple(args)).fetchone()
+        return int((row['n'] if row else 0) or 0)
+    finally:
+        con.close()
+
+
+def count_openish_order_intents_for_symbol(symbol: str, strategy_id: str | None = None) -> int:
+    ensure_schema()
+    args: List[Any] = [symbol, *sorted(OPENISH_ORDER_INTENT_STATES)]
+    where = f"symbol = ? AND state IN ({','.join('?' for _ in OPENISH_ORDER_INTENT_STATES)})"
+    if strategy_id:
+        where += ' AND strategy_id = ?'
+        args.append(strategy_id)
+    con = _connect()
+    try:
+        row = con.execute(f"SELECT COUNT(*) AS n FROM order_intents WHERE {where}", tuple(args)).fetchone()
+        return int((row['n'] if row else 0) or 0)
+    finally:
+        con.close()
+
+
+def can_start_new_entry(symbol: str, strategy_id: str, *, cooldown_sec: int = 0) -> Dict[str, Any]:
+    ensure_schema()
+    lock_key = f"entry:{symbol}:{strategy_id}"
+    active_lock = get_active_workflow_lock(lock_key)
+    if active_lock:
+        return {'ok': False, 'reason': 'active_workflow_lock', 'blocking_objects': {'workflow_lock': active_lock}, 'cooldown_remaining_sec': max(0, int(float(active_lock.get('expires_ts') or 0.0) - time.time()))}
+    open_plans = count_openish_trade_plans_for_symbol(symbol, strategy_id)
+    if open_plans > 0:
+        return {'ok': False, 'reason': 'open_trade_plan_exists', 'blocking_objects': {'open_trade_plans': open_plans}, 'cooldown_remaining_sec': 0}
+    open_intents = count_openish_order_intents_for_symbol(symbol, strategy_id)
+    if open_intents > 0:
+        return {'ok': False, 'reason': 'open_order_intent_exists', 'blocking_objects': {'open_order_intents': open_intents}, 'cooldown_remaining_sec': 0}
+    open_positions = count_open_positions_for_symbol(symbol)
+    if open_positions > 0:
+        return {'ok': False, 'reason': 'open_position_exists', 'blocking_objects': {'open_positions': open_positions}, 'cooldown_remaining_sec': 0}
+    if int(cooldown_sec or 0) > 0:
+        recent = list_recent_ops_events(symbol=symbol, strategy_id=strategy_id, event_types=['entry_submit_failed','entry_broker_rejected','entry_broker_cancelled','entry_failed'], since_ts=time.time() - float(cooldown_sec), limit=1)
+        if recent:
+            evt = recent[0]
+            remaining = max(0, int((float(evt.get('created_ts') or 0.0) + float(cooldown_sec)) - time.time()))
+            return {'ok': False, 'reason': 'entry_failure_cooldown', 'blocking_objects': {'recent_failure_event': evt}, 'cooldown_remaining_sec': remaining}
+    return {'ok': True, 'reason': '', 'blocking_objects': {}, 'cooldown_remaining_sec': 0}
 
 
 def summary() -> Dict[str, Any]:
