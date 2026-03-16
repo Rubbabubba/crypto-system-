@@ -3889,6 +3889,14 @@ def diagnostics_workflow_locks(limit: int = 100):
     }
 
 
+
+
+@app.get("/diagnostics/scanner_coordination")
+def diagnostics_scanner_coordination(lookback_sec: int = 900, limit: int = 100):
+    return {
+        'ok': True,
+        'coordination': lifecycle_db.coordination_snapshot(lookback_sec=lookback_sec, limit=limit),
+    }
 @app.get("/diagnostics/entry_pipeline")
 def diagnostics_entry_pipeline(limit: int = 100, lookback_hours: int = 24):
     limit = max(1, min(int(limit), 500))
