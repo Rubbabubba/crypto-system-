@@ -193,6 +193,11 @@ def load_settings() -> Settings:
     if execution_mode == "limit_aggressive":
         execution_mode = "limit_aggressive"
 
+    signal_dedupe_ttl_sec = int(float(_getenv("SIGNAL_DEDUPE_TTL_SEC", "90") or 90))
+    signal_fingerprint_ttl_raw = _getenv("SIGNAL_FINGERPRINT_TTL_SEC", "").strip()
+    signal_fingerprint_ttl_sec = int(float(signal_fingerprint_ttl_raw or signal_dedupe_ttl_sec or 900))
+    signal_dedupe_ttl_sec = max(signal_dedupe_ttl_sec, min(signal_fingerprint_ttl_sec, 900))
+
     return Settings(
         # Security
         webhook_secret=_getenv("WEBHOOK_SECRET", ""),
@@ -245,8 +250,8 @@ def load_settings() -> Settings:
         max_trades_per_symbol_per_day=int(float(_getenv("MAX_TRADES_PER_SYMBOL_PER_DAY", "999") or 999)),
 
         # Idempotency
-        signal_dedupe_ttl_sec=int(float(_getenv("SIGNAL_DEDUPE_TTL_SEC", "90") or 90)),
-        signal_fingerprint_ttl_sec=int(float(_getenv("SIGNAL_FINGERPRINT_TTL_SEC", "900") or 900)),
+        signal_dedupe_ttl_sec=signal_dedupe_ttl_sec,
+        signal_fingerprint_ttl_sec=signal_fingerprint_ttl_sec,
 
         # Exits
         stop_pct=float(_getenv("STOP_PCT", "0.01") or 0.01),

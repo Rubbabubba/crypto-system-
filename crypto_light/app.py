@@ -125,7 +125,12 @@ def _startup_self_check(*, rerun: bool = False, apply: bool | None = None) -> di
         }
         return dict(STARTUP_SELF_CHECK_RESULT)
 
+    lifecycle_repairs = {'expired_workflow_locks_released': 0, 'legacy_trade_lifecycle_events_backfilled': 0, 'expired_signal_fingerprints_purged': 0}
     try:
+        lifecycle_repairs = lifecycle_db.repair_lifecycle_integrity(
+            stale_age_sec=int(getattr(settings, 'workflow_lock_ttl_sec', 300) or 300),
+            backfill_limit=2000,
+        )
         recovery = _recovery_reconcile_summary(apply=bool(apply))
         critical_reasons: list[str] = []
         if not bool(recovery.get('ok')):
@@ -165,6 +170,7 @@ def _startup_self_check(*, rerun: bool = False, apply: bool | None = None) -> di
             'lockout_reason': lockout_reason,
             'lockout_remaining_sec': int(state.ops_lockout_remaining_sec() if hasattr(state, 'ops_lockout_remaining_sec') else 0),
             'recovery_reconcile': recovery,
+            'lifecycle_repairs': lifecycle_repairs,
         }
     except Exception as e:
         lockout_applied = False
@@ -186,12 +192,20 @@ def _startup_self_check(*, rerun: bool = False, apply: bool | None = None) -> di
             'lockout_remaining_sec': int(state.ops_lockout_remaining_sec() if hasattr(state, 'ops_lockout_remaining_sec') else 0),
             'error': str(e),
             'recovery_reconcile': None,
+            'lifecycle_repairs': lifecycle_repairs,
         }
     return dict(STARTUP_SELF_CHECK_RESULT)
 
 
 @app.on_event("startup")
 def _run_startup_self_check():
+    try:
+        lifecycle_db.repair_lifecycle_integrity(
+            stale_age_sec=int(getattr(settings, 'workflow_lock_ttl_sec', 300) or 300),
+            backfill_limit=5000,
+        )
+    except Exception:
+        pass
     _startup_self_check(rerun=True)
 
 

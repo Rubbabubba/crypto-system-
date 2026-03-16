@@ -1170,9 +1170,39 @@ def release_workflow_lock(lock_key: str) -> None:
         con.close()
 
 
+def sweep_expired_workflow_locks(*, now_ts: float | None = None, limit: int | None = None) -> int:
+    ensure_schema()
+    now_ts = float(now_ts or time.time())
+    con = _connect()
+    try:
+        if limit is None:
+            cur = con.execute(
+                'UPDATE workflow_locks SET released_ts = ? WHERE released_ts IS NULL AND expires_ts IS NOT NULL AND expires_ts <= ?',
+                (now_ts, now_ts),
+            )
+        else:
+            lock_rows = con.execute(
+                'SELECT lock_key FROM workflow_locks WHERE released_ts IS NULL AND expires_ts IS NOT NULL AND expires_ts <= ? ORDER BY created_ts ASC LIMIT ?',
+                (now_ts, int(limit)),
+            ).fetchall()
+            keys = [str(r["lock_key"]) for r in lock_rows if r and r["lock_key"]]
+            if not keys:
+                return 0
+            placeholders = ','.join('?' for _ in keys)
+            cur = con.execute(
+                f'UPDATE workflow_locks SET released_ts = ? WHERE released_ts IS NULL AND lock_key IN ({placeholders})',
+                (now_ts, *keys),
+            )
+        con.commit()
+        return int(getattr(cur, 'rowcount', 0) or 0)
+    finally:
+        con.close()
+
+
 def get_active_workflow_lock(lock_key: str) -> Optional[Dict[str, Any]]:
     ensure_schema()
     now = time.time()
+    sweep_expired_workflow_locks(now_ts=now, limit=100)
     con = _connect()
     try:
         row = con.execute(
@@ -1226,6 +1256,8 @@ def count_openish_order_intents_for_symbol(symbol: str, strategy_id: str | None 
 
 def can_start_new_entry(symbol: str, strategy_id: str, *, cooldown_sec: int = 0) -> Dict[str, Any]:
     ensure_schema()
+    now = time.time()
+    sweep_expired_workflow_locks(now_ts=now, limit=100)
     lock_key = f"entry:{symbol}:{strategy_id}"
     active_lock = get_active_workflow_lock(lock_key)
     if active_lock:
@@ -1312,8 +1344,10 @@ def register_signal_fingerprint(fingerprint: str, *, symbol: str | None = None, 
 
 def list_active_workflow_locks(*, symbol: str | None = None, strategy_id: str | None = None, limit: int = 100) -> List[Dict[str, Any]]:
     ensure_schema()
+    now = time.time()
+    sweep_expired_workflow_locks(now_ts=now, limit=100)
     clauses = ['released_ts IS NULL', 'expires_ts > ?']
-    args: List[Any] = [time.time()]
+    args: List[Any] = [now]
     if symbol is not None:
         clauses.append('symbol = ?')
         args.append(symbol)
@@ -1322,6 +1356,84 @@ def list_active_workflow_locks(*, symbol: str | None = None, strategy_id: str | 
         args.append(strategy_id)
     where = ' AND '.join(clauses)
     return list_rows('workflow_locks', limit=limit, where=where, args=args, order_by='created_ts DESC')
+
+
+def backfill_legacy_trade_lifecycle_events(*, limit: int = 1000) -> int:
+    ensure_schema()
+    now = time.time()
+    con = _connect()
+    try:
+        rows = con.execute(
+            """
+            SELECT tp.*
+            FROM trade_plans tp
+            LEFT JOIN trade_lifecycle_events tle ON tle.trade_plan_id = tp.trade_plan_id
+            WHERE tle.event_id IS NULL
+            ORDER BY COALESCE(tp.closed_ts, tp.updated_ts, tp.created_ts) ASC
+            LIMIT ?
+            """,
+            (int(limit),),
+        ).fetchall()
+        inserted = 0
+        for row in rows:
+            rec = dict(row)
+            status = str(rec.get('status') or '').strip()
+            trade_plan_id = str(rec.get('trade_plan_id') or '').strip()
+            if not trade_plan_id:
+                continue
+            if status in TERMINAL_TRADE_PLAN_STATUSES:
+                event_type = 'legacy_terminal_backfill'
+                stage = 'legacy_terminal'
+            elif status in OPENISH_TRADE_PLAN_STATUSES:
+                event_type = 'legacy_open_backfill'
+                stage = 'legacy_open'
+            else:
+                event_type = 'legacy_trade_plan_backfill'
+                stage = 'legacy'
+            reason = normalize_terminal_reason(status, default='legacy_backfill') or 'legacy_backfill'
+            event_ts = float(rec.get('closed_ts') or rec.get('updated_ts') or rec.get('created_ts') or now)
+            payload = {
+                'legacy_backfill': True,
+                'original_status': status,
+                'created_ts': rec.get('created_ts'),
+                'updated_ts': rec.get('updated_ts'),
+                'closed_ts': rec.get('closed_ts'),
+                'expires_ts': rec.get('expires_ts'),
+            }
+            con.execute(
+                """
+                INSERT OR IGNORE INTO trade_lifecycle_events(
+                    event_id, trade_plan_id, intent_id, broker_order_id, position_id,
+                    symbol, strategy_id, stage, event_type, reason, payload_json, created_ts
+                ) VALUES (?, ?, NULL, NULL, NULL, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    f"legacy:{trade_plan_id}",
+                    trade_plan_id,
+                    rec.get('symbol'),
+                    rec.get('strategy_id'),
+                    stage,
+                    event_type,
+                    reason,
+                    _json(payload),
+                    event_ts,
+                ),
+            )
+            inserted += 1
+        con.commit()
+        return inserted
+    finally:
+        con.close()
+
+
+def repair_lifecycle_integrity(*, stale_age_sec: int = 900, backfill_limit: int = 1000) -> Dict[str, int]:
+    ensure_schema()
+    now = time.time()
+    return {
+        'expired_workflow_locks_released': sweep_expired_workflow_locks(now_ts=now),
+        'legacy_trade_lifecycle_events_backfilled': backfill_legacy_trade_lifecycle_events(limit=backfill_limit),
+        'expired_signal_fingerprints_purged': purge_expired_signal_fingerprints(now),
+    }
 
 
 def record_admission_event(*, symbol: str, strategy_id: str | None = None, signal_id: str | None = None, signal_name: str | None = None, fingerprint: str | None = None, source: str | None = None, bar_ts: int | None = None, trigger_price: float | None = None, reference_price: float | None = None, atr: float | None = None, range_high: float | None = None, range_low: float | None = None, range_width_pct: float | None = None, breakout_level: float | None = None, breakout_distance_pct: float | None = None, ranking_score: float | None = None, spread_pct: float | None = None, regime_state: str | None = None, admission_result: str | None = None, reject_reason: str | None = None, payload: Optional[Dict[str, Any]] = None, event_id: str | None = None) -> str:
@@ -1459,10 +1571,11 @@ def summarize_terminal_reasons(*, since_ts: float | None = None) -> Dict[str, An
 
 def lifecycle_integrity_report(*, limit: int = 100, stale_age_sec: int = 900) -> Dict[str, Any]:
     ensure_schema()
+    repairs = repair_lifecycle_integrity(stale_age_sec=stale_age_sec, backfill_limit=max(int(limit or 100), 1000))
     now = time.time()
     con = _connect()
     try:
-        report: Dict[str, Any] = {'ok': True, 'checked_ts': now, 'stale_age_sec': int(stale_age_sec), 'counts': {}, 'samples': {}}
+        report: Dict[str, Any] = {'ok': True, 'checked_ts': now, 'stale_age_sec': int(stale_age_sec), 'repairs': repairs, 'counts': {}, 'samples': {}}
         checks = {
             'broker_orders_missing_intent': "SELECT bo.* FROM broker_orders bo LEFT JOIN order_intents oi ON oi.intent_id = bo.intent_id WHERE COALESCE(bo.intent_id, '') <> '' AND oi.intent_id IS NULL ORDER BY bo.updated_ts DESC LIMIT ?",
             'trade_plans_missing_lifecycle': "SELECT tp.* FROM trade_plans tp LEFT JOIN trade_lifecycle_events tle ON tle.trade_plan_id = tp.trade_plan_id WHERE tle.event_id IS NULL ORDER BY tp.updated_ts DESC LIMIT ?",
