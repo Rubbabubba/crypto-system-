@@ -2573,6 +2573,7 @@ def _execute_long_entry(
 
     _record_admission_event(admission_ctx, admission_result='accepted', payload={'req_id': req_id, 'risk_admission': risk_admission, 'sizing': sizing_meta or {}, 'reference_price': px, 'notional_usd': float(_notional)})
     _record_ops_event('admission_passed', symbol=symbol, strategy=strategy, signal_id=signal_id, reason='admission_passed', payload={'req_id': req_id, 'fingerprint': admission_ctx.get('fingerprint')}, fingerprint=admission_ctx.get('fingerprint'))
+    lifecycle_db.record_trade_lifecycle_event(stage='entry', event_type='candidate_accepted', trade_plan_id=None, intent_id=intent_id, symbol=symbol, strategy_id=strategy, reason='admission_passed', payload={'req_id': req_id, 'signal_id': signal_id, 'fingerprint': admission_ctx.get('fingerprint'), 'trigger_price': float(px), 'requested_notional_usd': float(_notional)})
 
     acquired_lock = lifecycle_db.acquire_workflow_lock(
         workflow_lock_key,
@@ -2603,10 +2604,35 @@ def _execute_long_entry(
             "raw_json": {"req_id": req_id, "source": source, "dry_run": dry_run, "stage": "pre_submit"},
         },
     )
+    lifecycle_db.upsert_broker_order({
+        "broker_order_id": intent_id,
+        "intent_id": intent_id,
+        "trade_plan_id": None,
+        "symbol": symbol,
+        "strategy_id": strategy,
+        "side": "buy",
+        "order_type": exec_mode_override or settings.execution_mode,
+        "lifecycle_stage": "entry",
+        "status": "created",
+        "client_order_key": client_order_key,
+        "requested_qty": (float(_notional) / float(px)) if float(px) > 0 else 0.0,
+        "requested_notional_usd": float(_notional),
+        "limit_price": float(px),
+        "raw_json": {"req_id": req_id, "source": source, "dry_run": dry_run, "stage": "pre_submit"},
+    })
+    lifecycle_db.record_trade_lifecycle_event(stage='entry', event_type='intent_created', trade_plan_id=None, intent_id=intent_id, broker_order_id=intent_id, symbol=symbol, strategy_id=strategy, payload={'req_id': req_id, 'client_order_key': client_order_key, 'requested_notional_usd': float(_notional)})
 
     try:
         state.set_order_lock(entry_lock_key, meta={"symbol": symbol, "side": "buy", "strategy": strategy, "req_id": req_id, "intent_id": intent_id})
         lifecycle_db.transition_order_intent(intent_id, 'submitted', raw_json={"req_id": req_id, "source": source, "dry_run": dry_run, "stage": "submit_attempt"})
+        lifecycle_db.upsert_broker_order({
+            "broker_order_id": intent_id, "intent_id": intent_id, "trade_plan_id": None, "symbol": symbol, "strategy_id": strategy,
+            "side": "buy", "order_type": exec_mode_override or settings.execution_mode, "lifecycle_stage": "entry",
+            "status": "submitted", "client_order_key": client_order_key, "requested_qty": (float(_notional) / float(px)) if float(px) > 0 else 0.0,
+            "requested_notional_usd": float(_notional), "limit_price": float(px),
+            "raw_json": {"req_id": req_id, "source": source, "dry_run": dry_run, "stage": "submit_attempt"},
+        })
+        lifecycle_db.record_trade_lifecycle_event(stage='entry', event_type='submit_attempted', trade_plan_id=None, intent_id=intent_id, broker_order_id=intent_id, symbol=symbol, strategy_id=strategy, payload={'req_id': req_id, 'client_order_key': client_order_key})
         res = _market_notional(
             symbol=symbol,
             side="buy",
@@ -2631,6 +2657,13 @@ def _execute_long_entry(
             last_broker_status="entry_exception_before_ack",
             raw_json={"error": str(e), "symbol": symbol, "strategy": strategy, "stage": "entry_submit"},
         )
+        lifecycle_db.upsert_broker_order({
+            "broker_order_id": intent_id, "intent_id": intent_id, "trade_plan_id": None, "symbol": symbol, "strategy_id": strategy,
+            "side": "buy", "order_type": exec_mode_override or settings.execution_mode, "lifecycle_stage": "entry",
+            "status": "failed", "client_order_key": client_order_key, "reject_reason": "submit_failed_pre_ack",
+            "raw_json": {"error": str(e), "symbol": symbol, "strategy": strategy, "stage": "entry_submit"}, "closed_ts": time.time(),
+        })
+        lifecycle_db.record_trade_lifecycle_event(stage='entry', event_type='submit_failed', trade_plan_id=None, intent_id=intent_id, broker_order_id=intent_id, symbol=symbol, strategy_id=strategy, reason='submit_failed_pre_ack', payload={'error': str(e), 'req_id': req_id})
         _record_ops_event('entry_submit_failed', symbol=symbol, strategy=strategy, signal_id=signal_id, reason='submit_failed_pre_ack', payload={"error": str(e), "intent_id": intent_id, "req_id": req_id}, fingerprint=admission_ctx.get('fingerprint'))
         lifecycle_db.release_workflow_lock(workflow_lock_key)
         raise
@@ -2654,6 +2687,14 @@ def _execute_long_entry(
             last_broker_status=str(classified.get("execution") or ""),
             raw_json=res or {},
         )
+        lifecycle_db.upsert_broker_order({
+            "broker_order_id": intent_id, "intent_id": intent_id, "trade_plan_id": None, "symbol": symbol, "strategy_id": strategy,
+            "side": "buy", "order_type": exec_mode_override or settings.execution_mode, "lifecycle_stage": "entry",
+            "status": next_state, "client_order_key": client_order_key, "broker_txid": classified.get("broker_txid"),
+            "avg_fill_price": classified.get("avg_fill_price"), "filled_qty": classified.get("filled_qty"), "fees_usd": classified.get("fees_usd"),
+            "reject_reason": reject_reason, "raw_json": res or {}, "closed_ts": time.time(),
+        })
+        lifecycle_db.record_trade_lifecycle_event(stage='entry', event_type='broker_terminal', trade_plan_id=None, intent_id=intent_id, broker_order_id=intent_id, symbol=symbol, strategy_id=strategy, reason=_structured_reason(reject_reason), payload={'response': res or {}, 'classified': classified, 'state': next_state})
         rej_count = state.note_entry_rejection() if hasattr(state, "note_entry_rejection") else 0
         if int(rej_count) >= int(getattr(settings, "max_consecutive_rejections", 0) or 0) and int(getattr(settings, "max_consecutive_rejections", 0) or 0) > 0 and hasattr(state, "set_ops_lockout"):
             state.set_ops_lockout("consecutive_entry_rejections", int(getattr(settings, "ops_lockout_sec", 0) or 0))
@@ -2744,7 +2785,25 @@ def _execute_long_entry(
                 "acknowledged_ts": time.time(),
             },
         )
+        lifecycle_db.upsert_broker_order({
+            "broker_order_id": intent_id, "intent_id": intent_id, "trade_plan_id": trade_plan_id, "symbol": symbol, "strategy_id": strategy,
+            "side": "buy", "order_type": exec_mode_override or settings.execution_mode, "lifecycle_stage": "entry",
+            "status": "acknowledged", "client_order_key": client_order_key, "broker_txid": broker_txid,
+            "requested_qty": qty, "requested_notional_usd": float(_notional), "limit_price": float(px),
+            "avg_fill_price": float(plan_entry_px), "filled_qty": qty, "fees_usd": fees_usd,
+            "acknowledged_ts": time.time(), "raw_json": res or {},
+        })
+        lifecycle_db.record_trade_lifecycle_event(stage='entry', event_type='broker_acknowledged', trade_plan_id=trade_plan_id, intent_id=intent_id, broker_order_id=intent_id, position_id=position_id, symbol=symbol, strategy_id=strategy, payload={'broker_txid': broker_txid, 'avg_fill_price': float(plan_entry_px), 'qty': qty})
         lifecycle_db.transition_order_intent(intent_id, "filled", broker_txid=broker_txid, filled_qty=qty, avg_fill_price=float(plan_entry_px), fees_usd=fees_usd, remaining_qty=0.0, last_broker_status=str(classified.get("execution") or ""), raw_json=res or {})
+        lifecycle_db.upsert_broker_order({
+            "broker_order_id": intent_id, "intent_id": intent_id, "trade_plan_id": trade_plan_id, "symbol": symbol, "strategy_id": strategy,
+            "side": "buy", "order_type": exec_mode_override or settings.execution_mode, "lifecycle_stage": "entry",
+            "status": "filled", "client_order_key": client_order_key, "broker_txid": broker_txid,
+            "requested_qty": qty, "requested_notional_usd": float(_notional), "limit_price": float(px),
+            "avg_fill_price": float(plan_entry_px), "filled_qty": qty, "remaining_qty": 0.0, "fees_usd": fees_usd,
+            "acknowledged_ts": time.time(), "closed_ts": time.time(), "raw_json": res or {},
+        })
+        lifecycle_db.record_trade_lifecycle_event(stage='entry', event_type='position_opened', trade_plan_id=trade_plan_id, intent_id=intent_id, broker_order_id=intent_id, position_id=position_id, symbol=symbol, strategy_id=strategy, payload={'broker_txid': broker_txid, 'entry_price': float(plan_entry_px), 'qty': qty, 'fees_usd': fees_usd})
         lifecycle_db.update_trade_plan_status(trade_plan_id, "active", approved_notional_usd=float(_notional))
         lifecycle_db.upsert_position_ledger({
             "position_id": position_id,
@@ -3304,12 +3363,33 @@ def worker_exit(payload: WorkerExitPayload):
                     if diagnostics:
                         evaluations.append({"symbol": symbol, "decision": reason, "skip_reason": "broker_open_sell_order_exists", "meta": sell_meta})
                     continue
+            lifecycle_db.upsert_broker_order({
+                "broker_order_id": exit_intent_id, "intent_id": exit_intent_id, "trade_plan_id": getattr(plan, "trade_plan_id", "") or None, "symbol": symbol,
+                "strategy_id": getattr(plan, "strategy", "") or None, "side": "sell", "order_type": STOP_EXIT_MODE if reason == "stop" else settings.execution_mode,
+                "lifecycle_stage": "exit", "status": "created", "client_order_key": exit_client_order_key, "requested_qty": float(qty),
+                "requested_notional_usd": float(notional_exit), "limit_price": float(px), "raw_json": {"reason": reason, "dry_run": dry_run},
+            })
+            lifecycle_db.record_trade_lifecycle_event(stage='exit', event_type='intent_created', trade_plan_id=getattr(plan, 'trade_plan_id', '') or None, intent_id=exit_intent_id, broker_order_id=exit_intent_id, position_id=getattr(plan, 'position_id', '') or None, symbol=symbol, strategy_id=getattr(plan, 'strategy', '') or None, reason=reason, payload={'client_order_key': exit_client_order_key, 'notional_exit': float(notional_exit)})
             if dry_run:
                 lifecycle_db.transition_order_intent(exit_intent_id, "acknowledged", client_order_key=exit_client_order_key, last_broker_status="dry_run")
+                lifecycle_db.upsert_broker_order({
+                    "broker_order_id": exit_intent_id, "intent_id": exit_intent_id, "trade_plan_id": getattr(plan, "trade_plan_id", "") or None, "symbol": symbol, "strategy_id": getattr(plan, "strategy", "") or None,
+                    "side": "sell", "order_type": STOP_EXIT_MODE if reason == "stop" else settings.execution_mode, "lifecycle_stage": "exit",
+                    "status": "acknowledged", "client_order_key": exit_client_order_key, "requested_qty": float(qty), "requested_notional_usd": float(notional_exit),
+                    "limit_price": float(px), "acknowledged_ts": time.time(), "raw_json": {"reason": reason, "dry_run": True}
+                })
+                lifecycle_db.record_trade_lifecycle_event(stage='exit', event_type='dry_run_acknowledged', trade_plan_id=getattr(plan, 'trade_plan_id', '') or None, intent_id=exit_intent_id, broker_order_id=exit_intent_id, position_id=getattr(plan, 'position_id', '') or None, symbol=symbol, strategy_id=getattr(plan, 'strategy', '') or None, reason=reason, payload={'notional_exit': float(notional_exit)})
                 res = {"ok": True, "dry_run": True, "side": "sell", "symbol": symbol, "notional": notional_exit, "reason": reason}
             else:
                 state.set_order_lock(exit_lock_key, meta={"symbol": symbol, "side": "sell", "reason": reason, "intent_id": exit_intent_id})
                 lifecycle_db.transition_order_intent(exit_intent_id, "submitted", client_order_key=exit_client_order_key, submitted_ts=time.time())
+                lifecycle_db.upsert_broker_order({
+                    "broker_order_id": exit_intent_id, "intent_id": exit_intent_id, "trade_plan_id": getattr(plan, "trade_plan_id", "") or None, "symbol": symbol, "strategy_id": getattr(plan, "strategy", "") or None,
+                    "side": "sell", "order_type": STOP_EXIT_MODE if reason == "stop" else settings.execution_mode, "lifecycle_stage": "exit",
+                    "status": "submitted", "client_order_key": exit_client_order_key, "requested_qty": float(qty), "requested_notional_usd": float(notional_exit),
+                    "limit_price": float(px), "raw_json": {"reason": reason, "dry_run": False}
+                })
+                lifecycle_db.record_trade_lifecycle_event(stage='exit', event_type='submit_attempted', trade_plan_id=getattr(plan, 'trade_plan_id', '') or None, intent_id=exit_intent_id, broker_order_id=exit_intent_id, position_id=getattr(plan, 'position_id', '') or None, symbol=symbol, strategy_id=getattr(plan, 'strategy', '') or None, reason=reason, payload={'notional_exit': float(notional_exit)})
                 if reason == "stop" and STOP_EXIT_MODE == "stop_limit":
                     res = broker_kraken.stop_limit_notional(
                         symbol=symbol,
@@ -3336,6 +3416,15 @@ def worker_exit(payload: WorkerExitPayload):
                         last_broker_status=str(classified_exit.get("execution") or ""),
                         raw_json=res or {},
                     )
+                    lifecycle_db.upsert_broker_order({
+                        "broker_order_id": exit_intent_id, "intent_id": exit_intent_id, "trade_plan_id": getattr(plan, "trade_plan_id", "") or None, "symbol": symbol, "strategy_id": getattr(plan, "strategy", "") or None,
+                        "side": "sell", "order_type": STOP_EXIT_MODE if reason == "stop" else settings.execution_mode, "lifecycle_stage": "exit",
+                        "status": str(classified_exit.get("state") or "rejected"), "client_order_key": exit_client_order_key, "broker_txid": classified_exit.get("broker_txid"),
+                        "requested_qty": float(qty), "requested_notional_usd": float(notional_exit), "limit_price": float(px), "avg_fill_price": classified_exit.get("avg_fill_price"),
+                        "filled_qty": classified_exit.get("filled_qty"), "fees_usd": classified_exit.get("fees_usd"), "reject_reason": str(classified_exit.get("error") or (res or {}).get("error") or "exit_order_failed"),
+                        "raw_json": res or {}, "closed_ts": time.time(),
+                    })
+                    lifecycle_db.record_trade_lifecycle_event(stage='exit', event_type='broker_terminal', trade_plan_id=getattr(plan, 'trade_plan_id', '') or None, intent_id=exit_intent_id, broker_order_id=exit_intent_id, position_id=getattr(plan, 'position_id', '') or None, symbol=symbol, strategy_id=getattr(plan, 'strategy', '') or None, reason=str(classified_exit.get("error") or (res or {}).get("error") or "exit_order_failed"), payload={'classified': classified_exit, 'response': res or {}})
                     _record_state_model_anomaly("exit_order_failed", "warn", symbol=symbol, trade_plan_id=getattr(plan, "trade_plan_id", "") or None, intent_id=exit_intent_id, response=res or {}, classified=classified_exit)
                 journal_close = None
                 if bool(res.get("ok")):
@@ -3350,7 +3439,23 @@ def worker_exit(payload: WorkerExitPayload):
                     exit_qty = float(metrics_exit.get("qty") or qty)
                     exit_fees = float(metrics_exit.get("fee") or 0.0)
                     lifecycle_db.transition_order_intent(exit_intent_id, "acknowledged", broker_txid=classified_exit.get("broker_txid"), last_broker_status=str(classified_exit.get("execution") or ""), raw_json=res or {})
+                    lifecycle_db.upsert_broker_order({
+                        "broker_order_id": exit_intent_id, "intent_id": exit_intent_id, "trade_plan_id": getattr(plan, "trade_plan_id", "") or None, "symbol": symbol, "strategy_id": getattr(plan, "strategy", "") or None,
+                        "side": "sell", "order_type": STOP_EXIT_MODE if reason == "stop" else settings.execution_mode, "lifecycle_stage": "exit",
+                        "status": "acknowledged", "client_order_key": exit_client_order_key, "broker_txid": classified_exit.get("broker_txid"),
+                        "requested_qty": float(qty), "requested_notional_usd": float(notional_exit), "limit_price": float(px),
+                        "avg_fill_price": exit_px, "filled_qty": exit_qty, "fees_usd": exit_fees, "acknowledged_ts": time.time(), "raw_json": res or {},
+                    })
+                    lifecycle_db.record_trade_lifecycle_event(stage='exit', event_type='broker_acknowledged', trade_plan_id=getattr(plan, 'trade_plan_id', '') or None, intent_id=exit_intent_id, broker_order_id=exit_intent_id, position_id=getattr(plan, 'position_id', '') or None, symbol=symbol, strategy_id=getattr(plan, 'strategy', '') or None, reason=reason, payload={'broker_txid': classified_exit.get("broker_txid"), 'avg_fill_price': exit_px, 'qty': exit_qty})
                     lifecycle_db.transition_order_intent(exit_intent_id, "filled", broker_txid=classified_exit.get("broker_txid"), filled_qty=exit_qty, avg_fill_price=exit_px, fees_usd=exit_fees, remaining_qty=0.0, last_broker_status=str(classified_exit.get("execution") or ""), raw_json=res or {})
+                    lifecycle_db.upsert_broker_order({
+                        "broker_order_id": exit_intent_id, "intent_id": exit_intent_id, "trade_plan_id": getattr(plan, "trade_plan_id", "") or None, "symbol": symbol, "strategy_id": getattr(plan, "strategy", "") or None,
+                        "side": "sell", "order_type": STOP_EXIT_MODE if reason == "stop" else settings.execution_mode, "lifecycle_stage": "exit",
+                        "status": "filled", "client_order_key": exit_client_order_key, "broker_txid": classified_exit.get("broker_txid"),
+                        "requested_qty": float(qty), "requested_notional_usd": float(notional_exit), "limit_price": float(px), "avg_fill_price": exit_px,
+                        "filled_qty": exit_qty, "remaining_qty": 0.0, "fees_usd": exit_fees, "acknowledged_ts": time.time(), "closed_ts": time.time(), "raw_json": res or {},
+                    })
+                    lifecycle_db.record_trade_lifecycle_event(stage='exit', event_type='position_closed', trade_plan_id=getattr(plan, 'trade_plan_id', '') or None, intent_id=exit_intent_id, broker_order_id=exit_intent_id, position_id=getattr(plan, 'position_id', '') or None, symbol=symbol, strategy_id=getattr(plan, 'strategy', '') or None, reason=reason, payload={'broker_txid': classified_exit.get("broker_txid"), 'exit_price': exit_px, 'qty': exit_qty, 'fees_usd': exit_fees})
                     if getattr(plan, "trade_plan_id", ""):
                         lifecycle_db.update_trade_plan_status(getattr(plan, "trade_plan_id", ""), "closed", closed_ts=now.timestamp())
                     lifecycle_db.upsert_position_ledger({
@@ -3823,6 +3928,34 @@ def diagnostics_entry_pipeline(limit: int = 100, lookback_hours: int = 24):
     }
 
 
+@app.get("/diagnostics/broker_orders")
+def diagnostics_broker_orders(limit: int = 100, lookback_hours: int = 24):
+    limit = max(1, min(int(limit), 500))
+    lookback_hours = max(1, min(int(lookback_hours), 24 * 30))
+    since_ts = time.time() - (float(lookback_hours) * 3600.0)
+    return {
+        'ok': True,
+        'utc': utc_now_iso(),
+        'lookback_hours': lookback_hours,
+        'summary': lifecycle_db.summarize_broker_orders(since_ts=since_ts),
+        'orders': lifecycle_db.list_recent_broker_orders(since_ts=since_ts, limit=limit),
+    }
+
+
+@app.get("/diagnostics/trade_lifecycle")
+def diagnostics_trade_lifecycle(limit: int = 100, lookback_hours: int = 24):
+    limit = max(1, min(int(limit), 500))
+    lookback_hours = max(1, min(int(lookback_hours), 24 * 30))
+    since_ts = time.time() - (float(lookback_hours) * 3600.0)
+    return {
+        'ok': True,
+        'utc': utc_now_iso(),
+        'lookback_hours': lookback_hours,
+        'summary': lifecycle_db.summarize_trade_lifecycle(since_ts=since_ts),
+        'events': lifecycle_db.list_recent_trade_lifecycle_events(since_ts=since_ts, limit=limit),
+    }
+
+
 @app.get("/diagnostics/runtime")
 def diagnostics_runtime():
     positions = get_positions()
@@ -3913,6 +4046,8 @@ def diagnostics_summary(limit: int = 25):
         "order_intents": lifecycle_db.list_rows("order_intents", limit=limit, order_by="updated_ts DESC"),
         "positions": lifecycle_db.list_rows("position_ledger", limit=limit, order_by="updated_ts DESC"),
         "fills": lifecycle_db.list_rows("fill_events", limit=limit, order_by="created_ts DESC"),
+        "broker_orders": lifecycle_db.list_rows("broker_orders", limit=limit, order_by="updated_ts DESC"),
+        "trade_lifecycle_events": lifecycle_db.list_rows("trade_lifecycle_events", limit=limit, order_by="created_ts DESC"),
         "anomalies": lifecycle_db.unresolved_anomalies(limit=limit),
     }
 
@@ -3928,6 +4063,8 @@ def diagnostics_state_model(limit: int = 25):
         "order_intents": lifecycle_db.list_rows("order_intents", limit=limit, order_by="updated_ts DESC"),
         "positions": lifecycle_db.list_rows("position_ledger", limit=limit, order_by="updated_ts DESC"),
         "fills": lifecycle_db.list_rows("fill_events", limit=limit, order_by="created_ts DESC"),
+        "broker_orders": lifecycle_db.list_rows("broker_orders", limit=limit, order_by="updated_ts DESC"),
+        "trade_lifecycle_events": lifecycle_db.list_rows("trade_lifecycle_events", limit=limit, order_by="created_ts DESC"),
         "anomalies": lifecycle_db.unresolved_anomalies(limit=limit),
     }
 

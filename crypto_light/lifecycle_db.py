@@ -117,6 +117,54 @@ def ensure_schema() -> str:
             CREATE INDEX IF NOT EXISTS idx_order_intents_plan_state ON order_intents(trade_plan_id, state);
             CREATE INDEX IF NOT EXISTS idx_order_intents_symbol_created ON order_intents(symbol, created_ts);
 
+            CREATE TABLE IF NOT EXISTS broker_orders (
+                broker_order_id TEXT PRIMARY KEY,
+                intent_id TEXT,
+                trade_plan_id TEXT,
+                symbol TEXT NOT NULL,
+                strategy_id TEXT,
+                side TEXT,
+                order_type TEXT,
+                lifecycle_stage TEXT,
+                status TEXT NOT NULL,
+                client_order_key TEXT,
+                broker_txid TEXT,
+                requested_qty REAL,
+                requested_notional_usd REAL,
+                limit_price REAL,
+                avg_fill_price REAL,
+                filled_qty REAL,
+                remaining_qty REAL,
+                fees_usd REAL,
+                reject_reason TEXT,
+                raw_json TEXT,
+                created_ts REAL,
+                updated_ts REAL,
+                acknowledged_ts REAL,
+                closed_ts REAL
+            );
+            CREATE INDEX IF NOT EXISTS idx_broker_orders_symbol_status ON broker_orders(symbol, status);
+            CREATE INDEX IF NOT EXISTS idx_broker_orders_intent_created ON broker_orders(intent_id, created_ts);
+            CREATE INDEX IF NOT EXISTS idx_broker_orders_plan_created ON broker_orders(trade_plan_id, created_ts);
+
+            CREATE TABLE IF NOT EXISTS trade_lifecycle_events (
+                event_id TEXT PRIMARY KEY,
+                trade_plan_id TEXT,
+                intent_id TEXT,
+                broker_order_id TEXT,
+                position_id TEXT,
+                symbol TEXT,
+                strategy_id TEXT,
+                stage TEXT NOT NULL,
+                event_type TEXT NOT NULL,
+                reason TEXT,
+                payload_json TEXT,
+                created_ts REAL
+            );
+            CREATE INDEX IF NOT EXISTS idx_trade_lifecycle_plan_created ON trade_lifecycle_events(trade_plan_id, created_ts);
+            CREATE INDEX IF NOT EXISTS idx_trade_lifecycle_symbol_created ON trade_lifecycle_events(symbol, created_ts);
+            CREATE INDEX IF NOT EXISTS idx_trade_lifecycle_stage_created ON trade_lifecycle_events(stage, created_ts);
+
             CREATE TABLE IF NOT EXISTS position_ledger (
                 position_id TEXT PRIMARY KEY,
                 trade_plan_id TEXT,
@@ -787,6 +835,178 @@ def link_trade_plan_to_intent_atomic(intent_id: str, trade_plan: Dict[str, Any],
         con.close()
 
 
+
+def upsert_broker_order(order: Dict[str, Any]) -> None:
+    ensure_schema()
+    now = time.time()
+    payload = dict(order or {})
+    payload.setdefault('status', 'created')
+    payload.setdefault('created_ts', now)
+    payload['updated_ts'] = now
+    payload.setdefault('raw_json', _json(payload.get('raw_json') or order))
+    payload = _sanitize_payload(payload, json_fields={'raw_json'})
+    con = _connect()
+    try:
+        con.execute(
+            """
+            INSERT INTO broker_orders (
+                broker_order_id, intent_id, trade_plan_id, symbol, strategy_id, side, order_type, lifecycle_stage, status,
+                client_order_key, broker_txid, requested_qty, requested_notional_usd, limit_price, avg_fill_price,
+                filled_qty, remaining_qty, fees_usd, reject_reason, raw_json, created_ts, updated_ts, acknowledged_ts, closed_ts
+            ) VALUES (
+                :broker_order_id, :intent_id, :trade_plan_id, :symbol, :strategy_id, :side, :order_type, :lifecycle_stage, :status,
+                :client_order_key, :broker_txid, :requested_qty, :requested_notional_usd, :limit_price, :avg_fill_price,
+                :filled_qty, :remaining_qty, :fees_usd, :reject_reason, :raw_json, :created_ts, :updated_ts, :acknowledged_ts, :closed_ts
+            )
+            ON CONFLICT(broker_order_id) DO UPDATE SET
+                intent_id=excluded.intent_id,
+                trade_plan_id=excluded.trade_plan_id,
+                symbol=excluded.symbol,
+                strategy_id=excluded.strategy_id,
+                side=excluded.side,
+                order_type=excluded.order_type,
+                lifecycle_stage=excluded.lifecycle_stage,
+                status=excluded.status,
+                client_order_key=excluded.client_order_key,
+                broker_txid=excluded.broker_txid,
+                requested_qty=excluded.requested_qty,
+                requested_notional_usd=excluded.requested_notional_usd,
+                limit_price=excluded.limit_price,
+                avg_fill_price=excluded.avg_fill_price,
+                filled_qty=excluded.filled_qty,
+                remaining_qty=excluded.remaining_qty,
+                fees_usd=excluded.fees_usd,
+                reject_reason=excluded.reject_reason,
+                raw_json=excluded.raw_json,
+                updated_ts=excluded.updated_ts,
+                acknowledged_ts=excluded.acknowledged_ts,
+                closed_ts=excluded.closed_ts
+            """,
+            payload,
+        )
+        con.commit()
+    finally:
+        con.close()
+
+
+def record_trade_lifecycle_event(*, stage: str, event_type: str, trade_plan_id: str | None = None, intent_id: str | None = None, broker_order_id: str | None = None, position_id: str | None = None, symbol: str | None = None, strategy_id: str | None = None, reason: str | None = None, payload: Optional[Dict[str, Any]] = None, event_id: str | None = None) -> str:
+    ensure_schema()
+    ts = time.time()
+    event_id = str(event_id or f"{int(ts*1000)}:{stage}:{event_type}:{trade_plan_id or intent_id or symbol or ''}")
+    con = _connect()
+    try:
+        con.execute(
+            """
+            INSERT OR REPLACE INTO trade_lifecycle_events(event_id, trade_plan_id, intent_id, broker_order_id, position_id, symbol, strategy_id, stage, event_type, reason, payload_json, created_ts)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (event_id, trade_plan_id, intent_id, broker_order_id, position_id, symbol, strategy_id, stage, event_type, reason, _json(payload or {}), ts),
+        )
+        con.commit()
+        return event_id
+    finally:
+        con.close()
+
+
+def list_recent_broker_orders(*, symbol: str | None = None, strategy_id: str | None = None, status: str | None = None, since_ts: float | None = None, limit: int = 100) -> List[Dict[str, Any]]:
+    ensure_schema()
+    clauses = []
+    args: List[Any] = []
+    if symbol is not None:
+        clauses.append('symbol = ?')
+        args.append(symbol)
+    if strategy_id is not None:
+        clauses.append('strategy_id = ?')
+        args.append(strategy_id)
+    if status is not None:
+        clauses.append('status = ?')
+        args.append(status)
+    if since_ts is not None:
+        clauses.append('created_ts >= ?')
+        args.append(float(since_ts))
+    where = ' AND '.join(clauses)
+    return list_rows('broker_orders', limit=limit, where=where, args=args, order_by='updated_ts DESC')
+
+
+def summarize_broker_orders(*, since_ts: float | None = None) -> Dict[str, Any]:
+    ensure_schema()
+    clauses = []
+    args: List[Any] = []
+    if since_ts is not None:
+        clauses.append('created_ts >= ?')
+        args.append(float(since_ts))
+    where_sql = f"WHERE {' AND '.join(clauses)}" if clauses else ''
+    con = _connect()
+    try:
+        rows = con.execute(
+            f"SELECT status, COALESCE(lifecycle_stage, '') AS lifecycle_stage, COUNT(*) AS n FROM broker_orders {where_sql} GROUP BY status, COALESCE(lifecycle_stage, '')",
+            tuple(args),
+        ).fetchall()
+        by_status: Dict[str, int] = {}
+        by_stage: Dict[str, int] = {}
+        total = 0
+        for row in rows:
+            status = str(row['status'] or '')
+            stage = str(row['lifecycle_stage'] or '')
+            n = int(row['n'] or 0)
+            total += n
+            by_status[status] = by_status.get(status, 0) + n
+            if stage:
+                by_stage[stage] = by_stage.get(stage, 0) + n
+        return {'total': total, 'by_status': by_status, 'by_stage': by_stage}
+    finally:
+        con.close()
+
+
+def list_recent_trade_lifecycle_events(*, symbol: str | None = None, trade_plan_id: str | None = None, stage: str | None = None, since_ts: float | None = None, limit: int = 100) -> List[Dict[str, Any]]:
+    ensure_schema()
+    clauses = []
+    args: List[Any] = []
+    if symbol is not None:
+        clauses.append('symbol = ?')
+        args.append(symbol)
+    if trade_plan_id is not None:
+        clauses.append('trade_plan_id = ?')
+        args.append(trade_plan_id)
+    if stage is not None:
+        clauses.append('stage = ?')
+        args.append(stage)
+    if since_ts is not None:
+        clauses.append('created_ts >= ?')
+        args.append(float(since_ts))
+    where = ' AND '.join(clauses)
+    return list_rows('trade_lifecycle_events', limit=limit, where=where, args=args, order_by='created_ts DESC')
+
+
+def summarize_trade_lifecycle(*, since_ts: float | None = None) -> Dict[str, Any]:
+    ensure_schema()
+    clauses = []
+    args: List[Any] = []
+    if since_ts is not None:
+        clauses.append('created_ts >= ?')
+        args.append(float(since_ts))
+    where_sql = f"WHERE {' AND '.join(clauses)}" if clauses else ''
+    con = _connect()
+    try:
+        rows = con.execute(
+            f"SELECT stage, event_type, COUNT(*) AS n FROM trade_lifecycle_events {where_sql} GROUP BY stage, event_type",
+            tuple(args),
+        ).fetchall()
+        by_stage: Dict[str, int] = {}
+        by_event_type: Dict[str, int] = {}
+        total = 0
+        for row in rows:
+            stage = str(row['stage'] or '')
+            event_type = str(row['event_type'] or '')
+            n = int(row['n'] or 0)
+            total += n
+            by_stage[stage] = by_stage.get(stage, 0) + n
+            by_event_type[event_type] = by_event_type.get(event_type, 0) + n
+        return {'total': total, 'by_stage': by_stage, 'by_event_type': by_event_type}
+    finally:
+        con.close()
+
+
 def record_ops_event(event_type: str, *, symbol: str | None = None, strategy_id: str | None = None, signal_id: str | None = None, fingerprint: str | None = None, reason: str | None = None, payload: Optional[Dict[str, Any]] = None, event_id: str | None = None) -> str:
     ensure_schema()
     payload_obj = dict(payload or {})
@@ -1139,6 +1359,8 @@ def summary() -> Dict[str, Any]:
         ).get('n', 0)
         positions_open = one("SELECT COUNT(*) AS n FROM position_ledger WHERE status = 'open'").get('n', 0)
         fills_total = one('SELECT COUNT(*) AS n FROM fill_events').get('n', 0)
+        broker_orders_total = one('SELECT COUNT(*) AS n FROM broker_orders').get('n', 0)
+        trade_lifecycle_total = one('SELECT COUNT(*) AS n FROM trade_lifecycle_events').get('n', 0)
         anomalies_open = one('SELECT COUNT(*) AS n FROM anomalies WHERE resolved_ts IS NULL').get('n', 0)
         return {
             'ok': True,
@@ -1148,6 +1370,8 @@ def summary() -> Dict[str, Any]:
             'order_intents_openish': int(intents_open or 0),
             'positions_open': int(positions_open or 0),
             'fill_events_total': int(fills_total or 0),
+            'broker_orders_total': int(broker_orders_total or 0),
+            'trade_lifecycle_events_total': int(trade_lifecycle_total or 0),
             'anomalies_open': int(anomalies_open or 0),
         }
     finally:
