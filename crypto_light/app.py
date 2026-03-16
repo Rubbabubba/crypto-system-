@@ -11,6 +11,7 @@ import logging
 import json
 import os
 import time
+import hashlib
 from datetime import datetime, timezone
 from typing import Any, Dict, Optional, Set, List, Tuple
 from uuid import uuid4
@@ -2077,6 +2078,175 @@ def _record_exit_trade_journal(*, symbol: str, reason: str, px_fallback: float, 
     return out
 
 
+def _fingerprint_ttl_sec() -> int:
+    ttl = int(getattr(settings, 'signal_fingerprint_ttl_sec', 0) or 0)
+    if ttl > 0:
+        return ttl
+    return max(int(getattr(settings, 'signal_dedupe_ttl_sec', 90) or 90), _entry_failure_cooldown_sec(), 60)
+
+
+def _structured_reason(reason: str) -> str:
+    raw = str(reason or '').strip()
+    mapping = {
+        'duplicate_signal_id': 'rejected_duplicate_signal',
+        'duplicate_signal_fingerprint': 'rejected_duplicate_signal',
+        'trading_disabled': 'rejected_trading_disabled',
+        'max_entries_per_day_reached': 'rejected_max_entries_per_day',
+        'global_entry_cooldown': 'rejected_global_entry_cooldown',
+        'max_daily_loss_reached': 'rejected_max_daily_loss',
+        'entry_cooldown': 'rejected_entry_cooldown',
+        'entry_failure_cooldown': 'rejected_cooldown_active',
+        'max_trades_per_symbol_per_day': 'rejected_max_trades_per_symbol_per_day',
+        'position_already_open': 'rejected_position_exists',
+        'open_position_exists': 'rejected_position_exists',
+        'entry_order_lock_active': 'rejected_order_lock_active',
+        'broker_open_buy_order_exists': 'rejected_broker_open_order_exists',
+        'active_workflow_lock': 'rejected_symbol_locked',
+        'open_trade_plan_exists': 'rejected_open_trade_plan_exists',
+        'open_order_intent_exists': 'rejected_open_intent_exists',
+        'broker_balance_unavailable': 'rejected_broker_balance_unavailable',
+        'ops_risk_lockout_active': 'rejected_ops_risk_lockout',
+        'spread_too_wide': 'rejected_spread_too_wide',
+        'scanner_symbol_not_allowed': 'rejected_scanner_symbol_not_allowed',
+        'signal_rejected_by_scanner': 'rejected_scanner_symbol_not_allowed',
+        'min_cash_buffer_breach': 'rejected_min_cash_buffer_breach',
+        'insufficient_cash_usd_estimate': 'rejected_insufficient_cash',
+        'risk_admission_reject': 'rejected_risk_admission',
+        'pretrade_health_gate_closed': 'rejected_pretrade_health_gate',
+        'submit_failed_pre_ack': 'submit_failed_pre_ack',
+        'broker_rejected': 'broker_rejected',
+        'intent_timeout': 'intent_timeout',
+        'reconcile_cleanup': 'reconcile_cleanup',
+    }
+    if raw in mapping:
+        return mapping[raw]
+    if raw.startswith('rejected_') or raw in {'submit_failed_pre_ack', 'broker_rejected', 'intent_timeout', 'reconcile_cleanup'}:
+        return raw
+    return raw
+
+
+def _float_or_none(v: Any) -> float | None:
+    try:
+        if v is None or v == '':
+            return None
+        return float(v)
+    except Exception:
+        return None
+
+
+def _int_or_none(v: Any) -> int | None:
+    try:
+        if v is None or v == '':
+            return None
+        return int(float(v))
+    except Exception:
+        return None
+
+
+def _build_signal_fingerprint(*, symbol: str, strategy: str, bar_ts: Any = None, trigger_price: Any = None, side: str = 'buy', signal_id: str | None = None, explicit_fingerprint: str | None = None) -> str:
+    if explicit_fingerprint:
+        return str(explicit_fingerprint).strip()
+    norm_symbol = normalize_symbol(symbol)
+    norm_strategy = str(strategy or '').strip().lower()
+    norm_side = str(side or 'buy').strip().lower()
+    bar_bucket = _int_or_none(bar_ts)
+    trigger = _float_or_none(trigger_price)
+    if trigger is not None:
+        trigger_key = f"{trigger:.8f}"
+    elif signal_id:
+        trigger_key = str(signal_id).strip()
+    else:
+        trigger_key = 'na'
+    parts = [norm_symbol, norm_strategy, norm_side, str(bar_bucket or 'na'), trigger_key]
+    base = '|'.join(parts)
+    digest = hashlib.sha1(base.encode('utf-8')).hexdigest()[:16]
+    return f"fp:{base}:{digest}"
+
+
+def _build_admission_context(*, symbol: str, strategy: str, signal_name: str | None, signal_id: str | None, source: str, extra: dict | None = None, px_hint: float | None = None) -> dict:
+    extra = dict(extra or {})
+    signal_meta = dict(extra.get('signal_meta') or {})
+    rank = dict(extra.get('rank') or {})
+    fingerprint = _build_signal_fingerprint(
+        symbol=symbol,
+        strategy=strategy,
+        bar_ts=extra.get('bar_ts', signal_meta.get('bar_ts')),
+        trigger_price=extra.get('trigger_price', signal_meta.get('level', signal_meta.get('range_high', signal_meta.get('ltf_ema', px_hint)))),
+        signal_id=signal_id,
+        explicit_fingerprint=extra.get('fingerprint'),
+    )
+    range_high = _float_or_none(signal_meta.get('range_high'))
+    range_low = _float_or_none(signal_meta.get('range_low'))
+    reference_price = _float_or_none(extra.get('reference_price', px_hint))
+    range_width_pct = None
+    if range_high is not None and range_low is not None and range_low >= 0:
+        denom = reference_price if reference_price and reference_price > 0 else range_high
+        if denom and denom > 0:
+            range_width_pct = (range_high - range_low) / denom
+    breakout_level = _float_or_none(signal_meta.get('level', signal_meta.get('range_high', signal_meta.get('ltf_ema'))))
+    breakout_distance_pct = None
+    if breakout_level and breakout_level > 0 and reference_price is not None:
+        breakout_distance_pct = (reference_price - breakout_level) / breakout_level
+    return {
+        'symbol': symbol,
+        'strategy': strategy,
+        'signal_name': signal_name,
+        'signal_id': signal_id,
+        'source': source,
+        'fingerprint': fingerprint,
+        'bar_ts': _int_or_none(extra.get('bar_ts', signal_meta.get('bar_ts'))),
+        'trigger_price': _float_or_none(extra.get('trigger_price', breakout_level)),
+        'reference_price': reference_price,
+        'atr': _float_or_none(signal_meta.get('atr_now')),
+        'range_high': range_high,
+        'range_low': range_low,
+        'range_width_pct': range_width_pct,
+        'breakout_level': breakout_level,
+        'breakout_distance_pct': breakout_distance_pct,
+        'ranking_score': _float_or_none(extra.get('ranking_score', rank.get('score'))),
+        'spread_pct': _float_or_none(extra.get('spread_pct', signal_meta.get('spread_pct'))),
+        'regime_state': 'quiet' if bool(extra.get('regime_quiet')) else 'expansion',
+        'signal_meta': signal_meta,
+        'rank': rank,
+        'extra': extra,
+    }
+
+
+def _record_admission_event(ctx: dict, *, admission_result: str, reject_reason: str | None = None, payload: dict | None = None) -> None:
+    try:
+        lifecycle_db.record_admission_event(
+            symbol=str(ctx.get('symbol') or ''),
+            strategy_id=(ctx.get('strategy') or None),
+            signal_id=(ctx.get('signal_id') or None),
+            signal_name=(ctx.get('signal_name') or None),
+            fingerprint=(ctx.get('fingerprint') or None),
+            source=(ctx.get('source') or None),
+            bar_ts=_int_or_none(ctx.get('bar_ts')),
+            trigger_price=_float_or_none(ctx.get('trigger_price')),
+            reference_price=_float_or_none(ctx.get('reference_price')),
+            atr=_float_or_none(ctx.get('atr')),
+            range_high=_float_or_none(ctx.get('range_high')),
+            range_low=_float_or_none(ctx.get('range_low')),
+            range_width_pct=_float_or_none(ctx.get('range_width_pct')),
+            breakout_level=_float_or_none(ctx.get('breakout_level')),
+            breakout_distance_pct=_float_or_none(ctx.get('breakout_distance_pct')),
+            ranking_score=_float_or_none(ctx.get('ranking_score')),
+            spread_pct=_float_or_none(ctx.get('spread_pct')),
+            regime_state=(ctx.get('regime_state') or None),
+            admission_result=admission_result,
+            reject_reason=_structured_reason(reject_reason or ''),
+            payload=payload or {},
+        )
+    except Exception:
+        pass
+
+
+def _record_rejected_admission(ctx: dict, reason: str, *, payload: dict | None = None) -> None:
+    structured = _structured_reason(reason)
+    _record_ops_event('admission_rejected', symbol=ctx.get('symbol'), strategy=ctx.get('strategy'), signal_id=ctx.get('signal_id'), reason=structured, payload=payload or {}, fingerprint=ctx.get('fingerprint'))
+    _record_admission_event(ctx, admission_result='rejected', reject_reason=structured, payload=payload or {})
+
+
 def _entry_failure_cooldown_sec() -> int:
     bars = int(getattr(settings, 'entry_failure_cooldown_bars', 0) or 0)
     tf_min = int(getattr(settings, 'entry_engine_timeframe_min', 0) or 0)
@@ -2124,19 +2294,26 @@ def _execute_long_entry(
     stop_price: float | None = None,
     take_price: float | None = None,
 ):
+    admission_ctx = _build_admission_context(symbol=symbol, strategy=strategy, signal_name=signal_name, signal_id=signal_id, source=source, extra=extra or {}, px_hint=px_override)
+
     def ignored(reason: str, **extra_fields):
+        structured_reason = _structured_reason(reason)
+        merged_payload = {'raw_reason': reason, **(extra_fields or {})}
+        if merged_payload.get('reference_price') is not None:
+            admission_ctx['reference_price'] = _float_or_none(merged_payload.get('reference_price'))
         evt = {
             "ts": datetime.now(timezone.utc).isoformat(),
             "req_id": req_id,
             "kind": source,
             "status": "ignored",
-            "reason": reason,
-            **(extra_fields or {}),
+            "reason": structured_reason,
+            **merged_payload,
         }
         _log_event("warning", evt)
-        _record_blocked_trade(reason, req_id=req_id, source=source, **(extra_fields or {}))
-        _record_ops_event('entry_ignored', symbol=symbol, strategy=strategy, signal_id=signal_id, reason=reason, payload=evt)
-        return {"ok": True, "ignored": True, "reason": reason, **(extra_fields or {})}
+        _record_blocked_trade(structured_reason, req_id=req_id, source=source, **merged_payload)
+        _record_ops_event('entry_ignored', symbol=symbol, strategy=strategy, signal_id=signal_id, reason=structured_reason, payload=evt, fingerprint=admission_ctx.get('fingerprint'))
+        _record_rejected_admission(admission_ctx, structured_reason, payload=evt)
+        return {"ok": True, "ignored": True, "reason": structured_reason, **merged_payload}
 
     now = datetime.now(timezone.utc)
     utc_date = _utc_date_str(now)
@@ -2144,6 +2321,23 @@ def _execute_long_entry(
 
     if signal_id and state.seen_recent_signal(signal_id, int(settings.signal_dedupe_ttl_sec)):
         return ignored("duplicate_signal_id", symbol=symbol, strategy=strategy, signal=signal_name, signal_id=signal_id)
+
+    fp_ttl = _fingerprint_ttl_sec()
+    fp_result = lifecycle_db.register_signal_fingerprint(
+        str(admission_ctx.get('fingerprint') or ''),
+        symbol=symbol,
+        strategy_id=strategy,
+        signal_id=signal_id,
+        ttl_sec=fp_ttl,
+        metadata={
+            'source': source,
+            'signal_name': signal_name,
+            'bar_ts': admission_ctx.get('bar_ts'),
+            'trigger_price': admission_ctx.get('trigger_price'),
+        },
+    )
+    if bool(fp_result.get('duplicate')):
+        return ignored('duplicate_signal_fingerprint', symbol=symbol, strategy=strategy, signal=signal_name, signal_id=signal_id, fingerprint=admission_ctx.get('fingerprint'), fingerprint_ttl_sec=fp_ttl, existing=fp_result.get('existing'))
 
     if not bool(settings.trading_enabled):
         return ignored("trading_disabled", symbol=symbol, strategy=strategy, signal=signal_name, signal_id=signal_id)
@@ -2191,6 +2385,9 @@ def _execute_long_entry(
 
     # Determine reference price for fills/brackets early because real risk sizing must use the actual stop distance.
     px = float(px_override) if px_override is not None else float(_last_price(symbol))
+    admission_ctx['reference_price'] = float(px)
+    if admission_ctx.get('breakout_level') and float(admission_ctx.get('breakout_level') or 0.0) > 0:
+        admission_ctx['breakout_distance_pct'] = (float(px) - float(admission_ctx.get('breakout_level'))) / float(admission_ctx.get('breakout_level'))
 
     # If caller didn't supply brackets, compute them from `px`.
     if stop_price is None or take_price is None:
@@ -2374,6 +2571,9 @@ def _execute_long_entry(
     client_order_key = f"entry:{signal_key}:{symbol}:{strategy}"
     workflow_lock_key = f"entry:{symbol}:{strategy}"
 
+    _record_admission_event(admission_ctx, admission_result='accepted', payload={'req_id': req_id, 'risk_admission': risk_admission, 'sizing': sizing_meta or {}, 'reference_price': px, 'notional_usd': float(_notional)})
+    _record_ops_event('admission_passed', symbol=symbol, strategy=strategy, signal_id=signal_id, reason='admission_passed', payload={'req_id': req_id, 'fingerprint': admission_ctx.get('fingerprint')}, fingerprint=admission_ctx.get('fingerprint'))
+
     acquired_lock = lifecycle_db.acquire_workflow_lock(
         workflow_lock_key,
         symbol=symbol,
@@ -2431,7 +2631,7 @@ def _execute_long_entry(
             last_broker_status="entry_exception_before_ack",
             raw_json={"error": str(e), "symbol": symbol, "strategy": strategy, "stage": "entry_submit"},
         )
-        _record_ops_event('entry_submit_failed', symbol=symbol, strategy=strategy, signal_id=signal_id, reason='submit_failed_pre_ack', payload={"error": str(e), "intent_id": intent_id, "req_id": req_id})
+        _record_ops_event('entry_submit_failed', symbol=symbol, strategy=strategy, signal_id=signal_id, reason='submit_failed_pre_ack', payload={"error": str(e), "intent_id": intent_id, "req_id": req_id}, fingerprint=admission_ctx.get('fingerprint'))
         lifecycle_db.release_workflow_lock(workflow_lock_key)
         raise
 
@@ -2459,7 +2659,8 @@ def _execute_long_entry(
             state.set_ops_lockout("consecutive_entry_rejections", int(getattr(settings, "ops_lockout_sec", 0) or 0))
         _record_state_model_anomaly("entry_order_rejected", "warn", symbol=symbol, intent_id=intent_id, response=res or {}, classified=classified, consecutive_entry_rejections=int(getattr(state, "consecutive_entry_rejections", 0) or 0))
         failure_event_type = 'entry_broker_cancelled' if next_state == 'cancelled' else 'entry_broker_rejected' if next_state == 'rejected' else 'entry_failed'
-        _record_ops_event(failure_event_type, symbol=symbol, strategy=strategy, signal_id=signal_id, reason=reject_reason, payload={"intent_id": intent_id, "req_id": req_id, "response": res or {}, "classified": classified})
+        _record_ops_event(failure_event_type, symbol=symbol, strategy=strategy, signal_id=signal_id, reason=_structured_reason(reject_reason), payload={"intent_id": intent_id, "req_id": req_id, "response": res or {}, "classified": classified}, fingerprint=admission_ctx.get('fingerprint'))
+        _record_admission_event(admission_ctx, admission_result='rejected', reject_reason=_structured_reason(reject_reason), payload={"intent_id": intent_id, "req_id": req_id, "response": res or {}, "classified": classified})
         lifecycle_db.release_workflow_lock(workflow_lock_key)
 
         # Do NOT create a plan on failed orders. Cooldown is enforced by recent ops events.
@@ -2592,8 +2793,9 @@ def _execute_long_entry(
             opened_ts=opened_ts,
             max_hold_sec=_strategy_max_hold_sec(strategy),
         ))
+        _record_ops_event('entry_executed', symbol=symbol, strategy=strategy, signal_id=signal_id, reason='entry_executed', payload={'req_id': req_id, 'trade_plan_id': trade_plan_id, 'intent_id': intent_id, 'position_id': position_id}, fingerprint=admission_ctx.get('fingerprint'))
         lifecycle_db.release_workflow_lock(workflow_lock_key)
-        return {"ok": True, "executed": True, "symbol": symbol, "strategy": strategy, "price": plan_entry_px, "stop": float(stop_price), "take": float(take_price), "trade_plan_id": trade_plan_id, "intent_id": intent_id, "position_id": position_id}
+        return {"ok": True, "executed": True, "symbol": symbol, "strategy": strategy, "price": plan_entry_px, "stop": float(stop_price), "take": float(take_price), "trade_plan_id": trade_plan_id, "intent_id": intent_id, "position_id": position_id, "fingerprint": admission_ctx.get('fingerprint')}
 
     return {"ok": False, "executed": False, "symbol": symbol, "strategy": strategy, "price": px, "stop": float(stop_price), "take": float(take_price), "error": res.get("error") or "order_failed", "trade_plan_id": None, "intent_id": intent_id, "position_id": None}
 
@@ -3304,7 +3506,7 @@ def _scanner_signal_id(symbol: str, strategy: str) -> str:
     return f"scan:{normalize_symbol(symbol)}:{str(strategy or '').strip().lower()}:{bucket}"
 
 
-def place_entry(symbol: str, *, strategy: str, req_id: str | None = None, client_ip: str | None = None, notional: float | None = None):
+def place_entry(symbol: str, *, strategy: str, req_id: str | None = None, client_ip: str | None = None, notional: float | None = None, candidate_meta: dict | None = None):
     """
     Wrapper used by /worker/scan_entries to execute an entry in live mode.
 
@@ -3323,7 +3525,7 @@ def place_entry(symbol: str, *, strategy: str, req_id: str | None = None, client
         source="scan_entries",
         req_id=rid,
         client_ip=client_ip,
-        extra={"strategy": strategy},
+        extra={"strategy": strategy, **(candidate_meta or {})},
     )
     # _execute_long_entry returns a dict like:
     #   {"ok": True, "executed": True|False, "reason": "..."} or {"ok": False, "error": "..."}
@@ -3566,6 +3768,61 @@ def diagnostics_execution_state(limit: int = 50):
     }
 
 
+@app.get("/diagnostics/ops_events")
+def diagnostics_ops_events(limit: int = 100, lookback_hours: int = 24):
+    limit = max(1, min(int(limit), 500))
+    lookback_hours = max(1, min(int(lookback_hours), 24 * 30))
+    since_ts = time.time() - (float(lookback_hours) * 3600.0)
+    return {
+        'ok': True,
+        'utc': utc_now_iso(),
+        'lookback_hours': lookback_hours,
+        'summary': lifecycle_db.summarize_ops_events(since_ts=since_ts),
+        'events': lifecycle_db.list_recent_ops_events(since_ts=since_ts, limit=limit),
+    }
+
+
+@app.get("/diagnostics/admission_events")
+def diagnostics_admission_events(limit: int = 100, lookback_hours: int = 24):
+    limit = max(1, min(int(limit), 500))
+    lookback_hours = max(1, min(int(lookback_hours), 24 * 30))
+    since_ts = time.time() - (float(lookback_hours) * 3600.0)
+    return {
+        'ok': True,
+        'utc': utc_now_iso(),
+        'lookback_hours': lookback_hours,
+        'summary': lifecycle_db.summarize_admission_events(since_ts=since_ts),
+        'events': lifecycle_db.list_recent_admission_events(since_ts=since_ts, limit=limit),
+    }
+
+
+@app.get("/diagnostics/workflow_locks")
+def diagnostics_workflow_locks(limit: int = 100):
+    limit = max(1, min(int(limit), 500))
+    return {
+        'ok': True,
+        'utc': utc_now_iso(),
+        'active_locks': lifecycle_db.list_active_workflow_locks(limit=limit),
+    }
+
+
+@app.get("/diagnostics/entry_pipeline")
+def diagnostics_entry_pipeline(limit: int = 100, lookback_hours: int = 24):
+    limit = max(1, min(int(limit), 500))
+    lookback_hours = max(1, min(int(lookback_hours), 24 * 30))
+    since_ts = time.time() - (float(lookback_hours) * 3600.0)
+    return {
+        'ok': True,
+        'utc': utc_now_iso(),
+        'lookback_hours': lookback_hours,
+        'ops_summary': lifecycle_db.summarize_ops_events(since_ts=since_ts),
+        'admission_summary': lifecycle_db.summarize_admission_events(since_ts=since_ts),
+        'recent_ops_events': lifecycle_db.list_recent_ops_events(since_ts=since_ts, limit=limit),
+        'recent_admission_events': lifecycle_db.list_recent_admission_events(since_ts=since_ts, limit=limit),
+        'active_workflow_locks': lifecycle_db.list_active_workflow_locks(limit=limit),
+    }
+
+
 @app.get("/diagnostics/runtime")
 def diagnostics_runtime():
     positions = get_positions()
@@ -3590,6 +3847,11 @@ def diagnostics_runtime():
         "recovery_reconcile": _recovery_reconcile_summary(apply=False),
         "pretrade_health_gate": _pretrade_health_gate_summary(rerun_startup_check=False),
         "ops_risk": _ops_risk_snapshot(),
+        "entry_pipeline": {
+            "signal_fingerprint_ttl_sec": int(getattr(settings, 'signal_fingerprint_ttl_sec', 0) or 0),
+            "entry_failure_cooldown_sec": int(_entry_failure_cooldown_sec()),
+            "workflow_lock_ttl_sec": int(getattr(settings, 'workflow_lock_ttl_sec', 0) or 0),
+        },
         "risk_admission": {
             "sizing_mode": str(getattr(settings, "sizing_mode", "fixed") or "fixed"),
             "risk_per_trade": float(getattr(settings, "risk_per_trade", 0.0) or 0.0),
@@ -3620,6 +3882,11 @@ def diagnostics_state_model_summary():
         "state_model": _state_model_summary(),
         "execution_state": _execution_state_summary(),
         "ops_risk": _ops_risk_snapshot(),
+        "entry_pipeline": {
+            "signal_fingerprint_ttl_sec": int(getattr(settings, 'signal_fingerprint_ttl_sec', 0) or 0),
+            "entry_failure_cooldown_sec": int(_entry_failure_cooldown_sec()),
+            "workflow_lock_ttl_sec": int(getattr(settings, 'workflow_lock_ttl_sec', 0) or 0),
+        },
         "risk_admission": {
             "sizing_mode": str(getattr(settings, "sizing_mode", "fixed") or "fixed"),
             "risk_per_trade": float(getattr(settings, "risk_per_trade", 0.0) or 0.0),
@@ -3848,12 +4115,16 @@ def scan_entries(payload: WorkerScanPayload):
 
         if sym in open_set:
             d["skip"].append("already_in_position")
+            scan_ctx = _build_admission_context(symbol=sym, strategy='scanner', signal_name=None, signal_id=_scanner_signal_id(sym, 'scanner'), source='scan_entries', extra={'regime_quiet': bool(regime_quiet)}, px_hint=None)
+            _record_rejected_admission(scan_ctx, 'position_already_open', payload=d)
             per_symbol[sym] = d
             continue
 
         if open_positions_count >= MAX_OPEN_POSITIONS:
             d["skip"].append("max_open_positions_reached")
             d["max_open_positions"] = MAX_OPEN_POSITIONS
+            scan_ctx = _build_admission_context(symbol=sym, strategy='scanner', signal_name=None, signal_id=_scanner_signal_id(sym, 'scanner'), source='scan_entries', extra={'regime_quiet': bool(regime_quiet)}, px_hint=None)
+            _record_rejected_admission(scan_ctx, 'rejected_max_open_positions', payload=d)
             per_symbol[sym] = d
             continue
 
@@ -3862,6 +4133,8 @@ def scan_entries(payload: WorkerScanPayload):
         except Exception as e:
             d["skip"].append(f"signal_error:{type(e).__name__}")
             d["signal_error"] = str(e)
+            scan_ctx = _build_admission_context(symbol=sym, strategy='scanner', signal_name=None, signal_id=_scanner_signal_id(sym, 'scanner'), source='scan_entries', extra={'regime_quiet': bool(regime_quiet)}, px_hint=None)
+            _record_rejected_admission(scan_ctx, 'signal_error', payload=d | {'error': str(e)})
             per_symbol[sym] = d
             continue
 
@@ -3871,6 +4144,8 @@ def scan_entries(payload: WorkerScanPayload):
         fired_strats = [k for k, v in fired.items() if v]
         if not fired_strats:
             d["skip"].append("no_signal")
+            scan_ctx = _build_admission_context(symbol=sym, strategy='scanner', signal_name=None, signal_id=_scanner_signal_id(sym, 'scanner'), source='scan_entries', extra={'regime_quiet': bool(regime_quiet), 'signal_meta': sig_debug.get('rb1') or {}}, px_hint=None)
+            _record_rejected_admission(scan_ctx, 'rejected_no_signal', payload=d)
             per_symbol[sym] = d
             continue
 
@@ -3901,7 +4176,7 @@ def scan_entries(payload: WorkerScanPayload):
         d["chosen_strategy"] = strategy
         rank = _rank_candidate(sym, strategy, sig_debug)
         d["rank"] = rank
-        candidates.append({"symbol": sym, "strategy": strategy, "score": float(rank.get("score") or 0.0), "rank": rank})
+        candidates.append({"symbol": sym, "strategy": strategy, "score": float(rank.get("score") or 0.0), "rank": rank, "signal_meta": dict((sig_debug or {}).get(strategy) or {}), "regime_quiet": bool(regime_quiet)})
         per_symbol[sym] = d
 
     # Apply per-scan entry cap *after* we have all candidates so we can prioritize.
@@ -3944,6 +4219,8 @@ def scan_entries(payload: WorkerScanPayload):
             d["eligible"] = False
             if "max_entries_per_scan_reached" not in d["skip"]:
                 d["skip"].append("max_entries_per_scan_reached")
+            loser_ctx = _build_admission_context(symbol=sym, strategy=str(c.get('strategy') or ''), signal_name=str(c.get('strategy') or ''), signal_id=_scanner_signal_id(sym, str(c.get('strategy') or 'scanner')), source='scan_entries', extra={'rank': c.get('rank') or {}, 'signal_meta': c.get('signal_meta') or {}, 'regime_quiet': c.get('regime_quiet'), 'ranking_score': c.get('score')}, px_hint=None)
+            _record_rejected_admission(loser_ctx, 'rejected_max_entries_per_scan', payload=d | {'score': c.get('score')})
             per_symbol[sym] = d
 
         candidates = winners
@@ -3972,7 +4249,9 @@ def scan_entries(payload: WorkerScanPayload):
             spread_pct = (ask - bid) / mid if mid else None
         if MAX_SPREAD_PCT and MAX_SPREAD_PCT > 0 and spread_pct is not None and spread_pct > MAX_SPREAD_PCT:
             meta2 = {"ok": False, "ignored": True, "reason": "spread_too_wide", "symbol": sym, "strategy": strategy, "bid": bid, "ask": ask, "spread_pct": spread_pct, "max_spread_pct": MAX_SPREAD_PCT, "score": score}
-            results.append({"symbol": sym, "strategy": strategy, "ok": False, "status": "skipped", "reason": "spread_too_wide", "meta": meta2})
+            scan_ctx = _build_admission_context(symbol=sym, strategy=strategy, signal_name=strategy, signal_id=_scanner_signal_id(sym, strategy), source='scan_entries', extra={'rank': c.get('rank') or {}, 'signal_meta': c.get('signal_meta') or {}, 'regime_quiet': c.get('regime_quiet'), 'ranking_score': score, 'spread_pct': spread_pct}, px_hint=None)
+            _record_rejected_admission(scan_ctx, 'spread_too_wide', payload=meta2)
+            results.append({"symbol": sym, "strategy": strategy, "ok": False, "status": "skipped", "reason": "rejected_spread_too_wide", "meta": meta2})
             # Also annotate per_symbol so diagnostics show why it didn't execute.
             d = per_symbol.get(sym) or {"symbol": sym, "skip": []}
             d.setdefault("skip", [])
@@ -3982,7 +4261,7 @@ def scan_entries(payload: WorkerScanPayload):
             per_symbol[sym] = d
             continue
 
-        ok2, reason2, meta2 = place_entry(sym, strategy=strategy)
+        ok2, reason2, meta2 = place_entry(sym, strategy=strategy, candidate_meta={'rank': c.get('rank') or {}, 'signal_meta': c.get('signal_meta') or {}, 'regime_quiet': c.get('regime_quiet'), 'ranking_score': c.get('score'), 'spread_pct': spread_pct})
         results.append(
             {
                 "symbol": sym,

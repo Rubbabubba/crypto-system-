@@ -15,6 +15,10 @@ class WebhookPayload(BaseModel):
     entry_price: float | None = Field(None, description="optional entry/reference price")
     stop_price: float | None = Field(None, description="optional stop price")
     take_price: float | None = Field(None, description="optional take price")
+    bar_ts: int | None = Field(None, description="optional bar timestamp for signal fingerprinting")
+    trigger_price: float | None = Field(None, description="optional trigger/breakout level for signal fingerprinting")
+    fingerprint: str | None = Field(None, description="optional explicit fingerprint override")
+    ranking_score: float | None = Field(None, description="optional scanner ranking score")
 
 
 class WorkerExitPayload(BaseModel):

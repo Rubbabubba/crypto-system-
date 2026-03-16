@@ -77,6 +77,7 @@ class Settings:
 
     # Idempotency / anti-spam
     signal_dedupe_ttl_sec: int
+    signal_fingerprint_ttl_sec: int
 
     # Exits
     stop_pct: float
@@ -245,6 +246,7 @@ def load_settings() -> Settings:
 
         # Idempotency
         signal_dedupe_ttl_sec=int(float(_getenv("SIGNAL_DEDUPE_TTL_SEC", "90") or 90)),
+        signal_fingerprint_ttl_sec=int(float(_getenv("SIGNAL_FINGERPRINT_TTL_SEC", "900") or 900)),
 
         # Exits
         stop_pct=float(_getenv("STOP_PCT", "0.01") or 0.01),

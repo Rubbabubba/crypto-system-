@@ -11,7 +11,7 @@ DEFAULT_DB_PATH = "/var/data/lifecycle.sqlite3"
 OPENISH_TRADE_PLAN_STATUSES = {'approved', 'submitted', 'active'}
 TERMINAL_TRADE_PLAN_STATUSES = {'closed', 'cancelled', 'rejected', 'failed', 'failed_reconcile', 'expired', 'abandoned'}
 OPENISH_ORDER_INTENT_STATES = {'created','validated','submitted','acknowledged','partial','replace_pending','cancel_pending'}
-
+ADMISSION_RESULT_FINAL = {'accepted', 'rejected', 'duplicate'}
 
 
 def _db_path() -> str:
@@ -196,6 +196,46 @@ def ensure_schema() -> str:
                 metadata_json TEXT
             );
             CREATE INDEX IF NOT EXISTS idx_workflow_locks_symbol_active ON workflow_locks(symbol, released_ts, expires_ts);
+
+            CREATE TABLE IF NOT EXISTS signal_fingerprints (
+                fingerprint TEXT PRIMARY KEY,
+                symbol TEXT,
+                strategy_id TEXT,
+                signal_id TEXT,
+                first_seen_ts REAL,
+                last_seen_ts REAL,
+                expires_ts REAL,
+                metadata_json TEXT
+            );
+            CREATE INDEX IF NOT EXISTS idx_signal_fingerprints_expires ON signal_fingerprints(expires_ts);
+
+            CREATE TABLE IF NOT EXISTS admission_events (
+                event_id TEXT PRIMARY KEY,
+                symbol TEXT NOT NULL,
+                strategy_id TEXT,
+                signal_id TEXT,
+                signal_name TEXT,
+                fingerprint TEXT,
+                source TEXT,
+                bar_ts INTEGER,
+                trigger_price REAL,
+                reference_price REAL,
+                atr REAL,
+                range_high REAL,
+                range_low REAL,
+                range_width_pct REAL,
+                breakout_level REAL,
+                breakout_distance_pct REAL,
+                ranking_score REAL,
+                spread_pct REAL,
+                regime_state TEXT,
+                admission_result TEXT,
+                reject_reason TEXT,
+                payload_json TEXT,
+                created_ts REAL
+            );
+            CREATE INDEX IF NOT EXISTS idx_admission_events_symbol_created ON admission_events(symbol, created_ts);
+            CREATE INDEX IF NOT EXISTS idx_admission_events_result_created ON admission_events(admission_result, created_ts);
             """
         )
         _ensure_columns(con, 'trade_plans', {
@@ -237,6 +277,41 @@ def ensure_schema() -> str:
             'expires_ts': 'REAL',
             'released_ts': 'REAL',
             'metadata_json': 'TEXT',
+        })
+        _ensure_columns(con, 'signal_fingerprints', {
+            'fingerprint': 'TEXT',
+            'symbol': 'TEXT',
+            'strategy_id': 'TEXT',
+            'signal_id': 'TEXT',
+            'first_seen_ts': 'REAL',
+            'last_seen_ts': 'REAL',
+            'expires_ts': 'REAL',
+            'metadata_json': 'TEXT',
+        })
+        _ensure_columns(con, 'admission_events', {
+            'event_id': 'TEXT',
+            'symbol': 'TEXT',
+            'strategy_id': 'TEXT',
+            'signal_id': 'TEXT',
+            'signal_name': 'TEXT',
+            'fingerprint': 'TEXT',
+            'source': 'TEXT',
+            'bar_ts': 'INTEGER',
+            'trigger_price': 'REAL',
+            'reference_price': 'REAL',
+            'atr': 'REAL',
+            'range_high': 'REAL',
+            'range_low': 'REAL',
+            'range_width_pct': 'REAL',
+            'breakout_level': 'REAL',
+            'breakout_distance_pct': 'REAL',
+            'ranking_score': 'REAL',
+            'spread_pct': 'REAL',
+            'regime_state': 'TEXT',
+            'admission_result': 'TEXT',
+            'reject_reason': 'TEXT',
+            'payload_json': 'TEXT',
+            'created_ts': 'REAL',
         })
         con.commit()
     finally:
@@ -874,6 +949,177 @@ def can_start_new_entry(symbol: str, strategy_id: str, *, cooldown_sec: int = 0)
             return {'ok': False, 'reason': 'entry_failure_cooldown', 'blocking_objects': {'recent_failure_event': evt}, 'cooldown_remaining_sec': remaining}
     return {'ok': True, 'reason': '', 'blocking_objects': {}, 'cooldown_remaining_sec': 0}
 
+
+
+def purge_expired_signal_fingerprints(now_ts: float | None = None) -> int:
+    ensure_schema()
+    now_ts = float(now_ts or time.time())
+    con = _connect()
+    try:
+        cur = con.execute('DELETE FROM signal_fingerprints WHERE expires_ts IS NOT NULL AND expires_ts <= ?', (now_ts,))
+        con.commit()
+        return int(getattr(cur, 'rowcount', 0) or 0)
+    finally:
+        con.close()
+
+
+def get_active_signal_fingerprint(fingerprint: str) -> Optional[Dict[str, Any]]:
+    ensure_schema()
+    now_ts = time.time()
+    con = _connect()
+    try:
+        row = con.execute(
+            'SELECT * FROM signal_fingerprints WHERE fingerprint = ? AND (expires_ts IS NULL OR expires_ts > ?) LIMIT 1',
+            (str(fingerprint or ''), now_ts),
+        ).fetchone()
+        return dict(row) if row else None
+    finally:
+        con.close()
+
+
+def register_signal_fingerprint(fingerprint: str, *, symbol: str | None = None, strategy_id: str | None = None, signal_id: str | None = None, ttl_sec: int = 0, metadata: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    ensure_schema()
+    fp = str(fingerprint or '').strip()
+    if not fp:
+        return {'ok': False, 'duplicate': False, 'reason': 'missing_fingerprint'}
+    now_ts = time.time()
+    purge_expired_signal_fingerprints(now_ts)
+    ttl = max(1, int(ttl_sec or 1))
+    expires_ts = now_ts + float(ttl)
+    con = _connect()
+    try:
+        row = con.execute(
+            'SELECT * FROM signal_fingerprints WHERE fingerprint = ? AND (expires_ts IS NULL OR expires_ts > ?) LIMIT 1',
+            (fp, now_ts),
+        ).fetchone()
+        if row:
+            con.execute(
+                'UPDATE signal_fingerprints SET last_seen_ts = ?, expires_ts = ? WHERE fingerprint = ?',
+                (now_ts, max(float(row['expires_ts'] or 0.0), expires_ts), fp),
+            )
+            con.commit()
+            return {'ok': True, 'duplicate': True, 'existing': dict(row)}
+        con.execute(
+            """
+            INSERT INTO signal_fingerprints(fingerprint, symbol, strategy_id, signal_id, first_seen_ts, last_seen_ts, expires_ts, metadata_json)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (fp, symbol, strategy_id, signal_id, now_ts, now_ts, expires_ts, _json(metadata or {})),
+        )
+        con.commit()
+        return {'ok': True, 'duplicate': False, 'expires_ts': expires_ts}
+    finally:
+        con.close()
+
+
+def list_active_workflow_locks(*, symbol: str | None = None, strategy_id: str | None = None, limit: int = 100) -> List[Dict[str, Any]]:
+    ensure_schema()
+    clauses = ['released_ts IS NULL', 'expires_ts > ?']
+    args: List[Any] = [time.time()]
+    if symbol is not None:
+        clauses.append('symbol = ?')
+        args.append(symbol)
+    if strategy_id is not None:
+        clauses.append('strategy_id = ?')
+        args.append(strategy_id)
+    where = ' AND '.join(clauses)
+    return list_rows('workflow_locks', limit=limit, where=where, args=args, order_by='created_ts DESC')
+
+
+def record_admission_event(*, symbol: str, strategy_id: str | None = None, signal_id: str | None = None, signal_name: str | None = None, fingerprint: str | None = None, source: str | None = None, bar_ts: int | None = None, trigger_price: float | None = None, reference_price: float | None = None, atr: float | None = None, range_high: float | None = None, range_low: float | None = None, range_width_pct: float | None = None, breakout_level: float | None = None, breakout_distance_pct: float | None = None, ranking_score: float | None = None, spread_pct: float | None = None, regime_state: str | None = None, admission_result: str | None = None, reject_reason: str | None = None, payload: Optional[Dict[str, Any]] = None, event_id: str | None = None) -> str:
+    ensure_schema()
+    ts = time.time()
+    event_id = str(event_id or f"{int(ts*1000)}:adm:{symbol}:{strategy_id or ''}")
+    payload_obj = dict(payload or {})
+    con = _connect()
+    try:
+        con.execute(
+            """
+            INSERT OR REPLACE INTO admission_events(event_id, symbol, strategy_id, signal_id, signal_name, fingerprint, source, bar_ts, trigger_price, reference_price, atr, range_high, range_low, range_width_pct, breakout_level, breakout_distance_pct, ranking_score, spread_pct, regime_state, admission_result, reject_reason, payload_json, created_ts)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (event_id, symbol, strategy_id, signal_id, signal_name, fingerprint, source, bar_ts, trigger_price, reference_price, atr, range_high, range_low, range_width_pct, breakout_level, breakout_distance_pct, ranking_score, spread_pct, regime_state, admission_result, reject_reason, _json(payload_obj), ts),
+        )
+        con.commit()
+        return event_id
+    finally:
+        con.close()
+
+
+def list_recent_admission_events(*, symbol: str | None = None, strategy_id: str | None = None, admission_result: str | None = None, since_ts: float | None = None, limit: int = 100) -> List[Dict[str, Any]]:
+    ensure_schema()
+    clauses = []
+    args: List[Any] = []
+    if symbol is not None:
+        clauses.append('symbol = ?')
+        args.append(symbol)
+    if strategy_id is not None:
+        clauses.append('strategy_id = ?')
+        args.append(strategy_id)
+    if admission_result is not None:
+        clauses.append('admission_result = ?')
+        args.append(admission_result)
+    if since_ts is not None:
+        clauses.append('created_ts >= ?')
+        args.append(float(since_ts))
+    where = ' AND '.join(clauses)
+    return list_rows('admission_events', limit=limit, where=where, args=args, order_by='created_ts DESC')
+
+
+def summarize_admission_events(*, since_ts: float | None = None) -> Dict[str, Any]:
+    ensure_schema()
+    clauses = []
+    args: List[Any] = []
+    if since_ts is not None:
+        clauses.append('created_ts >= ?')
+        args.append(float(since_ts))
+    where_sql = f"WHERE {' AND '.join(clauses)}" if clauses else ''
+    con = _connect()
+    try:
+        rows = con.execute(
+            f"SELECT admission_result, COALESCE(reject_reason, '') AS reject_reason, COUNT(*) AS n FROM admission_events {where_sql} GROUP BY admission_result, COALESCE(reject_reason, '')",
+            tuple(args),
+        ).fetchall()
+        by_result: Dict[str, int] = {}
+        by_reason: Dict[str, int] = {}
+        total = 0
+        for row in rows:
+            result = str(row['admission_result'] or '')
+            reason = str(row['reject_reason'] or '')
+            n = int(row['n'] or 0)
+            total += n
+            by_result[result] = by_result.get(result, 0) + n
+            if reason:
+                by_reason[reason] = by_reason.get(reason, 0) + n
+        return {'total': total, 'by_result': by_result, 'by_reason': by_reason}
+    finally:
+        con.close()
+
+
+def summarize_ops_events(*, since_ts: float | None = None) -> Dict[str, Any]:
+    ensure_schema()
+    clauses = []
+    args: List[Any] = []
+    if since_ts is not None:
+        clauses.append('created_ts >= ?')
+        args.append(float(since_ts))
+    where_sql = f"WHERE {' AND '.join(clauses)}" if clauses else ''
+    con = _connect()
+    try:
+        rows = con.execute(
+            f"SELECT event_type, COUNT(*) AS n FROM ops_events {where_sql} GROUP BY event_type",
+            tuple(args),
+        ).fetchall()
+        by_type: Dict[str, int] = {}
+        total = 0
+        for row in rows:
+            et = str(row['event_type'] or '')
+            n = int(row['n'] or 0)
+            total += n
+            by_type[et] = n
+        return {'total': total, 'by_type': by_type}
+    finally:
+        con.close()
 
 def summary() -> Dict[str, Any]:
     ensure_schema()
