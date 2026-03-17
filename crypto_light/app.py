@@ -2256,6 +2256,47 @@ def can_start_new_entry(symbol: str, strategy: str) -> dict:
         return {'ok': False, 'reason': 'workflow_gate_error', 'blocking_objects': {'error': str(e)}, 'cooldown_remaining_sec': 0}
 
 
+def _entry_submit_path_snapshot(*, symbol: str | None = None, strategy: str | None = None, limit: int = 50) -> dict:
+    limit = max(1, min(int(limit), 500))
+    where_bits = []
+    args = []
+    if symbol:
+        where_bits.append('symbol = ?')
+        args.append(str(symbol))
+    if strategy:
+        where_bits.append('strategy_id = ?')
+        args.append(str(strategy))
+    where = ' AND '.join(where_bits) if where_bits else None
+    try:
+        admission_events = lifecycle_db.list_rows('admission_events', limit=limit, where=where, args=args, order_by='created_ts DESC')
+        order_intents = lifecycle_db.list_rows('order_intents', limit=limit, where=where, args=args, order_by='updated_ts DESC')
+        broker_orders = lifecycle_db.list_rows('broker_orders', limit=limit, where=where, args=args, order_by='updated_ts DESC')
+        trade_lifecycle = lifecycle_db.list_rows('trade_lifecycle_events', limit=limit, where=where, args=args, order_by='created_ts DESC')
+        ops_events = lifecycle_db.list_rows('ops_events', limit=limit, where=where, args=args, order_by='created_ts DESC')
+    except Exception as e:
+        return {'ok': False, 'error': str(e)}
+
+    accepted = [r for r in admission_events if str(r.get('admission_result') or '') == 'accepted']
+    return {
+        'ok': True,
+        'utc': utc_now_iso(),
+        'filters': {'symbol': symbol, 'strategy': strategy, 'limit': limit},
+        'counts': {
+            'accepted_admissions': len(accepted),
+            'order_intents': len(order_intents),
+            'broker_orders': len(broker_orders),
+            'trade_lifecycle_events': len(trade_lifecycle),
+            'ops_events': len(ops_events),
+        },
+        'recent_accepted_admissions': accepted[:limit],
+        'recent_order_intents': order_intents[:limit],
+        'recent_broker_orders': broker_orders[:limit],
+        'recent_trade_lifecycle_events': trade_lifecycle[:limit],
+        'recent_ops_events': ops_events[:limit],
+        'active_workflow_locks': lifecycle_db.list_active_workflow_locks(symbol=symbol, strategy_id=strategy, limit=limit),
+    }
+
+
 def _execute_long_entry(
     *,
     symbol: str,
@@ -2566,6 +2607,7 @@ def _execute_long_entry(
         active_lock = lifecycle_db.get_active_workflow_lock(workflow_lock_key)
         return ignored('active_workflow_lock', symbol=symbol, strategy=strategy, workflow_lock=active_lock or {})
 
+    lifecycle_db.record_trade_lifecycle_event(stage='entry', event_type='workflow_lock_acquired', trade_plan_id=None, intent_id=intent_id, broker_order_id=None, position_id=None, symbol=symbol, strategy_id=strategy, payload={'req_id': req_id, 'lock_key': workflow_lock_key})
     lifecycle_db.upsert_order_intent(
         {
             "intent_id": intent_id,
@@ -2644,7 +2686,7 @@ def _execute_long_entry(
         lifecycle_db.record_trade_lifecycle_event(stage='entry', event_type='submit_failed', trade_plan_id=None, intent_id=intent_id, broker_order_id=intent_id, symbol=symbol, strategy_id=strategy, reason='submit_failed_pre_ack', payload={'error': str(e), 'req_id': req_id})
         _record_ops_event('entry_submit_failed', symbol=symbol, strategy=strategy, signal_id=signal_id, reason='submit_failed_pre_ack', payload={"error": str(e), "intent_id": intent_id, "req_id": req_id}, fingerprint=admission_ctx.get('fingerprint'))
         lifecycle_db.release_workflow_lock(workflow_lock_key)
-        raise
+        return {"ok": False, "executed": False, "symbol": symbol, "strategy": strategy, "price": px, "stop": float(stop_price), "take": float(take_price), "error": str(e), "trade_plan_id": None, "intent_id": intent_id, "position_id": None}
 
     if not (res and res.get("ok")):
         state.clear_order_lock(entry_lock_key)
@@ -2835,6 +2877,11 @@ def _execute_long_entry(
         return {"ok": True, "executed": True, "symbol": symbol, "strategy": strategy, "price": plan_entry_px, "stop": float(stop_price), "take": float(take_price), "trade_plan_id": trade_plan_id, "intent_id": intent_id, "position_id": position_id, "fingerprint": admission_ctx.get('fingerprint')}
 
     return {"ok": False, "executed": False, "symbol": symbol, "strategy": strategy, "price": px, "stop": float(stop_price), "take": float(take_price), "error": res.get("error") or "order_failed", "trade_plan_id": None, "intent_id": intent_id, "position_id": None}
+
+
+@app.get("/diagnostics/entry_submit_path")
+def diagnostics_entry_submit_path(symbol: str | None = None, strategy: str | None = None, limit: int = 50):
+    return _entry_submit_path_snapshot(symbol=symbol, strategy=strategy, limit=limit)
 
 
 @app.post("/webhook")
@@ -3889,14 +3936,6 @@ def diagnostics_workflow_locks(limit: int = 100):
     }
 
 
-
-
-@app.get("/diagnostics/scanner_coordination")
-def diagnostics_scanner_coordination(lookback_sec: int = 900, limit: int = 100):
-    return {
-        'ok': True,
-        'coordination': lifecycle_db.coordination_snapshot(lookback_sec=lookback_sec, limit=limit),
-    }
 @app.get("/diagnostics/entry_pipeline")
 def diagnostics_entry_pipeline(limit: int = 100, lookback_hours: int = 24):
     limit = max(1, min(int(limit), 500))

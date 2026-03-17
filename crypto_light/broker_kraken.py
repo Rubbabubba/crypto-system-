@@ -740,8 +740,7 @@ def _query_trades(txids: list[str]) -> dict:
         return {}
     try:
         res = _priv("QueryTrades", {"txid": ",".join(ids)}) or {}
-        out = res.get("result") or {}
-        return out if isinstance(out, dict) else {}
+        return res if isinstance(res, dict) else {}
     except Exception:
         return {}
 
@@ -1072,10 +1071,9 @@ def market_notional(
     
     exec_mode = (str(exec_mode_override).strip().lower() if exec_mode_override is not None else (os.getenv("EXECUTION_MODE", "market") or "market").strip().lower())
     post_offset = float(post_offset_override) if post_offset_override is not None else float(os.getenv("POST_ONLY_OFFSET_PCT", "0.0002") or 0.0002)
-    if exec_mode == "limit_aggressive":
-        exec_mode = "maker_first"
-        if post_offset_override is None:
-            post_offset = 0.0
+    aggressive_cross_pct = float(os.getenv("LIMIT_AGGRESSIVE_CROSS_PCT", "0.0005") or 0.0005)
+    aggressive_reconcile_sec = int(float(os.getenv("LIMIT_AGGRESSIVE_RECONCILE_SEC", "3") or 3))
+    aggressive_use_ioc = (os.getenv("LIMIT_AGGRESSIVE_USE_IOC", "1").strip().lower() in ("1", "true", "yes", "on"))
     chase_sec = int(chase_sec_override) if chase_sec_override is not None else int(float(os.getenv("LIMIT_CHASE_SEC", "10") or 10))
     chase_steps = int(chase_steps_override) if chase_steps_override is not None else int(float(os.getenv("LIMIT_CHASE_STEPS", "1") or 1))
     if market_fallback_override is not None:
@@ -1206,8 +1204,8 @@ def market_notional(
             "execution": "post_only_limit",
             "pair": pair,
             "side": side,
-            "notional": float(notional_to_report),
-            "volume": float(volume_to_send),
+            "notional": float(notional),
+            "volume": float(volume),
             "limit_price": float(limit_px),
             "txid": txid_l,
             "descr": descr_l,
@@ -1215,6 +1213,105 @@ def market_notional(
             "vol_exec": vol_exec,
             "error": "maker_not_filled",
         }
+
+    def _place_aggressive_limit_once(limit_px: float) -> Dict[str, Any]:
+        payload_lim = {
+            "pair": pair,
+            "type": "buy" if side == "buy" else "sell",
+            "ordertype": "limit",
+            "price": _format_price(float(limit_px), pair_decimals),
+            "volume": _format_volume(volume, lot_decimals),
+            "userref": str(_userref_for_strategy(strategy) if strategy is not None else _userref(ui, side, float(notional))),
+        }
+        if aggressive_use_ioc:
+            payload_lim["timeinforce"] = "IOC"
+        try:
+            res_l = _priv("AddOrder", payload_lim)
+        except Exception as e:
+            return {"ok": False, "error": f"limit_aggressive failed: {e}"}
+
+        txid_l = None
+        descr_l = None
+        try:
+            txid_l = (res_l.get("txid") or [None])[0]
+            descr_l = (res_l.get("descr") or {}).get("order")
+        except Exception:
+            pass
+
+        recon = _reconcile_order_fill(str(txid_l), timeout_sec=max(1, aggressive_reconcile_sec)) if txid_l else {}
+        status = str(recon.get("status") or "").lower() if txid_l else None
+        try:
+            vol_exec = float(recon.get("vol_exec") or 0.0)
+        except Exception:
+            vol_exec = 0.0
+        filled = bool(recon.get("filled")) or (status == "closed" and vol_exec > 0)
+        if filled:
+            _cooldown_latch(strat_tag, pair, side)
+            return {
+                "ok": True,
+                "filled": True,
+                "execution": "limit_aggressive",
+                "pair": pair,
+                "side": side,
+                "notional": float(notional),
+                "volume": float(volume),
+                "limit_price": float(limit_px),
+                "txid": txid_l,
+                "descr": descr_l,
+                "status": status,
+                "vol_exec": vol_exec,
+                "reconciled": recon,
+                "result": res_l,
+            }
+        return {
+            "ok": False,
+            "filled": False,
+            "execution": "limit_aggressive",
+            "pair": pair,
+            "side": side,
+            "notional": float(notional),
+            "volume": float(volume),
+            "limit_price": float(limit_px),
+            "txid": txid_l,
+            "descr": descr_l,
+            "status": status,
+            "vol_exec": vol_exec,
+            "reconciled": recon,
+            "result": res_l,
+            "error": "aggressive_limit_not_filled",
+        }
+
+    # Aggressive limit execution: cross the spread with a marketable IOC limit, then fallback to market.
+    if exec_mode == "limit_aggressive":
+        bid, ask = _best_bid_ask(pair)
+        if side == "buy":
+            ref = ask if (ask and ask > 0) else px
+            limit_px = float(ref) * (1.0 + max(0.0, float(aggressive_cross_pct)))
+        else:
+            ref = bid if (bid and bid > 0) else px
+            limit_px = float(ref) * (1.0 - max(0.0, float(aggressive_cross_pct)))
+        out = _place_aggressive_limit_once(limit_px=float(limit_px))
+        if out.get("ok"):
+            return out
+        if market_fallback:
+            remaining_volume = float(volume)
+            remaining_notional = float(notional)
+            try:
+                vol_exec = float(out.get("vol_exec") or 0.0)
+            except Exception:
+                vol_exec = 0.0
+            if vol_exec > 0:
+                remaining_volume = max(0.0, float(volume) - vol_exec)
+                remaining_notional = max(0.0, remaining_volume * float(px))
+            mkt = _place_market(volume_override=remaining_volume, notional_override=remaining_notional)
+            mkt["aggressive_limit_first"] = {
+                "attempt_failed": True,
+                "first_attempt": out,
+                "fallback_remaining_volume": remaining_volume,
+                "fallback_remaining_notional": remaining_notional,
+            }
+            return mkt
+        return out
 
     # Maker-first execution: try post-only limit (optionally chase), then fallback to market.
     if exec_mode == "maker_first":
