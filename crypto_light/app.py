@@ -11,6 +11,7 @@ import logging
 import json
 import os
 import time
+import traceback
 import hashlib
 from datetime import datetime, timezone
 from typing import Any, Dict, Optional, Set, List, Tuple
@@ -2297,6 +2298,54 @@ def _entry_submit_path_snapshot(*, symbol: str | None = None, strategy: str | No
     }
 
 
+def _accepted_not_submitted_snapshot(*, symbol: str | None = None, strategy: str | None = None, lookback_sec: int = 86400, min_age_sec: int = 5, limit: int = 50) -> dict:
+    now_ts = time.time()
+    rows = lifecycle_db.list_trade_lifecycle_events(limit=max(int(limit) * 20, 200), symbol=symbol, strategy_id=strategy)
+    accepted = {}
+    order_intents = set()
+    broker_orders = set()
+    trade_plans = set()
+    recent_events = []
+    for row in rows:
+        evt_ts = float(row.get('event_ts') or row.get('created_ts') or 0.0)
+        if lookback_sec > 0 and evt_ts > 0 and (now_ts - evt_ts) > float(lookback_sec):
+            continue
+        intent_id = str(row.get('intent_id') or '')
+        evt_type = str(row.get('event_type') or '')
+        if evt_type == 'candidate_accepted' and intent_id:
+            accepted[intent_id] = row
+        elif evt_type in {'intent_created', 'order_intent_created'} and intent_id:
+            order_intents.add(intent_id)
+        elif evt_type in {'submit_attempted', 'broker_acknowledged', 'broker_terminal', 'position_opened'} and intent_id:
+            broker_orders.add(intent_id)
+        if evt_type in {'trade_plan_created', 'position_opened'}:
+            tp = str(row.get('trade_plan_id') or '')
+            if tp:
+                trade_plans.add(tp)
+        if evt_type in {'candidate_accepted', 'workflow_lock_acquired', 'entry_packet_build_started', 'entry_packet_build_completed', 'order_intent_create_started', 'intent_created', 'submit_attempted', 'entry_abort_pre_intent', 'submit_failed'}:
+            recent_events.append(row)
+    stranded = []
+    for intent_id, row in accepted.items():
+        evt_ts = float(row.get('event_ts') or row.get('created_ts') or 0.0)
+        if min_age_sec > 0 and evt_ts > 0 and (now_ts - evt_ts) < float(min_age_sec):
+            continue
+        if intent_id in order_intents or intent_id in broker_orders:
+            continue
+        stranded.append(row)
+    stranded = sorted(stranded, key=lambda r: float(r.get('event_ts') or r.get('created_ts') or 0.0), reverse=True)[: int(limit)]
+    recent_events = sorted(recent_events, key=lambda r: float(r.get('event_ts') or r.get('created_ts') or 0.0), reverse=True)[: max(int(limit) * 4, 50)]
+    return {
+        'utc': utc_now_iso(),
+        'symbol': symbol,
+        'strategy': strategy,
+        'lookback_sec': int(lookback_sec),
+        'min_age_sec': int(min_age_sec),
+        'accepted_admissions_without_intent': len(stranded),
+        'recent_stranded_acceptances': stranded,
+        'recent_events': recent_events,
+    }
+
+
 def _execute_long_entry(
     *,
     symbol: str,
@@ -2608,41 +2657,47 @@ def _execute_long_entry(
         return ignored('active_workflow_lock', symbol=symbol, strategy=strategy, workflow_lock=active_lock or {})
 
     lifecycle_db.record_trade_lifecycle_event(stage='entry', event_type='workflow_lock_acquired', trade_plan_id=None, intent_id=intent_id, broker_order_id=None, position_id=None, symbol=symbol, strategy_id=strategy, payload={'req_id': req_id, 'lock_key': workflow_lock_key})
-    lifecycle_db.upsert_order_intent(
-        {
+    res = None
+    intent_created = False
+    try:
+        lifecycle_db.record_trade_lifecycle_event(stage='entry', event_type='entry_packet_build_started', trade_plan_id=None, intent_id=intent_id, broker_order_id=None, position_id=None, symbol=symbol, strategy_id=strategy, payload={'req_id': req_id, 'signal_id': signal_id, 'fingerprint': admission_ctx.get('fingerprint')})
+        lifecycle_db.record_trade_lifecycle_event(stage='entry', event_type='entry_packet_build_completed', trade_plan_id=None, intent_id=intent_id, broker_order_id=None, position_id=None, symbol=symbol, strategy_id=strategy, payload={'req_id': req_id, 'client_order_key': client_order_key, 'requested_notional_usd': float(_notional), 'reference_price': float(px), 'stop_price': float(stop_price), 'take_price': float(take_price)})
+        lifecycle_db.record_trade_lifecycle_event(stage='entry', event_type='order_intent_create_started', trade_plan_id=None, intent_id=intent_id, broker_order_id=None, position_id=None, symbol=symbol, strategy_id=strategy, payload={'req_id': req_id, 'client_order_key': client_order_key})
+        lifecycle_db.upsert_order_intent(
+            {
+                "intent_id": intent_id,
+                "trade_plan_id": None,
+                "symbol": symbol,
+                "side": "buy",
+                "order_type": exec_mode_override or settings.execution_mode,
+                "strategy_id": strategy,
+                "state": "created",
+                "desired_qty": (float(_notional) / float(px)) if float(px) > 0 else 0.0,
+                "desired_notional_usd": float(_notional),
+                "limit_price": float(px),
+                "client_order_key": client_order_key,
+                "raw_json": {"req_id": req_id, "source": source, "dry_run": dry_run, "stage": "pre_submit"},
+            },
+        )
+        intent_created = True
+        lifecycle_db.upsert_broker_order({
+            "broker_order_id": intent_id,
             "intent_id": intent_id,
             "trade_plan_id": None,
             "symbol": symbol,
+            "strategy_id": strategy,
             "side": "buy",
             "order_type": exec_mode_override or settings.execution_mode,
-            "strategy_id": strategy,
-            "state": "created",
-            "desired_qty": (float(_notional) / float(px)) if float(px) > 0 else 0.0,
-            "desired_notional_usd": float(_notional),
-            "limit_price": float(px),
+            "lifecycle_stage": "entry",
+            "status": "created",
             "client_order_key": client_order_key,
+            "requested_qty": (float(_notional) / float(px)) if float(px) > 0 else 0.0,
+            "requested_notional_usd": float(_notional),
+            "limit_price": float(px),
             "raw_json": {"req_id": req_id, "source": source, "dry_run": dry_run, "stage": "pre_submit"},
-        },
-    )
-    lifecycle_db.upsert_broker_order({
-        "broker_order_id": intent_id,
-        "intent_id": intent_id,
-        "trade_plan_id": None,
-        "symbol": symbol,
-        "strategy_id": strategy,
-        "side": "buy",
-        "order_type": exec_mode_override or settings.execution_mode,
-        "lifecycle_stage": "entry",
-        "status": "created",
-        "client_order_key": client_order_key,
-        "requested_qty": (float(_notional) / float(px)) if float(px) > 0 else 0.0,
-        "requested_notional_usd": float(_notional),
-        "limit_price": float(px),
-        "raw_json": {"req_id": req_id, "source": source, "dry_run": dry_run, "stage": "pre_submit"},
-    })
-    lifecycle_db.record_trade_lifecycle_event(stage='entry', event_type='intent_created', trade_plan_id=None, intent_id=intent_id, broker_order_id=intent_id, symbol=symbol, strategy_id=strategy, payload={'req_id': req_id, 'client_order_key': client_order_key, 'requested_notional_usd': float(_notional)})
+        })
+        lifecycle_db.record_trade_lifecycle_event(stage='entry', event_type='intent_created', trade_plan_id=None, intent_id=intent_id, broker_order_id=intent_id, symbol=symbol, strategy_id=strategy, payload={'req_id': req_id, 'client_order_key': client_order_key, 'requested_notional_usd': float(_notional)})
 
-    try:
         state.set_order_lock(entry_lock_key, meta={"symbol": symbol, "side": "buy", "strategy": strategy, "req_id": req_id, "intent_id": intent_id})
         lifecycle_db.transition_order_intent(intent_id, 'submitted', raw_json={"req_id": req_id, "source": source, "dry_run": dry_run, "stage": "submit_attempt"})
         lifecycle_db.upsert_broker_order({
@@ -2670,23 +2725,39 @@ def _execute_long_entry(
             state.clear_order_lock(entry_lock_key)
         except Exception:
             pass
-        lifecycle_db.transition_order_intent(
-            intent_id,
-            "failed",
-            reject_reason="submit_failed_pre_ack",
-            last_broker_status="entry_exception_before_ack",
-            raw_json={"error": str(e), "symbol": symbol, "strategy": strategy, "stage": "entry_submit"},
-        )
-        lifecycle_db.upsert_broker_order({
-            "broker_order_id": intent_id, "intent_id": intent_id, "trade_plan_id": None, "symbol": symbol, "strategy_id": strategy,
-            "side": "buy", "order_type": exec_mode_override or settings.execution_mode, "lifecycle_stage": "entry",
-            "status": "failed", "client_order_key": client_order_key, "reject_reason": "submit_failed_pre_ack",
-            "raw_json": {"error": str(e), "symbol": symbol, "strategy": strategy, "stage": "entry_submit"}, "closed_ts": time.time(),
-        })
-        lifecycle_db.record_trade_lifecycle_event(stage='entry', event_type='submit_failed', trade_plan_id=None, intent_id=intent_id, broker_order_id=intent_id, symbol=symbol, strategy_id=strategy, reason='submit_failed_pre_ack', payload={'error': str(e), 'req_id': req_id})
-        _record_ops_event('entry_submit_failed', symbol=symbol, strategy=strategy, signal_id=signal_id, reason='submit_failed_pre_ack', payload={"error": str(e), "intent_id": intent_id, "req_id": req_id}, fingerprint=admission_ctx.get('fingerprint'))
+        err_payload = {
+            "error": str(e),
+            "exception_type": type(e).__name__,
+            "traceback": traceback.format_exc(limit=12),
+            "symbol": symbol,
+            "strategy": strategy,
+            "stage": "entry_submit" if intent_created else "pre_intent",
+            "req_id": req_id,
+            "signal_id": signal_id,
+            "fingerprint": admission_ctx.get('fingerprint'),
+            "client_order_key": client_order_key,
+        }
+        if intent_created:
+            lifecycle_db.transition_order_intent(
+                intent_id,
+                "failed",
+                reject_reason="submit_failed_pre_ack",
+                last_broker_status="entry_exception_before_ack",
+                raw_json=err_payload,
+            )
+            lifecycle_db.upsert_broker_order({
+                "broker_order_id": intent_id, "intent_id": intent_id, "trade_plan_id": None, "symbol": symbol, "strategy_id": strategy,
+                "side": "buy", "order_type": exec_mode_override or settings.execution_mode, "lifecycle_stage": "entry",
+                "status": "failed", "client_order_key": client_order_key, "reject_reason": "submit_failed_pre_ack",
+                "raw_json": err_payload, "closed_ts": time.time(),
+            })
+            lifecycle_db.record_trade_lifecycle_event(stage='entry', event_type='submit_failed', trade_plan_id=None, intent_id=intent_id, broker_order_id=intent_id, symbol=symbol, strategy_id=strategy, reason='submit_failed_pre_ack', payload=err_payload)
+            _record_ops_event('entry_submit_failed', symbol=symbol, strategy=strategy, signal_id=signal_id, reason='submit_failed_pre_ack', payload={**err_payload, "intent_id": intent_id}, fingerprint=admission_ctx.get('fingerprint'))
+        else:
+            lifecycle_db.record_trade_lifecycle_event(stage='entry', event_type='entry_abort_pre_intent', trade_plan_id=None, intent_id=intent_id, broker_order_id=None, symbol=symbol, strategy_id=strategy, reason='entry_abort_pre_intent', payload=err_payload)
+            _record_ops_event('entry_abort_pre_intent', symbol=symbol, strategy=strategy, signal_id=signal_id, reason='entry_abort_pre_intent', payload={**err_payload, "intent_id": intent_id}, fingerprint=admission_ctx.get('fingerprint'))
         lifecycle_db.release_workflow_lock(workflow_lock_key)
-        return {"ok": False, "executed": False, "symbol": symbol, "strategy": strategy, "price": px, "stop": float(stop_price), "take": float(take_price), "error": str(e), "trade_plan_id": None, "intent_id": intent_id, "position_id": None}
+        return {"ok": False, "executed": False, "symbol": symbol, "strategy": strategy, "price": px, "stop": float(stop_price), "take": float(take_price), "error": str(e), "trade_plan_id": None, "intent_id": intent_id, "position_id": None, "exception_type": type(e).__name__, "pre_intent": not intent_created}
 
     if not (res and res.get("ok")):
         state.clear_order_lock(entry_lock_key)
@@ -2882,6 +2953,11 @@ def _execute_long_entry(
 @app.get("/diagnostics/entry_submit_path")
 def diagnostics_entry_submit_path(symbol: str | None = None, strategy: str | None = None, limit: int = 50):
     return _entry_submit_path_snapshot(symbol=symbol, strategy=strategy, limit=limit)
+
+
+@app.get("/diagnostics/accepted_not_submitted")
+def diagnostics_accepted_not_submitted(symbol: str | None = None, strategy: str | None = None, lookback_sec: int = 86400, min_age_sec: int = 5, limit: int = 50):
+    return _accepted_not_submitted_snapshot(symbol=symbol, strategy=strategy, lookback_sec=lookback_sec, min_age_sec=min_age_sec, limit=limit)
 
 
 @app.post("/webhook")
