@@ -382,8 +382,6 @@ def _risk_admission_check(*, symbol: str, strategy: str, px: float, stop_price: 
 
 # ---------- Entry engine (optional; replaces TradingView) ----------
 ENTRY_ENGINE_ENABLED = (os.getenv("ENTRY_ENGINE_ENABLED", "1").strip().lower() in ("1", "true", "yes", "on"))
-ENTRY_ENGINE_STRATEGIES_LIST = [s.strip().lower() for s in os.getenv("ENTRY_ENGINE_STRATEGIES", "tc0,tc1,rb1").split(",") if s.strip()]
-ENTRY_ENGINE_STRATEGIES = set(ENTRY_ENGINE_STRATEGIES_LIST)
 ENTRY_ENGINE_TIMEFRAME = os.getenv("ENTRY_ENGINE_TIMEFRAME", "5Min").strip() or "5Min"   # must match broker get_bars
 ENTRY_ENGINE_LIMIT_BARS = int(float(os.getenv("ENTRY_ENGINE_LIMIT_BARS", "300") or 300))
 
@@ -398,10 +396,46 @@ ENABLE_TC1 = (os.getenv("ENABLE_TC1", "1").strip().lower() in ("1", "true", "yes
 ENABLE_CR1 = (os.getenv("ENABLE_CR1", "0").strip().lower() in ("1", "true", "yes", "on"))
 ENABLE_MM1 = (os.getenv("ENABLE_MM1", "0").strip().lower() in ("1", "true", "yes", "on"))
 _ALLOWED_STRATEGY_NAMES = ("tc0", "rb1", "tc1", "cr1", "mm1")
-if not ENTRY_ENGINE_STRATEGIES_LIST:
-    ENTRY_ENGINE_STRATEGIES_LIST = ["tc0", "tc1", "rb1"]
-ENTRY_ENGINE_STRATEGIES_LIST = [s for s in ENTRY_ENGINE_STRATEGIES_LIST if s in _ALLOWED_STRATEGY_NAMES]
+_RAW_ENTRY_ENGINE_STRATEGIES_LIST = [s.strip().lower() for s in os.getenv("ENTRY_ENGINE_STRATEGIES", "tc0,tc1,rb1").split(",") if s.strip()]
+if not _RAW_ENTRY_ENGINE_STRATEGIES_LIST:
+    _RAW_ENTRY_ENGINE_STRATEGIES_LIST = ["tc0", "tc1", "rb1"]
+_RAW_ENTRY_ENGINE_STRATEGIES_LIST = [s for s in _RAW_ENTRY_ENGINE_STRATEGIES_LIST if s in _ALLOWED_STRATEGY_NAMES]
+
+def _strategy_enabled(name: str) -> bool:
+    s = (name or "").strip().lower()
+    return {
+        "tc0": ENABLE_TC0,
+        "rb1": ENABLE_RB1,
+        "tc1": ENABLE_TC1,
+        "cr1": ENABLE_CR1,
+        "mm1": ENABLE_MM1,
+    }.get(s, False)
+
+def _effective_entry_engine_strategies() -> list[str]:
+    effective: list[str] = []
+    for s in _RAW_ENTRY_ENGINE_STRATEGIES_LIST:
+        if s in effective:
+            continue
+        if _strategy_enabled(s):
+            effective.append(s)
+    return effective
+
+ENTRY_ENGINE_STRATEGIES_LIST = _effective_entry_engine_strategies()
 ENTRY_ENGINE_STRATEGIES = set(ENTRY_ENGINE_STRATEGIES_LIST)
+_EFFECTIVE_LIVE_CONFIG = {
+    "strategy_mode": STRATEGY_MODE,
+    "entry_engine_strategies_raw": list(_RAW_ENTRY_ENGINE_STRATEGIES_LIST),
+    "entry_engine_strategies": list(ENTRY_ENGINE_STRATEGIES_LIST),
+    "strategy_enablement": {
+        "tc0": ENABLE_TC0,
+        "rb1": ENABLE_RB1,
+        "tc1": ENABLE_TC1,
+        "cr1": ENABLE_CR1,
+        "mm1": ENABLE_MM1,
+    },
+    "entry_engine_enabled": ENTRY_ENGINE_ENABLED,
+    "entry_engine_timeframe": ENTRY_ENGINE_TIMEFRAME,
+}
 
 # Regime filter (benchmark is typically BTC/USD)
 REGIME_FILTER_ENABLED = (os.getenv("REGIME_FILTER_ENABLED", "1").strip().lower() in ("1", "true", "yes", "on"))
@@ -4130,18 +4164,16 @@ def diagnostics_workflow_locks(limit: int = 100):
 def diagnostics_live_config():
     return {
         "ok": True,
-        "config": {
-            "strategy_mode": STRATEGY_MODE,
-            "entry_engine_strategies": ENTRY_ENGINE_STRATEGIES_LIST,
-            "enable_tc0": ENABLE_TC0,
-            "enable_rb1": ENABLE_RB1,
-            "enable_tc1": ENABLE_TC1,
-            "enable_cr1": ENABLE_CR1,
-            "enable_mm1": ENABLE_MM1,
-            "entry_engine_enabled": ENTRY_ENGINE_ENABLED,
-            "entry_engine_timeframe": ENTRY_ENGINE_TIMEFRAME,
-        },
+        "config": dict(_EFFECTIVE_LIVE_CONFIG),
     }
+
+@app.get("/diagnostics/scanner_coordination")
+def diagnostics_scanner_coordination(lookback_sec: int = 900, limit: int = 100):
+    return {
+        "ok": True,
+        "coordination": lifecycle_db.coordination_snapshot(lookback_sec=lookback_sec, limit=limit),
+    }
+
 
 @app.get("/diagnostics/entry_pipeline")
 def diagnostics_entry_pipeline(limit: int = 100, lookback_hours: int = 24):
@@ -4735,6 +4767,7 @@ def scan_entries(payload: WorkerScanPayload):
                 "filter_universe_by_allowed_symbols": FILTER_UNIVERSE_BY_ALLOWED_SYMBOLS,
                 "strategy_mode": STRATEGY_MODE,
                 "entry_engine_strategies": ENTRY_ENGINE_STRATEGIES_LIST,
+                "entry_engine_strategies_raw": _RAW_ENTRY_ENGINE_STRATEGIES_LIST,
                 "enable_tc0": ENABLE_TC0,
                 "enable_rb1": ENABLE_RB1,
                 "enable_tc1": ENABLE_TC1,

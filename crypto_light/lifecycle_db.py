@@ -1088,6 +1088,29 @@ def list_recent_trade_lifecycle_events(*, symbol: str | None = None, trade_plan_
     return list_rows('trade_lifecycle_events', limit=limit, where=where, args=args, order_by='created_ts DESC')
 
 
+def list_trade_lifecycle_events(*, symbol: str | None = None, strategy_id: str | None = None, trade_plan_id: str | None = None, stage: str | None = None, since_ts: float | None = None, limit: int = 100) -> List[Dict[str, Any]]:
+    ensure_schema()
+    clauses = []
+    args: List[Any] = []
+    if symbol is not None:
+        clauses.append('symbol = ?')
+        args.append(symbol)
+    if strategy_id is not None:
+        clauses.append('strategy_id = ?')
+        args.append(strategy_id)
+    if trade_plan_id is not None:
+        clauses.append('trade_plan_id = ?')
+        args.append(trade_plan_id)
+    if stage is not None:
+        clauses.append('stage = ?')
+        args.append(stage)
+    if since_ts is not None:
+        clauses.append('created_ts >= ?')
+        args.append(float(since_ts))
+    where = ' AND '.join(clauses)
+    return list_rows('trade_lifecycle_events', limit=limit, where=where, args=args, order_by='created_ts DESC')
+
+
 def summarize_trade_lifecycle(*, since_ts: float | None = None) -> Dict[str, Any]:
     ensure_schema()
     clauses = []
@@ -1389,6 +1412,43 @@ def list_active_workflow_locks(*, symbol: str | None = None, strategy_id: str | 
         args.append(strategy_id)
     where = ' AND '.join(clauses)
     return list_rows('workflow_locks', limit=limit, where=where, args=args, order_by='created_ts DESC')
+
+
+def coordination_snapshot(*, lookback_sec: int = 900, limit: int = 100) -> Dict[str, Any]:
+    ensure_schema()
+    now = time.time()
+    since_ts = max(0.0, now - max(1, int(lookback_sec or 900)))
+    active_locks = list_active_workflow_locks(limit=limit)
+    active_fingerprints = list_active_signal_fingerprints(limit=limit)
+    recent_passed = list_recent_admission_events(admission_result='accepted', since_ts=since_ts, limit=limit)
+
+    def _by_symbol(rows: List[Dict[str, Any]]) -> Dict[str, List[Dict[str, Any]]]:
+        out: Dict[str, List[Dict[str, Any]]] = {}
+        for row in rows:
+            sym = str(row.get('symbol') or '').strip()
+            if not sym:
+                continue
+            out.setdefault(sym, []).append(dict(row))
+        return out
+
+    suppressed_symbols = sorted({
+        str(r.get('symbol') or '').strip()
+        for r in (active_locks + recent_passed + active_fingerprints)
+        if str(r.get('symbol') or '').strip()
+    })
+    return {
+        'generated_ts': now,
+        'lookback_sec': int(lookback_sec or 900),
+        'suppressed_symbols': suppressed_symbols,
+        'active_workflow_locks': active_locks,
+        'recent_admission_passed': recent_passed,
+        'active_signal_fingerprints': active_fingerprints,
+        'by_symbol': {
+            'workflow_locks': _by_symbol(active_locks),
+            'admission_passed': _by_symbol(recent_passed),
+            'signal_fingerprints': _by_symbol(active_fingerprints),
+        },
+    }
 
 
 def backfill_legacy_trade_lifecycle_events(*, limit: int = 1000) -> int:
