@@ -3771,11 +3771,14 @@ def _entry_signals_for_symbol(symbol: str, *, regime_quiet: bool) -> tuple[dict,
     signals: dict = {}
     debug: dict = {}
 
-    wants_tc0 = ENABLE_TC0 and (STRATEGY_MODE != "fixed" or "tc0" in ENTRY_ENGINE_STRATEGIES)
-    wants_rb1 = ENABLE_RB1 and (STRATEGY_MODE != "fixed" or "rb1" in ENTRY_ENGINE_STRATEGIES)
-    wants_tc1 = ENABLE_TC1 and (STRATEGY_MODE != "fixed" or "tc1" in ENTRY_ENGINE_STRATEGIES)
-    wants_cr1 = ENABLE_CR1 and (STRATEGY_MODE != "fixed" or "cr1" in ENTRY_ENGINE_STRATEGIES)
-    wants_mm1 = ENABLE_MM1 and (STRATEGY_MODE != "fixed" or "mm1" in ENTRY_ENGINE_STRATEGIES)
+    # Patch 43: always respect ENTRY_ENGINE_STRATEGIES and enable flags in live evaluation,
+    # not only in fixed mode. This prevents disabled / de-prioritized strategies like RB1
+    # from continuing to generate production signals when env says otherwise.
+    wants_tc0 = ENABLE_TC0 and ("tc0" in ENTRY_ENGINE_STRATEGIES)
+    wants_rb1 = ENABLE_RB1 and ("rb1" in ENTRY_ENGINE_STRATEGIES)
+    wants_tc1 = ENABLE_TC1 and ("tc1" in ENTRY_ENGINE_STRATEGIES)
+    wants_cr1 = ENABLE_CR1 and ("cr1" in ENTRY_ENGINE_STRATEGIES)
+    wants_mm1 = ENABLE_MM1 and ("mm1" in ENTRY_ENGINE_STRATEGIES)
 
     if wants_tc0:
         tc0_fired, tc0_meta = _tc0_long_signal(symbol)
@@ -4120,6 +4123,25 @@ def diagnostics_workflow_locks(limit: int = 100):
         'active_locks': lifecycle_db.list_active_workflow_locks(limit=limit),
     }
 
+
+
+
+@app.get("/diagnostics/live_config")
+def diagnostics_live_config():
+    return {
+        "ok": True,
+        "config": {
+            "strategy_mode": STRATEGY_MODE,
+            "entry_engine_strategies": ENTRY_ENGINE_STRATEGIES_LIST,
+            "enable_tc0": ENABLE_TC0,
+            "enable_rb1": ENABLE_RB1,
+            "enable_tc1": ENABLE_TC1,
+            "enable_cr1": ENABLE_CR1,
+            "enable_mm1": ENABLE_MM1,
+            "entry_engine_enabled": ENTRY_ENGINE_ENABLED,
+            "entry_engine_timeframe": ENTRY_ENGINE_TIMEFRAME,
+        },
+    }
 
 @app.get("/diagnostics/entry_pipeline")
 def diagnostics_entry_pipeline(limit: int = 100, lookback_hours: int = 24):

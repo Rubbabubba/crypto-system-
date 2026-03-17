@@ -535,6 +535,39 @@ def _prepare_order_intent_payload(intent: Dict[str, Any]) -> Dict[str, Any]:
     payload.setdefault('remaining_qty', payload.get('desired_qty'))
     payload.setdefault('submitted_ts', now if str(payload.get('state') or '') in {'submitted','acknowledged','filled','partial','cancel_pending','cancelled','failed_reconcile'} else None)
     payload.setdefault('acknowledged_ts', now if str(payload.get('state') or '') in {'acknowledged','filled','partial','cancel_pending','cancelled','failed_reconcile'} else None)
+
+    # Patch 43: make optional SQL bind params explicit so sqlite named binding never fails
+    # when an upstream caller omits a non-required field like broker_txid.
+    required_keys = {
+        'intent_id': None,
+        'trade_plan_id': None,
+        'symbol': None,
+        'side': None,
+        'order_type': None,
+        'strategy_id': None,
+        'state': 'created',
+        'desired_qty': None,
+        'desired_notional_usd': None,
+        'limit_price': None,
+        'broker_txid': None,
+        'filled_qty': None,
+        'avg_fill_price': None,
+        'fees_usd': None,
+        'retry_count': 0,
+        'reject_reason': None,
+        'cancel_reason': None,
+        'client_order_key': None,
+        'last_broker_status': None,
+        'remaining_qty': payload.get('desired_qty'),
+        'submitted_ts': payload.get('submitted_ts'),
+        'acknowledged_ts': payload.get('acknowledged_ts'),
+        'raw_json': None,
+        'created_ts': payload.get('created_ts', now),
+        'updated_ts': now,
+    }
+    for k, default in required_keys.items():
+        payload.setdefault(k, default)
+
     payload.setdefault('raw_json', _json(payload.get('raw_json') or payload))
     payload = _sanitize_payload(payload, json_fields={'raw_json'})
     return payload
