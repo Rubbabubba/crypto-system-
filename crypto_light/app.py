@@ -392,13 +392,13 @@ ENTRY_ENGINE_LIMIT_BARS = int(float(os.getenv("ENTRY_ENGINE_LIMIT_BARS", "300") 
 STRATEGY_MODE = (os.getenv("STRATEGY_MODE", "auto") or "auto").strip().lower()  # fixed|auto|legacy
 ENABLE_RB1 = (os.getenv("ENABLE_RB1", "1").strip().lower() in ("1", "true", "yes", "on"))
 ENABLE_TC0 = (os.getenv("ENABLE_TC0", "1").strip().lower() in ("1", "true", "yes", "on"))
-ENABLE_TC1 = (os.getenv("ENABLE_TC1", "1").strip().lower() in ("1", "true", "yes", "on"))
+ENABLE_TC1 = (os.getenv("ENABLE_TC1", "0").strip().lower() in ("1", "true", "yes", "on"))
 ENABLE_CR1 = (os.getenv("ENABLE_CR1", "0").strip().lower() in ("1", "true", "yes", "on"))
 ENABLE_MM1 = (os.getenv("ENABLE_MM1", "0").strip().lower() in ("1", "true", "yes", "on"))
 _ALLOWED_STRATEGY_NAMES = ("tc0", "rb1", "tc1", "cr1", "mm1")
-_RAW_ENTRY_ENGINE_STRATEGIES_LIST = [s.strip().lower() for s in os.getenv("ENTRY_ENGINE_STRATEGIES", "tc0,tc1,rb1").split(",") if s.strip()]
+_RAW_ENTRY_ENGINE_STRATEGIES_LIST = [s.strip().lower() for s in os.getenv("ENTRY_ENGINE_STRATEGIES", "tc0,tc1").split(",") if s.strip()]
 if not _RAW_ENTRY_ENGINE_STRATEGIES_LIST:
-    _RAW_ENTRY_ENGINE_STRATEGIES_LIST = ["tc0", "tc1", "rb1"]
+    _RAW_ENTRY_ENGINE_STRATEGIES_LIST = ["tc0", "tc1"]
 _RAW_ENTRY_ENGINE_STRATEGIES_LIST = [s for s in _RAW_ENTRY_ENGINE_STRATEGIES_LIST if s in _ALLOWED_STRATEGY_NAMES]
 
 def _strategy_enabled(name: str) -> bool:
@@ -468,12 +468,20 @@ MM1_POST_ONLY_OFFSET_PCT = float(os.getenv("MM1_POST_ONLY_OFFSET_PCT", os.getenv
 MM1_MAX_HOLD_SEC = int(float(os.getenv("MM1_MAX_HOLD_SEC", "1800") or 1800))
 
 # TC0 params
-TC0_LOOKBACK_BARS = int(float(os.getenv("TC0_LOOKBACK_BARS", "20") or 20))
-TC0_BREAKOUT_BUFFER_PCT = float(os.getenv("TC0_BREAKOUT_BUFFER_PCT", "0.0003") or 0.0003)
-TC0_MIN_ATR_PCT = float(os.getenv("TC0_MIN_ATR_PCT", "0.0015") or 0.0015)
-TC0_REQUIRE_VWAP = (os.getenv("TC0_REQUIRE_VWAP", "1").strip().lower() in ("1", "true", "yes", "on"))
-TC0_MAX_SPREAD_PCT = float(os.getenv("TC0_MAX_SPREAD_PCT", "0.0030") or 0.0030)
+TC0_LOOKBACK_BARS = int(float(os.getenv("TC0_LOOKBACK_BARS", "12") or 20))
+TC0_BREAKOUT_BUFFER_PCT = float(os.getenv("TC0_BREAKOUT_BUFFER_PCT", "0.0001") or 0.0003)
+TC0_MIN_ATR_PCT = float(os.getenv("TC0_MIN_ATR_PCT", "0.0008") or 0.0015)
+TC0_REQUIRE_VWAP = (os.getenv("TC0_REQUIRE_VWAP", "0").strip().lower() in ("1", "true", "yes", "on"))
+TC0_MAX_SPREAD_PCT = float(os.getenv("TC0_MAX_SPREAD_PCT", "0.0040") or 0.0030)
 TC0_MAX_HOLD_SEC = int(float(os.getenv("TC0_MAX_HOLD_SEC", "1800") or 1800))
+_EFFECTIVE_LIVE_CONFIG["tc0_params"] = {
+    "lookback_bars": int(TC0_LOOKBACK_BARS),
+    "breakout_buffer_pct": float(TC0_BREAKOUT_BUFFER_PCT),
+    "min_atr_pct": float(TC0_MIN_ATR_PCT),
+    "require_vwap": bool(TC0_REQUIRE_VWAP),
+    "max_spread_pct": float(TC0_MAX_SPREAD_PCT),
+    "max_hold_sec": int(TC0_MAX_HOLD_SEC),
+}
 
 # Execution canary (disabled by default; deterministic low-risk validation mode)
 EXECUTION_CANARY_ENABLED = (os.getenv("EXECUTION_CANARY_ENABLED", "0").strip().lower() in ("1", "true", "yes", "on"))
