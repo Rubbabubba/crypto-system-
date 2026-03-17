@@ -382,6 +382,8 @@ def _risk_admission_check(*, symbol: str, strategy: str, px: float, stop_price: 
 
 # ---------- Entry engine (optional; replaces TradingView) ----------
 ENTRY_ENGINE_ENABLED = (os.getenv("ENTRY_ENGINE_ENABLED", "1").strip().lower() in ("1", "true", "yes", "on"))
+ENTRY_ENGINE_STRATEGIES_LIST = [s.strip().lower() for s in os.getenv("ENTRY_ENGINE_STRATEGIES", "tc0,tc1").split(",") if s.strip()]
+ENTRY_ENGINE_STRATEGIES = set(ENTRY_ENGINE_STRATEGIES_LIST)
 ENTRY_ENGINE_TIMEFRAME = os.getenv("ENTRY_ENGINE_TIMEFRAME", "5Min").strip() or "5Min"   # must match broker get_bars
 ENTRY_ENGINE_LIMIT_BARS = int(float(os.getenv("ENTRY_ENGINE_LIMIT_BARS", "300") or 300))
 
@@ -392,50 +394,14 @@ ENTRY_ENGINE_LIMIT_BARS = int(float(os.getenv("ENTRY_ENGINE_LIMIT_BARS", "300") 
 STRATEGY_MODE = (os.getenv("STRATEGY_MODE", "auto") or "auto").strip().lower()  # fixed|auto|legacy
 ENABLE_RB1 = (os.getenv("ENABLE_RB1", "1").strip().lower() in ("1", "true", "yes", "on"))
 ENABLE_TC0 = (os.getenv("ENABLE_TC0", "1").strip().lower() in ("1", "true", "yes", "on"))
-ENABLE_TC1 = (os.getenv("ENABLE_TC1", "0").strip().lower() in ("1", "true", "yes", "on"))
+ENABLE_TC1 = (os.getenv("ENABLE_TC1", "1").strip().lower() in ("1", "true", "yes", "on"))
 ENABLE_CR1 = (os.getenv("ENABLE_CR1", "0").strip().lower() in ("1", "true", "yes", "on"))
 ENABLE_MM1 = (os.getenv("ENABLE_MM1", "0").strip().lower() in ("1", "true", "yes", "on"))
 _ALLOWED_STRATEGY_NAMES = ("tc0", "rb1", "tc1", "cr1", "mm1")
-_RAW_ENTRY_ENGINE_STRATEGIES_LIST = [s.strip().lower() for s in os.getenv("ENTRY_ENGINE_STRATEGIES", "tc0,tc1").split(",") if s.strip()]
-if not _RAW_ENTRY_ENGINE_STRATEGIES_LIST:
-    _RAW_ENTRY_ENGINE_STRATEGIES_LIST = ["tc0", "tc1"]
-_RAW_ENTRY_ENGINE_STRATEGIES_LIST = [s for s in _RAW_ENTRY_ENGINE_STRATEGIES_LIST if s in _ALLOWED_STRATEGY_NAMES]
-
-def _strategy_enabled(name: str) -> bool:
-    s = (name or "").strip().lower()
-    return {
-        "tc0": ENABLE_TC0,
-        "rb1": ENABLE_RB1,
-        "tc1": ENABLE_TC1,
-        "cr1": ENABLE_CR1,
-        "mm1": ENABLE_MM1,
-    }.get(s, False)
-
-def _effective_entry_engine_strategies() -> list[str]:
-    effective: list[str] = []
-    for s in _RAW_ENTRY_ENGINE_STRATEGIES_LIST:
-        if s in effective:
-            continue
-        if _strategy_enabled(s):
-            effective.append(s)
-    return effective
-
-ENTRY_ENGINE_STRATEGIES_LIST = _effective_entry_engine_strategies()
+if not ENTRY_ENGINE_STRATEGIES_LIST:
+    ENTRY_ENGINE_STRATEGIES_LIST = ["tc0", "tc1"]
+ENTRY_ENGINE_STRATEGIES_LIST = [s for s in ENTRY_ENGINE_STRATEGIES_LIST if s in _ALLOWED_STRATEGY_NAMES]
 ENTRY_ENGINE_STRATEGIES = set(ENTRY_ENGINE_STRATEGIES_LIST)
-_EFFECTIVE_LIVE_CONFIG = {
-    "strategy_mode": STRATEGY_MODE,
-    "entry_engine_strategies_raw": list(_RAW_ENTRY_ENGINE_STRATEGIES_LIST),
-    "entry_engine_strategies": list(ENTRY_ENGINE_STRATEGIES_LIST),
-    "strategy_enablement": {
-        "tc0": ENABLE_TC0,
-        "rb1": ENABLE_RB1,
-        "tc1": ENABLE_TC1,
-        "cr1": ENABLE_CR1,
-        "mm1": ENABLE_MM1,
-    },
-    "entry_engine_enabled": ENTRY_ENGINE_ENABLED,
-    "entry_engine_timeframe": ENTRY_ENGINE_TIMEFRAME,
-}
 
 # Regime filter (benchmark is typically BTC/USD)
 REGIME_FILTER_ENABLED = (os.getenv("REGIME_FILTER_ENABLED", "1").strip().lower() in ("1", "true", "yes", "on"))
@@ -467,27 +433,6 @@ MM1_CHASE_SEC = int(float(os.getenv("MM1_CHASE_SEC", "12") or 12))
 MM1_POST_ONLY_OFFSET_PCT = float(os.getenv("MM1_POST_ONLY_OFFSET_PCT", os.getenv("POST_ONLY_OFFSET_PCT", "0.0002")) or 0.0002)
 MM1_MAX_HOLD_SEC = int(float(os.getenv("MM1_MAX_HOLD_SEC", "1800") or 1800))
 
-# TC0 params
-TC0_LOOKBACK_BARS = int(float(os.getenv("TC0_LOOKBACK_BARS", "12") or 20))
-TC0_BREAKOUT_BUFFER_PCT = float(os.getenv("TC0_BREAKOUT_BUFFER_PCT", "0.0001") or 0.0003)
-TC0_MIN_ATR_PCT = float(os.getenv("TC0_MIN_ATR_PCT", "0.0008") or 0.0015)
-TC0_REQUIRE_VWAP = (os.getenv("TC0_REQUIRE_VWAP", "0").strip().lower() in ("1", "true", "yes", "on"))
-TC0_MAX_SPREAD_PCT = float(os.getenv("TC0_MAX_SPREAD_PCT", "0.0040") or 0.0030)
-TC0_MAX_HOLD_SEC = int(float(os.getenv("TC0_MAX_HOLD_SEC", "1800") or 1800))
-_EFFECTIVE_LIVE_CONFIG["tc0_params"] = {
-    "lookback_bars": int(TC0_LOOKBACK_BARS),
-    "breakout_buffer_pct": float(TC0_BREAKOUT_BUFFER_PCT),
-    "min_atr_pct": float(TC0_MIN_ATR_PCT),
-    "require_vwap": bool(TC0_REQUIRE_VWAP),
-    "max_spread_pct": float(TC0_MAX_SPREAD_PCT),
-    "max_hold_sec": int(TC0_MAX_HOLD_SEC),
-}
-
-# Execution canary (disabled by default; deterministic low-risk validation mode)
-EXECUTION_CANARY_ENABLED = (os.getenv("EXECUTION_CANARY_ENABLED", "0").strip().lower() in ("1", "true", "yes", "on"))
-EXECUTION_CANARY_SYMBOL = normalize_symbol(os.getenv("EXECUTION_CANARY_SYMBOL", "BTC/USD") or "BTC/USD")
-EXECUTION_CANARY_INTERVAL_SEC = int(float(os.getenv("EXECUTION_CANARY_INTERVAL_SEC", "3600") or 3600))
-
 # RB1 params (5m)
 RB1_LOOKBACK_BARS = int(float(os.getenv("RB1_LOOKBACK_BARS", "48") or 48))
 RB1_BREAKOUT_BUFFER_PCT = float(os.getenv("RB1_BREAKOUT_BUFFER_PCT", "0.0005") or 0.0005)  # 0.05%
@@ -498,6 +443,16 @@ RB1_BREAKOUT_BUFFER_PCT = float(os.getenv("RB1_BREAKOUT_BUFFER_PCT", "0.0005") o
 RB1_NEAR_BREAKOUT_PCT = float(os.getenv("RB1_NEAR_BREAKOUT_PCT", "0") or 0)  # e.g. 0.0015 = 0.15%
 RB1_NEAR_REQUIRE_UP = int(float(os.getenv("RB1_NEAR_REQUIRE_UP", "1") or 1)) == 1
 RB1_NEAR_UP_MODE = (os.getenv("RB1_NEAR_UP_MODE", "gt") or "gt").strip().lower()  # gt (default) or ge
+
+# TC0 params (5m)
+TC0_LOOKBACK_BARS = int(float(os.getenv("TC0_LOOKBACK_BARS", "8") or 8))
+TC0_BREAKOUT_BUFFER_PCT = float(os.getenv("TC0_BREAKOUT_BUFFER_PCT", "0.0") or 0.0)
+TC0_ATR_LEN = int(float(os.getenv("TC0_ATR_LEN", "14") or 14))
+TC0_MIN_ATR_PCT = float(os.getenv("TC0_MIN_ATR_PCT", "0.0005") or 0.0005)
+TC0_REQUIRE_VWAP = (os.getenv("TC0_REQUIRE_VWAP", "0").strip().lower() in ("1", "true", "yes", "on"))
+TC0_VWAP_LOOKBACK_BARS = int(float(os.getenv("TC0_VWAP_LOOKBACK_BARS", "20") or 20))
+TC0_MAX_SPREAD_PCT = float(os.getenv("TC0_MAX_SPREAD_PCT", os.getenv("MAX_SPREAD_PCT", "0.004")) or 0.004)
+TC0_MAX_HOLD_SEC = int(float(os.getenv("TC0_MAX_HOLD_SEC", "1800") or 1800))
 
 # TC1 params
 TC1_LTF_EMA = int(float(os.getenv("TC1_LTF_EMA", "20") or 20))
@@ -719,6 +674,25 @@ def _atr_from_bars(bars: list[dict], length: int = 14) -> tuple[float | None, li
     return (float(atrs[-1]) if atrs else None), atrs
 
 
+
+
+def _vwap_from_bars(bars: list[dict], lookback: int | None = None) -> float | None:
+    if not bars:
+        return None
+    use = bars[-int(lookback):] if lookback and int(lookback) > 0 else bars
+    num = 0.0
+    den = 0.0
+    for b in use:
+        h = float(b.get("h") or 0.0)
+        l = float(b.get("l") or 0.0)
+        c = float(b.get("c") or 0.0)
+        v = float(b.get("v") or 0.0)
+        if v <= 0:
+            continue
+        tp = (h + l + c) / 3.0
+        num += tp * v
+        den += v
+    return (num / den) if den > 0 else None
 def _median(xs: list[float]) -> float | None:
     if not xs:
         return None
@@ -784,17 +758,6 @@ def _rank_candidate(symbol: str, strategy: str, sig_debug: dict) -> dict:
         score += max(0.0, momentum) * 0.5
 
         components.update({"prox": prox, "dist_to_level_pct": dist, "near_pct": near_pct, "momentum": momentum})
-
-    elif strat == "tc0":
-        meta = (sig_debug or {}).get("tc0") or {}
-        close = float(meta.get("close") or 0.0)
-        level = float(meta.get("level") or 0.0)
-        atr_pct = float(meta.get("atr_pct") or 0.0)
-        edge = ((close - level) / level) if level > 0 else 0.0
-        score += max(0.0, edge) * 3.0
-        score += max(0.0, vol_ratio - 1.0)
-        score += max(0.0, atr_pct - float(TC0_MIN_ATR_PCT)) * 50.0
-        components.update({"edge": edge, "atr_pct": atr_pct, "level": level})
 
     elif strat == "tc1":
         meta = (sig_debug or {}).get("tc1") or {}
@@ -957,10 +920,10 @@ def _strategy_max_hold_sec(strategy: str) -> int:
         return int(CR1_MAX_HOLD_SEC)
     if s == "mm1":
         return int(MM1_MAX_HOLD_SEC)
-    if s == "rb1":
-        return int(getattr(settings, "rb1_max_hold_sec", 0) or 0)
     if s == "tc0":
         return int(TC0_MAX_HOLD_SEC)
+    if s == "rb1":
+        return int(getattr(settings, "rb1_max_hold_sec", 0) or 0)
     if s == "tc1":
         return int(getattr(settings, "tc1_max_hold_sec", 0) or 0)
     return 0
@@ -1001,7 +964,7 @@ def _rb1_long_signal(symbol: str) -> tuple[bool, dict]:
         # Still require we haven't already broken out in prior bar to avoid repeated triggers.
         near = (prev_close < level) and (cur_close >= near_threshold) and momentum_ok
 
-    fired = breakout
+    fired = breakout or near
 
     meta = {
         "range_high": range_high,
@@ -1021,73 +984,85 @@ def _rb1_long_signal(symbol: str) -> tuple[bool, dict]:
 
 
 def _tc0_long_signal(symbol: str) -> tuple[bool, dict]:
-    """Clean breakout continuation.
+    """Simple breakout continuation (TC0-lite).
 
-    Entry only when the latest close is above the prior N-bar high plus buffer,
-    ATR is sufficiently elevated, spread is acceptable, and price is above VWAP
-    when required. This is intentionally stricter and less ambiguous than RB1.
+    Fires when the latest closed 5m bar closes above the prior N-bar high,
+    subject to optional ATR, VWAP, and spread filters.
     """
-    lookback = max(int(TC0_LOOKBACK_BARS or 20), 2)
-    bars = _get_bars(symbol, timeframe=ENTRY_ENGINE_TIMEFRAME, limit=max(ENTRY_ENGINE_LIMIT_BARS, lookback + 30))
-    if not bars or len(bars) < (lookback + 3):
+    need = max(TC0_LOOKBACK_BARS + 5, TC0_ATR_LEN + 5, TC0_VWAP_LOOKBACK_BARS + 5)
+    bars = _get_bars(symbol, timeframe=ENTRY_ENGINE_TIMEFRAME, limit=max(ENTRY_ENGINE_LIMIT_BARS, need))
+    if not bars or len(bars) < need:
         return False, {"reason": "insufficient_bars", "bars": len(bars) if bars else 0}
     fresh_ok, fresh_meta = _guard_fresh_bars(bars, ENTRY_ENGINE_TIMEFRAME)
     if not fresh_ok:
         return False, {"reason": "stale_bars", "bars": len(bars), "freshness": fresh_meta}
 
     highs = [float(b["h"]) for b in bars]
-    lows = [float(b["l"]) for b in bars]
     closes = [float(b["c"]) for b in bars]
-    vols = [float(b.get("v") or 0.0) for b in bars]
     ts = [int(float(b["t"])) for b in bars]
-
-    prev_high = max(highs[-(lookback + 1):-1])
-    last_close = closes[-1]
+    cur_close = closes[-1]
     prev_close = closes[-2]
-    trigger_level = prev_high * (1.0 + float(TC0_BREAKOUT_BUFFER_PCT or 0.0))
-    breakout = last_close > trigger_level
+    look = highs[-(TC0_LOOKBACK_BARS+1):-1]
+    breakout_level = max(look)
+    trigger_level = breakout_level * (1.0 + TC0_BREAKOUT_BUFFER_PCT)
+    breakout = cur_close > trigger_level
+    breakout_distance_pct = ((cur_close / trigger_level) - 1.0) if trigger_level > 0 else None
 
-    atr_now, _ = _atr_from_bars(bars, length=14)
-    atr_pct = (float(atr_now) / float(last_close)) if atr_now and last_close > 0 else 0.0
+    atr_now, _ = _atr_from_bars(bars, length=int(TC0_ATR_LEN))
+    atr_pct = (float(atr_now) / float(cur_close)) if atr_now and cur_close > 0 else None
+    atr_ok = (atr_pct is not None and atr_pct >= float(TC0_MIN_ATR_PCT))
 
-    typical_prices = [((h + l + c) / 3.0) for h, l, c in zip(highs, lows, closes)]
-    vol_sum = sum(vols[-lookback:])
-    vwap = (sum(tp * v for tp, v in zip(typical_prices[-lookback:], vols[-lookback:])) / vol_sum) if vol_sum > 0 else None
-    vwap_ok = (last_close >= float(vwap)) if (TC0_REQUIRE_VWAP and vwap is not None) else True
+    vwap = _vwap_from_bars(bars, lookback=TC0_VWAP_LOOKBACK_BARS)
+    vwap_ok = (not bool(TC0_REQUIRE_VWAP)) or (vwap is not None and cur_close >= float(vwap))
 
-    try:
-        pair = _bk.to_kraken(symbol)
-        bid, ask = _bk._best_bid_ask(pair)  # type: ignore[attr-defined]
-    except Exception:
-        bid, ask = None, None
-    spread_pct = None
+    bid = ask = spread_pct = None
     spread_ok = True
-    if bid and ask and float(bid) > 0 and float(ask) > 0:
-        mid = (float(bid) + float(ask)) / 2.0
-        spread_pct = ((float(ask) - float(bid)) / mid) if mid > 0 else None
-        spread_ok = (spread_pct is not None) and (float(spread_pct) <= float(TC0_MAX_SPREAD_PCT))
+    try:
+        bid, ask = _best_bid_ask(symbol)
+        bid = float(bid or 0.0)
+        ask = float(ask or 0.0)
+        mid = ((bid + ask) / 2.0) if (bid > 0 and ask > 0) else 0.0
+        spread_pct = ((ask - bid) / mid) if mid > 0 else None
+        if TC0_MAX_SPREAD_PCT and spread_pct is not None:
+            spread_ok = spread_pct <= float(TC0_MAX_SPREAD_PCT)
+    except Exception:
+        spread_ok = True
 
-    fired = bool(breakout and atr_pct >= float(TC0_MIN_ATR_PCT) and vwap_ok and spread_ok)
+    reason = None
+    if not breakout:
+        reason = "below_breakout"
+    elif not atr_ok:
+        reason = "atr_too_low"
+    elif not vwap_ok:
+        reason = "below_vwap"
+    elif not spread_ok:
+        reason = "spread_too_wide"
+
     meta = {
-        "bar_ts": ts[-1],
-        "close": last_close,
-        "prev_close": prev_close,
-        "prev_high": prev_high,
-        "level": trigger_level,
-        "breakout": breakout,
-        "dist_to_level_pct": ((last_close - trigger_level) / trigger_level) if trigger_level > 0 else None,
-        "atr_pct": atr_pct,
+        "reason": reason or "signal",
+        "lookback_bars": int(TC0_LOOKBACK_BARS),
+        "breakout_buffer_pct": float(TC0_BREAKOUT_BUFFER_PCT),
         "min_atr_pct": float(TC0_MIN_ATR_PCT),
-        "vwap": float(vwap) if vwap is not None else None,
         "require_vwap": bool(TC0_REQUIRE_VWAP),
-        "vwap_ok": bool(vwap_ok),
-        "spread_pct": float(spread_pct) if spread_pct is not None else None,
         "max_spread_pct": float(TC0_MAX_SPREAD_PCT),
+        "breakout": bool(breakout),
+        "breakout_level": float(breakout_level),
+        "trigger_level": float(trigger_level),
+        "prev_close": float(prev_close),
+        "close": float(cur_close),
+        "bar_ts": ts[-1],
+        "breakout_distance_pct": float(breakout_distance_pct) if breakout_distance_pct is not None else None,
+        "atr": float(atr_now) if atr_now is not None else None,
+        "atr_pct": float(atr_pct) if atr_pct is not None else None,
+        "atr_ok": bool(atr_ok),
+        "vwap": float(vwap) if vwap is not None else None,
+        "vwap_ok": bool(vwap_ok),
+        "bid": bid,
+        "ask": ask,
+        "spread_pct": float(spread_pct) if spread_pct is not None else None,
         "spread_ok": bool(spread_ok),
-        "trigger_price": last_close,
-        "breakout_level": trigger_level,
     }
-    return fired, meta
+    return (bool(breakout and atr_ok and vwap_ok and spread_ok), meta)
 
 
 def _tc1_long_signal(symbol: str) -> tuple[bool, dict]:
@@ -3813,14 +3788,11 @@ def _entry_signals_for_symbol(symbol: str, *, regime_quiet: bool) -> tuple[dict,
     signals: dict = {}
     debug: dict = {}
 
-    # Patch 43: always respect ENTRY_ENGINE_STRATEGIES and enable flags in live evaluation,
-    # not only in fixed mode. This prevents disabled / de-prioritized strategies like RB1
-    # from continuing to generate production signals when env says otherwise.
-    wants_tc0 = ENABLE_TC0 and ("tc0" in ENTRY_ENGINE_STRATEGIES)
-    wants_rb1 = ENABLE_RB1 and ("rb1" in ENTRY_ENGINE_STRATEGIES)
-    wants_tc1 = ENABLE_TC1 and ("tc1" in ENTRY_ENGINE_STRATEGIES)
-    wants_cr1 = ENABLE_CR1 and ("cr1" in ENTRY_ENGINE_STRATEGIES)
-    wants_mm1 = ENABLE_MM1 and ("mm1" in ENTRY_ENGINE_STRATEGIES)
+    wants_tc0 = ENABLE_TC0 and (STRATEGY_MODE != "fixed" or "tc0" in ENTRY_ENGINE_STRATEGIES)
+    wants_rb1 = ENABLE_RB1 and (STRATEGY_MODE != "fixed" or "rb1" in ENTRY_ENGINE_STRATEGIES)
+    wants_tc1 = ENABLE_TC1 and (STRATEGY_MODE != "fixed" or "tc1" in ENTRY_ENGINE_STRATEGIES)
+    wants_cr1 = ENABLE_CR1 and (STRATEGY_MODE != "fixed" or "cr1" in ENTRY_ENGINE_STRATEGIES)
+    wants_mm1 = ENABLE_MM1 and (STRATEGY_MODE != "fixed" or "mm1" in ENTRY_ENGINE_STRATEGIES)
 
     if wants_tc0:
         tc0_fired, tc0_meta = _tc0_long_signal(symbol)
@@ -3846,11 +3818,6 @@ def _entry_signals_for_symbol(symbol: str, *, regime_quiet: bool) -> tuple[dict,
         mm1_fired, mm1_meta = _signal_mm1(symbol)
         signals["mm1"] = bool(mm1_fired)
         debug["mm1"] = mm1_meta
-
-    if EXECUTION_CANARY_ENABLED and normalize_symbol(symbol) == EXECUTION_CANARY_SYMBOL and not any(bool(v) for v in signals.values()):
-        now_ts = int(time.time())
-        bucket = int(now_ts // max(int(EXECUTION_CANARY_INTERVAL_SEC or 3600), 60))
-        debug["canary"] = {"enabled": True, "bucket": bucket, "symbol": symbol}
 
     return signals, debug
 
@@ -4092,6 +4059,7 @@ def diagnostics_risk_admission():
     return {
         "ok": True,
         "utc": utc_now_iso(),
+        "live_config": diagnostics_live_config(),
         "risk_admission": {
             "sizing_mode": str(getattr(settings, "sizing_mode", "fixed") or "fixed"),
             "risk_per_trade": float(getattr(settings, "risk_per_trade", 0.0) or 0.0),
@@ -4166,23 +4134,6 @@ def diagnostics_workflow_locks(limit: int = 100):
     }
 
 
-
-
-@app.get("/diagnostics/live_config")
-def diagnostics_live_config():
-    return {
-        "ok": True,
-        "config": dict(_EFFECTIVE_LIVE_CONFIG),
-    }
-
-@app.get("/diagnostics/scanner_coordination")
-def diagnostics_scanner_coordination(lookback_sec: int = 900, limit: int = 100):
-    return {
-        "ok": True,
-        "coordination": lifecycle_db.coordination_snapshot(lookback_sec=lookback_sec, limit=limit),
-    }
-
-
 @app.get("/diagnostics/entry_pipeline")
 def diagnostics_entry_pipeline(limit: int = 100, lookback_hours: int = 24):
     limit = max(1, min(int(limit), 500))
@@ -4254,6 +4205,44 @@ def diagnostics_lifecycle_integrity(limit: int = 100, stale_age_sec: int = 900):
     }
 
 
+@app.get("/diagnostics/live_config")
+def diagnostics_live_config():
+    runtime_order = []
+    for s in ENTRY_ENGINE_STRATEGIES_LIST:
+        if s == "tc0" and ENABLE_TC0:
+            runtime_order.append(s)
+        elif s == "rb1" and ENABLE_RB1:
+            runtime_order.append(s)
+        elif s == "tc1" and ENABLE_TC1:
+            runtime_order.append(s)
+        elif s == "cr1" and ENABLE_CR1:
+            runtime_order.append(s)
+        elif s == "mm1" and ENABLE_MM1:
+            runtime_order.append(s)
+    return {
+        "ok": True,
+        "utc": utc_now_iso(),
+        "raw_entry_engine_strategies": [s.strip().lower() for s in os.getenv("ENTRY_ENGINE_STRATEGIES", "tc0,tc1").split(",") if s.strip()],
+        "entry_engine_strategies": runtime_order,
+        "strategy_mode": STRATEGY_MODE,
+        "enable_tc0": bool(ENABLE_TC0),
+        "enable_rb1": bool(ENABLE_RB1),
+        "enable_tc1": bool(ENABLE_TC1),
+        "enable_cr1": bool(ENABLE_CR1),
+        "enable_mm1": bool(ENABLE_MM1),
+        "tc0_params": {
+            "lookback_bars": int(TC0_LOOKBACK_BARS),
+            "breakout_buffer_pct": float(TC0_BREAKOUT_BUFFER_PCT),
+            "atr_len": int(TC0_ATR_LEN),
+            "min_atr_pct": float(TC0_MIN_ATR_PCT),
+            "require_vwap": bool(TC0_REQUIRE_VWAP),
+            "vwap_lookback_bars": int(TC0_VWAP_LOOKBACK_BARS),
+            "max_spread_pct": float(TC0_MAX_SPREAD_PCT),
+            "max_hold_sec": int(TC0_MAX_HOLD_SEC),
+        },
+    }
+
+
 @app.get("/diagnostics/runtime")
 def diagnostics_runtime():
     positions = get_positions()
@@ -4283,6 +4272,7 @@ def diagnostics_runtime():
             "entry_failure_cooldown_sec": int(_entry_failure_cooldown_sec()),
             "workflow_lock_ttl_sec": int(getattr(settings, 'workflow_lock_ttl_sec', 0) or 0),
         },
+        "live_config": diagnostics_live_config(),
         "risk_admission": {
             "sizing_mode": str(getattr(settings, "sizing_mode", "fixed") or "fixed"),
             "risk_per_trade": float(getattr(settings, "risk_per_trade", 0.0) or 0.0),
@@ -4318,6 +4308,7 @@ def diagnostics_state_model_summary():
             "entry_failure_cooldown_sec": int(_entry_failure_cooldown_sec()),
             "workflow_lock_ttl_sec": int(getattr(settings, 'workflow_lock_ttl_sec', 0) or 0),
         },
+        "live_config": diagnostics_live_config(),
         "risk_admission": {
             "sizing_mode": str(getattr(settings, "sizing_mode", "fixed") or "fixed"),
             "risk_per_trade": float(getattr(settings, "risk_per_trade", 0.0) or 0.0),
@@ -4509,7 +4500,7 @@ def test_place_trade(payload: Dict[str, Any] = Body(default={})):
 @app.post("/worker/scan_entries")
 def scan_entries(payload: WorkerScanPayload):
     """
-    Scan the current universe for entry signals (RB1/TC1), optionally executing orders.
+    Scan the current universe for entry signals (TC0/RB1/TC1), optionally executing orders.
 
     This endpoint ALWAYS returns a rich diagnostics payload so you can see exactly why
     you got 0 entries (no signals, already in position, symbol not allowed, etc.).
@@ -4579,14 +4570,14 @@ def scan_entries(payload: WorkerScanPayload):
         fired_strats = [k for k, v in fired.items() if v]
         if not fired_strats:
             d["skip"].append("no_signal")
-            scan_ctx = _build_admission_context(symbol=sym, strategy='scanner', signal_name=None, signal_id=_scanner_signal_id(sym, 'scanner'), source='scan_entries', extra={'regime_quiet': bool(regime_quiet), 'signal_meta': sig_debug.get('tc0') or sig_debug.get('rb1') or {}}, px_hint=None)
+            scan_ctx = _build_admission_context(symbol=sym, strategy='scanner', signal_name=None, signal_id=_scanner_signal_id(sym, 'scanner'), source='scan_entries', extra={'regime_quiet': bool(regime_quiet), 'signal_meta': sig_debug.get('rb1') or {}}, px_hint=None)
             _record_rejected_admission(scan_ctx, 'rejected_no_signal', payload=d)
             per_symbol[sym] = d
             continue
 
         # Strategy preference:
         # - fixed: preserve ENTRY_ENGINE_STRATEGIES env order and ignore all others
-        # - auto: in quiet regime, prefer MM1/CR1 over RB1/TC1; otherwise RB1 over TC1
+        # - auto: in quiet regime, prefer MM1/CR1, then TC0/TC1/RB1; otherwise TC0 over TC1 over RB1
         # - legacy: RB1 over TC1 only
         if STRATEGY_MODE == "fixed":
             strategy = None
@@ -4603,12 +4594,21 @@ def scan_entries(payload: WorkerScanPayload):
                 strategy = "cr1"
             elif fired.get("tc0"):
                 strategy = "tc0"
+            elif fired.get("tc1"):
+                strategy = "tc1"
             elif fired.get("rb1"):
                 strategy = "rb1"
             else:
                 strategy = fired_strats[0]
         else:
-            strategy = "tc0" if fired.get("tc0") else ("rb1" if fired.get("rb1") else fired_strats[0])
+            if fired.get("tc0"):
+                strategy = "tc0"
+            elif fired.get("tc1"):
+                strategy = "tc1"
+            elif fired.get("rb1"):
+                strategy = "rb1"
+            else:
+                strategy = fired_strats[0]
         d["eligible"] = True
         d["chosen_strategy"] = strategy
         rank = _rank_candidate(sym, strategy, sig_debug)
@@ -4624,9 +4624,9 @@ def scan_entries(payload: WorkerScanPayload):
             s = (s or "").lower()
             if bool(regime_quiet) and STRATEGY_MODE != "legacy":
                 # Quiet regime: prioritize inventory-friendly / maker-capture first.
-                return {"mm1": 0, "cr1": 1, "tc0": 2, "rb1": 3, "tc1": 4}.get(s, 9)
+                return {"mm1": 0, "cr1": 1, "tc0": 2, "tc1": 3, "rb1": 4}.get(s, 9)
             # Non-quiet: prioritize directional edge.
-            return {"tc0": 0, "rb1": 1, "tc1": 2, "cr1": 3, "mm1": 4}.get(s, 9)
+            return {"tc0": 0, "tc1": 1, "rb1": 2, "cr1": 3, "mm1": 4}.get(s, 9)
 
         def _uix(sym: str) -> int:
             try:
@@ -4775,12 +4775,21 @@ def scan_entries(payload: WorkerScanPayload):
                 "filter_universe_by_allowed_symbols": FILTER_UNIVERSE_BY_ALLOWED_SYMBOLS,
                 "strategy_mode": STRATEGY_MODE,
                 "entry_engine_strategies": ENTRY_ENGINE_STRATEGIES_LIST,
-                "entry_engine_strategies_raw": _RAW_ENTRY_ENGINE_STRATEGIES_LIST,
                 "enable_tc0": ENABLE_TC0,
                 "enable_rb1": ENABLE_RB1,
                 "enable_tc1": ENABLE_TC1,
                 "enable_cr1": ENABLE_CR1,
                 "enable_mm1": ENABLE_MM1,
+                "tc0_params": {
+                    "lookback_bars": TC0_LOOKBACK_BARS,
+                    "breakout_buffer_pct": TC0_BREAKOUT_BUFFER_PCT,
+                    "atr_len": TC0_ATR_LEN,
+                    "min_atr_pct": TC0_MIN_ATR_PCT,
+                    "require_vwap": TC0_REQUIRE_VWAP,
+                    "vwap_lookback_bars": TC0_VWAP_LOOKBACK_BARS,
+                    "max_spread_pct": TC0_MAX_SPREAD_PCT,
+                    "max_hold_sec": TC0_MAX_HOLD_SEC,
+                },
                 "max_open_positions": MAX_OPEN_POSITIONS,
                 "max_entries_per_scan": MAX_ENTRIES_PER_SCAN,
                 "max_entries_per_day": MAX_ENTRIES_PER_DAY,
