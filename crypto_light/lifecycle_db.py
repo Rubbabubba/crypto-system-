@@ -525,6 +525,15 @@ def _execute_trade_plan_upsert(con: sqlite3.Connection, payload: Dict[str, Any])
     )
 
 
+_ORDER_INTENT_SQL_KEYS = (
+    'intent_id', 'trade_plan_id', 'symbol', 'side', 'order_type', 'strategy_id', 'state',
+    'desired_qty', 'desired_notional_usd', 'limit_price', 'broker_txid',
+    'filled_qty', 'avg_fill_price', 'fees_usd', 'retry_count', 'reject_reason',
+    'cancel_reason', 'client_order_key', 'last_broker_status', 'remaining_qty',
+    'submitted_ts', 'acknowledged_ts', 'raw_json', 'created_ts', 'updated_ts',
+)
+
+
 def _prepare_order_intent_payload(intent: Dict[str, Any]) -> Dict[str, Any]:
     now = time.time()
     payload = dict(intent or {})
@@ -533,10 +542,22 @@ def _prepare_order_intent_payload(intent: Dict[str, Any]) -> Dict[str, Any]:
     payload['updated_ts'] = now
     payload.setdefault('retry_count', 0)
     payload.setdefault('remaining_qty', payload.get('desired_qty'))
+    payload.setdefault('broker_txid', None)
+    payload.setdefault('filled_qty', None)
+    payload.setdefault('avg_fill_price', None)
+    payload.setdefault('fees_usd', None)
+    payload.setdefault('reject_reason', None)
+    payload.setdefault('cancel_reason', None)
+    payload.setdefault('client_order_key', None)
+    payload.setdefault('last_broker_status', None)
     payload.setdefault('submitted_ts', now if str(payload.get('state') or '') in {'submitted','acknowledged','filled','partial','cancel_pending','cancelled','failed_reconcile'} else None)
     payload.setdefault('acknowledged_ts', now if str(payload.get('state') or '') in {'acknowledged','filled','partial','cancel_pending','cancelled','failed_reconcile'} else None)
     payload.setdefault('raw_json', _json(payload.get('raw_json') or payload))
     payload = _sanitize_payload(payload, json_fields={'raw_json'})
+    for key in _ORDER_INTENT_SQL_KEYS:
+        payload.setdefault(key, None)
+    payload['reject_reason'] = normalize_terminal_reason(payload.get('reject_reason'))
+    payload['cancel_reason'] = normalize_terminal_reason(payload.get('cancel_reason'))
     return payload
 
 
