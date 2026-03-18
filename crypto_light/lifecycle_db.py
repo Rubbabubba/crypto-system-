@@ -562,6 +562,13 @@ def _prepare_order_intent_payload(intent: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def _execute_order_intent_upsert(con: sqlite3.Connection, payload: Dict[str, Any]) -> None:
+    bind_payload = {key: payload.get(key, None) for key in _ORDER_INTENT_SQL_KEYS}
+    bind_payload = _sanitize_payload(bind_payload, json_fields={'raw_json'})
+    # Guarantee all named bind params exist locally at the exact execute site.
+    # This avoids any upstream caller/path accidentally dropping optional keys like broker_txid.
+    missing_keys = [key for key in _ORDER_INTENT_SQL_KEYS if key not in bind_payload]
+    if missing_keys:
+        raise RuntimeError(f"order_intent bind payload missing keys: {missing_keys}")
     con.execute(
         """
         INSERT INTO order_intents (
@@ -602,7 +609,7 @@ def _execute_order_intent_upsert(con: sqlite3.Connection, payload: Dict[str, Any
             raw_json=excluded.raw_json,
             updated_ts=excluded.updated_ts
         """,
-        payload,
+        bind_payload,
     )
 
 
@@ -1063,6 +1070,29 @@ def list_recent_trade_lifecycle_events(*, symbol: str | None = None, trade_plan_
     if symbol is not None:
         clauses.append('symbol = ?')
         args.append(symbol)
+    if trade_plan_id is not None:
+        clauses.append('trade_plan_id = ?')
+        args.append(trade_plan_id)
+    if stage is not None:
+        clauses.append('stage = ?')
+        args.append(stage)
+    if since_ts is not None:
+        clauses.append('created_ts >= ?')
+        args.append(float(since_ts))
+    where = ' AND '.join(clauses)
+    return list_rows('trade_lifecycle_events', limit=limit, where=where, args=args, order_by='created_ts DESC')
+
+
+def list_trade_lifecycle_events(*, symbol: str | None = None, strategy_id: str | None = None, trade_plan_id: str | None = None, stage: str | None = None, since_ts: float | None = None, limit: int = 100) -> List[Dict[str, Any]]:
+    ensure_schema()
+    clauses = []
+    args: List[Any] = []
+    if symbol is not None:
+        clauses.append('symbol = ?')
+        args.append(symbol)
+    if strategy_id is not None:
+        clauses.append('strategy_id = ?')
+        args.append(strategy_id)
     if trade_plan_id is not None:
         clauses.append('trade_plan_id = ?')
         args.append(trade_plan_id)
