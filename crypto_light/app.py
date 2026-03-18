@@ -1990,6 +1990,7 @@ def health():
     return {
         "ok": True,
         "utc": utc_now_iso(),
+        "build": PATCH_BUILD,
         "scanner_url": SCANNER_URL or None,
         "scanner_ok": scanner_ok and (len(scanner_syms) > 0),
         "scanner_reason": scanner_reason,
@@ -4241,6 +4242,58 @@ def diagnostics_live_config():
             "max_hold_sec": int(TC0_MAX_HOLD_SEC),
         },
     }
+
+
+@app.get("/diagnostics/persistence_self_test")
+def diagnostics_persistence_self_test():
+    import os
+    import sqlite3
+    import tempfile
+    tmp = tempfile.NamedTemporaryFile(prefix="patch51-", suffix=".sqlite3", delete=False)
+    path = tmp.name
+    tmp.close()
+    old_path = os.environ.get("LIFECYCLE_DB_PATH")
+    try:
+        os.environ["LIFECYCLE_DB_PATH"] = path
+        lifecycle_db.ensure_schema()
+        lifecycle_db.upsert_order_intent({
+            "intent_id": "selftest-intent",
+            "symbol": "BTC/USD",
+            "side": "buy",
+            "order_type": "limit_aggressive",
+            "strategy_id": "tc0",
+            "state": "created",
+        })
+        lifecycle_db.upsert_broker_order({
+            "broker_order_id": "selftest-broker-order",
+            "intent_id": "selftest-intent",
+            "symbol": "BTC/USD",
+            "strategy_id": "tc0",
+            "side": "buy",
+            "order_type": "limit_aggressive",
+            "lifecycle_stage": "pre_submit",
+            "status": "created",
+        })
+        con = sqlite3.connect(path)
+        con.row_factory = sqlite3.Row
+        irow = con.execute("SELECT intent_id, broker_txid FROM order_intents WHERE intent_id = ?", ("selftest-intent",)).fetchone()
+        brow = con.execute("SELECT broker_order_id, broker_txid FROM broker_orders WHERE broker_order_id = ?", ("selftest-broker-order",)).fetchone()
+        con.close()
+        return {
+            "ok": True,
+            "build": PATCH_BUILD,
+            "intent": dict(irow) if irow else None,
+            "broker_order": dict(brow) if brow else None,
+        }
+    finally:
+        if old_path is None:
+            os.environ.pop("LIFECYCLE_DB_PATH", None)
+        else:
+            os.environ["LIFECYCLE_DB_PATH"] = old_path
+        try:
+            os.unlink(path)
+        except Exception:
+            pass
 
 
 @app.get("/diagnostics/runtime")

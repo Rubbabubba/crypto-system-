@@ -983,58 +983,66 @@ def _prepare_broker_order_payload(order: Dict[str, Any]) -> Dict[str, Any]:
     return payload
 
 
+def _execute_broker_order_upsert(con: sqlite3.Connection, payload: Dict[str, Any]) -> None:
+    """Persist broker orders with a fixed positional bind contract only."""
+    sanitized = _sanitize_payload(dict(payload or {}), json_fields={"raw_json"})
+    bind = []
+    missing = []
+    for key in _BROKER_ORDER_SQL_KEYS:
+        if key not in sanitized:
+            missing.append(key)
+        bind.append(sanitized.get(key, None))
+    if missing:
+        raise RuntimeError(f"broker_order positional payload missing keys before execute: {missing}")
+    con.execute(
+        """
+        INSERT INTO broker_orders (
+            broker_order_id, intent_id, trade_plan_id, symbol, strategy_id, side, order_type, lifecycle_stage, status,
+            client_order_key, broker_txid, requested_qty, requested_notional_usd, limit_price, avg_fill_price,
+            filled_qty, remaining_qty, fees_usd, reject_reason, raw_json, created_ts, updated_ts, acknowledged_ts, closed_ts
+        ) VALUES (
+            ?, ?, ?, ?, ?, ?, ?, ?, ?,
+            ?, ?, ?, ?, ?, ?,
+            ?, ?, ?, ?, ?, ?, ?, ?, ?
+        )
+        ON CONFLICT(broker_order_id) DO UPDATE SET
+            intent_id=excluded.intent_id,
+            trade_plan_id=excluded.trade_plan_id,
+            symbol=excluded.symbol,
+            strategy_id=excluded.strategy_id,
+            side=excluded.side,
+            order_type=excluded.order_type,
+            lifecycle_stage=excluded.lifecycle_stage,
+            status=excluded.status,
+            client_order_key=excluded.client_order_key,
+            broker_txid=excluded.broker_txid,
+            requested_qty=excluded.requested_qty,
+            requested_notional_usd=excluded.requested_notional_usd,
+            limit_price=excluded.limit_price,
+            avg_fill_price=excluded.avg_fill_price,
+            filled_qty=excluded.filled_qty,
+            remaining_qty=excluded.remaining_qty,
+            fees_usd=excluded.fees_usd,
+            reject_reason=excluded.reject_reason,
+            raw_json=excluded.raw_json,
+            updated_ts=excluded.updated_ts,
+            acknowledged_ts=excluded.acknowledged_ts,
+            closed_ts=excluded.closed_ts
+        """,
+        tuple(bind),
+    )
+
+
 def upsert_broker_order(order: Dict[str, Any]) -> None:
     ensure_schema()
     payload = _prepare_broker_order_payload(order)
-    values_by_key = {key: payload.get(key, None) for key in _BROKER_ORDER_SQL_KEYS}
-    missing_keys = [key for key in _BROKER_ORDER_SQL_KEYS if key not in values_by_key]
-    if missing_keys:
-        raise RuntimeError(f"broker_order positional payload missing keys: {missing_keys}")
-    values = tuple(values_by_key[key] for key in _BROKER_ORDER_SQL_KEYS)
-    if len(values) != len(_BROKER_ORDER_SQL_KEYS):
-        raise RuntimeError(
-            f"broker_order positional payload size mismatch: expected {len(_BROKER_ORDER_SQL_KEYS)} got {len(values)}"
-        )
     con = _connect()
     try:
-        con.execute(
-            """
-            INSERT INTO broker_orders (
-                broker_order_id, intent_id, trade_plan_id, symbol, strategy_id, side, order_type, lifecycle_stage, status,
-                client_order_key, broker_txid, requested_qty, requested_notional_usd, limit_price, avg_fill_price,
-                filled_qty, remaining_qty, fees_usd, reject_reason, raw_json, created_ts, updated_ts, acknowledged_ts, closed_ts
-            ) VALUES (
-                ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                ?, ?, ?, ?, ?, ?,
-                ?, ?, ?, ?, ?, ?, ?, ?, ?
-            )
-            ON CONFLICT(broker_order_id) DO UPDATE SET
-                intent_id=excluded.intent_id,
-                trade_plan_id=excluded.trade_plan_id,
-                symbol=excluded.symbol,
-                strategy_id=excluded.strategy_id,
-                side=excluded.side,
-                order_type=excluded.order_type,
-                lifecycle_stage=excluded.lifecycle_stage,
-                status=excluded.status,
-                client_order_key=excluded.client_order_key,
-                broker_txid=excluded.broker_txid,
-                requested_qty=excluded.requested_qty,
-                requested_notional_usd=excluded.requested_notional_usd,
-                limit_price=excluded.limit_price,
-                avg_fill_price=excluded.avg_fill_price,
-                filled_qty=excluded.filled_qty,
-                remaining_qty=excluded.remaining_qty,
-                fees_usd=excluded.fees_usd,
-                reject_reason=excluded.reject_reason,
-                raw_json=excluded.raw_json,
-                updated_ts=excluded.updated_ts,
-                acknowledged_ts=excluded.acknowledged_ts,
-                closed_ts=excluded.closed_ts
-            """,
-            values,
-        )
+        _execute_broker_order_upsert(con, payload)
         con.commit()
+    except Exception:
+        con.rollback()
+        raise
     finally:
         con.close()
 
