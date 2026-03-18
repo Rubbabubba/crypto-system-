@@ -950,16 +950,51 @@ def link_trade_plan_to_intent_atomic(intent_id: str, trade_plan: Dict[str, Any],
 
 
 
-def upsert_broker_order(order: Dict[str, Any]) -> None:
-    ensure_schema()
+_BROKER_ORDER_SQL_KEYS = (
+    'broker_order_id', 'intent_id', 'trade_plan_id', 'symbol', 'strategy_id', 'side', 'order_type',
+    'lifecycle_stage', 'status', 'client_order_key', 'broker_txid', 'requested_qty',
+    'requested_notional_usd', 'limit_price', 'avg_fill_price', 'filled_qty', 'remaining_qty',
+    'fees_usd', 'reject_reason', 'raw_json', 'created_ts', 'updated_ts', 'acknowledged_ts', 'closed_ts',
+)
+
+
+def _prepare_broker_order_payload(order: Dict[str, Any]) -> Dict[str, Any]:
     now = time.time()
     payload = dict(order or {})
     payload.setdefault('status', 'created')
     payload.setdefault('created_ts', now)
     payload['updated_ts'] = now
     payload['reject_reason'] = normalize_terminal_reason(payload.get('reject_reason'))
+    payload.setdefault('client_order_key', None)
+    payload.setdefault('broker_txid', None)
+    payload.setdefault('requested_qty', None)
+    payload.setdefault('requested_notional_usd', None)
+    payload.setdefault('limit_price', None)
+    payload.setdefault('avg_fill_price', None)
+    payload.setdefault('filled_qty', None)
+    payload.setdefault('remaining_qty', None)
+    payload.setdefault('fees_usd', None)
+    payload.setdefault('acknowledged_ts', None)
+    payload.setdefault('closed_ts', None)
     payload.setdefault('raw_json', _json(payload.get('raw_json') or order))
     payload = _sanitize_payload(payload, json_fields={'raw_json'})
+    for key in _BROKER_ORDER_SQL_KEYS:
+        payload.setdefault(key, None)
+    return payload
+
+
+def upsert_broker_order(order: Dict[str, Any]) -> None:
+    ensure_schema()
+    payload = _prepare_broker_order_payload(order)
+    values_by_key = {key: payload.get(key, None) for key in _BROKER_ORDER_SQL_KEYS}
+    missing_keys = [key for key in _BROKER_ORDER_SQL_KEYS if key not in values_by_key]
+    if missing_keys:
+        raise RuntimeError(f"broker_order positional payload missing keys: {missing_keys}")
+    values = tuple(values_by_key[key] for key in _BROKER_ORDER_SQL_KEYS)
+    if len(values) != len(_BROKER_ORDER_SQL_KEYS):
+        raise RuntimeError(
+            f"broker_order positional payload size mismatch: expected {len(_BROKER_ORDER_SQL_KEYS)} got {len(values)}"
+        )
     con = _connect()
     try:
         con.execute(
@@ -969,9 +1004,9 @@ def upsert_broker_order(order: Dict[str, Any]) -> None:
                 client_order_key, broker_txid, requested_qty, requested_notional_usd, limit_price, avg_fill_price,
                 filled_qty, remaining_qty, fees_usd, reject_reason, raw_json, created_ts, updated_ts, acknowledged_ts, closed_ts
             ) VALUES (
-                :broker_order_id, :intent_id, :trade_plan_id, :symbol, :strategy_id, :side, :order_type, :lifecycle_stage, :status,
-                :client_order_key, :broker_txid, :requested_qty, :requested_notional_usd, :limit_price, :avg_fill_price,
-                :filled_qty, :remaining_qty, :fees_usd, :reject_reason, :raw_json, :created_ts, :updated_ts, :acknowledged_ts, :closed_ts
+                ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                ?, ?, ?, ?, ?, ?,
+                ?, ?, ?, ?, ?, ?, ?, ?, ?
             )
             ON CONFLICT(broker_order_id) DO UPDATE SET
                 intent_id=excluded.intent_id,
@@ -997,7 +1032,7 @@ def upsert_broker_order(order: Dict[str, Any]) -> None:
                 acknowledged_ts=excluded.acknowledged_ts,
                 closed_ts=excluded.closed_ts
             """,
-            payload,
+            values,
         )
         con.commit()
     finally:
