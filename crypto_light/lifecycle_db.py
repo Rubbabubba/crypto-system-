@@ -562,13 +562,23 @@ def _prepare_order_intent_payload(intent: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def _execute_order_intent_upsert(con: sqlite3.Connection, payload: Dict[str, Any]) -> None:
-    bind_payload = {key: payload.get(key, None) for key in _ORDER_INTENT_SQL_KEYS}
-    bind_payload = _sanitize_payload(bind_payload, json_fields={'raw_json'})
-    # Guarantee all named bind params exist locally at the exact execute site.
-    # This avoids any upstream caller/path accidentally dropping optional keys like broker_txid.
-    missing_keys = [key for key in _ORDER_INTENT_SQL_KEYS if key not in bind_payload]
+    """Persist an order intent using positional binds only.
+
+    We intentionally avoid named-parameter execution here because repeated regressions
+    have shown that one live call path can still arrive with optional keys omitted,
+    most notably ``broker_txid``. Positional binding removes that entire failure class
+    by building a fixed-length tuple from the canonical SQL key list.
+    """
+    sanitized = _sanitize_payload(dict(payload or {}), json_fields={'raw_json'})
+    values_by_key = {key: sanitized.get(key, None) for key in _ORDER_INTENT_SQL_KEYS}
+    missing_keys = [key for key in _ORDER_INTENT_SQL_KEYS if key not in values_by_key]
     if missing_keys:
-        raise RuntimeError(f"order_intent bind payload missing keys: {missing_keys}")
+        raise RuntimeError(f"order_intent positional payload missing keys: {missing_keys}")
+    values = tuple(values_by_key[key] for key in _ORDER_INTENT_SQL_KEYS)
+    if len(values) != len(_ORDER_INTENT_SQL_KEYS):
+        raise RuntimeError(
+            f"order_intent positional payload size mismatch: expected {len(_ORDER_INTENT_SQL_KEYS)} got {len(values)}"
+        )
     con.execute(
         """
         INSERT INTO order_intents (
@@ -578,11 +588,11 @@ def _execute_order_intent_upsert(con: sqlite3.Connection, payload: Dict[str, Any
             cancel_reason, client_order_key, last_broker_status, remaining_qty,
             submitted_ts, acknowledged_ts, raw_json, created_ts, updated_ts
         ) VALUES (
-            :intent_id, :trade_plan_id, :symbol, :side, :order_type, :strategy_id, :state,
-            :desired_qty, :desired_notional_usd, :limit_price, :broker_txid,
-            :filled_qty, :avg_fill_price, :fees_usd, :retry_count, :reject_reason,
-            :cancel_reason, :client_order_key, :last_broker_status, :remaining_qty,
-            :submitted_ts, :acknowledged_ts, :raw_json, :created_ts, :updated_ts
+            ?, ?, ?, ?, ?, ?, ?,
+            ?, ?, ?, ?,
+            ?, ?, ?, ?, ?,
+            ?, ?, ?, ?,
+            ?, ?, ?, ?, ?
         )
         ON CONFLICT(intent_id) DO UPDATE SET
             trade_plan_id=excluded.trade_plan_id,
@@ -609,7 +619,7 @@ def _execute_order_intent_upsert(con: sqlite3.Connection, payload: Dict[str, Any
             raw_json=excluded.raw_json,
             updated_ts=excluded.updated_ts
         """,
-        bind_payload,
+        values,
     )
 
 
