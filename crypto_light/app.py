@@ -1261,10 +1261,8 @@ def _scanner_fetch_active_symbols_and_meta() -> tuple[bool, str | None, dict, li
         meta["last_refresh_utc"] = data.get("last_refresh_utc")
         if isinstance(data.get("meta"), dict):
             meta["scanner_meta"] = data.get("meta")
-        if isinstance(data.get("contract"), dict):
-            meta["scanner_contract"] = data.get("contract")
-        if isinstance(data.get("compatibility"), dict) and "scanner_contract" not in meta:
-            meta["scanner_contract"] = data.get("compatibility")
+        if isinstance(data.get("compatibility"), dict):
+            meta["compatibility"] = data.get("compatibility")
 
         raw_syms = data.get("active_symbols")
         if not isinstance(raw_syms, list):
@@ -1293,90 +1291,6 @@ def _scanner_fetch_active_symbols_and_meta() -> tuple[bool, str | None, dict, li
     except Exception as e:
         meta["error"] = f"{type(e).__name__}: {e}"
         return False, "exception", meta, []
-def _scanner_contract_snapshot(scanner_ok: bool, scanner_reason: str | None, scanner_meta: dict | None, scanner_syms: list[str] | None) -> dict:
-    scanner_meta = dict(scanner_meta or {})
-    scanner_syms = list(scanner_syms or [])
-    allowed_symbols_sorted = sorted(list(ALLOWED_SYMBOLS))
-    allow_new_symbols = os.getenv("ALLOW_SCANNER_NEW_SYMBOLS", "0").strip().lower() in ("1", "true", "yes", "on")
-    active_count = len(scanner_syms)
-    sample_limit = 25
-    active_sample = scanner_syms[:sample_limit]
-    invalid_symbols = []
-    if scanner_ok and scanner_syms and allowed_symbols_sorted and bool(FILTER_UNIVERSE_BY_ALLOWED_SYMBOLS) and not allow_new_symbols:
-        allowed_set = set(allowed_symbols_sorted)
-        invalid_symbols = [sym for sym in scanner_syms if sym not in allowed_set]
-    mode = "locked_allowed_symbols" if (allowed_symbols_sorted and bool(FILTER_UNIVERSE_BY_ALLOWED_SYMBOLS) and not allow_new_symbols and not bool(SCANNER_DRIVEN_UNIVERSE)) else "scanner_multi_symbol"
-    compatibility_ok = True
-    compatibility_reason = "compatible"
-    warnings: list[str] = []
-    if not SCANNER_URL:
-        compatibility_ok = False
-        compatibility_reason = "missing_scanner_url"
-    elif not scanner_ok:
-        compatibility_ok = False
-        compatibility_reason = str(scanner_reason or "scanner_not_ok")
-    elif active_count == 0:
-        compatibility_ok = False
-        compatibility_reason = "scanner_active_symbols_empty"
-    elif invalid_symbols:
-        compatibility_ok = False
-        compatibility_reason = "invalid_active_symbols"
-        warnings.append("scanner_symbols_outside_allowed_symbols")
-    if mode == "locked_allowed_symbols" and active_count > len(allowed_symbols_sorted):
-        warnings.append("scanner_broader_than_main_contract")
-    main_guardrails = {
-        "execution_mode": str(os.getenv("EXECUTION_MODE", "") or ""),
-        "entry_fee_bps": float(os.getenv("ENTRY_FEE_BPS", "0") or 0.0),
-        "exit_fee_bps": float(os.getenv("EXIT_FEE_BPS", "0") or 0.0),
-        "expected_slippage_bps": float(os.getenv("EXPECTED_SLIPPAGE_BPS", os.getenv("SLIPPAGE_BPS", "0")) or 0.0),
-        "max_entries_per_day": int(os.getenv("MAX_ENTRIES_PER_DAY", "0") or 0),
-        "max_open_positions": int(os.getenv("MAX_OPEN_POSITIONS", "0") or 0),
-        "entry_failure_cooldown_bars": int(os.getenv("ENTRY_FAILURE_COOLDOWN_BARS", "0") or 0),
-        "signal_dedupe_ttl_sec": int(os.getenv("SIGNAL_DEDUPE_TTL_SEC", "0") or 0),
-        "tc0_max_hold_sec": int(os.getenv("TC0_MAX_HOLD_SEC", "0") or 0),
-        "min_risk_reward_ratio": float(os.getenv("MIN_RISK_REWARD_RATIO", "0") or 0.0),
-    }
-    fee_drag_bps_round_trip = float(main_guardrails["entry_fee_bps"]) + float(main_guardrails["exit_fee_bps"]) + (2.0 * float(main_guardrails["expected_slippage_bps"]))
-    safe_multi_symbol_candidate = bool(
-        compatibility_ok
-        and bool(SCANNER_DRIVEN_UNIVERSE)
-        and bool(allow_new_symbols or SCANNER_SOFT_ALLOW or not FILTER_UNIVERSE_BY_ALLOWED_SYMBOLS)
-        and int(main_guardrails["max_entries_per_day"]) <= 3
-        and int(main_guardrails["max_open_positions"]) <= 1
-        and fee_drag_bps_round_trip <= 80.0
-    )
-    return {
-        "scanner_url": SCANNER_URL or None,
-        "main_contract_mode": mode,
-        "scanner_ok": bool(scanner_ok),
-        "scanner_reason": scanner_contract.get("compatibility_reason") or scanner_reason,
-        "scanner_status_code": scanner_meta.get("status_code"),
-        "scanner_elapsed_ms": scanner_meta.get("elapsed_ms"),
-        "scanner_last_refresh_utc": scanner_meta.get("last_refresh_utc"),
-        "scanner_last_error": scanner_meta.get("last_error") or scanner_meta.get("error"),
-        "scanner_active_count": active_count,
-        "scanner_active_symbols_sample": active_sample,
-        "scanner_active_symbols_truncated": bool(active_count > sample_limit),
-        "allowed_symbols": allowed_symbols_sorted,
-        "allowed_symbols_count": len(allowed_symbols_sorted),
-        "filter_universe_by_allowed_symbols": bool(FILTER_UNIVERSE_BY_ALLOWED_SYMBOLS),
-        "allow_scanner_new_symbols": bool(allow_new_symbols),
-        "scanner_driven_universe": bool(SCANNER_DRIVEN_UNIVERSE),
-        "scanner_soft_allow": bool(SCANNER_SOFT_ALLOW),
-        "invalid_active_symbols": invalid_symbols[:sample_limit],
-        "invalid_active_symbols_count": len(invalid_symbols),
-        "compatibility_ok": compatibility_ok,
-        "compatibility_reason": compatibility_reason,
-        "warnings": warnings,
-        "main_fee_churn_guardrails": {
-            **main_guardrails,
-            "estimated_round_trip_fee_drag_bps": fee_drag_bps_round_trip,
-            "safe_multi_symbol_candidate": safe_multi_symbol_candidate,
-        },
-        "scanner_contract": scanner_meta.get("scanner_contract") or (scanner_meta.get("scanner_meta") or {}).get("contract") or (scanner_meta.get("scanner_meta") or {}).get("compatibility"),
-    }
-
-
 def _build_universe(payload, scanner_syms: list[str]) -> list[str]:
     """Build the scan universe safely.
 
@@ -1553,7 +1467,6 @@ def _symbol_allowed_by_scanner(symbol: str) -> tuple[bool, str, Dict[str, Any]]:
         "scanner_error": err,
         "scanner_active_count": len(active),
         "scanner_soft_allow": SCANNER_SOFT_ALLOW,
-        "scanner_contract": scanner_contract,
     }
 
     if not ok or len(active) == 0:
@@ -2080,20 +1993,17 @@ def health():
     scan_meta = _worker_status_meta(getattr(state, 'last_scan_status', {}) or {})
     exit_meta = _worker_status_meta(getattr(state, 'last_exit_status', {}) or {})
     account_truth = _account_truth_snapshot()
-    scanner_contract = _scanner_contract_snapshot(scanner_ok, scanner_reason, scanner_meta, scanner_syms)
     return {
         "ok": True,
         "utc": utc_now_iso(),
         "build": PATCH_BUILD,
         "scanner_url": SCANNER_URL or None,
         "scanner_ok": scanner_ok and (len(scanner_syms) > 0),
-        "scanner_reason": scanner_contract.get("compatibility_reason") or scanner_reason,
+        "scanner_reason": scanner_reason,
         "scanner_active_count": len(scanner_syms),
         "scanner_last_refresh_utc": (scanner_meta or {}).get("last_refresh_utc"),
-        "scanner_contract": scanner_contract,
         "scanner_last_error": (scanner_meta or {}).get("last_error"),
         "scanner_soft_allow": SCANNER_SOFT_ALLOW,
-        "scanner_contract": scanner_contract,
         "worker_health": {
             "scan": scan_meta,
             "exit": exit_meta,
@@ -4885,7 +4795,7 @@ def scan_entries(payload: WorkerScanPayload):
             "utc": utc_now_iso(),
             "ok": True,
             "scanner_ok": bool(scanner_ok),
-            "scanner_reason": scanner_contract.get("compatibility_reason") or scanner_reason,
+            "scanner_reason": scanner_reason,
             "universe_count": len(universe),
             "results_count": len(results),
             "dry_run": bool(payload.dry_run),
@@ -4915,7 +4825,6 @@ def scan_entries(payload: WorkerScanPayload):
             "config": {
                 "scanner_url": SCANNER_URL,
                 "scanner_soft_allow": SCANNER_SOFT_ALLOW,
-        "scanner_contract": scanner_contract,
                 "allowed_symbols_count": len(ALLOWED_SYMBOLS),
                 "allowed_symbols_sample": sorted(list(ALLOWED_SYMBOLS))[:50],
                 "scanner_driven_universe": SCANNER_DRIVEN_UNIVERSE,
@@ -4956,21 +4865,119 @@ def scan_entries(payload: WorkerScanPayload):
         },
     }
 
-@app.get("/compatibility")
-def compatibility_endpoint():
-    scanner_ok, scanner_reason, scanner_meta, scanner_syms = _scanner_fetch_active_symbols_and_meta()
-    scanner_contract = _scanner_contract_snapshot(scanner_ok, scanner_reason, scanner_meta, scanner_syms)
+def _service_meta_payload() -> Dict[str, Any]:
     return {
-        "ok": True,
-        "utc": utc_now_iso(),
-        "build": PATCH_BUILD,
-        "service": {
-            "name": PATCH_BUILD.get("system_name"),
-            "role": PATCH_BUILD.get("service_role"),
-            "env_name": PATCH_BUILD.get("env_name"),
-            "release_stage": PATCH_BUILD.get("release_stage_configured"),
+        "name": PATCH_BUILD.get("system_name"),
+        "role": PATCH_BUILD.get("service_role"),
+        "env_name": PATCH_BUILD.get("env_name"),
+        "release_stage": PATCH_BUILD.get("release_stage_configured"),
+    }
+
+
+def _scanner_contract_snapshot(scanner_ok: bool, scanner_reason: str | None, scanner_meta: dict | None, scanner_syms: list[str]) -> Dict[str, Any]:
+    scanner_meta = scanner_meta or {}
+    external = scanner_meta.get("compatibility") if isinstance(scanner_meta.get("compatibility"), dict) else {}
+    active_symbols = list(scanner_syms or [])
+    fee_guardrails = external.get("fee_churn_guardrails") if isinstance(external.get("fee_churn_guardrails"), dict) else {}
+    if not fee_guardrails:
+        fee_guardrails = {
+            "emission_controls_active": False,
+            "symbol_holdoff_active": False,
+            "bar_lock_active": False,
+            "fingerprint_ttl_active": False,
+        }
+    return {
+        "scanner_url": scanner_meta.get("scanner_url") or SCANNER_URL or None,
+        "scanner_ok": bool(scanner_ok),
+        "scanner_reason": scanner_reason,
+        "mode": str(external.get("mode") or ("ranked_multi_symbol_scanner" if len(active_symbols) > 1 else "scanner")),
+        "supports_multi_symbol": bool(external.get("supports_multi_symbol", len(active_symbols) > 1)),
+        "active_count": len(active_symbols),
+        "active_symbols_sample": active_symbols[:12],
+        "active_symbols_truncated": len(active_symbols) > 12,
+        "last_refresh_utc": external.get("last_refresh_utc") or scanner_meta.get("last_refresh_utc"),
+        "last_error": external.get("last_error") or scanner_meta.get("last_error") or scanner_meta.get("error"),
+        "quote_allow": list(external.get("quote_allow") or []),
+        "refresh_sec": external.get("refresh_sec"),
+        "top_n": external.get("top_n"),
+        "coordination_url_configured": bool(external.get("coordination_url_configured")),
+        "fee_churn_guardrails": fee_guardrails,
+    }
+
+
+def _path_b_guardrails_snapshot(scanner_contract: Dict[str, Any]) -> Dict[str, Any]:
+    entry_fee_bps = float(getattr(settings, "entry_fee_bps", 0.0) or 0.0)
+    exit_fee_bps = float(getattr(settings, "exit_fee_bps", 0.0) or 0.0)
+    expected_slippage_bps = float(getattr(settings, "expected_slippage_bps", getattr(settings, "slippage_bps", 0.0)) or 0.0)
+    max_open_positions = int(getattr(settings, "max_open_positions", MAX_OPEN_POSITIONS) or MAX_OPEN_POSITIONS)
+    max_entries_per_day = int(getattr(settings, "max_entries_per_day", MAX_ENTRIES_PER_DAY) or MAX_ENTRIES_PER_DAY)
+    scanner_guardrails = scanner_contract.get("fee_churn_guardrails") or {}
+    round_trip_cost_bps = entry_fee_bps + exit_fee_bps + expected_slippage_bps
+    main_guards = {
+        "pretrade_health_gate_enabled": bool(PRETRADE_HEALTH_GATE_ENABLED),
+        "worker_stale_block_enabled": bool(PRETRADE_BLOCK_ON_WORKER_STALE),
+        "max_open_positions_safe": max_open_positions <= 1,
+        "max_entries_per_day_safe": max_entries_per_day <= 3,
+        "round_trip_cost_bps_safe": round_trip_cost_bps <= 60.0,
+    }
+    scanner_guards = {
+        "scanner_emission_controls_active": bool(scanner_guardrails.get("emission_controls_active")),
+        "scanner_symbol_holdoff_active": bool(scanner_guardrails.get("symbol_holdoff_active")),
+        "scanner_bar_lock_active": bool(scanner_guardrails.get("bar_lock_active")),
+        "scanner_fingerprint_ttl_active": bool(scanner_guardrails.get("fingerprint_ttl_active")),
+    }
+    return {
+        "path_b_requested": True,
+        "multi_symbol_capable": bool(scanner_contract.get("supports_multi_symbol")),
+        "multi_symbol_admission_enabled": bool(SCANNER_DRIVEN_UNIVERSE or SCANNER_SOFT_ALLOW or (os.getenv("ALLOW_SCANNER_NEW_SYMBOLS", "0").strip().lower() in ("1", "true", "yes", "on"))),
+        "main_guardrails": main_guards,
+        "scanner_guardrails": scanner_guards,
+        "guardrails_pass": bool(all(main_guards.values()) and all(scanner_guards.values())),
+        "estimated_round_trip_cost_bps": round_trip_cost_bps,
+        "round_trip_cost_components_bps": {
+            "entry_fee_bps": entry_fee_bps,
+            "exit_fee_bps": exit_fee_bps,
+            "expected_slippage_bps": expected_slippage_bps,
         },
-        "compatibility": scanner_contract,
+    }
+
+
+def _compatibility_snapshot(scanner_ok: bool, scanner_reason: str | None, scanner_meta: dict | None, scanner_syms: list[str]) -> Dict[str, Any]:
+    allowed_symbols_sorted = sorted(list(ALLOWED_SYMBOLS))
+    scanner_contract = _scanner_contract_snapshot(scanner_ok, scanner_reason, scanner_meta, scanner_syms)
+    allow_new_symbols = os.getenv("ALLOW_SCANNER_NEW_SYMBOLS", "0").strip().lower() in ("1", "true", "yes", "on")
+    invalid_active_symbols = []
+    if allowed_symbols_sorted and FILTER_UNIVERSE_BY_ALLOWED_SYMBOLS and not allow_new_symbols:
+        invalid_active_symbols = [s for s in (scanner_syms or []) if s not in ALLOWED_SYMBOLS]
+    contract_compatible = bool(scanner_ok) and (not invalid_active_symbols)
+    reason = None
+    blockers: list[str] = []
+    if not scanner_ok:
+        reason = scanner_reason or "scanner_unavailable"
+        blockers.append("scanner_unavailable")
+    elif invalid_active_symbols:
+        reason = "invalid_active_symbols"
+        blockers.append("invalid_active_symbols")
+    path_b = _path_b_guardrails_snapshot(scanner_contract)
+    return {
+        "contract_compatible": contract_compatible,
+        "compatibility_reason": reason,
+        "blockers": blockers,
+        "main_contract": {
+            "allowed_symbols_count": len(allowed_symbols_sorted),
+            "allowed_symbols_sample": allowed_symbols_sorted[:50],
+            "allow_scanner_new_symbols": bool(allow_new_symbols),
+            "scanner_driven_universe": bool(SCANNER_DRIVEN_UNIVERSE),
+            "scanner_soft_allow": bool(SCANNER_SOFT_ALLOW),
+            "filter_universe_by_allowed_symbols": bool(FILTER_UNIVERSE_BY_ALLOWED_SYMBOLS),
+            "max_open_positions": int(MAX_OPEN_POSITIONS),
+            "max_entries_per_day": int(MAX_ENTRIES_PER_DAY),
+        },
+        "scanner_contract": scanner_contract,
+        "invalid_active_symbols_count": len(invalid_active_symbols),
+        "invalid_active_symbols_sample": invalid_active_symbols[:12],
+        "invalid_active_symbols_truncated": len(invalid_active_symbols) > 12,
+        "path_b_guardrails": path_b,
     }
 
 
@@ -4979,23 +4986,28 @@ def build_info_endpoint():
     return {**PATCH_BUILD}
 
 
-@app.get("/runtime")
-def runtime_endpoint():
-    data = diagnostics_runtime()
+@app.get("/compatibility")
+def compatibility_endpoint():
     scanner_ok, scanner_reason, scanner_meta, scanner_syms = _scanner_fetch_active_symbols_and_meta()
-    scanner_contract = _scanner_contract_snapshot(scanner_ok, scanner_reason, scanner_meta, scanner_syms)
+    compatibility = _compatibility_snapshot(scanner_ok, scanner_reason, scanner_meta, scanner_syms)
     return {
         "ok": True,
         "utc": utc_now_iso(),
         "build": PATCH_BUILD,
-        "service": {
-            "name": PATCH_BUILD.get("system_name"),
-            "role": PATCH_BUILD.get("service_role"),
-            "env_name": PATCH_BUILD.get("env_name"),
-            "release_stage": PATCH_BUILD.get("release_stage_configured"),
-        },
+        "service": _service_meta_payload(),
+        "compatibility": compatibility,
+    }
+
+
+@app.get("/runtime")
+def runtime_endpoint():
+    data = diagnostics_runtime()
+    return {
+        "ok": True,
+        "utc": utc_now_iso(),
+        "build": PATCH_BUILD,
+        "service": _service_meta_payload(),
         "runtime": data,
-        "compatibility": scanner_contract,
     }
 
 
@@ -5004,42 +5016,36 @@ def ready_endpoint():
     startup = _startup_self_check(rerun=False, apply=None)
     gate = _pretrade_health_gate_summary(rerun_startup_check=False)
     scanner_ok, scanner_reason, scanner_meta, scanner_syms = _scanner_fetch_active_symbols_and_meta()
-    scanner_contract = _scanner_contract_snapshot(scanner_ok, scanner_reason, scanner_meta, scanner_syms)
+    compatibility = _compatibility_snapshot(scanner_ok, scanner_reason, scanner_meta, scanner_syms)
     startup_ok = bool(startup.get("ok")) and not bool((startup.get("startup_self_check") or {}).get("critical"))
     gate_open = bool(gate.get("gate_open"))
-    scanner_ready = bool(scanner_ok and len(scanner_syms) > 0 and scanner_contract.get("compatibility_ok"))
+    scanner_ready = bool(scanner_ok and len(scanner_syms) > 0)
+    contract_compatible = bool(compatibility.get("contract_compatible"))
     issues = list(gate.get("violations") or [])
     if not startup_ok and "startup_self_check_not_ok" not in issues:
         issues.append("startup_self_check_not_ok")
-    if not scanner_ok and not SCANNER_SOFT_ALLOW and "scanner_unavailable_block" not in issues:
+    if not scanner_ready and not SCANNER_SOFT_ALLOW and "scanner_unavailable_block" not in issues:
         issues.append("scanner_unavailable_block")
-    if scanner_ok and not scanner_contract.get("compatibility_ok"):
-        issue = f"scanner_contract_{scanner_contract.get('compatibility_reason') or 'invalid'}"
-        if issue not in issues:
-            issues.append(issue)
-    ready = bool(startup_ok and gate_open and (scanner_ready or SCANNER_SOFT_ALLOW))
+    if scanner_ready and not contract_compatible and "scanner_contract_incompatible" not in issues:
+        issues.append("scanner_contract_incompatible")
+    ready = bool(startup_ok and gate_open and (scanner_ready or SCANNER_SOFT_ALLOW) and (contract_compatible or not scanner_ready))
     return {
         "ok": True,
         "ready": ready,
         "utc": utc_now_iso(),
         "build": PATCH_BUILD,
-        "service": {
-            "name": PATCH_BUILD.get("system_name"),
-            "role": PATCH_BUILD.get("service_role"),
-            "env_name": PATCH_BUILD.get("env_name"),
-            "release_stage": PATCH_BUILD.get("release_stage_configured"),
-        },
+        "service": _service_meta_payload(),
         "issues": issues,
         "startup_self_check_ok": startup_ok,
         "pretrade_gate_open": gate_open,
         "scanner_ready": scanner_ready,
         "scanner_soft_allow": bool(SCANNER_SOFT_ALLOW),
-        "scanner_reason": scanner_contract.get("compatibility_reason") or scanner_reason,
+        "scanner_reason": compatibility.get("compatibility_reason") or scanner_reason,
         "scanner_last_refresh_utc": (scanner_meta or {}).get("last_refresh_utc"),
-        "scanner_contract": scanner_contract,
         "worker_health": gate.get("worker_health"),
         "startup_self_check": startup,
         "pretrade_health_gate": gate,
+        "compatibility": compatibility,
     }
 
 
