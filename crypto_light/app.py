@@ -37,6 +37,7 @@ from .models import WebhookPayload, WorkerExitPayload, WorkerScanPayload, Worker
 from .risk import compute_brackets, compute_atr_brackets, compute_effective_stop_pct, compute_rr_ratio, compute_stop_distance_pct
 from .state import InMemoryState, TradePlan
 from .symbol_map import normalize_symbol
+from .build_info import build_payload
 
 settings = load_settings()
 
@@ -101,6 +102,9 @@ except Exception:
 
 STARTUP_SELF_CHECK_RESULT: dict[str, Any] = {}
 STARTUP_SELF_CHECK_TS: float = 0.0
+
+PATCH_BUILD = build_payload()
+
 
 
 def _startup_self_check(*, rerun: bool = False, apply: bool | None = None) -> dict:
@@ -4858,6 +4862,66 @@ def scan_entries(payload: WorkerScanPayload):
             "per_symbol": per_symbol,
         },
     }
+
+@app.get("/build")
+def build_info_endpoint():
+    return {**PATCH_BUILD}
+
+
+@app.get("/runtime")
+def runtime_endpoint():
+    data = diagnostics_runtime()
+    return {
+        "ok": True,
+        "utc": utc_now_iso(),
+        "build": PATCH_BUILD,
+        "service": {
+            "name": PATCH_BUILD.get("system_name"),
+            "role": PATCH_BUILD.get("service_role"),
+            "env_name": PATCH_BUILD.get("env_name"),
+            "release_stage": PATCH_BUILD.get("release_stage_configured"),
+        },
+        "runtime": data,
+    }
+
+
+@app.get("/ready")
+def ready_endpoint():
+    startup = _startup_self_check(rerun=False, apply=None)
+    gate = _pretrade_health_gate_summary(rerun_startup_check=False)
+    scanner_ok, scanner_reason, scanner_meta, scanner_syms = _scanner_fetch_active_symbols_and_meta()
+    startup_ok = bool(startup.get("ok")) and not bool((startup.get("startup_self_check") or {}).get("critical"))
+    gate_open = bool(gate.get("gate_open"))
+    scanner_ready = bool(scanner_ok and len(scanner_syms) > 0)
+    issues = list(gate.get("violations") or [])
+    if not startup_ok and "startup_self_check_not_ok" not in issues:
+        issues.append("startup_self_check_not_ok")
+    if not scanner_ready and not SCANNER_SOFT_ALLOW and "scanner_unavailable_block" not in issues:
+        issues.append("scanner_unavailable_block")
+    ready = bool(startup_ok and gate_open and (scanner_ready or SCANNER_SOFT_ALLOW))
+    return {
+        "ok": True,
+        "ready": ready,
+        "utc": utc_now_iso(),
+        "build": PATCH_BUILD,
+        "service": {
+            "name": PATCH_BUILD.get("system_name"),
+            "role": PATCH_BUILD.get("service_role"),
+            "env_name": PATCH_BUILD.get("env_name"),
+            "release_stage": PATCH_BUILD.get("release_stage_configured"),
+        },
+        "issues": issues,
+        "startup_self_check_ok": startup_ok,
+        "pretrade_gate_open": gate_open,
+        "scanner_ready": scanner_ready,
+        "scanner_soft_allow": bool(SCANNER_SOFT_ALLOW),
+        "scanner_reason": scanner_reason,
+        "scanner_last_refresh_utc": (scanner_meta or {}).get("last_refresh_utc"),
+        "worker_health": gate.get("worker_health"),
+        "startup_self_check": startup,
+        "pretrade_health_gate": gate,
+    }
+
 
 @app.get("/dashboard")
 def dashboard():
