@@ -33,7 +33,7 @@ from .broker import get_bars as _get_bars
 from .broker import best_bid_ask as _best_bid_ask
 from .sizing import compute_risk_pct_equity_notional, compute_equity_fraction_notional, compute_risk_based_notional_actual
 from .config import load_settings
-from .models import WebhookPayload, WorkerExitPayload, WorkerScanPayload, WorkerExitDiagnosticsPayload, WorkerAdoptPositionsPayload
+from .models import WebhookPayload, WorkerExitPayload, WorkerScanPayload, WorkerExitDiagnosticsPayload, WorkerAdoptPositionsPayload, WorkerRouteTruthPayload
 from .risk import compute_brackets, compute_atr_brackets, compute_effective_stop_pct, compute_rr_ratio, compute_stop_distance_pct
 from .state import InMemoryState, TradePlan
 from .symbol_map import normalize_symbol
@@ -105,6 +105,57 @@ STARTUP_SELF_CHECK_TS: float = 0.0
 
 PATCH_BUILD = build_payload()
 
+
+
+def _route_truth_from_payload(payload: Any, kind: str) -> dict:
+    obj = payload
+    return {
+        "worker_kind": str(getattr(obj, "worker_kind", "") or getattr(obj, "heartbeat_kind", "") or kind),
+        "heartbeat_kind": str(getattr(obj, "heartbeat_kind", "") or kind),
+        "heartbeat_utc": str(getattr(obj, "heartbeat_utc", "") or utc_now_iso()),
+        "heartbeat_ts": getattr(obj, "heartbeat_ts", None),
+        "heartbeat_seq": getattr(obj, "heartbeat_seq", None),
+        "loop_interval_sec": getattr(obj, "loop_interval_sec", None),
+        "loop_pid": getattr(obj, "loop_pid", None),
+        "heartbeat_source": getattr(obj, "heartbeat_source", None),
+        "worker_request_id": getattr(obj, "worker_request_id", None),
+        "phase": getattr(obj, "phase", None),
+        "ok": getattr(obj, "ok", None),
+        "target_base_url": getattr(obj, "target_base_url", None),
+        "target_path": getattr(obj, "target_path", None),
+        "target_url": getattr(obj, "target_url", None),
+        "status_code": getattr(obj, "status_code", None),
+        "elapsed_ms": getattr(obj, "elapsed_ms", None),
+        "auth_present": getattr(obj, "auth_present", None),
+        "error": getattr(obj, "error", None),
+        "response_excerpt": getattr(obj, "response_excerpt", None),
+        "route_truth_utc": str(getattr(obj, "route_truth_utc", "") or utc_now_iso()),
+    }
+
+
+def _classify_route_truth_reason(route_truth: dict | None) -> str | None:
+    rt = dict(route_truth or {})
+    if not rt:
+        return None
+    code = rt.get("status_code")
+    phase = str(rt.get("phase") or "")
+    err = str(rt.get("error") or "")
+    if code == 401 or phase == "auth_failed" or "401" in err:
+        return "auth_failed"
+    if code == 404 or "404" in err:
+        return "route_not_found"
+    if phase == "post_failed":
+        return "heartbeat_post_failed"
+    if phase in ("attempt", "result", "started"):
+        return "loop_not_invoked" if not bool(rt.get("ok")) and not code else "loop_invoked_no_heartbeat"
+    return "route_truth_seen_no_heartbeat"
+
+
+def _route_truth_summary(kind: str) -> dict:
+    snap = dict(getattr(state, f"last_{kind}_route_truth", {}) or {})
+    if not snap:
+        return {"seen": False, "worker_kind": kind}
+    return {"seen": True, **snap, "derived_reason": _classify_route_truth_reason(snap)}
 
 
 def _startup_self_check(*, rerun: bool = False, apply: bool | None = None) -> dict:
@@ -1907,8 +1958,9 @@ def _symbol_allowed_by_scanner(symbol: str) -> tuple[bool, str, Dict[str, Any]]:
 
 
 
-def _worker_status_meta(snapshot: dict | None, *, stale_after_sec: int | None = None) -> dict:
+def _worker_status_meta(snapshot: dict | None, *, route_truth: dict | None = None, stale_after_sec: int | None = None) -> dict:
     snap = dict(snapshot or {})
+    rt = dict(route_truth or {})
     last_ts = None
     try:
         utc_raw = snap.get('heartbeat_utc') or snap.get('completed_utc') or snap.get('utc')
@@ -1917,19 +1969,33 @@ def _worker_status_meta(snapshot: dict | None, *, stale_after_sec: int | None = 
     except Exception:
         last_ts = None
     lim = int(stale_after_sec or WORKER_STALE_AFTER_SEC)
+    route_fields = {
+        'route_truth_seen': bool(rt),
+        'route_phase': rt.get('phase'),
+        'route_status_code': rt.get('status_code'),
+        'route_error': rt.get('error'),
+        'target_path': rt.get('target_path'),
+        'target_url': rt.get('target_url'),
+        'auth_present': rt.get('auth_present'),
+        'worker_request_id': rt.get('worker_request_id'),
+        'route_elapsed_ms': rt.get('elapsed_ms'),
+        'last_route_truth_utc': rt.get('route_truth_utc'),
+    }
     if last_ts is None:
+        reason = _classify_route_truth_reason(rt) or 'never_started'
         return {
             "seen": False,
             "stale": True,
             "age_sec": None,
             "stale_after_sec": lim,
-            "reason": "never_seen",
-            "phase": str(snap.get('phase') or 'unknown'),
-            "source": snap.get('heartbeat_source') or snap.get('source'),
-            "heartbeat_seq": snap.get('heartbeat_seq'),
+            "reason": reason,
+            "phase": str(snap.get('phase') or rt.get('phase') or 'unknown'),
+            "source": snap.get('heartbeat_source') or snap.get('source') or rt.get('heartbeat_source'),
+            "heartbeat_seq": snap.get('heartbeat_seq') if snap.get('heartbeat_seq') is not None else rt.get('heartbeat_seq'),
             "last_success_utc": snap.get('last_success_utc'),
-            "last_error": snap.get('error'),
+            "last_error": snap.get('error') or rt.get('error'),
             "last_duration_ms": snap.get('duration_ms'),
+            **route_fields,
         }
     age = max(0.0, time.time() - float(last_ts))
     stale = bool(age > lim)
@@ -1951,6 +2017,7 @@ def _worker_status_meta(snapshot: dict | None, *, stale_after_sec: int | None = 
         "last_duration_ms": snap.get('duration_ms'),
         "loop_interval_sec": snap.get('loop_interval_sec'),
         "loop_pid": snap.get('loop_pid'),
+        **route_fields,
     }
 
 
@@ -2110,8 +2177,8 @@ def _account_truth_snapshot() -> dict:
 def _pretrade_health_gate_summary(*, rerun_startup_check: bool = False) -> dict:
     enabled = bool(getattr(settings, 'pretrade_health_gate_enabled', True))
     worker_health = {
-        'scan': _worker_status_meta(getattr(state, 'last_scan_status', {}) or {}),
-        'exit': _worker_status_meta(getattr(state, 'last_exit_status', {}) or {}),
+        'scan': _worker_status_meta(getattr(state, 'last_scan_status', {}) or {}, route_truth=getattr(state, 'last_scan_route_truth', {}) or {}),
+        'exit': _worker_status_meta(getattr(state, 'last_exit_status', {}) or {}, route_truth=getattr(state, 'last_exit_route_truth', {}) or {}),
     }
     worker_health['overall_stale'] = bool(worker_health['scan'].get('stale') or worker_health['exit'].get('stale'))
 
@@ -2157,6 +2224,10 @@ def _pretrade_health_gate_summary(*, rerun_startup_check: bool = False) -> dict:
         'gate_open': bool((not enabled) or (len(violations) == 0)),
         'violations': violations,
         'worker_health': worker_health,
+        'worker_route_truth': {
+            'scan': _route_truth_summary('scan'),
+            'exit': _route_truth_summary('exit'),
+        },
         'startup_self_check': startup,
         'account_truth': {
             'balance_ok': bool(account_truth.get('balance_ok')),
@@ -2485,8 +2556,8 @@ def diagnostics_open_orders():
 
 @app.get("/diagnostics/worker_health")
 def diagnostics_worker_health():
-    scan_meta = _worker_status_meta(getattr(state, 'last_scan_status', {}) or {})
-    exit_meta = _worker_status_meta(getattr(state, 'last_exit_status', {}) or {})
+    scan_meta = _worker_status_meta(getattr(state, 'last_scan_status', {}) or {}, route_truth=getattr(state, 'last_scan_route_truth', {}) or {})
+    exit_meta = _worker_status_meta(getattr(state, 'last_exit_status', {}) or {}, route_truth=getattr(state, 'last_exit_route_truth', {}) or {})
     return {
         'ok': True,
         'utc': utc_now_iso(),
@@ -2509,6 +2580,27 @@ def diagnostics_worker_heartbeat_truth():
             'scan': getattr(state, 'last_scan_status', {}) or {},
             'exit': getattr(state, 'last_exit_status', {}) or {},
         },
+        'worker_route_truth': {
+            'scan': _route_truth_summary('scan'),
+            'exit': _route_truth_summary('exit'),
+        },
+    }
+
+
+@app.get("/diagnostics/worker_route_truth")
+def diagnostics_worker_route_truth():
+    return {
+        'ok': True,
+        'utc': utc_now_iso(),
+        'build': PATCH_BUILD,
+        'worker_route_truth': {
+            'scan': _route_truth_summary('scan'),
+            'exit': _route_truth_summary('exit'),
+        },
+        'worker_health': {
+            'scan': _worker_status_meta(getattr(state, 'last_scan_status', {}) or {}, route_truth=getattr(state, 'last_scan_route_truth', {}) or {}),
+            'exit': _worker_status_meta(getattr(state, 'last_exit_status', {}) or {}, route_truth=getattr(state, 'last_exit_route_truth', {}) or {}),
+        },
     }
 
 
@@ -2516,8 +2608,8 @@ def diagnostics_worker_heartbeat_truth():
 def health():
     scanner_ok, scanner_reason, scanner_meta, scanner_syms = _scanner_fetch_active_symbols_and_meta()
     open_orders = _broker_open_orders_summary()
-    scan_meta = _worker_status_meta(getattr(state, 'last_scan_status', {}) or {})
-    exit_meta = _worker_status_meta(getattr(state, 'last_exit_status', {}) or {})
+    scan_meta = _worker_status_meta(getattr(state, 'last_scan_status', {}) or {}, route_truth=getattr(state, 'last_scan_route_truth', {}) or {})
+    exit_meta = _worker_status_meta(getattr(state, 'last_exit_status', {}) or {}, route_truth=getattr(state, 'last_exit_route_truth', {}) or {})
     account_truth = _account_truth_snapshot()
     return {
         "ok": True,
@@ -3844,11 +3936,42 @@ def webhook(payload: WebhookPayload, request: Request):
     }
 
 
+@app.post("/worker/route_truth")
+def worker_route_truth(payload: WorkerRouteTruthPayload):
+    ok_secret, reason = _require_worker_secret(getattr(payload, 'worker_secret', None))
+    kind = str(getattr(payload, 'worker_kind', '') or getattr(payload, 'heartbeat_kind', '') or 'unknown').strip().lower()
+    if kind not in ('scan', 'exit'):
+        raise HTTPException(status_code=400, detail='invalid worker kind')
+    route_payload = _route_truth_from_payload(payload, kind)
+    route_payload['auth'] = 'ok' if ok_secret else 'failed'
+    route_payload['ingested_utc'] = utc_now_iso()
+    if not ok_secret:
+        route_payload['phase'] = 'auth_failed'
+        route_payload['ok'] = False
+        route_payload['error'] = reason
+    if kind == 'scan':
+        state.set_last_scan_route_truth(route_payload)
+    else:
+        state.set_last_exit_route_truth(route_payload)
+    if not ok_secret:
+        raise HTTPException(status_code=401, detail=reason)
+    return {'ok': True, 'utc': utc_now_iso(), 'worker_kind': kind, 'phase': route_payload.get('phase'), 'status_code': route_payload.get('status_code')}
+
+
 @app.post("/worker/exit")
 def worker_exit(payload: WorkerExitPayload):
+    started_at = time.time()
+    try:
+        _record_worker_status('exit', phase='started', payload=payload, ok=True, extra={'auth': 'pending'}, started_at=started_at)
+    except Exception:
+        pass
     # Worker secret
     if settings.worker_secret:
         if not payload.worker_secret or payload.worker_secret != settings.worker_secret:
+            try:
+                _record_worker_status('exit', phase='failure', payload=payload, ok=False, error='invalid worker secret', extra={'auth': 'failed'}, started_at=started_at)
+            except Exception:
+                pass
             raise HTTPException(status_code=401, detail="invalid worker secret")
 
     try:
@@ -5465,6 +5588,7 @@ def ready_endpoint():
         "scanner_reason": compatibility.get("compatibility_reason"),
         "scanner_last_refresh_utc": ((compatibility.get("scanner_contract") or {}).get("last_refresh_utc")),
         "worker_health": gate.get("worker_health"),
+        "worker_route_truth": gate.get("worker_route_truth"),
         "startup_self_check": startup,
         "pretrade_health_gate": gate,
         "compatibility": compatibility,

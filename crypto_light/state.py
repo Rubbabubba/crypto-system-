@@ -120,6 +120,8 @@ class InMemoryState:
         # Operational status snapshots
         self.last_scan_status: Dict[str, Any] = {}
         self.last_exit_status: Dict[str, Any] = {}
+        self.last_scan_route_truth: Dict[str, Any] = {}
+        self.last_exit_route_truth: Dict[str, Any] = {}
         self.blocked_trades: List[Dict[str, Any]] = []
         self.blocked_trades_max: int = 500
 
@@ -431,6 +433,12 @@ class InMemoryState:
 
     def set_last_exit_status(self, payload: Dict[str, Any]) -> None:
         self.last_exit_status = dict(payload or {})
+
+    def set_last_scan_route_truth(self, payload: Dict[str, Any]) -> None:
+        self.last_scan_route_truth = dict(payload or {})
+
+    def set_last_exit_route_truth(self, payload: Dict[str, Any]) -> None:
+        self.last_exit_route_truth = dict(payload or {})
 
     def record_blocked_trade(self, event: Dict[str, Any]) -> None:
         try:
