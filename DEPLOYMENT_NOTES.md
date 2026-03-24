@@ -1,4 +1,1 @@
-Patch 002A
-- Fix main scanner_contract regression
-- Add /compatibility on main
-- Add structured main/scanner contract diagnostics and Path B guardrails
+Patch 002B: contract endpoint hardening. Fixes main compatibility/readiness regressions and scanner compatibility endpoint deadlock. Drop-in patch built on Patch 001 baseline.
