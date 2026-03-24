@@ -1345,14 +1345,17 @@ def _derive_scanner_compatibility_url(scanner_url: str) -> str:
 
 
 def _scanner_contract_snapshot() -> dict[str, Any]:
-    ok, reason, meta, active_symbols = _scanner_fetch_active_symbols_and_meta()
+    active_fetch_ok, active_reason, meta, active_symbols = _scanner_fetch_active_symbols_and_meta()
     scanner_url = str((meta or {}).get("scanner_url") or SCANNER_URL or "").strip()
     compat_url = _derive_scanner_compatibility_url(scanner_url)
-    compatibility = {}
+    compatibility: dict[str, Any] = {}
+    compat_fetch_ok = False
     if compat_url:
         try:
             r = requests.get(compat_url, timeout=min(float(SCANNER_TIMEOUT_SEC or 10), 3.0))
+            meta = {**(meta or {}), "compatibility_status_code": r.status_code}
             if r.status_code == 200:
+                compat_fetch_ok = True
                 payload = r.json() if r.content else {}
                 compatibility = payload.get("compatibility") if isinstance(payload, dict) else {}
                 if isinstance(compatibility, dict):
@@ -1372,9 +1375,6 @@ def _scanner_contract_snapshot() -> dict[str, Any]:
                         clean.append(ns)
                     if clean:
                         active_symbols = clean
-                    ok = bool(compatibility.get("scanner_ok", ok))
-                    reason = reason if reason else None
-                    meta = {**(meta or {}), "compatibility_status_code": r.status_code}
         except Exception as e:
             meta = {**(meta or {}), "compatibility_error": f"{type(e).__name__}: {e}"}
     compat_active_count = None
@@ -1386,9 +1386,21 @@ def _scanner_contract_snapshot() -> dict[str, Any]:
     active_count = len(active_symbols)
     if compat_active_count is not None and compat_active_count > active_count:
         active_count = compat_active_count
+
+    reachable = bool(active_fetch_ok or compat_fetch_ok)
+    scanner_ok = reachable and active_count > 0
+    reason = None
+    if not reachable:
+        reason = str(active_reason or "scanner_unavailable")
+    elif active_count <= 0:
+        reason = "scanner_empty_active_set"
+
+    mode = (compatibility or {}).get("mode") or (meta or {}).get("mode") or "unknown"
+    multi_symbol_capable = bool((compatibility or {}).get("supports_multi_symbol", active_count > 1))
+    guardrails = dict((compatibility or {}).get("fee_churn_guardrails") or {})
     return {
-        "reachable": bool(ok),
-        "scanner_ok": bool(ok),
+        "reachable": reachable,
+        "scanner_ok": scanner_ok,
         "reason": reason,
         "scanner_url": scanner_url or None,
         "compatibility_url": compat_url or None,
@@ -1396,11 +1408,11 @@ def _scanner_contract_snapshot() -> dict[str, Any]:
         "active_count": active_count,
         "active_symbols_sample": active_symbols[:12],
         "last_refresh_utc": (compatibility or {}).get("last_refresh_utc") or (meta or {}).get("last_refresh_utc"),
-        "mode": (compatibility or {}).get("mode") or "unknown",
-        "multi_symbol_capable": bool((compatibility or {}).get("multi_symbol_capable", active_count > 1)),
-        "guardrails": (compatibility or {}).get("guardrails") or {},
+        "mode": mode,
+        "multi_symbol_capable": multi_symbol_capable,
+        "guardrails": guardrails,
         "raw_compatibility": compatibility if isinstance(compatibility, dict) else {},
-        "meta": meta or {},
+        "meta": {**(meta or {}), "active_fetch_ok": bool(active_fetch_ok), "compat_fetch_ok": bool(compat_fetch_ok)},
     }
 
 
@@ -1459,8 +1471,8 @@ def _compatibility_snapshot() -> dict[str, Any]:
     if not scanner_contract.get("reachable"):
         reason = str(scanner_contract.get("reason") or "scanner_unavailable")
         blockers.append("scanner_unavailable")
-    elif not active_symbols:
-        reason = "scanner_empty_active_set"
+    elif not scanner_contract.get("scanner_ok") or not active_symbols:
+        reason = str(scanner_contract.get("reason") or "scanner_empty_active_set")
         blockers.append("scanner_empty_active_set")
     elif invalid_active_symbols:
         reason = "invalid_active_symbols"
@@ -1477,7 +1489,9 @@ def _compatibility_snapshot() -> dict[str, Any]:
         "contract_compatible": contract_compatible,
         "compatibility_reason": reason,
         "blockers": blockers,
-        "scanner_ok": bool(scanner_contract.get("reachable")),
+        "scanner_ok": bool(scanner_contract.get("scanner_ok")),
+        "scanner_reachable": bool(scanner_contract.get("reachable")),
+        "scanner_healthy": bool(scanner_contract.get("scanner_ok")),
         "scanner_contract": scanner_contract,
         "scanner_mode": scanner_contract.get("mode"),
         "allowed_symbols_count": len(allowed_symbols),
