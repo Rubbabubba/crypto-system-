@@ -140,14 +140,17 @@ def _classify_route_truth_reason(route_truth: dict | None) -> str | None:
     code = rt.get("status_code")
     phase = str(rt.get("phase") or "")
     err = str(rt.get("error") or "")
+    ok = bool(rt.get("ok"))
+    if ok and (phase in ("success", "result") or (isinstance(code, int) and 200 <= code < 300)):
+        return "fresh"
     if code == 401 or phase == "auth_failed" or "401" in err:
         return "auth_failed"
     if code == 404 or "404" in err:
         return "route_not_found"
     if phase == "post_failed":
         return "heartbeat_post_failed"
-    if phase in ("attempt", "result", "started"):
-        return "loop_not_invoked" if not bool(rt.get("ok")) and not code else "loop_invoked_no_heartbeat"
+    if phase in ("attempt", "result", "started", "success"):
+        return "loop_not_invoked" if not ok and not code else "loop_invoked_no_heartbeat"
     return "route_truth_seen_no_heartbeat"
 
 
@@ -1490,18 +1493,20 @@ def _derive_scanner_compatibility_url(scanner_url: str) -> str:
 
 
 def _scanner_contract_snapshot() -> dict[str, Any]:
+    scanner_url = (SCANNER_URL or os.getenv("SCANNER_URL", "").strip())
     active_fetch_ok, active_reason, meta, active_symbols = _scanner_fetch_active_symbols_and_meta()
-    scanner_url = str((meta or {}).get("scanner_url") or SCANNER_URL or "").strip()
     compat_url = _derive_scanner_compatibility_url(scanner_url)
     compatibility: dict[str, Any] = {}
     compat_fetch_ok = False
+    compat_fetch_reason = None
+    symbols_source = "active_endpoint" if active_fetch_ok else "none"
     if compat_url:
         try:
-            r = requests.get(compat_url, timeout=min(float(SCANNER_TIMEOUT_SEC or 10), 3.0))
+            r = requests.get(compat_url, timeout=SCANNER_TIMEOUT_SEC)
             meta = {**(meta or {}), "compatibility_status_code": r.status_code}
             if r.status_code == 200:
-                compat_fetch_ok = True
                 payload = r.json() if r.content else {}
+                compat_fetch_ok = True
                 compatibility = payload.get("compatibility") if isinstance(payload, dict) else {}
                 if isinstance(compatibility, dict):
                     compat_active = compatibility.get("active_symbols") or compatibility.get("active_symbols_sample") or []
@@ -1518,10 +1523,18 @@ def _scanner_contract_snapshot() -> dict[str, Any]:
                             continue
                         seen.add(ns)
                         clean.append(ns)
-                    if clean:
+                    if clean and (not active_fetch_ok or not active_symbols):
                         active_symbols = clean
+                        symbols_source = "compatibility_fallback"
+                    elif clean:
+                        symbols_source = "active_endpoint"
+                else:
+                    compat_fetch_reason = "invalid_compatibility_payload"
+            else:
+                compat_fetch_reason = f"http_{r.status_code}"
         except Exception as e:
-            meta = {**(meta or {}), "compatibility_error": f"{type(e).__name__}: {e}"}
+            compat_fetch_reason = f"{type(e).__name__}: {e}"
+            meta = {**(meta or {}), "compatibility_error": compat_fetch_reason}
     compat_active_count = None
     if isinstance(compatibility, dict):
         try:
@@ -1532,11 +1545,12 @@ def _scanner_contract_snapshot() -> dict[str, Any]:
     if compat_active_count is not None and compat_active_count > active_count:
         active_count = compat_active_count
 
-    reachable = bool(active_fetch_ok or compat_fetch_ok)
-    scanner_ok = reachable and active_count > 0
+    active_fetch_ok_effective = bool(active_fetch_ok or (compat_fetch_ok and active_count > 0))
+    reachable = bool(active_fetch_ok_effective or compat_fetch_ok)
+    scanner_ok = bool(reachable and active_count > 0)
     reason = None
     if not reachable:
-        reason = str(active_reason or "scanner_unavailable")
+        reason = str(active_reason or compat_fetch_reason or "scanner_unavailable")
     elif active_count <= 0:
         reason = "scanner_empty_active_set"
 
@@ -1552,23 +1566,35 @@ def _scanner_contract_snapshot() -> dict[str, Any]:
         "active_symbols": active_symbols,
         "active_count": active_count,
         "active_symbols_sample": active_symbols[:12],
+        "active_symbols_source": symbols_source,
         "last_refresh_utc": (compatibility or {}).get("last_refresh_utc") or (meta or {}).get("last_refresh_utc"),
         "mode": mode,
         "multi_symbol_capable": multi_symbol_capable,
         "guardrails": guardrails,
         "raw_compatibility": compatibility if isinstance(compatibility, dict) else {},
-        "meta": {**(meta or {}), "active_fetch_ok": bool(active_fetch_ok), "compat_fetch_ok": bool(compat_fetch_ok)},
+        "meta": {
+            **(meta or {}),
+            "active_fetch_ok": active_fetch_ok_effective,
+            "active_fetch_ok_raw": bool(active_fetch_ok),
+            "active_fetch_reason": active_reason,
+            "compat_fetch_ok": bool(compat_fetch_ok),
+            "compat_fetch_reason": compat_fetch_reason,
+            "active_symbols_source": symbols_source,
+        },
     }
-
 
 
 def _path_b_admission_snapshot(scanner_contract: dict[str, Any]) -> dict[str, Any]:
     admission_enabled = _env_bool("PATH_B_ADMISSION_ENABLED", False)
     pilot_gate_enabled = _env_bool("PATH_B_PILOT_GATE_ENABLED", True)
-    max_active_symbols = max(1, _env_int("PATH_B_MAX_ACTIVE_SYMBOLS", 3))
-    allowed_pilot_symbols = _env_symbol_list("PATH_B_ALLOWED_SYMBOLS")
-    scanner_rank_cap = max(1, _env_int("PATH_B_SCANNER_RANK_CAP", max_active_symbols))
-    scanner_guardrails = dict((scanner_contract or {}).get("guardrails") or {})
+
+    env_allowlist = _env_symbol_list("PATH_B_PILOT_ALLOWLIST")
+    legacy_allowlist = _env_symbol_list("PATH_B_ALLOWED_SYMBOLS")
+    allowed_pilot_symbols = env_allowlist or legacy_allowlist
+
+    max_active_symbols = max(1, _env_int("PATH_B_PILOT_MAX_ADMITTED_SYMBOLS", _env_int("PATH_B_MAX_ACTIVE_SYMBOLS", 3)))
+    scanner_rank_cap = max(1, _env_int("PATH_B_PILOT_SCANNER_RANK_CAP", _env_int("PATH_B_SCANNER_RANK_CAP", max_active_symbols)))
+
     fee_churn_truth = _fee_churn_truth_snapshot(
         scanner_contract,
         max_active_symbols=max_active_symbols,
@@ -1604,6 +1630,28 @@ def _path_b_admission_snapshot(scanner_contract: dict[str, Any]) -> dict[str, An
         blockers.append('pilot_gate_no_symbols')
     pilot_gate_ready = bool(pilot_gate_enabled and fee_guard_pass and churn_guard_pass and coordination_guard_pass and len(admitted_symbols) > 0)
     pilot_gate_open = bool(pilot_gate_ready and admission_enabled)
+
+    allowlist_source = "env:PATH_B_PILOT_ALLOWLIST" if env_allowlist else ("env:PATH_B_ALLOWED_SYMBOLS" if legacy_allowlist else "scanner_ranked_candidates")
+    pilot_controls = {
+        "pilot_gate_enabled": pilot_gate_enabled,
+        "admission_enabled": admission_enabled,
+        "allowlist_source": allowlist_source,
+        "allowlist_count": len(allowed_pilot_symbols),
+        "allowlist_sample": allowed_pilot_symbols[:12],
+        "max_admitted_symbols": max_active_symbols,
+        "scanner_rank_cap": scanner_rank_cap,
+        "candidate_symbols_count": len(candidate_symbols),
+        "candidate_symbols_sample": candidate_symbols[:12],
+        "admitted_symbols_count": len(admitted_symbols),
+        "admitted_symbols_sample": admitted_symbols[:12],
+        "requirements": {
+            "require_contract_compatible": True,
+            "require_fee_guard": True,
+            "require_churn_guard": True,
+            "require_coordination_guard": True,
+        },
+    }
+
     return {
         "multi_symbol_capable": bool((scanner_contract or {}).get("multi_symbol_capable")),
         "multi_symbol_admission_enabled": admission_enabled,
@@ -1613,7 +1661,7 @@ def _path_b_admission_snapshot(scanner_contract: dict[str, Any]) -> dict[str, An
         "pilot_gate_open": pilot_gate_open,
         "pilot_gate_blockers": blockers,
         "pilot_symbol_list": allowed_pilot_symbols,
-        "pilot_allowlist_source": "env:PATH_B_ALLOWED_SYMBOLS" if allowed_pilot_symbols else "scanner_ranked_candidates",
+        "pilot_allowlist_source": allowlist_source,
         "pilot_config": {
             "max_active_symbols": max_active_symbols,
             "scanner_rank_cap": scanner_rank_cap,
@@ -1622,6 +1670,7 @@ def _path_b_admission_snapshot(scanner_contract: dict[str, Any]) -> dict[str, An
             "require_churn_guard": True,
             "require_coordination_guard": True,
         },
+        "pilot_controls": pilot_controls,
         "fee_guard_pass": fee_guard_pass,
         "churn_guard_pass": churn_guard_pass,
         "coordination_guard_pass": coordination_guard_pass,
