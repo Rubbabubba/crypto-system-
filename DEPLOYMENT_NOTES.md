@@ -1,2 +1,3 @@
-Patch 004: scanner coordination endpoint + safe Path B pilot gate
-Role: main
+# Patch 004A
+
+Main side preserves Patch 004 coordination endpoint work and bumps build metadata for deploy verification.
