@@ -23,11 +23,25 @@ class WebhookPayload(BaseModel):
 
 class WorkerExitPayload(BaseModel):
     worker_secret: str | None = None
+    heartbeat_kind: str | None = None
+    heartbeat_utc: str | None = None
+    heartbeat_ts: float | None = None
+    heartbeat_seq: int | None = None
+    loop_interval_sec: float | None = None
+    loop_pid: int | None = None
+    heartbeat_source: str | None = None
 
 
 class WorkerScanPayload(BaseModel):
     worker_secret: str | None = None
     dry_run: bool | None = False
+    heartbeat_kind: str | None = None
+    heartbeat_utc: str | None = None
+    heartbeat_ts: float | None = None
+    heartbeat_seq: int | None = None
+    loop_interval_sec: float | None = None
+    loop_pid: int | None = None
+    heartbeat_source: str | None = None
 
     # Optional controls used by /worker/scan_entries
     # - symbols: explicit universe override (e.g. ["BTC/USD", "ETH/USD"])

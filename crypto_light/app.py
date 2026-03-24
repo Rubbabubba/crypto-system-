@@ -1911,16 +1911,100 @@ def _worker_status_meta(snapshot: dict | None, *, stale_after_sec: int | None = 
     snap = dict(snapshot or {})
     last_ts = None
     try:
-        utc_raw = snap.get('utc')
+        utc_raw = snap.get('heartbeat_utc') or snap.get('completed_utc') or snap.get('utc')
         if utc_raw:
             last_ts = datetime.fromisoformat(str(utc_raw).replace('Z', '+00:00')).timestamp()
     except Exception:
         last_ts = None
-    if last_ts is None:
-        return {"seen": False, "stale": True, "age_sec": None, "stale_after_sec": int(stale_after_sec or WORKER_STALE_AFTER_SEC)}
-    age = max(0.0, time.time() - float(last_ts))
     lim = int(stale_after_sec or WORKER_STALE_AFTER_SEC)
-    return {"seen": True, "stale": bool(age > lim), "age_sec": round(age, 3), "stale_after_sec": lim}
+    if last_ts is None:
+        return {
+            "seen": False,
+            "stale": True,
+            "age_sec": None,
+            "stale_after_sec": lim,
+            "reason": "never_seen",
+            "phase": str(snap.get('phase') or 'unknown'),
+            "source": snap.get('heartbeat_source') or snap.get('source'),
+            "heartbeat_seq": snap.get('heartbeat_seq'),
+            "last_success_utc": snap.get('last_success_utc'),
+            "last_error": snap.get('error'),
+            "last_duration_ms": snap.get('duration_ms'),
+        }
+    age = max(0.0, time.time() - float(last_ts))
+    stale = bool(age > lim)
+    phase = str(snap.get('phase') or 'unknown')
+    reason = 'stale_heartbeat' if stale else 'fresh'
+    if phase == 'failure' and not stale:
+        reason = 'last_cycle_failed'
+    return {
+        "seen": True,
+        "stale": stale,
+        "age_sec": round(age, 3),
+        "stale_after_sec": lim,
+        "reason": reason,
+        "phase": phase,
+        "source": snap.get('heartbeat_source') or snap.get('source'),
+        "heartbeat_seq": snap.get('heartbeat_seq'),
+        "last_success_utc": snap.get('last_success_utc'),
+        "last_error": snap.get('error'),
+        "last_duration_ms": snap.get('duration_ms'),
+        "loop_interval_sec": snap.get('loop_interval_sec'),
+        "loop_pid": snap.get('loop_pid'),
+    }
+
+
+def _worker_heartbeat_from_payload(payload: Any, kind: str) -> dict:
+    obj = payload
+    hb_kind = str(getattr(obj, 'heartbeat_kind', '') or kind)
+    hb_utc = str(getattr(obj, 'heartbeat_utc', '') or utc_now_iso())
+    hb_ts = getattr(obj, 'heartbeat_ts', None)
+    try:
+        hb_ts = float(hb_ts) if hb_ts is not None else None
+    except Exception:
+        hb_ts = None
+    return {
+        'worker_kind': kind,
+        'heartbeat_kind': hb_kind,
+        'heartbeat_utc': hb_utc,
+        'heartbeat_ts': hb_ts,
+        'heartbeat_seq': getattr(obj, 'heartbeat_seq', None),
+        'loop_interval_sec': getattr(obj, 'loop_interval_sec', None),
+        'loop_pid': getattr(obj, 'loop_pid', None),
+        'heartbeat_source': getattr(obj, 'heartbeat_source', None),
+    }
+
+
+def _record_worker_status(kind: str, *, phase: str, payload: Any | None = None, ok: bool | None = None, error: str | None = None, extra: dict | None = None, started_at: float | None = None) -> dict:
+    heartbeat = _worker_heartbeat_from_payload(payload, kind) if payload is not None else {'worker_kind': kind, 'heartbeat_kind': kind, 'heartbeat_utc': utc_now_iso()}
+    completed_utc = utc_now_iso()
+    status_payload = {
+        **heartbeat,
+        'utc': completed_utc,
+        'completed_utc': completed_utc,
+        'phase': phase,
+        'ok': bool(ok) if ok is not None else (phase != 'failure'),
+        'error': error,
+    }
+    if started_at is not None:
+        status_payload['duration_ms'] = round((time.time() - float(started_at)) * 1000.0, 3)
+    if extra:
+        status_payload.update(dict(extra or {}))
+    if phase == 'success':
+        status_payload['last_success_utc'] = completed_utc
+    elif kind == 'scan':
+        prev = dict(getattr(state, 'last_scan_status', {}) or {})
+        if prev.get('last_success_utc') and 'last_success_utc' not in status_payload:
+            status_payload['last_success_utc'] = prev.get('last_success_utc')
+    else:
+        prev = dict(getattr(state, 'last_exit_status', {}) or {})
+        if prev.get('last_success_utc') and 'last_success_utc' not in status_payload:
+            status_payload['last_success_utc'] = prev.get('last_success_utc')
+    if kind == 'scan':
+        state.set_last_scan_status(status_payload)
+    else:
+        state.set_last_exit_status(status_payload)
+    return status_payload
 
 
 def _broker_open_orders_summary() -> dict:
@@ -2409,6 +2493,22 @@ def diagnostics_worker_health():
         'scan': {**scan_meta, 'snapshot': getattr(state, 'last_scan_status', {}) or {}},
         'exit': {**exit_meta, 'snapshot': getattr(state, 'last_exit_status', {}) or {}},
         'overall_stale': bool(scan_meta.get('stale') or exit_meta.get('stale')),
+    }
+
+
+@app.get("/diagnostics/worker_heartbeat_truth")
+def diagnostics_worker_heartbeat_truth():
+    gate = _pretrade_health_gate_summary(rerun_startup_check=False)
+    return {
+        'ok': True,
+        'utc': utc_now_iso(),
+        'worker_health': gate.get('worker_health'),
+        'gate_open': gate.get('gate_open'),
+        'violations': gate.get('violations') or [],
+        'heartbeat_truth': {
+            'scan': getattr(state, 'last_scan_status', {}) or {},
+            'exit': getattr(state, 'last_exit_status', {}) or {},
+        },
     }
 
 
@@ -4175,14 +4275,13 @@ def worker_exit(payload: WorkerExitPayload):
         if diagnostics:
             resp["evaluations"] = evaluations
         try:
-            state.set_last_exit_status({
-                "utc": now.isoformat(),
-                "ok": True,
+            _record_worker_status('exit', phase='success', payload=payload, ok=True, started_at=started_at, extra={
                 "did_flatten": bool(did_flatten),
                 "exits_count": len(exits),
                 "symbols_evaluated": len(symbols),
                 "stale_pending_cleared": int(stale_pending_cleared),
                 "pending_exits": len(getattr(state, 'pending_exits', {}) or {}),
+                "auth": 'ok',
             })
         except Exception:
             pass
@@ -4192,11 +4291,7 @@ def worker_exit(payload: WorkerExitPayload):
         raise
     except Exception as e:
         try:
-            state.set_last_exit_status({
-                "utc": utc_now_iso(),
-                "ok": False,
-                "error": str(e),
-            })
+            _record_worker_status('exit', phase='failure', payload=payload, ok=False, error=str(e), started_at=started_at, extra={'auth': 'ok'})
         except Exception:
             pass
         _log_event(
@@ -4990,10 +5085,12 @@ def scan_entries(payload: WorkerScanPayload):
     This endpoint ALWAYS returns a rich diagnostics payload so you can see exactly why
     you got 0 entries (no signals, already in position, symbol not allowed, etc.).
     """
+    started_at = time.time()
+    _record_worker_status('scan', phase='started', payload=payload, ok=True, extra={'auth': 'pending'}, started_at=started_at)
     ok, reason = _require_worker_secret(payload.worker_secret)
     if not ok:
         try:
-            state.set_last_scan_status({"utc": utc_now_iso(), "ok": False, "error": reason})
+            _record_worker_status('scan', phase='failure', payload=payload, ok=False, error=reason, extra={'auth': 'failed'}, started_at=started_at)
         except Exception:
             pass
         return JSONResponse(status_code=401, content={"ok": False, "utc": utc_now_iso(), "error": reason})
@@ -5217,14 +5314,14 @@ def scan_entries(payload: WorkerScanPayload):
             strat = str(r.get('strategy') or '')
             strategy_summary.setdefault(strat, {'signals': 0, 'chosen': 0, 'executed': 0})['executed'] += 1
     try:
-        state.set_last_scan_status({
-            "utc": utc_now_iso(),
-            "ok": True,
+        _record_worker_status('scan', phase='success', payload=payload, ok=True, started_at=started_at, extra={
             "scanner_ok": bool(scanner_ok),
             "scanner_reason": scanner_reason,
             "universe_count": len(universe),
             "results_count": len(results),
+            "candidate_count": len(candidates),
             "dry_run": bool(payload.dry_run),
+            "auth": 'ok',
         })
     except Exception:
         pass
