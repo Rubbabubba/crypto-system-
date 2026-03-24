@@ -1332,6 +1332,100 @@ def _env_symbol_list(name: str) -> list[str]:
         out.append(sym)
     return out
 
+def _safe_count(value: Any) -> int:
+    if value is None:
+        return 0
+    if isinstance(value, bool):
+        return int(value)
+    if isinstance(value, (int, float)):
+        try:
+            return max(0, int(value))
+        except Exception:
+            return 0
+    if isinstance(value, dict):
+        return len(value)
+    if isinstance(value, (list, tuple, set)):
+        return len(value)
+    try:
+        return len(value)  # type: ignore[arg-type]
+    except Exception:
+        return 0
+
+
+def _spread_bps_from_guardrails(scanner_guardrails: dict[str, Any]) -> float:
+    try:
+        max_spread_pct = float((scanner_guardrails or {}).get("max_spread_pct") or 0.0)
+    except Exception:
+        max_spread_pct = 0.0
+    return max(0.0, max_spread_pct * 10000.0)
+
+
+def _fee_churn_truth_snapshot(scanner_contract: dict[str, Any], *, max_active_symbols: int, scanner_rank_cap: int) -> dict[str, Any]:
+    scanner_guardrails = dict((scanner_contract or {}).get("guardrails") or {})
+    entry_fee_bps = _env_float("ENTRY_FEE_BPS", 0.0)
+    exit_fee_bps = _env_float("EXIT_FEE_BPS", 0.0)
+    slippage_bps_each_side = _env_float("EXPECTED_SLIPPAGE_BPS", _env_float("SLIPPAGE_BPS", 0.0))
+    spread_bps_each_side = _env_float("PATH_B_SPREAD_BPS_EACH_SIDE", _spread_bps_from_guardrails(scanner_guardrails) / 2.0)
+    estimated_round_trip_bps = float(entry_fee_bps + exit_fee_bps + (2.0 * slippage_bps_each_side) + (2.0 * spread_bps_each_side))
+    max_est_round_trip_bps = _env_float("PATH_B_MAX_EST_ROUND_TRIP_BPS", 60.0)
+    fee_over_limit_bps = max(0.0, estimated_round_trip_bps - max_est_round_trip_bps)
+    signal_dedupe_ttl_sec = _env_int("SIGNAL_DEDUPE_TTL_SEC", 0)
+    bar_lock_sec = _env_int("SCANNER_BAR_LOCK_SEC", int((scanner_guardrails or {}).get("bar_lock_sec") or 0))
+    inflight_holdoff_sec = _env_int("SCANNER_INFLIGHT_HOLDOFF_SEC", int((scanner_guardrails or {}).get("inflight_holdoff_sec") or 0))
+    churn_thresholds = {
+        "max_open_positions_lte": 1,
+        "max_entries_per_day_lte": 3,
+        "max_active_symbols_lte": 3,
+        "signal_dedupe_ttl_sec_gte": 120,
+        "scanner_bar_lock_sec_gte": 60,
+        "scanner_inflight_holdoff_sec_gte": 60,
+        "scanner_rank_cap_lte": 3,
+    }
+    churn_inputs = {
+        "max_open_positions": int(MAX_OPEN_POSITIONS),
+        "max_entries_per_day": int(MAX_ENTRIES_PER_DAY),
+        "max_active_symbols": int(max_active_symbols),
+        "signal_dedupe_ttl_sec": int(signal_dedupe_ttl_sec),
+        "scanner_bar_lock_sec": int(bar_lock_sec),
+        "scanner_inflight_holdoff_sec": int(inflight_holdoff_sec),
+        "scanner_rank_cap": int(scanner_rank_cap),
+    }
+    failing_checks = []
+    if churn_inputs["max_open_positions"] > churn_thresholds["max_open_positions_lte"]:
+        failing_checks.append("max_open_positions")
+    if churn_inputs["max_entries_per_day"] > churn_thresholds["max_entries_per_day_lte"]:
+        failing_checks.append("max_entries_per_day")
+    if churn_inputs["max_active_symbols"] > churn_thresholds["max_active_symbols_lte"]:
+        failing_checks.append("max_active_symbols")
+    if churn_inputs["signal_dedupe_ttl_sec"] < churn_thresholds["signal_dedupe_ttl_sec_gte"]:
+        failing_checks.append("signal_dedupe_ttl_sec")
+    if churn_inputs["scanner_bar_lock_sec"] < churn_thresholds["scanner_bar_lock_sec_gte"]:
+        failing_checks.append("scanner_bar_lock_sec")
+    if churn_inputs["scanner_inflight_holdoff_sec"] < churn_thresholds["scanner_inflight_holdoff_sec_gte"]:
+        failing_checks.append("scanner_inflight_holdoff_sec")
+    if churn_inputs["scanner_rank_cap"] > churn_thresholds["scanner_rank_cap_lte"]:
+        failing_checks.append("scanner_rank_cap")
+    churn_guard_pass = len(failing_checks) == 0
+    return {
+        "fee_model": {
+            "entry_fee_bps": round(entry_fee_bps, 3),
+            "exit_fee_bps": round(exit_fee_bps, 3),
+            "expected_slippage_bps_each_side": round(slippage_bps_each_side, 3),
+            "expected_spread_bps_each_side": round(spread_bps_each_side, 3),
+            "estimated_round_trip_bps": round(estimated_round_trip_bps, 3),
+            "max_est_round_trip_bps": round(max_est_round_trip_bps, 3),
+            "fee_over_limit_bps": round(fee_over_limit_bps, 3),
+            "fee_guard_pass": bool(estimated_round_trip_bps <= max_est_round_trip_bps),
+        },
+        "churn_model": {
+            "inputs": churn_inputs,
+            "thresholds": churn_thresholds,
+            "failing_checks": failing_checks,
+            "churn_guard_pass": churn_guard_pass,
+        },
+    }
+
+
 
 def _derive_scanner_compatibility_url(scanner_url: str) -> str:
     url = str(scanner_url or "").strip()
@@ -1423,27 +1517,25 @@ def _path_b_admission_snapshot(scanner_contract: dict[str, Any]) -> dict[str, An
     max_active_symbols = max(1, _env_int("PATH_B_MAX_ACTIVE_SYMBOLS", 3))
     allowed_pilot_symbols = _env_symbol_list("PATH_B_ALLOWED_SYMBOLS")
     scanner_rank_cap = max(1, _env_int("PATH_B_SCANNER_RANK_CAP", max_active_symbols))
-    max_est_round_trip_bps = _env_float("PATH_B_MAX_EST_ROUND_TRIP_BPS", 60.0)
-    entry_fee_bps = _env_float("ENTRY_FEE_BPS", 0.0)
-    exit_fee_bps = _env_float("EXIT_FEE_BPS", 0.0)
-    expected_slippage_bps = _env_float("EXPECTED_SLIPPAGE_BPS", _env_float("SLIPPAGE_BPS", 0.0))
-    estimated_round_trip_bps = float(entry_fee_bps + exit_fee_bps + (2.0 * expected_slippage_bps))
     scanner_guardrails = dict((scanner_contract or {}).get("guardrails") or {})
+    fee_churn_truth = _fee_churn_truth_snapshot(
+        scanner_contract,
+        max_active_symbols=max_active_symbols,
+        scanner_rank_cap=scanner_rank_cap,
+    )
+    fee_model = dict(fee_churn_truth.get("fee_model") or {})
+    churn_model = dict(fee_churn_truth.get("churn_model") or {})
+    fee_guard_pass = bool(fee_model.get("fee_guard_pass"))
+    churn_guard_pass = bool(churn_model.get("churn_guard_pass"))
     coordination = _scanner_coordination_snapshot(
         lookback_sec=_env_int("PATH_B_COORDINATION_LOOKBACK_SEC", 900),
         limit=max(25, scanner_rank_cap * 10),
     )
-    churn_guard_pass = bool(
-        int(MAX_OPEN_POSITIONS) <= 1
-        and int(MAX_ENTRIES_PER_DAY) <= 3
-        and max_active_symbols <= 3
-        and _env_int("SIGNAL_DEDUPE_TTL_SEC", 0) >= 120
-        and int(scanner_guardrails.get("bar_lock_sec") or 0) >= 60
-    )
-    fee_guard_pass = bool(estimated_round_trip_bps <= max_est_round_trip_bps)
     coordination_guard_pass = bool(coordination.get('ok'))
     active_symbols = list((scanner_contract or {}).get("active_symbols") or [])
-    admitted_symbols = active_symbols[:scanner_rank_cap]
+    ranked_symbols = list((scanner_contract or {}).get("ranked_active_symbols") or [])
+    candidate_symbols = ranked_symbols or active_symbols
+    admitted_symbols = candidate_symbols[:scanner_rank_cap]
     if allowed_pilot_symbols:
         allowed_set = set(allowed_pilot_symbols)
         admitted_symbols = [s for s in admitted_symbols if s in allowed_set]
@@ -1470,24 +1562,32 @@ def _path_b_admission_snapshot(scanner_contract: dict[str, Any]) -> dict[str, An
         "pilot_gate_open": pilot_gate_open,
         "pilot_gate_blockers": blockers,
         "pilot_symbol_list": allowed_pilot_symbols,
-        "max_active_symbols": max_active_symbols,
-        "scanner_rank_cap": scanner_rank_cap,
-        "estimated_round_trip_bps": round(estimated_round_trip_bps, 3),
-        "max_est_round_trip_bps": round(max_est_round_trip_bps, 3),
+        "pilot_allowlist_source": "env:PATH_B_ALLOWED_SYMBOLS" if allowed_pilot_symbols else "scanner_ranked_candidates",
+        "pilot_config": {
+            "max_active_symbols": max_active_symbols,
+            "scanner_rank_cap": scanner_rank_cap,
+            "require_contract_compatible": True,
+            "require_fee_guard": True,
+            "require_churn_guard": True,
+            "require_coordination_guard": True,
+        },
         "fee_guard_pass": fee_guard_pass,
         "churn_guard_pass": churn_guard_pass,
         "coordination_guard_pass": coordination_guard_pass,
+        "fee_churn_truth": fee_churn_truth,
         "coordination": {
             'ok': bool(coordination.get('ok')),
             'reason': coordination.get('reason'),
-            'suppressed_symbols_count': int(((coordination.get('counts') or {}).get('suppressed_symbols')) or len(coordination.get('suppressed_symbols') or [])),
+            'suppressed_symbols_count': int(((coordination.get('counts') or {}).get('suppressed_symbols')) or _safe_count(coordination.get('suppressed_symbols'))),
             'suppressed_symbols_sample': list(coordination.get('suppressed_symbols') or [])[:12],
-            'active_workflow_locks_count': int(((coordination.get('counts') or {}).get('active_workflow_locks')) or len(coordination.get('active_workflow_locks') or [])),
-            'recent_admission_passed_count': int(((coordination.get('counts') or {}).get('recent_admission_passed')) or len(coordination.get('recent_admission_passed') or [])),
-            'active_signal_fingerprints_count': int(((coordination.get('counts') or {}).get('active_signal_fingerprints')) or len(coordination.get('active_signal_fingerprints') or [])),
+            'active_workflow_locks_count': int(((coordination.get('counts') or {}).get('active_workflow_locks')) or _safe_count(coordination.get('active_workflow_locks'))),
+            'recent_admission_passed_count': int(((coordination.get('counts') or {}).get('recent_admission_passed')) or _safe_count(coordination.get('recent_admission_passed'))),
+            'active_signal_fingerprints_count': int(((coordination.get('counts') or {}).get('active_signal_fingerprints')) or _safe_count(coordination.get('active_signal_fingerprints'))),
         },
         "admitted_symbols_count": len(admitted_symbols),
         "admitted_symbols_sample": admitted_symbols[:12],
+        "candidate_symbols_count": len(candidate_symbols),
+        "candidate_symbols_sample": candidate_symbols[:12],
     }
 
 def _extract_symbols_for_coordination(items: list[Any] | None) -> list[str]:
