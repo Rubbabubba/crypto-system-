@@ -1416,8 +1416,10 @@ def _scanner_contract_snapshot() -> dict[str, Any]:
     }
 
 
+
 def _path_b_admission_snapshot(scanner_contract: dict[str, Any]) -> dict[str, Any]:
     admission_enabled = _env_bool("PATH_B_ADMISSION_ENABLED", False)
+    pilot_gate_enabled = _env_bool("PATH_B_PILOT_GATE_ENABLED", True)
     max_active_symbols = max(1, _env_int("PATH_B_MAX_ACTIVE_SYMBOLS", 3))
     allowed_pilot_symbols = _env_symbol_list("PATH_B_ALLOWED_SYMBOLS")
     scanner_rank_cap = max(1, _env_int("PATH_B_SCANNER_RANK_CAP", max_active_symbols))
@@ -1427,6 +1429,10 @@ def _path_b_admission_snapshot(scanner_contract: dict[str, Any]) -> dict[str, An
     expected_slippage_bps = _env_float("EXPECTED_SLIPPAGE_BPS", _env_float("SLIPPAGE_BPS", 0.0))
     estimated_round_trip_bps = float(entry_fee_bps + exit_fee_bps + (2.0 * expected_slippage_bps))
     scanner_guardrails = dict((scanner_contract or {}).get("guardrails") or {})
+    coordination = _scanner_coordination_snapshot(
+        lookback_sec=_env_int("PATH_B_COORDINATION_LOOKBACK_SEC", 900),
+        limit=max(25, scanner_rank_cap * 10),
+    )
     churn_guard_pass = bool(
         int(MAX_OPEN_POSITIONS) <= 1
         and int(MAX_ENTRIES_PER_DAY) <= 3
@@ -1435,16 +1441,34 @@ def _path_b_admission_snapshot(scanner_contract: dict[str, Any]) -> dict[str, An
         and int(scanner_guardrails.get("bar_lock_sec") or 0) >= 60
     )
     fee_guard_pass = bool(estimated_round_trip_bps <= max_est_round_trip_bps)
+    coordination_guard_pass = bool(coordination.get('ok'))
     active_symbols = list((scanner_contract or {}).get("active_symbols") or [])
     admitted_symbols = active_symbols[:scanner_rank_cap]
     if allowed_pilot_symbols:
         allowed_set = set(allowed_pilot_symbols)
         admitted_symbols = [s for s in admitted_symbols if s in allowed_set]
     admitted_symbols = admitted_symbols[:max_active_symbols]
+    blockers: list[str] = []
+    if not fee_guard_pass:
+        blockers.append('fee_guard_fail')
+    if not churn_guard_pass:
+        blockers.append('churn_guard_fail')
+    if not coordination_guard_pass:
+        blockers.append('coordination_guard_fail')
+    if admission_enabled is False:
+        blockers.append('admission_disabled')
+    if pilot_gate_enabled and not admitted_symbols:
+        blockers.append('pilot_gate_no_symbols')
+    pilot_gate_ready = bool(pilot_gate_enabled and fee_guard_pass and churn_guard_pass and coordination_guard_pass and len(admitted_symbols) > 0)
+    pilot_gate_open = bool(pilot_gate_ready and admission_enabled)
     return {
         "multi_symbol_capable": bool((scanner_contract or {}).get("multi_symbol_capable")),
         "multi_symbol_admission_enabled": admission_enabled,
         "path_b_enabled": admission_enabled,
+        "pilot_gate_enabled": pilot_gate_enabled,
+        "pilot_gate_ready": pilot_gate_ready,
+        "pilot_gate_open": pilot_gate_open,
+        "pilot_gate_blockers": blockers,
         "pilot_symbol_list": allowed_pilot_symbols,
         "max_active_symbols": max_active_symbols,
         "scanner_rank_cap": scanner_rank_cap,
@@ -1452,10 +1476,93 @@ def _path_b_admission_snapshot(scanner_contract: dict[str, Any]) -> dict[str, An
         "max_est_round_trip_bps": round(max_est_round_trip_bps, 3),
         "fee_guard_pass": fee_guard_pass,
         "churn_guard_pass": churn_guard_pass,
+        "coordination_guard_pass": coordination_guard_pass,
+        "coordination": {
+            'ok': bool(coordination.get('ok')),
+            'reason': coordination.get('reason'),
+            'suppressed_symbols_count': int(((coordination.get('counts') or {}).get('suppressed_symbols')) or len(coordination.get('suppressed_symbols') or [])),
+            'suppressed_symbols_sample': list(coordination.get('suppressed_symbols') or [])[:12],
+            'active_workflow_locks_count': int(((coordination.get('counts') or {}).get('active_workflow_locks')) or len(coordination.get('active_workflow_locks') or [])),
+            'recent_admission_passed_count': int(((coordination.get('counts') or {}).get('recent_admission_passed')) or len(coordination.get('recent_admission_passed') or [])),
+            'active_signal_fingerprints_count': int(((coordination.get('counts') or {}).get('active_signal_fingerprints')) or len(coordination.get('active_signal_fingerprints') or [])),
+        },
         "admitted_symbols_count": len(admitted_symbols),
         "admitted_symbols_sample": admitted_symbols[:12],
     }
 
+def _extract_symbols_for_coordination(items: list[Any] | None) -> list[str]:
+    seen: set[str] = set()
+    out: list[str] = []
+    for item in items or []:
+        sym = None
+        if isinstance(item, dict):
+            sym = item.get("symbol") or item.get("symbol_id") or item.get("pair")
+        elif isinstance(item, str):
+            sym = item
+        s = str(sym or "").strip().upper()
+        if not s or s in seen:
+            continue
+        seen.add(s)
+        out.append(s)
+    return out
+
+
+def _scanner_coordination_snapshot(*, lookback_sec: int = 900, limit: int = 50) -> dict[str, Any]:
+    now_ts = time.time()
+    lookback_sec = max(60, int(lookback_sec or 900))
+    limit = max(1, min(int(limit or 50), 500))
+    since_ts = now_ts - float(lookback_sec)
+    errors: list[str] = []
+    try:
+        active_workflow_locks = lifecycle_db.list_active_workflow_locks(limit=limit)
+    except Exception as e:
+        active_workflow_locks = []
+        errors.append(f"workflow_locks:{type(e).__name__}: {e}")
+    try:
+        recent_admission_passed = lifecycle_db.list_recent_admission_events(admission_result='passed', since_ts=since_ts, limit=limit)
+    except Exception as e:
+        recent_admission_passed = []
+        errors.append(f"admission_events:{type(e).__name__}: {e}")
+    try:
+        active_signal_fingerprints = lifecycle_db.list_rows(
+            'signal_fingerprints',
+            limit=limit,
+            where='expires_ts IS NULL OR expires_ts > ?',
+            args=[now_ts],
+            order_by='last_seen_ts DESC',
+        )
+    except Exception as e:
+        active_signal_fingerprints = []
+        errors.append(f"signal_fingerprints:{type(e).__name__}: {e}")
+
+    suppressed_symbols: list[str] = []
+    seen: set[str] = set()
+    for sym in (
+        _extract_symbols_for_coordination(active_workflow_locks)
+        + _extract_symbols_for_coordination(recent_admission_passed)
+        + _extract_symbols_for_coordination(active_signal_fingerprints)
+    ):
+        if sym in seen:
+            continue
+        seen.add(sym)
+        suppressed_symbols.append(sym)
+
+    return {
+        'ok': len(errors) == 0,
+        'reason': None if not errors else '; '.join(errors),
+        'lookback_sec': lookback_sec,
+        'active_workflow_locks': active_workflow_locks,
+        'recent_admission_passed': recent_admission_passed,
+        'active_signal_fingerprints': active_signal_fingerprints,
+        'suppressed_symbols': suppressed_symbols,
+        'hard_suppressed_symbols': suppressed_symbols,
+        'counts': {
+            'active_workflow_locks': len(active_workflow_locks),
+            'recent_admission_passed': len(recent_admission_passed),
+            'active_signal_fingerprints': len(active_signal_fingerprints),
+            'suppressed_symbols': len(suppressed_symbols),
+        },
+    }
 
 def _compatibility_snapshot() -> dict[str, Any]:
     scanner_contract = _scanner_contract_snapshot()
@@ -5164,6 +5271,23 @@ def ready_endpoint():
         "startup_self_check": startup,
         "pretrade_health_gate": gate,
         "compatibility": compatibility,
+    }
+
+
+@app.get("/diagnostics/scanner_coordination")
+def diagnostics_scanner_coordination(lookback_sec: int = 900, limit: int = 50):
+    coordination = _scanner_coordination_snapshot(lookback_sec=lookback_sec, limit=limit)
+    return {
+        "ok": True,
+        "utc": utc_now_iso(),
+        "build": PATCH_BUILD,
+        "service": {
+            "name": PATCH_BUILD.get("system_name"),
+            "role": PATCH_BUILD.get("service_role"),
+            "env_name": PATCH_BUILD.get("env_name"),
+            "release_stage": PATCH_BUILD.get("release_stage_configured"),
+        },
+        "coordination": coordination,
     }
 
 
