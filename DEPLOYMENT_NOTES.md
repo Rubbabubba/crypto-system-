@@ -22,3 +22,7 @@ Notes:
 - This patch does not remove or weaken Path B controls.
 - This patch does not change strategy or execution logic.
 - Path B future architecture remains intact.
+
+
+## Patch 011
+- Scanner forced-symbol normalization and BTC emit repair.
