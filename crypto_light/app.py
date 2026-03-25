@@ -5868,15 +5868,122 @@ def diagnostics_scanner_coordination(lookback_sec: int = 900, limit: int = 50):
     }
 
 
-@app.get("/dashboard")
-def dashboard():
-    # Dashboard is a JSON snapshot. Keep it resilient: failures here should not break the whole service.
+def _safe_float(value: Any, default: float = 0.0) -> float:
     try:
-        positions = get_positions()
+        if value is None:
+            return float(default)
+        return float(value)
     except Exception:
-        positions = []
+        return float(default)
 
-    # Safe serialization for plans/state (TradePlan is a dataclass)
+
+def _serialize_recent_trade(row: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "trade_id": row.get("trade_id"),
+        "symbol": row.get("symbol"),
+        "strategy": row.get("strategy"),
+        "entry_ts": row.get("entry_ts"),
+        "closed_ts": row.get("closed_ts"),
+        "entry_price": row.get("entry_price"),
+        "exit_price": row.get("exit_price"),
+        "qty": row.get("qty"),
+        "fees_total": row.get("fees_total"),
+        "gross_pnl_usd": row.get("gross_pnl_usd"),
+        "net_pnl_usd": row.get("net_pnl_usd"),
+        "exit_reason": row.get("exit_reason"),
+        "clean_trade": bool(row.get("clean_trade")),
+        "max_realized_slippage_bps": row.get("max_realized_slippage_bps"),
+        "alert_flags_json": row.get("alert_flags_json"),
+        "updated_utc": row.get("updated_utc"),
+    }
+
+
+def _performance_snapshot(days: float = 30.0, recent_limit: int = 25) -> dict[str, Any]:
+    positions = get_positions()
+    open_notional = sum(_safe_float(p.get("notional_usd")) for p in positions)
+    account_truth = _account_truth_snapshot()
+    realized_today = _journal_sync_daily_realized_pnl()
+
+    try:
+        recent_raw = telemetry_db.recent_trades(limit=max(1, int(recent_limit)))
+    except Exception:
+        recent_raw = []
+    recent = [_serialize_recent_trade(dict(r)) for r in (recent_raw or [])]
+
+    try:
+        journal_1d = trade_journal.summary(days=1.0)
+    except Exception:
+        journal_1d = {"ok": False}
+    try:
+        journal_7d = trade_journal.summary(days=7.0)
+    except Exception:
+        journal_7d = {"ok": False}
+    try:
+        journal_window = trade_journal.summary(days=float(days))
+    except Exception:
+        journal_window = {"ok": False, "days": float(days)}
+    try:
+        telemetry_window = telemetry_db.summary(days=float(days))
+    except Exception:
+        telemetry_window = {"ok": False, "days": float(days)}
+    try:
+        validation = telemetry_db.live_validation_summary()
+    except Exception:
+        validation = {"ok": False}
+
+    return {
+        "ok": True,
+        "utc": utc_now_iso(),
+        "build": PATCH_BUILD,
+        "service": {
+            "name": PATCH_BUILD.get("system_name"),
+            "role": PATCH_BUILD.get("service_role"),
+            "env_name": PATCH_BUILD.get("env_name"),
+            "release_stage": PATCH_BUILD.get("release_stage_configured"),
+        },
+        "window_days": float(days),
+        "account": {
+            "cash_usd": account_truth.get("cash_usd"),
+            "equity_usd": account_truth.get("equity_usd"),
+            "balance_ok": bool(account_truth.get("balance_ok")),
+        },
+        "open_positions": {
+            "count": len(positions),
+            "total_open_notional_usd": open_notional,
+            "positions": positions,
+        },
+        "pnl": {
+            "realized_today_usd": realized_today,
+            "journal_1d": journal_1d,
+            "journal_7d": journal_7d,
+            "journal_window": journal_window,
+            "telemetry_window": telemetry_window,
+        },
+        "recent_trades": {
+            "count": len(recent),
+            "trades": recent,
+        },
+        "live_validation": validation,
+    }
+
+
+@app.get("/dashboard")
+def dashboard(recent_limit: int = 15):
+    try:
+        compatibility = _compatibility_snapshot()
+    except Exception:
+        compatibility = {"ok": False}
+    try:
+        promotion = _live_promotion_guardrails_snapshot()
+    except Exception:
+        promotion = {"ok": False}
+    try:
+        gate = _pretrade_health_gate_summary(rerun_startup_check=False)
+    except Exception:
+        gate = {"ok": False}
+
+    perf = _performance_snapshot(days=30.0, recent_limit=recent_limit)
+
     open_plans = []
     try:
         from dataclasses import asdict, is_dataclass
@@ -5885,58 +5992,32 @@ def dashboard():
     except Exception:
         open_plans = []
 
-    # Telemetry buffer is best-effort and may be absent/non-serializable
-    telemetry_out = None
-    try:
-        telemetry_out = list(getattr(state, "telemetry", []) or [])
-    except Exception:
-        telemetry_out = None
-
     return {
         "ok": True,
         "utc": utc_now_iso(),
-        "settings": {
-            "max_open_positions": MAX_OPEN_POSITIONS,
-            "max_entries_per_day": MAX_ENTRIES_PER_DAY,
-            "max_entries_per_scan": MAX_ENTRIES_PER_SCAN,
-            "scanner_url": SCANNER_URL,
-        },
-        "open_positions": positions,
+        "build": PATCH_BUILD,
+        "service": perf.get("service") or {},
+        "ready": bool((promotion or {}).get("checks", {}).get("readiness_green")),
+        "promotion_ready": bool((promotion or {}).get("promotion_ready")),
+        "compatibility": compatibility,
+        "pretrade_health_gate": gate,
+        "promotion_guardrails": promotion,
+        "performance": perf,
         "open_plans": open_plans,
-        "telemetry": telemetry_out,
-    }
-
-    t = None
-    try:
-        t = telemetry.snapshot()  # type: ignore[attr-defined]
-    except Exception:
-        try:
-            t = telemetry.to_dict()  # type: ignore[attr-defined]
-        except Exception:
-            t = None
-
-    return {
-        "ok": True,
-        "time": utc_now_iso(),
-        "mode": getattr(settings, "mode", None),
-        "allowed_symbols": getattr(settings, "allowed_symbols", None),
-        "positions": positions,
-        "open_plans": list(plans.values()) if isinstance(plans, dict) else None,
-        "telemetry": t,
     }
 
 
 @app.get("/performance")
-def performance():
-    """Very simple P&L proxy using current positions (mark-to-market).
+def performance(days: float = 30.0, recent_limit: int = 25):
+    return _performance_snapshot(days=days, recent_limit=recent_limit)
 
-    If you're logging fills elsewhere, you can swap this for realized P&L.
-    """
-    positions = get_positions()
-    total_exposure = sum(float(p.get("notional_usd", 0.0) or 0.0) for p in positions)
+
+@app.get("/diagnostics/recent_trades")
+def diagnostics_recent_trades(limit: int = 25):
+    snapshot = _performance_snapshot(days=30.0, recent_limit=limit)
     return {
         "ok": True,
-        "time": utc_now_iso(),
-        "open_positions": positions,
-        "total_open_notional_usd": total_exposure,
+        "utc": utc_now_iso(),
+        "build": PATCH_BUILD,
+        "recent_trades": snapshot.get("recent_trades") or {"count": 0, "trades": []},
     }
