@@ -161,61 +161,6 @@ def _route_truth_summary(kind: str) -> dict:
     return {"seen": True, **snap, "derived_reason": _classify_route_truth_reason(snap)}
 
 
-def _iso_to_ts(value: Any) -> float | None:
-    try:
-        if value in (None, ""):
-            return None
-        if isinstance(value, (int, float)):
-            return float(value)
-        return datetime.fromisoformat(str(value).replace('Z', '+00:00')).timestamp()
-    except Exception:
-        return None
-
-
-def _worker_state_reconciled_snapshot(kind: str, snapshot: dict | None, route_truth: dict | None) -> tuple[dict, str | None, float | None]:
-    snap = dict(snapshot or {})
-    rt = dict(route_truth or {})
-    snap_ts = _iso_to_ts(snap.get('heartbeat_utc') or snap.get('completed_utc') or snap.get('utc'))
-    route_ts = _iso_to_ts(rt.get('route_truth_utc') or rt.get('heartbeat_utc') or rt.get('completed_utc') or rt.get('utc'))
-    route_reason = _classify_route_truth_reason(rt)
-
-    if snap_ts is not None and (route_ts is None or snap_ts >= route_ts):
-        merged = dict(snap)
-        if rt and merged.get('phase') in (None, '', 'unknown'):
-            merged['phase'] = rt.get('phase')
-        if rt and not merged.get('heartbeat_source'):
-            merged['heartbeat_source'] = rt.get('heartbeat_source')
-        if rt and merged.get('heartbeat_seq') is None:
-            merged['heartbeat_seq'] = rt.get('heartbeat_seq')
-        if rt and not merged.get('last_success_utc') and route_reason == 'fresh':
-            merged['last_success_utc'] = rt.get('route_truth_utc') or rt.get('heartbeat_utc')
-        return merged, 'heartbeat', snap_ts
-
-    if route_ts is not None and route_reason == 'fresh':
-        merged = dict(snap)
-        merged.update({
-            'worker_kind': kind,
-            'heartbeat_kind': rt.get('heartbeat_kind') or kind,
-            'heartbeat_utc': rt.get('route_truth_utc') or rt.get('heartbeat_utc') or utc_now_iso(),
-            'heartbeat_ts': rt.get('heartbeat_ts') or route_ts,
-            'heartbeat_seq': rt.get('heartbeat_seq'),
-            'loop_interval_sec': rt.get('loop_interval_sec'),
-            'loop_pid': rt.get('loop_pid'),
-            'heartbeat_source': rt.get('heartbeat_source'),
-            'phase': 'success' if str(rt.get('phase') or '').lower() in ('success', 'result', 'completed') else (rt.get('phase') or 'success'),
-            'ok': True,
-            'last_success_utc': rt.get('route_truth_utc') or rt.get('heartbeat_utc') or utc_now_iso(),
-            'duration_ms': rt.get('elapsed_ms'),
-        })
-        if not merged.get('completed_utc'):
-            merged['completed_utc'] = merged.get('last_success_utc')
-        if not merged.get('utc'):
-            merged['utc'] = merged.get('last_success_utc')
-        return merged, 'route_truth', route_ts
-
-    return dict(snap), None, snap_ts
-
-
 def _startup_self_check(*, rerun: bool = False, apply: bool | None = None) -> dict:
     global STARTUP_SELF_CHECK_RESULT, STARTUP_SELF_CHECK_TS
     if apply is None:
@@ -1612,6 +1557,8 @@ def _scanner_contract_snapshot() -> dict[str, Any]:
     mode = (compatibility or {}).get("mode") or (meta or {}).get("mode") or "unknown"
     multi_symbol_capable = bool((compatibility or {}).get("supports_multi_symbol", active_count > 1))
     guardrails = dict((compatibility or {}).get("fee_churn_guardrails") or {})
+    raw_alignment = dict((compatibility or {}).get("alignment") or {}) if isinstance(compatibility, dict) else {}
+    btc_alignment = dict((compatibility or {}).get("btc_only_live_alignment") or {}) if isinstance(compatibility, dict) else {}
     return {
         "reachable": reachable,
         "scanner_ok": scanner_ok,
@@ -1626,6 +1573,8 @@ def _scanner_contract_snapshot() -> dict[str, Any]:
         "mode": mode,
         "multi_symbol_capable": multi_symbol_capable,
         "guardrails": guardrails,
+        "alignment": raw_alignment,
+        "btc_only_live_alignment": btc_alignment,
         "raw_compatibility": compatibility if isinstance(compatibility, dict) else {},
         "meta": {
             **(meta or {}),
@@ -1672,11 +1621,6 @@ def _path_b_admission_snapshot(scanner_contract: dict[str, Any]) -> dict[str, An
         allowed_set = set(allowed_pilot_symbols)
         admitted_symbols = [s for s in admitted_symbols if s in allowed_set]
     admitted_symbols = admitted_symbols[:max_active_symbols]
-
-    scan_worker = _worker_status_meta(getattr(state, 'last_scan_status', {}) or {}, route_truth=getattr(state, 'last_scan_route_truth', {}) or {})
-    exit_worker = _worker_status_meta(getattr(state, 'last_exit_status', {}) or {}, route_truth=getattr(state, 'last_exit_route_truth', {}) or {})
-    worker_truth_ready = bool(not scan_worker.get('stale') and not exit_worker.get('stale'))
-
     blockers: list[str] = []
     if not fee_guard_pass:
         blockers.append('fee_guard_fail')
@@ -1684,13 +1628,11 @@ def _path_b_admission_snapshot(scanner_contract: dict[str, Any]) -> dict[str, An
         blockers.append('churn_guard_fail')
     if not coordination_guard_pass:
         blockers.append('coordination_guard_fail')
-    if not worker_truth_ready:
-        blockers.append('worker_truth_fail')
     if admission_enabled is False:
         blockers.append('admission_disabled')
     if pilot_gate_enabled and not admitted_symbols:
         blockers.append('pilot_gate_no_symbols')
-    pilot_gate_ready = bool(pilot_gate_enabled and fee_guard_pass and churn_guard_pass and coordination_guard_pass and worker_truth_ready and len(admitted_symbols) > 0)
+    pilot_gate_ready = bool(pilot_gate_enabled and fee_guard_pass and churn_guard_pass and coordination_guard_pass and len(admitted_symbols) > 0)
     pilot_gate_open = bool(pilot_gate_ready and admission_enabled)
 
     allowlist_source = "env:PATH_B_PILOT_ALLOWLIST" if env_allowlist else ("env:PATH_B_ALLOWED_SYMBOLS" if legacy_allowlist else "scanner_ranked_candidates")
@@ -1711,22 +1653,6 @@ def _path_b_admission_snapshot(scanner_contract: dict[str, Any]) -> dict[str, An
             "require_fee_guard": True,
             "require_churn_guard": True,
             "require_coordination_guard": True,
-            "require_worker_truth": True,
-        },
-        "worker_truth_ready": worker_truth_ready,
-        "worker_health": {
-            "scan": {
-                "seen": bool(scan_worker.get('seen')),
-                "stale": bool(scan_worker.get('stale')),
-                "reason": scan_worker.get('reason'),
-                "state_source": scan_worker.get('state_source'),
-            },
-            "exit": {
-                "seen": bool(exit_worker.get('seen')),
-                "stale": bool(exit_worker.get('stale')),
-                "reason": exit_worker.get('reason'),
-                "state_source": exit_worker.get('state_source'),
-            },
         },
     }
 
@@ -1747,14 +1673,8 @@ def _path_b_admission_snapshot(scanner_contract: dict[str, Any]) -> dict[str, An
             "require_fee_guard": True,
             "require_churn_guard": True,
             "require_coordination_guard": True,
-            "require_worker_truth": True,
         },
         "pilot_controls": pilot_controls,
-        "worker_truth_ready": worker_truth_ready,
-        "worker_truth": {
-            "scan": scan_worker,
-            "exit": exit_worker,
-        },
         "fee_guard_pass": fee_guard_pass,
         "churn_guard_pass": churn_guard_pass,
         "coordination_guard_pass": coordination_guard_pass,
@@ -1848,14 +1768,38 @@ def _scanner_coordination_snapshot(*, lookback_sec: int = 900, limit: int = 50) 
         },
     }
 
+def _btc_only_live_alignment_snapshot(scanner_contract: dict[str, Any], allowed_symbols: list[str], active_symbols: list[str], invalid_active_symbols: list[str]) -> dict[str, Any]:
+    allowed_set = set(allowed_symbols)
+    admissible = [s for s in active_symbols if s in allowed_set]
+    extra = [s for s in active_symbols if s not in allowed_set]
+    single_symbol_mode = bool(len(allowed_symbols) == 1 and FILTER_UNIVERSE_BY_ALLOWED_SYMBOLS and not SCANNER_DRIVEN_UNIVERSE and not SCANNER_SOFT_ALLOW and not _env_bool("ALLOW_SCANNER_NEW_SYMBOLS", False))
+    scanner_alignment = dict(scanner_contract.get("btc_only_live_alignment") or {})
+    return {
+        "single_symbol_live_mode": single_symbol_mode,
+        "required_symbols": allowed_symbols[:12],
+        "required_symbol_count": len(allowed_symbols),
+        "admissible_active_symbols_count": len(admissible),
+        "admissible_active_symbols_sample": admissible[:12],
+        "extra_active_symbols_count": len(extra),
+        "extra_active_symbols_sample": extra[:12],
+        "scanner_alignment_enabled": bool(scanner_alignment.get("enabled")),
+        "scanner_emit_only": bool(scanner_alignment.get("emit_only")),
+        "scanner_force_emit_symbols": list(scanner_alignment.get("force_emit_symbols") or []),
+        "scanner_active_symbols_all_admissible": bool(scanner_alignment.get("active_symbols_all_admissible")),
+        "alignment_ready": bool(single_symbol_mode and len(admissible) > 0 and len(extra) == 0),
+        "future_architecture_preserved": True,
+    }
+
+
 def _compatibility_snapshot() -> dict[str, Any]:
     scanner_contract = _scanner_contract_snapshot()
     allowed_symbols = sorted(list(ALLOWED_SYMBOLS))
     allow_scanner_new_symbols = _env_bool("ALLOW_SCANNER_NEW_SYMBOLS", False)
     active_symbols = list(scanner_contract.get("active_symbols") or [])
+    allowed_set = set(allowed_symbols)
+    admissible_active_symbols = [s for s in active_symbols if s in allowed_set] if allowed_symbols else list(active_symbols)
     invalid_active_symbols = []
     if active_symbols and FILTER_UNIVERSE_BY_ALLOWED_SYMBOLS and allowed_symbols and not allow_scanner_new_symbols:
-        allowed_set = set(allowed_symbols)
         invalid_active_symbols = [s for s in active_symbols if s not in allowed_set]
     blockers: list[str] = []
     reason = "ok"
@@ -1876,6 +1820,7 @@ def _compatibility_snapshot() -> dict[str, Any]:
         and bool(path_b.get("fee_guard_pass"))
         and bool(path_b.get("churn_guard_pass"))
     )
+    btc_alignment = _btc_only_live_alignment_snapshot(scanner_contract, allowed_symbols, active_symbols, invalid_active_symbols)
     return {
         "contract_compatible": contract_compatible,
         "compatibility_reason": reason,
@@ -1889,6 +1834,8 @@ def _compatibility_snapshot() -> dict[str, Any]:
         "allowed_symbols_sample": allowed_symbols[:12],
         "scanner_active_count": len(active_symbols),
         "scanner_active_symbols_sample": active_symbols[:12],
+        "admissible_active_symbols_count": len(admissible_active_symbols),
+        "admissible_active_symbols_sample": admissible_active_symbols[:12],
         "invalid_active_symbols_count": len(invalid_active_symbols),
         "invalid_active_symbols_sample": invalid_active_symbols[:12],
         "allow_scanner_new_symbols": allow_scanner_new_symbols,
@@ -1896,6 +1843,7 @@ def _compatibility_snapshot() -> dict[str, Any]:
         "scanner_soft_allow": bool(SCANNER_SOFT_ALLOW),
         "filter_universe_by_allowed_symbols": bool(FILTER_UNIVERSE_BY_ALLOWED_SYMBOLS),
         "path_b_guardrails": path_b,
+        "btc_only_live_alignment": btc_alignment,
         "multi_symbol_capable": bool(scanner_contract.get("multi_symbol_capable")),
         "multi_symbol_contract_compatible": multi_symbol_contract_compatible,
         "multi_symbol_admission_enabled": bool(path_b.get("multi_symbol_admission_enabled")),
@@ -2094,6 +2042,13 @@ def _symbol_allowed_by_scanner(symbol: str) -> tuple[bool, str, Dict[str, Any]]:
 def _worker_status_meta(snapshot: dict | None, *, route_truth: dict | None = None, stale_after_sec: int | None = None) -> dict:
     snap = dict(snapshot or {})
     rt = dict(route_truth or {})
+    last_ts = None
+    try:
+        utc_raw = snap.get('heartbeat_utc') or snap.get('completed_utc') or snap.get('utc')
+        if utc_raw:
+            last_ts = datetime.fromisoformat(str(utc_raw).replace('Z', '+00:00')).timestamp()
+    except Exception:
+        last_ts = None
     lim = int(stale_after_sec or WORKER_STALE_AFTER_SEC)
     route_fields = {
         'route_truth_seen': bool(rt),
@@ -2107,8 +2062,6 @@ def _worker_status_meta(snapshot: dict | None, *, route_truth: dict | None = Non
         'route_elapsed_ms': rt.get('elapsed_ms'),
         'last_route_truth_utc': rt.get('route_truth_utc'),
     }
-
-    merged, state_source, last_ts = _worker_state_reconciled_snapshot(str(snap.get('worker_kind') or rt.get('worker_kind') or rt.get('heartbeat_kind') or 'unknown'), snap, rt)
     if last_ts is None:
         reason = _classify_route_truth_reason(rt) or 'never_started'
         return {
@@ -2117,27 +2070,20 @@ def _worker_status_meta(snapshot: dict | None, *, route_truth: dict | None = Non
             "age_sec": None,
             "stale_after_sec": lim,
             "reason": reason,
-            "phase": str(merged.get('phase') or rt.get('phase') or 'unknown'),
-            "source": merged.get('heartbeat_source') or merged.get('source') or rt.get('heartbeat_source'),
-            "heartbeat_seq": merged.get('heartbeat_seq') if merged.get('heartbeat_seq') is not None else rt.get('heartbeat_seq'),
-            "last_success_utc": merged.get('last_success_utc'),
-            "last_error": merged.get('error') or rt.get('error'),
-            "last_duration_ms": merged.get('duration_ms') or rt.get('elapsed_ms'),
-            "loop_interval_sec": merged.get('loop_interval_sec') or rt.get('loop_interval_sec'),
-            "loop_pid": merged.get('loop_pid') or rt.get('loop_pid'),
-            "state_source": state_source or 'unseen',
+            "phase": str(snap.get('phase') or rt.get('phase') or 'unknown'),
+            "source": snap.get('heartbeat_source') or snap.get('source') or rt.get('heartbeat_source'),
+            "heartbeat_seq": snap.get('heartbeat_seq') if snap.get('heartbeat_seq') is not None else rt.get('heartbeat_seq'),
+            "last_success_utc": snap.get('last_success_utc'),
+            "last_error": snap.get('error') or rt.get('error'),
+            "last_duration_ms": snap.get('duration_ms'),
             **route_fields,
         }
-
     age = max(0.0, time.time() - float(last_ts))
     stale = bool(age > lim)
-    phase = str(merged.get('phase') or rt.get('phase') or 'unknown')
+    phase = str(snap.get('phase') or 'unknown')
     reason = 'stale_heartbeat' if stale else 'fresh'
     if phase == 'failure' and not stale:
         reason = 'last_cycle_failed'
-    elif stale and state_source == 'route_truth':
-        reason = 'stale_route_truth'
-
     return {
         "seen": True,
         "stale": stale,
@@ -2145,14 +2091,13 @@ def _worker_status_meta(snapshot: dict | None, *, route_truth: dict | None = Non
         "stale_after_sec": lim,
         "reason": reason,
         "phase": phase,
-        "source": merged.get('heartbeat_source') or merged.get('source') or rt.get('heartbeat_source'),
-        "heartbeat_seq": merged.get('heartbeat_seq') if merged.get('heartbeat_seq') is not None else rt.get('heartbeat_seq'),
-        "last_success_utc": merged.get('last_success_utc'),
-        "last_error": merged.get('error') or rt.get('error'),
-        "last_duration_ms": merged.get('duration_ms') or rt.get('elapsed_ms'),
-        "loop_interval_sec": merged.get('loop_interval_sec') or rt.get('loop_interval_sec'),
-        "loop_pid": merged.get('loop_pid') or rt.get('loop_pid'),
-        "state_source": state_source or 'heartbeat',
+        "source": snap.get('heartbeat_source') or snap.get('source'),
+        "heartbeat_seq": snap.get('heartbeat_seq'),
+        "last_success_utc": snap.get('last_success_utc'),
+        "last_error": snap.get('error'),
+        "last_duration_ms": snap.get('duration_ms'),
+        "loop_interval_sec": snap.get('loop_interval_sec'),
+        "loop_pid": snap.get('loop_pid'),
         **route_fields,
     }
 
@@ -5688,6 +5633,24 @@ def compatibility_endpoint():
         "compatibility": snapshot,
     }
 
+
+@app.get("/diagnostics/btc_only_live_alignment")
+def diagnostics_btc_only_live_alignment():
+    snapshot = _compatibility_snapshot()
+    return {
+        "ok": True,
+        "utc": utc_now_iso(),
+        "build": PATCH_BUILD,
+        "service": {
+            "name": PATCH_BUILD.get("system_name"),
+            "role": PATCH_BUILD.get("service_role"),
+            "env_name": PATCH_BUILD.get("env_name"),
+            "release_stage": PATCH_BUILD.get("release_stage_configured"),
+        },
+        "btc_only_live_alignment": snapshot.get("btc_only_live_alignment"),
+        "compatibility_reason": snapshot.get("compatibility_reason"),
+        "contract_compatible": snapshot.get("contract_compatible"),
+    }
 
 
 @app.get("/ready")
