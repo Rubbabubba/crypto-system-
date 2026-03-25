@@ -121,9 +121,9 @@ def _env_csv(name: str) -> list[str]:
     return [s.strip() for s in raw.split(",") if s.strip()]
 
 
-def _live_promotion_guardrails_snapshot() -> dict[str, Any]:
-    compatibility = _compatibility_snapshot()
-    gate = _pretrade_health_gate_summary(rerun_startup_check=False)
+def _live_promotion_guardrails_snapshot(compatibility: dict[str, Any] | None = None, gate: dict[str, Any] | None = None) -> dict[str, Any]:
+    compatibility = compatibility if isinstance(compatibility, dict) else _compatibility_snapshot()
+    gate = gate if isinstance(gate, dict) else _pretrade_health_gate_summary(rerun_startup_check=False)
     scanner_contract = dict((compatibility or {}).get("scanner_contract") or {})
     btc_alignment = dict((compatibility or {}).get("btc_only_live_alignment") or {})
     account_truth = _account_truth_snapshot()
@@ -5969,18 +5969,19 @@ def _performance_snapshot(days: float = 30.0, recent_limit: int = 25) -> dict[st
 
 @app.get("/dashboard")
 def dashboard(recent_limit: int = 15):
+    snapshot_utc = utc_now_iso()
     try:
         compatibility = _compatibility_snapshot()
     except Exception:
         compatibility = {"ok": False}
     try:
-        promotion = _live_promotion_guardrails_snapshot()
-    except Exception:
-        promotion = {"ok": False}
-    try:
         gate = _pretrade_health_gate_summary(rerun_startup_check=False)
     except Exception:
         gate = {"ok": False}
+    try:
+        promotion = _live_promotion_guardrails_snapshot(compatibility=compatibility, gate=gate)
+    except Exception:
+        promotion = {"ok": False}
 
     perf = _performance_snapshot(days=30.0, recent_limit=recent_limit)
 
@@ -5994,7 +5995,8 @@ def dashboard(recent_limit: int = 15):
 
     return {
         "ok": True,
-        "utc": utc_now_iso(),
+        "utc": snapshot_utc,
+        "snapshot_utc": snapshot_utc,
         "build": PATCH_BUILD,
         "service": perf.get("service") or {},
         "ready": bool((promotion or {}).get("checks", {}).get("readiness_green")),
@@ -6004,6 +6006,11 @@ def dashboard(recent_limit: int = 15):
         "promotion_guardrails": promotion,
         "performance": perf,
         "open_plans": open_plans,
+        "snapshot_consistency": {
+            "ok": True,
+            "shared_snapshot_inputs": ["compatibility", "pretrade_health_gate", "promotion_guardrails"],
+            "note": "dashboard now reuses a single fresh compatibility/pretrade snapshot for promotion readiness fields",
+        },
     }
 
 
