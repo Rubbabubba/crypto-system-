@@ -5,6 +5,7 @@ from . import lifecycle_db
 from . import broker_kraken
 from . import trade_journal
 from . import execution_state
+from . import telemetry_db
 from .broker_kraken import trades_history
 
 import logging
@@ -105,6 +106,139 @@ STARTUP_SELF_CHECK_TS: float = 0.0
 
 PATCH_BUILD = build_payload()
 
+
+
+
+def _env_bool(name: str, default: bool = False) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return bool(default)
+    return str(raw).strip().lower() in ("1", "true", "yes", "on")
+
+
+def _env_csv(name: str) -> list[str]:
+    raw = str(os.getenv(name, "") or "")
+    return [s.strip() for s in raw.split(",") if s.strip()]
+
+
+def _live_promotion_guardrails_snapshot() -> dict[str, Any]:
+    compatibility = _compatibility_snapshot()
+    gate = _pretrade_health_gate_summary(rerun_startup_check=False)
+    scanner_contract = dict((compatibility or {}).get("scanner_contract") or {})
+    btc_alignment = dict((compatibility or {}).get("btc_only_live_alignment") or {})
+    account_truth = _account_truth_snapshot()
+    open_orders = _broker_open_orders_summary()
+    positions = get_positions()
+    live_validation = telemetry_db.live_validation_summary()
+
+    release_stage = str(PATCH_BUILD.get("release_stage_configured") or "paper")
+    live_stage_requested = release_stage == "live"
+    scanner_alignment_enabled = bool(scanner_contract.get("btc_only_live_alignment", {}).get("alignment_enabled") or btc_alignment.get("scanner_alignment_enabled"))
+
+    checks = {
+        "release_stage_live": live_stage_requested,
+        "readiness_green": bool((compatibility or {}).get("contract_compatible")) and bool(gate.get("gate_open")),
+        "btc_only_alignment_ready": bool(btc_alignment.get("alignment_ready")),
+        "scanner_ready": bool((compatibility or {}).get("scanner_ok")),
+        "workers_healthy": not bool((gate.get("worker_health") or {}).get("overall_stale")),
+        "open_orders_clear": int(open_orders.get("count") or 0) == 0,
+        "positions_clear": len(positions or []) == 0,
+        "balance_ok": bool(account_truth.get("balance_ok")),
+        "trading_enabled": bool(getattr(settings, "trading_enabled", False)),
+        "worker_secret_present": bool(getattr(settings, "worker_secret", "")),
+        "webhook_secret_present": bool(getattr(settings, "webhook_secret", "")),
+        "kraken_key_present": bool(os.getenv("KRAKEN_API_KEY")),
+        "kraken_secret_present": bool(os.getenv("KRAKEN_API_SECRET")),
+        "scanner_url_present": bool(os.getenv("SCANNER_URL")),
+        "scanner_alignment_enabled": scanner_alignment_enabled,
+        "live_validation_mode_enabled": _env_bool("LIVE_VALIDATION_MODE", True),
+        "execution_canary_enabled": _env_bool("EXECUTION_CANARY_ENABLED", False),
+    }
+
+    blockers = []
+    if not checks["readiness_green"]:
+        blockers.append("system_not_ready")
+    if not checks["btc_only_alignment_ready"]:
+        blockers.append("btc_alignment_not_ready")
+    if not checks["scanner_ready"]:
+        blockers.append("scanner_not_ready")
+    if not checks["workers_healthy"]:
+        blockers.append("worker_health_not_green")
+    if not checks["open_orders_clear"]:
+        blockers.append("open_orders_present")
+    if not checks["positions_clear"]:
+        blockers.append("positions_present")
+    if not checks["balance_ok"]:
+        blockers.append("broker_balance_not_ok")
+    if not checks["trading_enabled"]:
+        blockers.append("trading_disabled")
+    if not checks["worker_secret_present"]:
+        blockers.append("worker_secret_missing")
+    if not checks["webhook_secret_present"]:
+        blockers.append("webhook_secret_missing")
+    if not checks["kraken_key_present"]:
+        blockers.append("kraken_api_key_missing")
+    if not checks["kraken_secret_present"]:
+        blockers.append("kraken_api_secret_missing")
+    if not checks["scanner_url_present"]:
+        blockers.append("scanner_url_missing")
+    if not checks["scanner_alignment_enabled"]:
+        blockers.append("scanner_alignment_disabled")
+
+    env_guidance = {
+        "release_stage": release_stage,
+        "recommended_env_changes_for_live": {
+            "main": [
+                "Set RELEASE_STAGE=live when you are ready to cut over from paper-label mode.",
+                "Keep TRADING_ENABLED=1.",
+                "Keep SCANNER_URL set to your scanner service.",
+                "Keep WORKER_SECRET and WEBHOOK_SECRET populated.",
+                "Use live Kraken API credentials in KRAKEN_API_KEY and KRAKEN_API_SECRET.",
+            ],
+            "scanner": [
+                "Keep BTC_ONLY_ALIGNMENT_ENABLED=1.",
+                "Keep SCANNER_FORCE_EMIT_SYMBOLS=BTC/USD.",
+                "Keep SCANNER_EMIT_ONLY_SYMBOLS=1 until you intentionally leave BTC-only mode.",
+            ],
+            "do_not_change_yet": [
+                "Do not enable multi-symbol admission yet.",
+                "Do not disable fee/churn guardrails for Path B.",
+            ],
+        },
+    }
+
+    return {
+        "ok": True,
+        "utc": utc_now_iso(),
+        "build": PATCH_BUILD,
+        "service": {
+            "name": PATCH_BUILD.get("system_name"),
+            "role": PATCH_BUILD.get("service_role"),
+            "env_name": PATCH_BUILD.get("env_name"),
+            "release_stage": release_stage,
+        },
+        "checks": checks,
+        "promotion_blockers": blockers,
+        "promotion_ready": len(blockers) == 0,
+        "compatibility_reason": (compatibility or {}).get("compatibility_reason"),
+        "scanner_contract": scanner_contract,
+        "btc_only_live_alignment": btc_alignment,
+        "pretrade_health_gate": gate,
+        "account_truth": {
+            "balance_ok": bool(account_truth.get("balance_ok")),
+            "cash_usd": account_truth.get("cash_usd"),
+            "equity_usd": account_truth.get("equity_usd"),
+            "positions_count": account_truth.get("positions_count"),
+            "open_order_count": account_truth.get("open_order_count"),
+        },
+        "live_validation": live_validation,
+        "env_guidance": env_guidance,
+        "scanner_alignment_env": {
+            "BTC_ONLY_ALIGNMENT_ENABLED": os.getenv("BTC_ONLY_ALIGNMENT_ENABLED"),
+            "SCANNER_FORCE_EMIT_SYMBOLS": os.getenv("SCANNER_FORCE_EMIT_SYMBOLS"),
+            "SCANNER_EMIT_ONLY_SYMBOLS": os.getenv("SCANNER_EMIT_ONLY_SYMBOLS"),
+        },
+    }
 
 
 def _route_truth_from_payload(payload: Any, kind: str) -> dict:
@@ -5633,6 +5767,29 @@ def compatibility_endpoint():
         "compatibility": snapshot,
     }
 
+
+
+
+@app.get("/diagnostics/live_promotion_guardrails")
+def diagnostics_live_promotion_guardrails():
+    return _live_promotion_guardrails_snapshot()
+
+
+@app.get("/diagnostics/live_readiness_summary")
+def diagnostics_live_readiness_summary():
+    snapshot = _live_promotion_guardrails_snapshot()
+    return {
+        "ok": True,
+        "utc": utc_now_iso(),
+        "build": PATCH_BUILD,
+        "service": snapshot.get("service"),
+        "promotion_ready": snapshot.get("promotion_ready"),
+        "promotion_blockers": snapshot.get("promotion_blockers") or [],
+        "checks": snapshot.get("checks") or {},
+        "btc_only_live_alignment": snapshot.get("btc_only_live_alignment") or {},
+        "compatibility_reason": snapshot.get("compatibility_reason"),
+        "live_validation": snapshot.get("live_validation") or {},
+    }
 
 @app.get("/diagnostics/btc_only_live_alignment")
 def diagnostics_btc_only_live_alignment():
