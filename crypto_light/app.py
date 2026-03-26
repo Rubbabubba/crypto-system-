@@ -3075,6 +3075,7 @@ def _recovery_reconcile_summary(*, apply: bool = False) -> dict:
             'resolved_anomaly_ids': resolved_anomaly_ids,
             'resolved_anomaly_count': resolved_anomaly_count,
         },
+        'broker_trade_backfill': broker_trade_backfill,
     }
 
 
@@ -4716,6 +4717,171 @@ def _find_recent_exit_fill(symbol: str, *, now_ts: float, lookback_sec: float = 
                 'raw': item,
             }
     return best
+
+
+def _closed_trade_exists_for_exit_txid(txid: str, *, lookback_sec: float = 30 * 86400.0) -> bool:
+    key = str(txid or '').strip()
+    if not key:
+        return False
+    try:
+        rows = trade_journal.list_closed_trades(since=max(0.0, time.time() - float(lookback_sec)), limit=2000)
+    except Exception:
+        return False
+    for row in rows:
+        if str(row.get('exit_txid') or '').strip() == key:
+            return True
+    return False
+
+
+def _backfill_closed_trades_from_broker_history(*, now_ts: float, lookback_sec: float = 24 * 3600.0) -> dict[str, Any]:
+    out = {
+        'ok': True,
+        'lookback_sec': float(lookback_sec),
+        'backfilled': [],
+        'skipped': [],
+        'matched_sell_count': 0,
+    }
+    try:
+        raw = broker_kraken.trades_history_since(since_ts=max(0.0, float(now_ts) - float(lookback_sec)), limit=250) or []
+    except Exception as e:
+        return {'ok': False, 'error': str(e), 'backfilled': [], 'skipped': [], 'matched_sell_count': 0}
+
+    by_symbol: dict[str, list[dict[str, Any]]] = {}
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        pair_raw = str(item.get('pair') or '')
+        pair_norm = _normalize_symbol(pair_raw) if pair_raw else ''
+        side = str(item.get('type') or '').lower()
+        if not pair_norm or side not in {'buy', 'sell'}:
+            continue
+        rec = {
+            'txid': str(item.get('txid') or ''),
+            'time': float(item.get('time') or 0.0),
+            'price': float(item.get('price') or 0.0),
+            'qty': float(item.get('vol') or 0.0),
+            'fee': float(item.get('fee') or 0.0),
+            'cost': float(item.get('cost') or 0.0),
+            'side': side,
+            'symbol': pair_norm,
+            'raw': item,
+        }
+        if rec['time'] <= 0.0 or rec['qty'] <= 0.0:
+            continue
+        by_symbol.setdefault(pair_norm, []).append(rec)
+
+    for symbol, items in by_symbol.items():
+        try:
+            live_syms = {p.get('symbol') for p in get_positions() if p.get('symbol')}
+        except Exception:
+            live_syms = set()
+        if symbol in live_syms or symbol in (getattr(state, 'plans', {}) or {}) or trade_journal.get_open_trade(symbol):
+            out['skipped'].append({'symbol': symbol, 'reason': 'live_or_open_state_present'})
+            continue
+        items = sorted(items, key=lambda r: (float(r.get('time') or 0.0), str(r.get('txid') or '')))
+        buys = [r for r in items if r.get('side') == 'buy']
+        sells = [r for r in items if r.get('side') == 'sell']
+        used_buy_ids: set[str] = set()
+        for sell in sells:
+            sell_txid = str(sell.get('txid') or '')
+            if not sell_txid:
+                out['skipped'].append({'symbol': symbol, 'reason': 'sell_missing_txid'})
+                continue
+            if _closed_trade_exists_for_exit_txid(sell_txid, lookback_sec=max(lookback_sec, 30 * 86400.0)):
+                out['skipped'].append({'symbol': symbol, 'txid': sell_txid, 'reason': 'already_journaled'})
+                continue
+            candidates = [b for b in buys if float(b.get('time') or 0.0) <= float(sell.get('time') or 0.0) and str(b.get('txid') or '') not in used_buy_ids]
+            if not candidates:
+                out['skipped'].append({'symbol': symbol, 'txid': sell_txid, 'reason': 'no_prior_buy_match'})
+                continue
+            buy = candidates[-1]
+            used_buy_ids.add(str(buy.get('txid') or ''))
+            sell_qty = float(sell.get('qty') or 0.0)
+            buy_qty = float(buy.get('qty') or 0.0)
+            entry_qty = min(sell_qty, buy_qty) if buy_qty > 0.0 and sell_qty > 0.0 else max(sell_qty, buy_qty)
+            if entry_qty <= 0.0:
+                out['skipped'].append({'symbol': symbol, 'txid': sell_txid, 'reason': 'invalid_qty_match'})
+                continue
+            buy_ratio = min(1.0, entry_qty / buy_qty) if buy_qty > 0 else 1.0
+            sell_ratio = min(1.0, entry_qty / sell_qty) if sell_qty > 0 else 1.0
+            open_payload = {
+                'symbol': symbol,
+                'opened_ts': float(buy.get('time') or now_ts),
+                'strategy': 'adopted',
+                'source': 'broker_trade_history_backfill',
+                'signal_name': None,
+                'signal_id': None,
+                'req_id': f'broker_backfill:{symbol}:{sell_txid}',
+                'entry_txid': str(buy.get('txid') or ''),
+                'entry_execution': str((buy.get('raw') or {}).get('ordertype') or 'broker_trade_history_backfill'),
+                'entry_price': float(buy.get('price') or 0.0),
+                'entry_qty': float(entry_qty),
+                'entry_cost': float((buy.get('cost') or 0.0) * buy_ratio) if float(buy.get('cost') or 0.0) > 0 else float(entry_qty * float(buy.get('price') or 0.0)),
+                'entry_fee': float((buy.get('fee') or 0.0) * buy_ratio),
+                'requested_notional_usd': float(entry_qty * float(buy.get('price') or 0.0)),
+                'stop_price': 0.0,
+                'take_price': 0.0,
+                'meta': {
+                    'reconstructed_open_trade': True,
+                    'reconstruction_source': 'broker_trade_history_backfill',
+                    'matched_exit_txid': sell_txid,
+                    'matched_entry_txid': str(buy.get('txid') or ''),
+                },
+            }
+            try:
+                trade_journal.upsert_open_trade(open_payload)
+                closed = trade_journal.close_trade(symbol, {
+                    'closed_ts': float(sell.get('time') or now_ts),
+                    'exit_txid': sell_txid,
+                    'exit_execution': str((sell.get('raw') or {}).get('ordertype') or 'broker_trade_history_backfill'),
+                    'exit_price': float(sell.get('price') or 0.0),
+                    'exit_qty': float(entry_qty),
+                    'exit_cost': float((sell.get('cost') or 0.0) * sell_ratio) if float(sell.get('cost') or 0.0) > 0 else float(entry_qty * float(sell.get('price') or 0.0)),
+                    'exit_fee': float((sell.get('fee') or 0.0) * sell_ratio),
+                    'exit_reason': 'reconciled_fill_backfill',
+                    'meta': {
+                        'reconciled_close': True,
+                        'journal_backfill': True,
+                        'backfill_source': 'broker_trade_history',
+                        'matched_entry_txid': str(buy.get('txid') or ''),
+                        'matched_exit_txid': sell_txid,
+                    },
+                })
+            except Exception as e:
+                out['skipped'].append({'symbol': symbol, 'txid': sell_txid, 'reason': f'journal_exception:{e}'})
+                try:
+                    trade_journal.delete_open_trade(symbol)
+                except Exception:
+                    pass
+                continue
+            if not (isinstance(closed, dict) and closed.get('ok')):
+                out['skipped'].append({'symbol': symbol, 'txid': sell_txid, 'reason': 'journal_close_failed', 'result': closed})
+                try:
+                    trade_journal.delete_open_trade(symbol)
+                except Exception:
+                    pass
+                continue
+            out['matched_sell_count'] += 1
+            out['backfilled'].append({
+                'symbol': symbol,
+                'entry_txid': str(buy.get('txid') or ''),
+                'exit_txid': sell_txid,
+                'entry_qty': float(entry_qty),
+                'exit_qty': float(entry_qty),
+                'entry_price': float(buy.get('price') or 0.0),
+                'exit_price': float(sell.get('price') or 0.0),
+                'closed_ts': float(sell.get('time') or now_ts),
+            })
+
+    try:
+        telemetry_db.sync_from_trade_journal(limit=500)
+    except Exception as e:
+        out['telemetry_sync_error'] = str(e)
+    try:
+        _journal_sync_daily_realized_pnl()
+    except Exception as e:
+        out['pnl_sync_error'] = str(e)
+    return out
 
 
 def _ensure_reconciled_open_trade(symbol: str, *, plan: TradePlan | None, now_ts: float, px: float) -> dict[str, Any] | None:
