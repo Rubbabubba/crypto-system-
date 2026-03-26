@@ -4675,9 +4675,95 @@ def _dust_snapshot(symbol: str, *, qty: float, px: float) -> dict[str, Any]:
     }
 
 
+
+
+def _find_recent_exit_fill(symbol: str, *, now_ts: float, lookback_sec: float = 6 * 3600.0) -> dict[str, Any] | None:
+    try:
+        since_ts = max(0.0, float(now_ts) - float(lookback_sec))
+        raw = broker_kraken.trades_history_since(since_ts=since_ts, limit=100) or []
+    except Exception:
+        return None
+    base = _base_asset(symbol)
+    best = None
+    best_ts = -1.0
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        side = str(item.get('type') or '').lower()
+        if side != 'sell':
+            continue
+        pair_raw = str(item.get('pair') or '')
+        pair_norm = _normalize_symbol(pair_raw) if pair_raw else ''
+        if pair_norm and pair_norm != symbol:
+            continue
+        if not pair_norm:
+            if base and base not in pair_raw:
+                continue
+        t = float(item.get('time') or 0.0)
+        if t <= 0.0 or t > float(now_ts) + 300.0:
+            continue
+        if t > best_ts:
+            best_ts = t
+            best = {
+                'txid': item.get('txid'),
+                'time': t,
+                'price': float(item.get('price') or 0.0),
+                'qty': float(item.get('vol') or 0.0),
+                'fee': float(item.get('fee') or 0.0),
+                'cost': float(item.get('cost') or 0.0),
+                'execution': str(item.get('ordertype') or 'reconciled_broker_state'),
+                'pair': pair_norm or pair_raw,
+                'raw': item,
+            }
+    return best
+
+
+def _ensure_reconciled_open_trade(symbol: str, *, plan: TradePlan | None, now_ts: float, px: float) -> dict[str, Any] | None:
+    open_trade = trade_journal.get_open_trade(symbol)
+    if open_trade:
+        return open_trade
+    if plan is None:
+        return None
+    entry_price = float(getattr(plan, 'entry_price', 0.0) or 0.0) or float(px or 0.0)
+    requested_notional = float(getattr(plan, 'notional_usd', 0.0) or 0.0)
+    entry_qty = requested_notional / entry_price if entry_price > 0 and requested_notional > 0 else 0.0
+    if entry_qty <= 0.0:
+        return None
+    opened_ts = float(getattr(plan, 'opened_ts', 0.0) or 0.0) or float(now_ts)
+    risk_snapshot = dict(getattr(plan, 'risk_snapshot', {}) or {})
+    lifecycle_policy = dict(risk_snapshot.get('lifecycle_policy') or {})
+    meta = {
+        'reconstructed_open_trade': True,
+        'reconstruction_source': 'plan_state',
+        'plan_origin': _plan_origin(plan),
+        'plan_policy_source': _plan_policy_source(plan),
+        'max_hold_sec': int(_effective_plan_max_hold_sec(plan) or 0),
+        'lifecycle_policy': lifecycle_policy,
+    }
+    trade_journal.upsert_open_trade({
+        'symbol': symbol,
+        'opened_ts': float(opened_ts),
+        'strategy': str(getattr(plan, 'strategy', '') or 'adopted'),
+        'source': 'reconciled_plan_state',
+        'signal_name': None,
+        'signal_id': None,
+        'req_id': getattr(plan, 'trade_plan_id', None) or getattr(plan, 'position_id', None) or f'reconciled:{symbol}:{int(opened_ts)}',
+        'entry_txid': None,
+        'entry_execution': 'reconstructed_plan_state',
+        'entry_price': float(entry_price),
+        'entry_qty': float(entry_qty),
+        'entry_cost': float(entry_qty * entry_price),
+        'entry_fee': 0.0,
+        'requested_notional_usd': float(requested_notional or (entry_qty * entry_price)),
+        'stop_price': float(getattr(plan, 'stop_price', 0.0) or 0.0),
+        'take_price': float(getattr(plan, 'take_price', 0.0) or 0.0),
+        'meta': meta,
+    })
+    return trade_journal.get_open_trade(symbol)
+
 def _reconciled_close_trade(symbol: str, *, plan: TradePlan | None, reason: str, px: float, now_ts: float, post_reconcile: dict | None = None, broker_result: dict | None = None, classified: dict | None = None) -> dict[str, Any] | None:
     post = dict(post_reconcile or {})
-    open_trade = trade_journal.get_open_trade(symbol)
+    open_trade = _ensure_reconciled_open_trade(symbol, plan=plan, now_ts=float(now_ts), px=float(px or post.get('price') or 0.0))
     if not open_trade and not plan:
         return None
 
@@ -4713,6 +4799,13 @@ def _reconciled_close_trade(symbol: str, *, plan: TradePlan | None, reason: str,
     exit_fee = 0.0
     if isinstance(classified, dict):
         exit_fee = float(classified.get('fees_usd') or 0.0)
+    matched_fill = _find_recent_exit_fill(symbol, now_ts=float(now_ts))
+    if matched_fill:
+        exit_price = float(matched_fill.get('price') or exit_price or 0.0)
+        exit_qty = float(matched_fill.get('qty') or exit_qty or 0.0)
+        approx_exit_cost = float(matched_fill.get('cost') or (exit_qty * exit_price) or approx_exit_cost)
+        exit_fee = float(matched_fill.get('fee') or exit_fee or 0.0)
+    close_mode = 'reconciled_fill' if sold_qty > 0 else 'terminal_dust'
     close_meta = {
         'reconciled_close': True,
         'terminal_dust': bool(force_terminal),
@@ -4721,20 +4814,21 @@ def _reconciled_close_trade(symbol: str, *, plan: TradePlan | None, reason: str,
         'dust': dust,
         'broker_result': broker_result or {},
         'classified': classified or {},
-        'close_mode': 'reconciled_fill' if sold_qty > 0 else 'terminal_dust',
+        'close_mode': close_mode,
+        'matched_fill': matched_fill or {},
     }
     out = None
     if open_trade:
         try:
             out = trade_journal.close_trade(symbol, {
-                'closed_ts': float(now_ts),
-                'exit_txid': ((classified or {}).get('broker_txid') if isinstance(classified, dict) else None),
-                'exit_execution': ((classified or {}).get('execution') if isinstance(classified, dict) else None) or 'reconciled_broker_state',
+                'closed_ts': float(matched_fill.get('time') or now_ts),
+                'exit_txid': ((classified or {}).get('broker_txid') if isinstance(classified, dict) else None) or (matched_fill or {}).get('txid'),
+                'exit_execution': ((classified or {}).get('execution') if isinstance(classified, dict) else None) or (matched_fill or {}).get('execution') or 'reconciled_broker_state',
                 'exit_price': float(exit_price),
                 'exit_qty': float(exit_qty),
                 'exit_cost': float(approx_exit_cost),
                 'exit_fee': float(exit_fee),
-                'exit_reason': 'reconciled_fill' if sold_qty > 0 else 'terminal_dust',
+                'exit_reason': close_mode,
                 'meta': close_meta,
             })
         except Exception:
@@ -4765,12 +4859,14 @@ def _reconciled_close_trade(symbol: str, *, plan: TradePlan | None, reason: str,
     return {
         'symbol': symbol,
         'closed': True,
-        'close_reason': 'reconciled_fill' if sold_qty > 0 else 'terminal_dust',
+        'close_reason': close_mode,
         'force_terminal': bool(force_terminal),
         'sold_qty_estimate': float(sold_qty),
         'remaining_qty': float(remaining_qty),
         'dust': dust,
+        'matched_fill': matched_fill or {},
         'journal_close': out,
+        'journal_written': bool(out and out.get('ok')),
     }
 
 
