@@ -74,18 +74,78 @@ def _portfolio_exposure_usd_from_balances(balances: dict[str, float]) -> float:
     return float(exposure)
 
 
+def _canonical_asset(asset: str) -> str:
+    """Collapse Kraken/raw balance aliases into one canonical asset code."""
+    a = str(asset or "").upper().strip()
+    if not a:
+        return ""
+    if a.endswith(".F"):
+        a = a[:-2]
+    alias_map = {
+        "ZUSD": "USD",
+        "USD": "USD",
+        "ZUSDC": "USDC",
+        "USDC": "USDC",
+        "ZUSDT": "USDT",
+        "USDT": "USDT",
+        "XXBT": "BTC",
+        "XBT": "BTC",
+        "BTC": "BTC",
+        "XETH": "ETH",
+        "ETH": "ETH",
+        "XDG": "DOGE",
+        "DOGE": "DOGE",
+        "XXRP": "XRP",
+        "XRP": "XRP",
+        "XLTC": "LTC",
+        "LTC": "LTC",
+        "XBCH": "BCH",
+        "BCH": "BCH",
+    }
+    return alias_map.get(a, a)
+
+
+def _canonicalize_balances(balances: dict[str, float]) -> dict[str, float]:
+    """Aggregate balances by canonical asset to prevent alias double counting."""
+    out: dict[str, float] = {}
+    for asset, qty_raw in (balances or {}).items():
+        asset_c = _canonical_asset(asset)
+        try:
+            qty = float(qty_raw or 0.0)
+        except Exception:
+            qty = 0.0
+        if not asset_c or qty <= 0:
+            continue
+        out[asset_c] = float(out.get(asset_c, 0.0) or 0.0) + qty
+    return out
+
+
+def _canonicalize_balance_sources(sources: dict[str, list[str]] | None) -> dict[str, list[str]]:
+    out: dict[str, set[str]] = {}
+    for asset, source_list in (sources or {}).items():
+        asset_c = _canonical_asset(asset)
+        if not asset_c:
+            continue
+        bucket = out.setdefault(asset_c, set())
+        for source in (source_list or []):
+            if source:
+                bucket.add(str(source))
+    return {asset: sorted(list(vals)) for asset, vals in out.items()}
+
+
 def _stable_cash_usd(balances: dict[str, float]) -> float:
-    """Return USD-like cash from balances.
+    """Return USD-like cash from canonicalized balances.
 
     Kraken may report USD cash as USD or ZUSD depending on endpoint/account.
     Some accounts primarily hold stables (USDC/USDT). Treat those as cash-equivalent
     for sizing and eligibility checks.
     """
-    keys = ('USD', 'ZUSD', 'USDC', 'ZUSDC', 'USDT', 'ZUSDT')
+    canonical = _canonicalize_balances(balances)
+    keys = ('USD', 'USDC', 'USDT')
     total = 0.0
     for k in keys:
         try:
-            total += float(balances.get(k, 0.0) or 0.0)
+            total += float(canonical.get(k, 0.0) or 0.0)
         except Exception:
             continue
     return float(total)
@@ -788,11 +848,16 @@ def _merged_balances_snapshot() -> dict[str, Any]:
             merged[asset_u] = max(float(merged.get(asset_u, 0.0) or 0.0), qty)
             sources.setdefault(asset_u, []).append(source_name)
 
+    canonical_merged = _canonicalize_balances(merged)
+    canonical_sources = _canonicalize_balance_sources(sources)
+
     return {
         "parsed": parsed,
         "positions_api": positions_api,
         "merged": merged,
+        "canonical_merged": canonical_merged,
         "sources": sources,
+        "canonical_sources": canonical_sources,
         "raw": raw,
         "raw_ok": bool(raw_ok),
         "raw_error": raw_error,
@@ -801,8 +866,10 @@ def _merged_balances_snapshot() -> dict[str, Any]:
     }
 
 
-def _merged_balances_by_asset() -> dict[str, float]:
-    return dict((_merged_balances_snapshot() or {}).get("merged") or {})
+def _merged_balances_by_asset(canonical: bool = True) -> dict[str, float]:
+    snap = _merged_balances_snapshot() or {}
+    key = "canonical_merged" if canonical else "merged"
+    return dict(snap.get(key) or {})
 
 
 def get_positions() -> list[dict]:
@@ -813,8 +880,8 @@ def get_positions() -> list[dict]:
     """
     try:
         snap = _merged_balances_snapshot() or {}
-        balances = dict(snap.get("merged") or {})
-        balance_sources = dict(snap.get("sources") or {})
+        balances = dict(snap.get("canonical_merged") or snap.get("merged") or {})
+        balance_sources = dict(snap.get("canonical_sources") or snap.get("sources") or {})
     except Exception as e:
         log.exception("merged balances failed: %s", e)
         return []
@@ -2433,10 +2500,17 @@ def _sum_open_order_notional_usd(summary: dict, *, side: str | None = None) -> f
 
 def _account_truth_snapshot() -> dict:
     balances = {}
+    raw_balances = {}
+    canonical_balances = {}
+    balance_sources = {}
     balance_ok = True
     balance_error = None
     try:
-        balances = _merged_balances_by_asset() or {}
+        snap = _merged_balances_snapshot() or {}
+        raw_balances = dict(snap.get('merged') or {})
+        canonical_balances = dict(snap.get('canonical_merged') or {})
+        balance_sources = dict(snap.get('canonical_sources') or snap.get('sources') or {})
+        balances = canonical_balances or _merged_balances_by_asset() or {}
         balance_error = _last_balance_error()
         if balance_error:
             balance_ok = False
@@ -2453,11 +2527,22 @@ def _account_truth_snapshot() -> dict:
 
     open_orders = _broker_open_orders_summary()
     realized_today = _journal_sync_daily_realized_pnl()
-    cash_usd = float(_stable_cash_usd(balances) or 0.0)
+    cash_balances = {k: float(v or 0.0) for k, v in (balances or {}).items() if k in ('USD', 'USDC', 'USDT')}
+    cash_usd = float(sum(cash_balances.values()) or 0.0)
     position_exposure_usd = sum(float(p.get('notional_usd', 0.0) or 0.0) for p in positions)
     open_buy_order_notional_usd = _sum_open_order_notional_usd(open_orders, side='buy') if open_orders.get('ok') else 0.0
     equity_usd = float(cash_usd + position_exposure_usd)
     utilization_pct = (float(position_exposure_usd + open_buy_order_notional_usd) / float(equity_usd)) if equity_usd > 0 else 0.0
+    position_contributions = []
+    for p in positions:
+        position_contributions.append({
+            'symbol': p.get('symbol'),
+            'asset': p.get('asset'),
+            'qty': float(p.get('qty', 0.0) or 0.0),
+            'price': float(p.get('price', 0.0) or 0.0),
+            'notional_usd': float(p.get('notional_usd', 0.0) or 0.0),
+            'balance_sources': list(p.get('balance_sources') or []),
+        })
     return {
         'ok': True,
         'utc': utc_now_iso(),
@@ -2474,6 +2559,15 @@ def _account_truth_snapshot() -> dict:
         'sell_order_symbols': sorted(list(open_orders.get('sell_symbols') or [])),
         'realized_today_usd': float(realized_today),
         'last_reconcile': dict(getattr(state, 'last_reconcile_result', {}) or {}),
+        'raw_merged_balances': raw_balances,
+        'canonical_balances': canonical_balances,
+        'canonical_balance_sources': balance_sources,
+        'cash_components_usd': cash_balances,
+        'position_components': position_contributions,
+        'equity_components': {
+            'cash_usd': float(cash_usd),
+            'position_exposure_usd': float(position_exposure_usd),
+        },
     }
 
 
@@ -2827,6 +2921,7 @@ def diagnostics_account_truth():
 def diagnostics_holdings_truth(include_raw: int = 1):
     snap = _merged_balances_snapshot() or {}
     merged = dict(snap.get('merged') or {})
+    canonical_merged = dict(snap.get('canonical_merged') or {})
     parsed = dict(snap.get('parsed') or {})
     positions_api = dict(snap.get('positions_api') or {})
     plan_syms = set((getattr(state, 'plans', {}) or {}).keys())
@@ -2834,10 +2929,12 @@ def diagnostics_holdings_truth(include_raw: int = 1):
     pending = dict(getattr(state, 'pending_exits', {}) or {})
 
     rows = []
-    for asset in sorted(merged.keys()):
+    parsed_canonical = _canonicalize_balances(parsed)
+    positions_api_canonical = _canonicalize_balances(positions_api)
+    for asset in sorted(canonical_merged.keys()):
         if str(asset).upper() == 'USD':
             continue
-        qty = float(merged.get(asset, 0.0) or 0.0)
+        qty = float(canonical_merged.get(asset, 0.0) or 0.0)
         symbol = normalize_symbol(f"{asset}/USD")
         try:
             px = float(_last_price(symbol) or 0.0)
@@ -2860,9 +2957,9 @@ def diagnostics_holdings_truth(include_raw: int = 1):
             'asset': asset,
             'symbol': symbol,
             'qty_merged': qty,
-            'qty_parsed': float(parsed.get(asset, 0.0) or 0.0),
-            'qty_positions_api': float(positions_api.get(asset, 0.0) or 0.0),
-            'sources': list(snap.get('sources', {}).get(asset, [])),
+            'qty_parsed': float(parsed_canonical.get(asset, 0.0) or 0.0),
+            'qty_positions_api': float(positions_api_canonical.get(asset, 0.0) or 0.0),
+            'sources': list((snap.get('canonical_sources') or {}).get(asset, [])),
             'price': px,
             'notional_usd': notional,
             'qualifies_as_position': qualifies,
@@ -2883,6 +2980,7 @@ def diagnostics_holdings_truth(include_raw: int = 1):
         'min_position_notional_usd': float(getattr(settings, 'min_position_notional_usd', 0.0) or 0.0),
         'exit_min_notional_usd': float(getattr(settings, 'exit_min_notional_usd', 0.0) or 0.0),
         'merged_balances': merged,
+        'canonical_balances': canonical_merged,
         'parsed_balances': parsed,
         'positions_api_balances': positions_api,
         'holdings': rows,
@@ -4954,6 +5052,12 @@ def worker_exit_diagnostics(payload: WorkerExitDiagnosticsPayload):
                 ok_to_place = False
                 reason = (reason or "exit") + "_insufficient_qty_for_target_notional"
 
+        opened_ts = float(getattr(plan, "opened_ts", 0.0) or 0.0)
+        age_sec = (time.time() - opened_ts) if opened_ts > 0 else 0.0
+        plan_max_hold = int(getattr(plan, "max_hold_sec", 0) or 0)
+        grace_sec = int(getattr(settings, "time_exit_grace_sec", 0) or 0)
+        eligible_time_exit = bool(plan_max_hold > 0 and age_sec >= float(plan_max_hold + grace_sec))
+
         diagnostics.append({
             "symbol": sym,
             "qty": qty,
@@ -4967,7 +5071,11 @@ def worker_exit_diagnostics(payload: WorkerExitDiagnosticsPayload):
                 "take_price": take_px,
                 "strategy": getattr(plan, "strategy", None),
                 "opened_ts": getattr(plan, "opened_ts", None),
+                "max_hold_sec": plan_max_hold,
             },
+            "age_sec": round(age_sec, 3),
+            "eligible_time_exit": eligible_time_exit,
+            "time_exit_grace_sec": grace_sec,
             "should_exit": should_exit,
             "ok_to_place": ok_to_place,
             "reason": reason,
