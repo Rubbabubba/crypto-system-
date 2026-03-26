@@ -1,1 +1,1 @@
-Crypto main service drop-in patch 023.
+Patch 024: reconciled trade journaling + P&L fix
