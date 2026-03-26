@@ -454,7 +454,7 @@ def _record_blocked_trade(reason: str, **fields) -> None:
 
 
 def _risk_snapshot_for_entry(*, symbol: str, strategy: str, px: float, stop_price: float, take_price: float, notional: float) -> Dict[str, Any]:
-    balances = _balances_by_asset() or {}
+    balances = _merged_balances_by_asset() or {}
     stable_cash = _stable_cash_usd(balances)
     total_exposure = _portfolio_exposure_usd_from_balances(balances)
     stop_gap = max(0.0, float(px) - float(stop_price))
@@ -713,21 +713,110 @@ def _log_event(level: str, event: Dict[str, Any]) -> None:
 
 
 
+def _merged_balances_snapshot() -> dict[str, Any]:
+    """Return broker holdings truth merged across multiple Kraken balance views.
+
+    Why this exists:
+    - The main system historically trusted only `balances_by_asset()`.
+    - In live trading we observed cases where broker-held BTC existed, but the
+      runtime position model did not see it.
+    - Broker truth must win over local/runtime state.
+
+    Output shape:
+      {
+        "parsed": {"BTC": 0.01, "USD": 1000.0},
+        "positions_api": {"BTC": 0.01, "USD": 1000.0},
+        "merged": {"BTC": 0.01, "USD": 1000.0},
+        "sources": {"BTC": ["parsed", "positions_api"]},
+        "raw": {...},
+        "raw_ok": True,
+        "raw_error": None,
+      }
+    """
+    parsed: dict[str, float] = {}
+    positions_api: dict[str, float] = {}
+    raw: dict[str, Any] = {}
+    raw_ok = True
+    raw_error = None
+    parsed_error = None
+    positions_error = None
+
+    try:
+        parsed = _balances_by_asset() or {}
+    except Exception as e:
+        parsed_error = f"{type(e).__name__}: {e}"
+        parsed = {}
+
+    try:
+        raw = broker_kraken._fetch_balances() or {}
+        if not isinstance(raw, dict):
+            raw = {}
+    except Exception as e:
+        raw_ok = False
+        raw_error = f"{type(e).__name__}: {e}"
+        raw = {}
+
+    try:
+        for row in (broker_kraken.positions() or []):
+            if not isinstance(row, dict):
+                continue
+            asset = str(row.get("asset") or "").upper().strip()
+            if not asset:
+                continue
+            try:
+                qty = float(row.get("qty") or 0.0)
+            except Exception:
+                qty = 0.0
+            if qty <= 0:
+                continue
+            positions_api[asset] = max(float(positions_api.get(asset, 0.0) or 0.0), qty)
+    except Exception as e:
+        positions_error = f"{type(e).__name__}: {e}"
+        positions_api = {}
+
+    merged: dict[str, float] = {}
+    sources: dict[str, list[str]] = {}
+    for source_name, source_map in (("parsed", parsed), ("positions_api", positions_api)):
+        for asset, qty_raw in (source_map or {}).items():
+            asset_u = str(asset or "").upper().strip()
+            try:
+                qty = float(qty_raw or 0.0)
+            except Exception:
+                qty = 0.0
+            if not asset_u or qty <= 0:
+                continue
+            merged[asset_u] = max(float(merged.get(asset_u, 0.0) or 0.0), qty)
+            sources.setdefault(asset_u, []).append(source_name)
+
+    return {
+        "parsed": parsed,
+        "positions_api": positions_api,
+        "merged": merged,
+        "sources": sources,
+        "raw": raw,
+        "raw_ok": bool(raw_ok),
+        "raw_error": raw_error,
+        "parsed_error": parsed_error,
+        "positions_error": positions_error,
+    }
+
+
+def _merged_balances_by_asset() -> dict[str, float]:
+    return dict((_merged_balances_snapshot() or {}).get("merged") or {})
+
+
 def get_positions() -> list[dict]:
-    """Return open positions derived from Kraken balances + live USD prices.
+    """Return open positions derived from merged broker holdings + live USD prices.
 
-    - Uses normalized balances from `balances_by_asset()` (e.g., "BTC", "ADA").
-    - Prices are fetched per-symbol via `last_price("ASSET/USD")`.
-    - Ignores *dust* positions below `settings.min_position_notional_usd` to prevent
-      repeated exit/entry churn around exchange minimums.
-
-    Return format:
-      [{"symbol": "BTC/USD", "asset": "BTC", "qty": 0.01, "price": 65000, "notional_usd": 650}]
+    We intentionally merge multiple Kraken balance views so live broker-held
+    inventory is still recognized even if one parsing path misses it.
     """
     try:
-        balances = _balances_by_asset() or {}
+        snap = _merged_balances_snapshot() or {}
+        balances = dict(snap.get("merged") or {})
+        balance_sources = dict(snap.get("sources") or {})
     except Exception as e:
-        log.exception("balances_by_asset failed: %s", e)
+        log.exception("merged balances failed: %s", e)
         return []
 
     positions: list[dict] = []
@@ -743,7 +832,7 @@ def get_positions() -> list[dict]:
         if qty_f <= 0:
             continue
 
-        sym = f"{asset_u}/USD"
+        sym = normalize_symbol(f"{asset_u}/USD")
         try:
             px = float(_last_price(sym) or 0.0)
         except Exception:
@@ -762,6 +851,7 @@ def get_positions() -> list[dict]:
                 "qty": qty_f,
                 "price": px,
                 "notional_usd": notional,
+                "balance_sources": list(balance_sources.get(asset_u, [])),
             }
         )
 
@@ -1350,7 +1440,7 @@ def _has_position(symbol: str) -> tuple[bool, float]:
 
     IMPORTANT: treat tiny 'dust' balances as *not* a position so they don't block entries/exits.
     """
-    bal = _balances_by_asset()
+    bal = _merged_balances_by_asset()
     base = _base_asset(symbol)
     qty = float(bal.get(base, 0.0) or 0.0)
     if qty <= 0:
@@ -2346,7 +2436,7 @@ def _account_truth_snapshot() -> dict:
     balance_ok = True
     balance_error = None
     try:
-        balances = _balances_by_asset() or {}
+        balances = _merged_balances_by_asset() or {}
         balance_error = _last_balance_error()
         if balance_error:
             balance_ok = False
@@ -2731,6 +2821,73 @@ def _reconcile_runtime_state() -> dict:
 @app.get("/diagnostics/account_truth")
 def diagnostics_account_truth():
     return _account_truth_snapshot()
+
+
+@app.get("/diagnostics/holdings_truth")
+def diagnostics_holdings_truth(include_raw: int = 1):
+    snap = _merged_balances_snapshot() or {}
+    merged = dict(snap.get('merged') or {})
+    parsed = dict(snap.get('parsed') or {})
+    positions_api = dict(snap.get('positions_api') or {})
+    plan_syms = set((getattr(state, 'plans', {}) or {}).keys())
+    state_open = set(getattr(state, 'open_positions', []) or [])
+    pending = dict(getattr(state, 'pending_exits', {}) or {})
+
+    rows = []
+    for asset in sorted(merged.keys()):
+        if str(asset).upper() == 'USD':
+            continue
+        qty = float(merged.get(asset, 0.0) or 0.0)
+        symbol = normalize_symbol(f"{asset}/USD")
+        try:
+            px = float(_last_price(symbol) or 0.0)
+        except Exception:
+            px = 0.0
+        notional = float(qty * px) if qty > 0 and px > 0 else 0.0
+        qualifies = bool(notional >= float(getattr(settings, 'min_position_notional_usd', 0.0) or 0.0)) if px > 0 else False
+        has_plan = symbol in plan_syms
+        pending_exit = symbol in pending
+        in_state_open = symbol in state_open
+        if px <= 0:
+            classification = 'unpriced_broker_inventory'
+        elif not qualifies:
+            classification = 'dust_inventory'
+        elif has_plan:
+            classification = 'managed_open_position'
+        else:
+            classification = 'unmanaged_broker_inventory'
+        rows.append({
+            'asset': asset,
+            'symbol': symbol,
+            'qty_merged': qty,
+            'qty_parsed': float(parsed.get(asset, 0.0) or 0.0),
+            'qty_positions_api': float(positions_api.get(asset, 0.0) or 0.0),
+            'sources': list(snap.get('sources', {}).get(asset, [])),
+            'price': px,
+            'notional_usd': notional,
+            'qualifies_as_position': qualifies,
+            'has_plan': has_plan,
+            'state_open': in_state_open,
+            'pending_exit': pending_exit,
+            'classification': classification,
+        })
+
+    return {
+        'ok': True,
+        'utc': utc_now_iso(),
+        'build': PATCH_BUILD,
+        'raw_ok': bool(snap.get('raw_ok', True)),
+        'raw_error': snap.get('raw_error'),
+        'parsed_error': snap.get('parsed_error'),
+        'positions_error': snap.get('positions_error'),
+        'min_position_notional_usd': float(getattr(settings, 'min_position_notional_usd', 0.0) or 0.0),
+        'exit_min_notional_usd': float(getattr(settings, 'exit_min_notional_usd', 0.0) or 0.0),
+        'merged_balances': merged,
+        'parsed_balances': parsed,
+        'positions_api_balances': positions_api,
+        'holdings': rows,
+        'raw_balances': snap.get('raw') if int(include_raw or 0) == 1 else None,
+    }
 
 
 @app.get("/diagnostics/position_reconcile")
@@ -4200,7 +4357,7 @@ def worker_exit(payload: WorkerExitPayload):
 
         exits: list[dict] = []
         evaluations: list[dict] = []
-        bal = _balances_by_asset()
+        bal = _merged_balances_by_asset()
         stale_order_locks_cleared = state.clear_stale_order_locks(OPEN_ORDER_LOCK_TTL_SEC)
         try:
             stale_pending_cleared = int(state.clear_stale_pending_exits(PENDING_EXIT_TTL_SEC))
@@ -4754,7 +4911,7 @@ def worker_exit_diagnostics(payload: WorkerExitDiagnosticsPayload):
     """
     _require_worker_secret(payload.worker_secret)
 
-    balances = _balances_by_asset()
+    balances = _merged_balances_by_asset()
     symbols = payload.symbols or []
     selected = set([normalize_symbol(s) for s in symbols]) if symbols else None
 
@@ -4833,7 +4990,7 @@ def worker_adopt_positions(payload: WorkerAdoptPositionsPayload):
     """
     _require_worker_secret(payload.worker_secret)
 
-    balances = _balances_by_asset()
+    balances = _merged_balances_by_asset()
 
     if payload.reset_plans:
         state.plans.clear()
