@@ -3185,6 +3185,26 @@ def diagnostics_position_reconcile(apply: int = 0):
     }
 
 
+@app.get("/diagnostics/exit_execution_truth")
+def diagnostics_exit_execution_truth(limit: int = 10):
+    try:
+        lim = max(1, min(int(limit or 10), 50))
+    except Exception:
+        lim = 10
+    history = list(getattr(state, 'exit_execution_history', []) or [])
+    return {
+        'ok': True,
+        'utc': utc_now_iso(),
+        'build': PATCH_BUILD,
+        'last_exit_execution': dict(getattr(state, 'last_exit_execution', {}) or {}),
+        'recent_exit_executions': history[-lim:],
+        'pending_exits': dict(getattr(state, 'pending_exits', {}) or {}),
+        'last_exit_status': dict(getattr(state, 'last_exit_status', {}) or {}),
+        'last_exit_route_truth': dict(getattr(state, 'last_exit_route_truth', {}) or {}),
+        'last_reconcile_result': dict(getattr(state, 'last_reconcile_result', {}) or {}),
+    }
+
+
 @app.get("/diagnostics/open_orders")
 def diagnostics_open_orders():
     summary = _broker_open_orders_summary()
@@ -4581,6 +4601,79 @@ def webhook(payload: WebhookPayload, request: Request):
     }
 
 
+def _exit_broker_reconcile_snapshot(symbol: str) -> dict[str, Any]:
+    snap = _merged_balances_snapshot() or {}
+    economic = dict(snap.get('economic_balances') or snap.get('canonical_merged') or {})
+    base = _base_asset(symbol)
+    qty = float(economic.get(base, 0.0) or 0.0)
+    try:
+        px = float(_last_price(symbol) or 0.0)
+    except Exception:
+        px = 0.0
+    notional = float(qty * px) if qty > 0 and px > 0 else 0.0
+    qualifies = bool(notional >= float(getattr(settings, 'min_position_notional_usd', 0.0) or 0.0)) if px > 0 else False
+    return {
+        'symbol': symbol,
+        'base_asset': base,
+        'economic_qty': float(qty),
+        'price': float(px),
+        'notional_usd': float(notional),
+        'qualifies_as_position': bool(qualifies),
+        'has_plan': bool(symbol in (getattr(state, 'plans', {}) or {})),
+        'pending_exit': bool(symbol in (getattr(state, 'pending_exits', {}) or {})),
+        'open_position_symbols': sorted(list(getattr(state, 'open_positions', []) or [])),
+        'raw_ok': bool(snap.get('raw_ok', True)),
+        'parsed_error': snap.get('parsed_error'),
+        'positions_error': snap.get('positions_error'),
+        'balance_sources': list((snap.get('economic_balance_sources') or snap.get('canonical_sources') or {}).get(base, [])),
+    }
+
+
+def _compact_exit_result(res: Any) -> Any:
+    if not isinstance(res, dict):
+        return res
+    recon = dict(res.get('reconciled') or {})
+    result = dict(res.get('result') or {})
+    return {
+        'ok': bool(res.get('ok')),
+        'filled': bool(res.get('filled')),
+        'execution': res.get('execution'),
+        'pair': res.get('pair'),
+        'side': res.get('side'),
+        'notional': res.get('notional'),
+        'volume': res.get('volume'),
+        'txid': res.get('txid'),
+        'descr': res.get('descr'),
+        'status': res.get('status'),
+        'vol_exec': res.get('vol_exec'),
+        'limit_price': res.get('limit_price'),
+        'error': res.get('error'),
+        'reconciled': {
+            'filled': bool(recon.get('filled')),
+            'status': recon.get('status'),
+            'avg_price': recon.get('avg_price'),
+            'cost': recon.get('cost'),
+            'fee': recon.get('fee'),
+            'vol_exec': recon.get('vol_exec'),
+        } if recon else {},
+        'result': {
+            'txid': result.get('txid'),
+            'descr': result.get('descr'),
+            'error': result.get('error'),
+        } if result else {},
+    }
+
+
+def _record_exit_execution_truth(payload: dict[str, Any]) -> None:
+    snap = dict(payload or {})
+    snap.setdefault('utc', utc_now_iso())
+    snap.setdefault('build', PATCH_BUILD)
+    try:
+        state.record_exit_execution(snap)
+    except Exception:
+        pass
+
+
 @app.post("/worker/route_truth")
 def worker_route_truth(payload: WorkerRouteTruthPayload):
     ok_secret, reason = _require_worker_secret(getattr(payload, 'worker_secret', None))
@@ -4860,6 +4953,23 @@ def worker_exit(payload: WorkerExitPayload):
             if not can_exit_now:
                 continue
 
+            pre_reconcile = _exit_broker_reconcile_snapshot(symbol)
+            exit_attempt_base = {
+                'phase': 'decision_ready',
+                'symbol': symbol,
+                'strategy': plan.strategy,
+                'reason': reason,
+                'decision_price': float(px),
+                'entry_price': float(entry_px),
+                'qty': float(qty),
+                'age_sec': round(age_sec, 3),
+                'max_hold_sec': int(max_hold),
+                'plan_origin': _plan_origin(plan),
+                'plan_policy_source': _plan_policy_source(plan),
+                'pending_exit_before': bool(state.has_pending_exit(symbol, PENDING_EXIT_TTL_SEC)),
+                'pre_reconcile': pre_reconcile,
+            }
+
             # Phase 6: execute
             notional_exit = max(float(settings.exit_min_notional_usd), float(plan.notional_usd))
             exit_intent_id = str(uuid4())
@@ -4896,6 +5006,17 @@ def worker_exit(payload: WorkerExitPayload):
                 "requested_notional_usd": float(notional_exit), "limit_price": float(px), "raw_json": {"reason": reason, "dry_run": dry_run},
             })
             lifecycle_db.record_trade_lifecycle_event(stage='exit', event_type='intent_created', trade_plan_id=getattr(plan, 'trade_plan_id', '') or None, intent_id=exit_intent_id, broker_order_id=exit_intent_id, position_id=getattr(plan, 'position_id', '') or None, symbol=symbol, strategy_id=getattr(plan, 'strategy', '') or None, reason=reason, payload={'client_order_key': exit_client_order_key, 'notional_exit': float(notional_exit)})
+            _record_exit_execution_truth({
+                **exit_attempt_base,
+                'phase': 'intent_created',
+                'intent_id': exit_intent_id,
+                'client_order_key': exit_client_order_key,
+                'dry_run': bool(dry_run),
+                'requested_notional_usd': float(notional_exit),
+                'requested_qty': float(qty),
+                'execution_mode': STOP_EXIT_MODE if reason == 'stop' else settings.execution_mode,
+                'order_lock_key': exit_lock_key,
+            })
             if dry_run:
                 lifecycle_db.transition_order_intent(exit_intent_id, "acknowledged", client_order_key=exit_client_order_key, last_broker_status="dry_run")
                 lifecycle_db.upsert_broker_order({
@@ -4906,6 +5027,17 @@ def worker_exit(payload: WorkerExitPayload):
                 })
                 lifecycle_db.record_trade_lifecycle_event(stage='exit', event_type='dry_run_acknowledged', trade_plan_id=getattr(plan, 'trade_plan_id', '') or None, intent_id=exit_intent_id, broker_order_id=exit_intent_id, position_id=getattr(plan, 'position_id', '') or None, symbol=symbol, strategy_id=getattr(plan, 'strategy', '') or None, reason=reason, payload={'notional_exit': float(notional_exit)})
                 res = {"ok": True, "dry_run": True, "side": "sell", "symbol": symbol, "notional": notional_exit, "reason": reason}
+                _record_exit_execution_truth({
+                    **exit_attempt_base,
+                    'phase': 'dry_run_acknowledged',
+                    'intent_id': exit_intent_id,
+                    'client_order_key': exit_client_order_key,
+                    'requested_notional_usd': float(notional_exit),
+                    'requested_qty': float(qty),
+                    'broker_result': _compact_exit_result(res),
+                    'classified': {'state': 'acknowledged', 'execution': 'dry_run'},
+                    'post_reconcile': _exit_broker_reconcile_snapshot(symbol),
+                })
             else:
                 state.set_order_lock(exit_lock_key, meta={"symbol": symbol, "side": "sell", "reason": reason, "intent_id": exit_intent_id})
                 lifecycle_db.transition_order_intent(exit_intent_id, "submitted", client_order_key=exit_client_order_key, submitted_ts=time.time())
@@ -4928,6 +5060,17 @@ def worker_exit(payload: WorkerExitPayload):
                 else:
                     res = _market_notional(symbol=symbol, side="sell", notional=notional_exit, strategy=plan.strategy, price=px)
                 classified_exit = execution_state.classify_order_result(res or {})
+                _record_exit_execution_truth({
+                    **exit_attempt_base,
+                    'phase': 'broker_response',
+                    'intent_id': exit_intent_id,
+                    'client_order_key': exit_client_order_key,
+                    'requested_notional_usd': float(notional_exit),
+                    'requested_qty': float(qty),
+                    'broker_result': _compact_exit_result(res),
+                    'classified': dict(classified_exit or {}),
+                    'pending_exit_after_broker': bool(state.has_pending_exit(symbol, PENDING_EXIT_TTL_SEC)),
+                })
                 if not bool(res.get("ok")):
                     state.clear_order_lock(exit_lock_key)
                     lifecycle_db.transition_order_intent(
@@ -4951,6 +5094,18 @@ def worker_exit(payload: WorkerExitPayload):
                         "raw_json": res or {}, "closed_ts": time.time(),
                     })
                     lifecycle_db.record_trade_lifecycle_event(stage='exit', event_type='broker_terminal', trade_plan_id=getattr(plan, 'trade_plan_id', '') or None, intent_id=exit_intent_id, broker_order_id=exit_intent_id, position_id=getattr(plan, 'position_id', '') or None, symbol=symbol, strategy_id=getattr(plan, 'strategy', '') or None, reason=str(classified_exit.get("error") or (res or {}).get("error") or "exit_order_failed"), payload={'classified': classified_exit, 'response': res or {}})
+                    _record_exit_execution_truth({
+                        **exit_attempt_base,
+                        'phase': 'broker_terminal',
+                        'intent_id': exit_intent_id,
+                        'client_order_key': exit_client_order_key,
+                        'requested_notional_usd': float(notional_exit),
+                        'requested_qty': float(qty),
+                        'broker_result': _compact_exit_result(res),
+                        'classified': dict(classified_exit or {}),
+                        'post_reconcile': _exit_broker_reconcile_snapshot(symbol),
+                        'pending_exit_after_terminal': bool(state.has_pending_exit(symbol, PENDING_EXIT_TTL_SEC)),
+                    })
                     _record_state_model_anomaly("exit_order_failed", "warn", symbol=symbol, trade_plan_id=getattr(plan, "trade_plan_id", "") or None, intent_id=exit_intent_id, response=res or {}, classified=classified_exit)
                 journal_close = None
                 if bool(res.get("ok")):
@@ -5014,9 +5169,35 @@ def worker_exit(payload: WorkerExitPayload):
                         "broker_txid": classified_exit.get("broker_txid"),
                         "raw_json": metrics_exit,
                     })
+                    _record_exit_execution_truth({
+                        **exit_attempt_base,
+                        'phase': 'position_closed',
+                        'intent_id': exit_intent_id,
+                        'client_order_key': exit_client_order_key,
+                        'requested_notional_usd': float(notional_exit),
+                        'requested_qty': float(qty),
+                        'broker_result': _compact_exit_result(res),
+                        'classified': dict(classified_exit or {}),
+                        'fill_metrics': {'avg_price': float(exit_px), 'qty': float(exit_qty), 'fee_usd': float(exit_fees)},
+                        'journal_close': journal_close,
+                        'post_reconcile': _exit_broker_reconcile_snapshot(symbol),
+                        'pending_exit_after_close': bool(state.has_pending_exit(symbol, PENDING_EXIT_TTL_SEC)),
+                    })
                 else:
                     # Do not latch exit cooldowns or pending state if the order failed.
                     state.clear_pending_exit(symbol)
+                    _record_exit_execution_truth({
+                        **exit_attempt_base,
+                        'phase': 'order_failed',
+                        'intent_id': exit_intent_id,
+                        'client_order_key': exit_client_order_key,
+                        'requested_notional_usd': float(notional_exit),
+                        'requested_qty': float(qty),
+                        'broker_result': _compact_exit_result(res),
+                        'classified': dict(classified_exit or {}),
+                        'post_reconcile': _exit_broker_reconcile_snapshot(symbol),
+                        'pending_exit_after_failure_clear': bool(state.has_pending_exit(symbol, PENDING_EXIT_TTL_SEC)),
+                    })
                 # Stopout cooldown latch: only on successful orders (anti-churn)
                 try:
                     if bool(res.get("ok")):

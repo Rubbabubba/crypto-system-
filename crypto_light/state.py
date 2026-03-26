@@ -125,6 +125,11 @@ class InMemoryState:
         self.blocked_trades: List[Dict[str, Any]] = []
         self.blocked_trades_max: int = 500
 
+        # Exit execution truth (best-effort, in-memory).
+        self.last_exit_execution: Dict[str, Any] = {}
+        self.exit_execution_history: List[Dict[str, Any]] = []
+        self.exit_execution_history_max: int = 100
+
         # Best-effort order locks to reduce duplicate order submission across
         # rapid retries / slow broker state propagation. Key format is typically
         # "<side>:<symbol>". This is intentionally in-memory only.
@@ -445,6 +450,17 @@ class InMemoryState:
             self.blocked_trades.append(dict(event or {}))
             if len(self.blocked_trades) > self.blocked_trades_max:
                 self.blocked_trades = self.blocked_trades[-self.blocked_trades_max :]
+        except Exception:
+            pass
+
+
+    def record_exit_execution(self, payload: Dict[str, Any]) -> None:
+        try:
+            snap = dict(payload or {})
+            self.last_exit_execution = snap
+            self.exit_execution_history.append(snap)
+            if len(self.exit_execution_history) > self.exit_execution_history_max:
+                self.exit_execution_history = self.exit_execution_history[-self.exit_execution_history_max :]
         except Exception:
             pass
 
