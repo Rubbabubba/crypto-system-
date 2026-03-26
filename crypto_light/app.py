@@ -1343,6 +1343,101 @@ def _strategy_max_hold_sec(strategy: str) -> int:
     return 0
 
 
+def _adopted_lifecycle_policy() -> dict[str, Any]:
+    enabled = bool(getattr(settings, 'adopted_time_exit_enabled', True))
+    max_hold = int(getattr(settings, 'adopted_max_hold_sec', 0) or 0)
+    if not enabled:
+        max_hold = 0
+    return {
+        'origin': 'adopted',
+        'policy_source': 'adopted_defaults',
+        'time_exit_enabled': bool(enabled and max_hold > 0),
+        'max_hold_sec': int(max_hold),
+    }
+
+
+def _plan_origin(plan: TradePlan | None) -> str:
+    if plan is None:
+        return ''
+    strategy = str(getattr(plan, 'strategy', '') or '').strip().lower()
+    if strategy == 'adopted':
+        return 'adopted'
+    return 'strategy' if strategy else 'unknown'
+
+
+def _plan_policy_source(plan: TradePlan | None) -> str:
+    if plan is None:
+        return ''
+    rs = dict(getattr(plan, 'risk_snapshot', {}) or {})
+    lp = dict(rs.get('lifecycle_policy') or {})
+    source = str(lp.get('policy_source') or '').strip()
+    if source:
+        return source
+    return 'adopted_defaults' if _plan_origin(plan) == 'adopted' else 'strategy_defaults'
+
+
+def _effective_plan_max_hold_sec(plan: TradePlan | None) -> int:
+    if plan is None:
+        return 0
+    rs = dict(getattr(plan, 'risk_snapshot', {}) or {})
+    lp = dict(rs.get('lifecycle_policy') or {})
+    if 'max_hold_sec' in lp:
+        try:
+            return int(lp.get('max_hold_sec') or 0)
+        except Exception:
+            return 0
+    plan_max = int(getattr(plan, 'max_hold_sec', 0) or 0)
+    if plan_max > 0:
+        return plan_max
+    if _plan_origin(plan) == 'adopted' and bool(getattr(settings, 'adopted_time_exit_enabled', True)):
+        return int(getattr(settings, 'adopted_max_hold_sec', 0) or 0)
+    strategy = str(getattr(plan, 'strategy', '') or '')
+    return int(_strategy_max_hold_sec(strategy) or 0)
+
+
+def _normalize_plan_lifecycle_policy(plan: TradePlan | None, *, now_ts: float | None = None, persist: bool = False) -> tuple[TradePlan | None, bool]:
+    if plan is None:
+        return None, False
+    changed = False
+    rs = dict(getattr(plan, 'risk_snapshot', {}) or {})
+    lp = dict(rs.get('lifecycle_policy') or {})
+    origin = _plan_origin(plan)
+    if origin == 'adopted':
+        desired = _adopted_lifecycle_policy()
+    else:
+        eff_max = int(getattr(plan, 'max_hold_sec', 0) or _strategy_max_hold_sec(str(getattr(plan, 'strategy', '') or '')) or 0)
+        desired = {
+            'origin': origin or 'strategy',
+            'policy_source': 'strategy_defaults',
+            'time_exit_enabled': bool(eff_max > 0),
+            'max_hold_sec': int(eff_max),
+        }
+    merged = dict(desired)
+    merged.update({k: v for k, v in lp.items() if k not in {'origin', 'policy_source', 'time_exit_enabled', 'max_hold_sec'}})
+    # hard normalize the lifecycle control keys so legacy adopted plans with max_hold=0 get repaired
+    for key in ('origin', 'policy_source', 'time_exit_enabled', 'max_hold_sec'):
+        if lp.get(key) != desired.get(key):
+            changed = True
+    merged['origin'] = desired['origin']
+    merged['policy_source'] = desired['policy_source']
+    merged['time_exit_enabled'] = desired['time_exit_enabled']
+    merged['max_hold_sec'] = desired['max_hold_sec']
+    rs['lifecycle_policy'] = merged
+    if (getattr(plan, 'risk_snapshot', {}) or {}) != rs:
+        plan.risk_snapshot = rs
+        changed = True
+    desired_plan_max = int(desired.get('max_hold_sec', 0) or 0)
+    if int(getattr(plan, 'max_hold_sec', 0) or 0) != desired_plan_max:
+        plan.max_hold_sec = desired_plan_max
+        changed = True
+    if persist and changed:
+        try:
+            state.set_plan(plan)
+        except Exception:
+            pass
+    return plan, changed
+
+
 def _rb1_long_signal(symbol: str) -> tuple[bool, dict]:
     """True breakout: close crosses above prior N-bar high (edge-trigger)."""
     bars = _get_bars(symbol, timeframe=ENTRY_ENGINE_TIMEFRAME, limit=max(ENTRY_ENGINE_LIMIT_BARS, RB1_LOOKBACK_BARS + 5))
