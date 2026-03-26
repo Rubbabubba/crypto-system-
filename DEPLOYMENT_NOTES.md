@@ -1,49 +1,31 @@
-Patch 010 — BTC-Only Live Readiness Alignment
+# Patch 018 — Economic Balance Truth / De-dup Fix
 
-Purpose:
-- Fastest safe path toward live in controlled BTC-only mode
-- Preserve future Path B multi-symbol architecture
-- Add scanner-side alignment controls and main-side truth for BTC-only readiness
+This drop-in patch builds surgically on Patch 017.
 
-Key scanner envs (safe defaults are OFF):
-- BTC_ONLY_ALIGNMENT_ENABLED=1
-- SCANNER_FORCE_EMIT_SYMBOLS=BTC/USD
-- SCANNER_EMIT_ONLY_SYMBOLS=1
+## Main service changes
+- separates visibility balances from economic balances
+- stops summing duplicate broker inventory across parsed balances and positions API
+- uses one selected economic quantity per canonical asset for:
+  - /performance
+  - /diagnostics/account_truth
+  - holdings qualification
+  - exit sizing and open-position truth
+- adds source agreement details to:
+  - /diagnostics/account_truth
+  - /diagnostics/holdings_truth
 
-Optional aliases also supported:
-- BTC_ONLY_ALIGNMENT_SYMBOLS=BTC/USD
-- BTC_ONLY_ALIGNMENT_EMIT_ONLY=1
+## Selection rule
+- canonicalize aliases like BTC/XXBT and USD/ZUSD within each source
+- choose a single economic quantity per asset using max(parsed, positions_api) when both exist
+- keep both sources visible for diagnostics without double-counting them
 
-Main diagnostics added/updated:
-- /compatibility -> btc_only_live_alignment block
-- /diagnostics/btc_only_live_alignment
+## Expected post-deploy checks
+- /diagnostics/account_truth
+- /performance
+- /diagnostics/holdings_truth
+- /worker/exit_diagnostics
 
-Notes:
-- This patch does not remove or weaken Path B controls.
-- This patch does not change strategy or execution logic.
-- Path B future architecture remains intact.
-
-
-## Patch 011
-- Scanner forced-symbol normalization and BTC emit repair.
-
-
-## Patch 012
-- Added BTC-only live promotion guardrails diagnostics and release-proof marker.
-
-## Patch 014
-- Dashboard now reuses a single fresh compatibility/pretrade snapshot for promotion/readiness blocks to prevent mixed-time-state output.
-- No strategy, execution, or worker behavior changes.
-
-## Patch 016
-- Main: added merged broker-holdings truth, broker-aware open-position detection, and /diagnostics/holdings_truth.
-- Main: exit/position/adoption paths now use merged broker holdings so live broker inventory is visible even if one balance parsing path misses it.
-- Scanner: no strategy or emission logic changes; build/version synced to Patch 016 for clean baseline management.
-
-
-## Patch 017
-- Main: canonicalized aliased balances before account-level math so USD/ZUSD and BTC/XXBT are not double-counted.
-- Main: /diagnostics/account_truth now exposes raw merged balances, canonical balances, cash components, position components, and equity inputs.
-- Main: /diagnostics/holdings_truth now includes canonical balances.
-- Main: /worker/exit_diagnostics now includes age_sec, plan max_hold_sec, and eligible_time_exit for adopted-plan lifecycle truth.
-- Scanner: no strategy logic changes; build/version synced to Patch 017 for clean baseline management.
+## Expected truth
+- USD no longer doubled
+- BTC qty matches live broker holding once
+- position notional aligns with adopted plan / live holdings
