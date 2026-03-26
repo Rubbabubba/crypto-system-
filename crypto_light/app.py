@@ -42,6 +42,10 @@ from .build_info import build_payload
 
 settings = load_settings()
 
+# Patch 022 hotfix: define pending-exit TTL in the active exit path so
+# live worker/exit cycles cannot crash on a missing module global.
+PENDING_EXIT_TTL_SEC = int(getattr(settings, 'pending_exit_ttl_sec', 900) or 900)
+
 
 def _portfolio_exposure_usd_from_balances(balances: dict[str, float]) -> float:
     """Best-effort mark-to-market exposure for non-USD *non-stable* assets.
@@ -414,6 +418,26 @@ def _route_truth_summary(kind: str) -> dict:
     return {"seen": True, **snap, "derived_reason": _classify_route_truth_reason(snap)}
 
 
+def _startup_dependency_guard() -> dict[str, Any]:
+    required = {
+        'PENDING_EXIT_TTL_SEC': PENDING_EXIT_TTL_SEC,
+        '_adopted_lifecycle_policy': _adopted_lifecycle_policy,
+        '_plan_origin': _plan_origin,
+        '_plan_policy_source': _plan_policy_source,
+        '_effective_plan_max_hold_sec': _effective_plan_max_hold_sec,
+        '_normalize_plan_lifecycle_policy': _normalize_plan_lifecycle_policy,
+    }
+    missing: list[str] = []
+    for name, value in required.items():
+        if value is None:
+            missing.append(name)
+    return {
+        'ok': len(missing) == 0,
+        'missing': missing,
+        'pending_exit_ttl_sec': int(PENDING_EXIT_TTL_SEC),
+    }
+
+
 def _startup_self_check(*, rerun: bool = False, apply: bool | None = None) -> dict:
     global STARTUP_SELF_CHECK_RESULT, STARTUP_SELF_CHECK_TS
     if apply is None:
@@ -438,6 +462,24 @@ def _startup_self_check(*, rerun: bool = False, apply: bool | None = None) -> di
         return dict(STARTUP_SELF_CHECK_RESULT)
 
     lifecycle_repairs = {'expired_workflow_locks_released': 0, 'legacy_trade_lifecycle_events_backfilled': 0, 'expired_signal_fingerprints_purged': 0}
+    dependency_guard = _startup_dependency_guard()
+    if not bool(dependency_guard.get('ok')):
+        STARTUP_SELF_CHECK_TS = time.time()
+        STARTUP_SELF_CHECK_RESULT = {
+            'ok': False,
+            'utc': utc_now_iso(),
+            'enabled': True,
+            'apply_changes': bool(apply),
+            'critical': True,
+            'critical_reasons': ['startup_dependency_guard_failed'],
+            'lockout_applied': False,
+            'lockout_reason': '',
+            'lockout_remaining_sec': int(state.ops_lockout_remaining_sec() if hasattr(state, 'ops_lockout_remaining_sec') else 0),
+            'dependency_guard': dependency_guard,
+            'recovery_reconcile': None,
+            'lifecycle_repairs': lifecycle_repairs,
+        }
+        return dict(STARTUP_SELF_CHECK_RESULT)
     try:
         lifecycle_repairs = lifecycle_db.repair_lifecycle_integrity(
             stale_age_sec=int(getattr(settings, 'workflow_lock_ttl_sec', 300) or 300),
@@ -481,6 +523,7 @@ def _startup_self_check(*, rerun: bool = False, apply: bool | None = None) -> di
             'lockout_applied': lockout_applied,
             'lockout_reason': lockout_reason,
             'lockout_remaining_sec': int(state.ops_lockout_remaining_sec() if hasattr(state, 'ops_lockout_remaining_sec') else 0),
+            'dependency_guard': dependency_guard,
             'recovery_reconcile': recovery,
             'lifecycle_repairs': lifecycle_repairs,
         }
@@ -503,6 +546,7 @@ def _startup_self_check(*, rerun: bool = False, apply: bool | None = None) -> di
             'lockout_reason': lockout_reason,
             'lockout_remaining_sec': int(state.ops_lockout_remaining_sec() if hasattr(state, 'ops_lockout_remaining_sec') else 0),
             'error': str(e),
+            'dependency_guard': dependency_guard,
             'recovery_reconcile': None,
             'lifecycle_repairs': lifecycle_repairs,
         }
