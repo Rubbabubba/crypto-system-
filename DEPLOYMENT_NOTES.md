@@ -39,3 +39,11 @@ Notes:
 - Main: added merged broker-holdings truth, broker-aware open-position detection, and /diagnostics/holdings_truth.
 - Main: exit/position/adoption paths now use merged broker holdings so live broker inventory is visible even if one balance parsing path misses it.
 - Scanner: no strategy or emission logic changes; build/version synced to Patch 016 for clean baseline management.
+
+
+## Patch 017
+- Main: canonicalized aliased balances before account-level math so USD/ZUSD and BTC/XXBT are not double-counted.
+- Main: /diagnostics/account_truth now exposes raw merged balances, canonical balances, cash components, position components, and equity inputs.
+- Main: /diagnostics/holdings_truth now includes canonical balances.
+- Main: /worker/exit_diagnostics now includes age_sec, plan max_hold_sec, and eligible_time_exit for adopted-plan lifecycle truth.
+- Scanner: no strategy logic changes; build/version synced to Patch 017 for clean baseline management.
