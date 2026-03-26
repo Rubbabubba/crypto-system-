@@ -45,6 +45,8 @@ settings = load_settings()
 # Patch 022 hotfix: define pending-exit TTL in the active exit path so
 # live worker/exit cycles cannot crash on a missing module global.
 PENDING_EXIT_TTL_SEC = int(getattr(settings, 'pending_exit_ttl_sec', 900) or 900)
+DUST_NOTIONAL_CLOSE_THRESHOLD_USD = float(getattr(settings, 'dust_notional_close_threshold_usd', 5.0) or 5.0)
+DUST_MIN_VOLUME_BUFFER_PCT = float(getattr(settings, 'dust_min_volume_buffer_pct', 0.05) or 0.05)
 
 
 def _portfolio_exposure_usd_from_balances(balances: dict[str, float]) -> float:
@@ -4645,6 +4647,133 @@ def webhook(payload: WebhookPayload, request: Request):
     }
 
 
+def _symbol_min_volume(symbol: str) -> float:
+    try:
+        pair = broker_kraken.to_kraken(symbol)
+        meta = broker_kraken._pair_meta(pair) or {}
+        return float(meta.get('ordermin') or 0.0)
+    except Exception:
+        return 0.0
+
+
+def _dust_snapshot(symbol: str, *, qty: float, px: float) -> dict[str, Any]:
+    min_volume = float(_symbol_min_volume(symbol) or 0.0)
+    notional = float(qty or 0.0) * float(px or 0.0) if float(qty or 0.0) > 0 and float(px or 0.0) > 0 else 0.0
+    buffer_mult = 1.0 + max(0.0, float(DUST_MIN_VOLUME_BUFFER_PCT or 0.0))
+    below_min_volume = bool(min_volume > 0.0 and float(qty or 0.0) > 0.0 and float(qty or 0.0) < (min_volume * buffer_mult))
+    below_close_notional = bool(notional > 0.0 and notional < float(DUST_NOTIONAL_CLOSE_THRESHOLD_USD or 0.0))
+    terminal = bool(float(qty or 0.0) <= 0.0 or below_min_volume or below_close_notional)
+    return {
+        'qty': float(qty or 0.0),
+        'price': float(px or 0.0),
+        'notional_usd': float(notional),
+        'exchange_min_qty': float(min_volume),
+        'below_min_volume': bool(below_min_volume),
+        'below_close_notional': bool(below_close_notional),
+        'terminal_dust': bool(terminal),
+        'dust_notional_close_threshold_usd': float(DUST_NOTIONAL_CLOSE_THRESHOLD_USD or 0.0),
+    }
+
+
+def _reconciled_close_trade(symbol: str, *, plan: TradePlan | None, reason: str, px: float, now_ts: float, post_reconcile: dict | None = None, broker_result: dict | None = None, classified: dict | None = None) -> dict[str, Any] | None:
+    post = dict(post_reconcile or {})
+    open_trade = trade_journal.get_open_trade(symbol)
+    if not open_trade and not plan:
+        return None
+
+    remaining_qty = float(post.get('economic_qty', 0.0) or 0.0)
+    dust = _dust_snapshot(symbol, qty=remaining_qty, px=float(px or post.get('price') or 0.0))
+    qualifies = bool(post.get('qualifies_as_position'))
+    if not (remaining_qty <= 0.0 or (not qualifies and dust.get('terminal_dust'))):
+        return None
+
+    entry_qty_total = 0.0
+    entry_px = 0.0
+    requested_notional = 0.0
+    if open_trade:
+        entry_qty_total = float(open_trade.get('entry_qty') or 0.0)
+        entry_px = float(open_trade.get('entry_price') or 0.0)
+        requested_notional = float(open_trade.get('requested_notional_usd') or 0.0)
+    if entry_qty_total <= 0.0 and plan is not None:
+        entry_qty_total = float(getattr(plan, 'notional_usd', 0.0) or 0.0) / float(getattr(plan, 'entry_price', 0.0) or 1.0) if float(getattr(plan, 'entry_price', 0.0) or 0.0) > 0 else 0.0
+        entry_px = float(getattr(plan, 'entry_price', 0.0) or 0.0)
+        requested_notional = float(getattr(plan, 'notional_usd', 0.0) or 0.0)
+
+    if entry_qty_total <= 0.0:
+        return None
+
+    sold_qty = max(0.0, float(entry_qty_total) - max(0.0, float(remaining_qty)))
+    force_terminal = bool(dust.get('terminal_dust'))
+    if sold_qty <= 0.0 and not force_terminal:
+        return None
+
+    exit_qty = float(entry_qty_total if force_terminal else sold_qty)
+    exit_price = float(px or entry_px or 0.0)
+    approx_exit_cost = float(exit_qty * exit_price) if exit_qty > 0 and exit_price > 0 else float(requested_notional or 0.0)
+    exit_fee = 0.0
+    if isinstance(classified, dict):
+        exit_fee = float(classified.get('fees_usd') or 0.0)
+    close_meta = {
+        'reconciled_close': True,
+        'terminal_dust': bool(force_terminal),
+        'remaining_qty': float(remaining_qty),
+        'remaining_notional_usd': float(dust.get('notional_usd') or 0.0),
+        'dust': dust,
+        'broker_result': broker_result or {},
+        'classified': classified or {},
+        'close_mode': 'reconciled_fill' if sold_qty > 0 else 'terminal_dust',
+    }
+    out = None
+    if open_trade:
+        try:
+            out = trade_journal.close_trade(symbol, {
+                'closed_ts': float(now_ts),
+                'exit_txid': ((classified or {}).get('broker_txid') if isinstance(classified, dict) else None),
+                'exit_execution': ((classified or {}).get('execution') if isinstance(classified, dict) else None) or 'reconciled_broker_state',
+                'exit_price': float(exit_price),
+                'exit_qty': float(exit_qty),
+                'exit_cost': float(approx_exit_cost),
+                'exit_fee': float(exit_fee),
+                'exit_reason': 'reconciled_fill' if sold_qty > 0 else 'terminal_dust',
+                'meta': close_meta,
+            })
+        except Exception:
+            out = None
+        if force_terminal:
+            try:
+                trade_journal.delete_open_trade(symbol)
+            except Exception:
+                pass
+        try:
+            telemetry_db.sync_from_trade_journal(limit=500)
+        except Exception:
+            pass
+        try:
+            _journal_sync_daily_realized_pnl()
+        except Exception:
+            pass
+
+    try:
+        state.clear_pending_exit(symbol)
+    except Exception:
+        pass
+    try:
+        state.remove_plan(symbol)
+    except Exception:
+        pass
+
+    return {
+        'symbol': symbol,
+        'closed': True,
+        'close_reason': 'reconciled_fill' if sold_qty > 0 else 'terminal_dust',
+        'force_terminal': bool(force_terminal),
+        'sold_qty_estimate': float(sold_qty),
+        'remaining_qty': float(remaining_qty),
+        'dust': dust,
+        'journal_close': out,
+    }
+
+
 def _exit_broker_reconcile_snapshot(symbol: str) -> dict[str, Any]:
     snap = _merged_balances_snapshot() or {}
     economic = dict(snap.get('economic_balances') or snap.get('canonical_merged') or {})
@@ -4926,7 +5055,15 @@ def worker_exit(payload: WorkerExitPayload):
             base = _base_asset(symbol)
             qty = float(bal.get(base, 0.0) or 0.0)
             if qty <= 0:
-                # No holding: clear stale state.
+                # No holding: reconcile and clear stale state.
+                reconciled_close = _reconciled_close_trade(symbol, plan=state.plans.get(symbol), reason='broker_flat', px=float(px), now_ts=now.timestamp(), post_reconcile=_exit_broker_reconcile_snapshot(symbol), broker_result={}, classified={'state': 'reconciled_flat'})
+                if diagnostics and reconciled_close:
+                    evaluations.append({
+                        'symbol': symbol,
+                        'decision': None,
+                        'skip_reason': 'broker_flat_reconciled_close',
+                        'reconciled_close': reconciled_close,
+                    })
                 state.remove_plan(symbol)
                 state.clear_pending_exit(symbol)
                 continue
@@ -5230,6 +5367,17 @@ def worker_exit(payload: WorkerExitPayload):
                 else:
                     # Do not latch exit cooldowns or pending state if the order failed.
                     state.clear_pending_exit(symbol)
+                    post_reconcile = _exit_broker_reconcile_snapshot(symbol)
+                    reconciled_close = _reconciled_close_trade(
+                        symbol,
+                        plan=plan,
+                        reason=reason,
+                        px=float(px),
+                        now_ts=now.timestamp(),
+                        post_reconcile=post_reconcile,
+                        broker_result=_compact_exit_result(res),
+                        classified=dict(classified_exit or {}),
+                    )
                     _record_exit_execution_truth({
                         **exit_attempt_base,
                         'phase': 'order_failed',
@@ -5239,9 +5387,21 @@ def worker_exit(payload: WorkerExitPayload):
                         'requested_qty': float(qty),
                         'broker_result': _compact_exit_result(res),
                         'classified': dict(classified_exit or {}),
-                        'post_reconcile': _exit_broker_reconcile_snapshot(symbol),
+                        'post_reconcile': post_reconcile,
+                        'reconciled_close': reconciled_close,
                         'pending_exit_after_failure_clear': bool(state.has_pending_exit(symbol, PENDING_EXIT_TTL_SEC)),
                     })
+                    if reconciled_close:
+                        lifecycle_db.record_trade_lifecycle_event(stage='exit', event_type='reconciled_close', trade_plan_id=getattr(plan, 'trade_plan_id', '') or None, intent_id=exit_intent_id, broker_order_id=exit_intent_id, position_id=getattr(plan, 'position_id', '') or None, symbol=symbol, strategy_id=getattr(plan, 'strategy', '') or None, reason=str(reconciled_close.get('close_reason') or 'reconciled_close'), payload=reconciled_close)
+                        exits.append({
+                            'symbol': symbol,
+                            'reason': str(reconciled_close.get('close_reason') or reason),
+                            'price': float(px),
+                            'age_sec': round(age_sec, 3),
+                            'dry_run': bool(dry_run),
+                            'result': {'ok': True, 'reconciled_close': reconciled_close},
+                        })
+                        continue
                 # Stopout cooldown latch: only on successful orders (anti-churn)
                 try:
                     if bool(res.get("ok")):
@@ -5462,10 +5622,14 @@ def worker_exit_diagnostics(payload: WorkerExitDiagnosticsPayload):
 
         exit_floor = float(getattr(settings, "exit_min_notional_usd", 0.0) or 0.0)
         target_notional = max(exit_floor, float(getattr(plan, "notional_usd", 0.0) or 0.0))
+        dust = _dust_snapshot(sym, qty=float(qty), px=float(px))
 
         ok_to_place = should_exit
         if should_exit:
-            if notional <= 0:
+            if bool(dust.get('terminal_dust')) and not bool(notional >= target_notional * 0.98):
+                ok_to_place = False
+                reason = 'terminal_dust_reconciled_close'
+            elif notional <= 0:
                 ok_to_place = False
             elif notional < target_notional * 0.98:
                 ok_to_place = False
@@ -5496,6 +5660,7 @@ def worker_exit_diagnostics(payload: WorkerExitDiagnosticsPayload):
             "ok_to_place": ok_to_place,
             "reason": reason,
             "target_exit_notional_usd": target_notional,
+            "dust": dust,
         })
 
     return {

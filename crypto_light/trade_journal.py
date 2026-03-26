@@ -104,6 +104,17 @@ def list_open_trades(limit: int = 200) -> List[Dict[str, Any]]:
     return [dict(r) for r in rows]
 
 
+def delete_open_trade(symbol: str) -> Dict[str, Any]:
+    init_db()
+    sym = str(symbol or '').strip().upper()
+    if not sym:
+        raise ValueError('symbol is required')
+    with _connect() as conn:
+        conn.execute("DELETE FROM open_trades WHERE symbol=?", (sym,))
+        conn.commit()
+    return {"ok": True, "db_path": _db_path(), "symbol": sym}
+
+
 def upsert_open_trade(trade: Dict[str, Any]) -> Dict[str, Any]:
     init_db()
     now = time.time()
