@@ -1,5 +1,5 @@
-# Patch 022 Deployment Notes
+Patch 023
 
-- Hotfixes the active `/worker/exit` crash by defining `PENDING_EXIT_TTL_SEC` in the live Patch 021 code path.
-- Adds startup dependency guard coverage for required exit lifecycle helpers/constants.
-- Preserves Patch 021 exit execution truth instrumentation and Patch 018 balance truth behavior.
+- Adds reconciliation-driven trade closure when broker state is flat or only residual dust remains.
+- Adds terminal dust handling to stop repeated unsellable exit attempts.
+- Preserves Patch 018 economic balance truth, Patch 020 adopted lifecycle control, and Patch 021/022 exit execution diagnostics.
