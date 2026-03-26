@@ -1,31 +1,26 @@
-# Patch 018 — Economic Balance Truth / De-dup Fix
+# Patch 019 — Adopted Position Lifecycle Control
 
-This drop-in patch builds surgically on Patch 017.
+This drop-in patch builds surgically on Patch 018.
 
 ## Main service changes
-- separates visibility balances from economic balances
-- stops summing duplicate broker inventory across parsed balances and positions API
-- uses one selected economic quantity per canonical asset for:
-  - /performance
-  - /diagnostics/account_truth
-  - holdings qualification
-  - exit sizing and open-position truth
-- adds source agreement details to:
-  - /diagnostics/account_truth
-  - /diagnostics/holdings_truth
+- gives adopted positions an explicit lifecycle policy with time-exit control
+- adds adopted-plan policy normalization so legacy adopted plans with `max_hold_sec = 0` are upgraded in place
+- applies adopted lifecycle policy consistently in:
+  - `/worker/exit`
+  - `/worker/exit_diagnostics`
+  - `/diagnostics/holdings_truth`
+- surfaces adopted plan origin, policy source, and time-exit eligibility in diagnostics
 
-## Selection rule
-- canonicalize aliases like BTC/XXBT and USD/ZUSD within each source
-- choose a single economic quantity per asset using max(parsed, positions_api) when both exist
-- keep both sources visible for diagnostics without double-counting them
+## Default adopted policy
+- `ADOPTED_TIME_EXIT_ENABLED=1`
+- `ADOPTED_MAX_HOLD_SEC` defaults to `MAX_HOLD_SEC` when set, otherwise `7200`
 
 ## Expected post-deploy checks
-- /diagnostics/account_truth
-- /performance
-- /diagnostics/holdings_truth
-- /worker/exit_diagnostics
+- `/worker/exit_diagnostics`
+- `/diagnostics/holdings_truth`
+- `/performance`
 
 ## Expected truth
-- USD no longer doubled
-- BTC qty matches live broker holding once
-- position notional aligns with adopted plan / live holdings
+- adopted positions no longer sit indefinitely with `max_hold_sec = 0`
+- diagnostics show adopted origin and lifecycle policy clearly
+- time-exit eligibility is visible and actionable
