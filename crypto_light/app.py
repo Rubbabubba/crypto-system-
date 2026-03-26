@@ -105,9 +105,15 @@ def _canonical_asset(asset: str) -> str:
     return alias_map.get(a, a)
 
 
-def _canonicalize_balances(balances: dict[str, float]) -> dict[str, float]:
-    """Aggregate balances by canonical asset to prevent alias double counting."""
+def _canonicalize_balances(balances: dict[str, float], *, aggregate: str = "sum") -> dict[str, float]:
+    """Normalize balances into canonical asset codes.
+
+    aggregate="sum" keeps additive behavior for truly distinct rows within a
+    single source. aggregate="max" is used for economic truth when the same
+    broker inventory appears under multiple aliases like BTC/XXBT or USD/ZUSD.
+    """
     out: dict[str, float] = {}
+    mode = str(aggregate or "sum").strip().lower()
     for asset, qty_raw in (balances or {}).items():
         asset_c = _canonical_asset(asset)
         try:
@@ -116,8 +122,61 @@ def _canonicalize_balances(balances: dict[str, float]) -> dict[str, float]:
             qty = 0.0
         if not asset_c or qty <= 0:
             continue
-        out[asset_c] = float(out.get(asset_c, 0.0) or 0.0) + qty
+        if mode == "max":
+            out[asset_c] = max(float(out.get(asset_c, 0.0) or 0.0), qty)
+        else:
+            out[asset_c] = float(out.get(asset_c, 0.0) or 0.0) + qty
     return out
+
+
+def _economic_balance_truth(parsed: dict[str, float] | None, positions_api: dict[str, float] | None) -> dict[str, Any]:
+    """Choose one economic balance per canonical asset instead of summing views.
+
+    Kraken can surface the same inventory through multiple balance views. Those
+    views improve visibility, but they must not be added together for account
+    truth, exposure, or exit sizing.
+    """
+    parsed_canonical = _canonicalize_balances(parsed or {}, aggregate="max")
+    positions_canonical = _canonicalize_balances(positions_api or {}, aggregate="max")
+    assets = sorted(set(parsed_canonical.keys()) | set(positions_canonical.keys()))
+    balances: dict[str, float] = {}
+    selected_sources: dict[str, list[str]] = {}
+    agreement: dict[str, dict[str, Any]] = {}
+    for asset in assets:
+        parsed_qty = float(parsed_canonical.get(asset, 0.0) or 0.0)
+        positions_qty = float(positions_canonical.get(asset, 0.0) or 0.0)
+        if parsed_qty > 0 and positions_qty > 0:
+            selected_qty = max(parsed_qty, positions_qty)
+            source_used = "positions_api" if positions_qty >= parsed_qty else "parsed"
+            selection_rule = "max_of_sources"
+        elif positions_qty > 0:
+            selected_qty = positions_qty
+            source_used = "positions_api"
+            selection_rule = "positions_api_only"
+        elif parsed_qty > 0:
+            selected_qty = parsed_qty
+            source_used = "parsed"
+            selection_rule = "parsed_only"
+        else:
+            continue
+        balances[asset] = float(selected_qty)
+        selected_sources[asset] = [source_used]
+        agreement[asset] = {
+            "parsed_qty": float(parsed_qty),
+            "positions_api_qty": float(positions_qty),
+            "selected_qty": float(selected_qty),
+            "selected_source": source_used,
+            "selection_rule": selection_rule,
+            "source_delta": float(abs(parsed_qty - positions_qty)),
+            "sources_match": bool(abs(parsed_qty - positions_qty) <= 1e-12),
+        }
+    return {
+        "balances": balances,
+        "selected_sources": selected_sources,
+        "agreement": agreement,
+        "parsed_canonical": parsed_canonical,
+        "positions_api_canonical": positions_canonical,
+    }
 
 
 def _canonicalize_balance_sources(sources: dict[str, list[str]] | None) -> dict[str, list[str]]:
@@ -848,14 +907,20 @@ def _merged_balances_snapshot() -> dict[str, Any]:
             merged[asset_u] = max(float(merged.get(asset_u, 0.0) or 0.0), qty)
             sources.setdefault(asset_u, []).append(source_name)
 
-    canonical_merged = _canonicalize_balances(merged)
+    visibility_canonical = _canonicalize_balances(merged, aggregate="max")
     canonical_sources = _canonicalize_balance_sources(sources)
+    economic = _economic_balance_truth(parsed, positions_api)
 
     return {
         "parsed": parsed,
         "positions_api": positions_api,
         "merged": merged,
-        "canonical_merged": canonical_merged,
+        "canonical_merged": visibility_canonical,
+        "economic_balances": dict(economic.get("balances") or {}),
+        "economic_balance_sources": dict(economic.get("selected_sources") or {}),
+        "economic_balance_agreement": dict(economic.get("agreement") or {}),
+        "parsed_canonical": dict(economic.get("parsed_canonical") or {}),
+        "positions_api_canonical": dict(economic.get("positions_api_canonical") or {}),
         "sources": sources,
         "canonical_sources": canonical_sources,
         "raw": raw,
@@ -868,7 +933,7 @@ def _merged_balances_snapshot() -> dict[str, Any]:
 
 def _merged_balances_by_asset(canonical: bool = True) -> dict[str, float]:
     snap = _merged_balances_snapshot() or {}
-    key = "canonical_merged" if canonical else "merged"
+    key = "economic_balances" if canonical else "merged"
     return dict(snap.get(key) or {})
 
 
@@ -880,8 +945,8 @@ def get_positions() -> list[dict]:
     """
     try:
         snap = _merged_balances_snapshot() or {}
-        balances = dict(snap.get("canonical_merged") or snap.get("merged") or {})
-        balance_sources = dict(snap.get("canonical_sources") or snap.get("sources") or {})
+        balances = dict(snap.get("economic_balances") or snap.get("canonical_merged") or snap.get("merged") or {})
+        balance_sources = dict(snap.get("economic_balance_sources") or snap.get("canonical_sources") or snap.get("sources") or {})
     except Exception as e:
         log.exception("merged balances failed: %s", e)
         return []
@@ -2508,8 +2573,8 @@ def _account_truth_snapshot() -> dict:
     try:
         snap = _merged_balances_snapshot() or {}
         raw_balances = dict(snap.get('merged') or {})
-        canonical_balances = dict(snap.get('canonical_merged') or {})
-        balance_sources = dict(snap.get('canonical_sources') or snap.get('sources') or {})
+        canonical_balances = dict(snap.get('economic_balances') or snap.get('canonical_merged') or {})
+        balance_sources = dict(snap.get('economic_balance_sources') or snap.get('canonical_sources') or snap.get('sources') or {})
         balances = canonical_balances or _merged_balances_by_asset() or {}
         balance_error = _last_balance_error()
         if balance_error:
@@ -2562,6 +2627,7 @@ def _account_truth_snapshot() -> dict:
         'raw_merged_balances': raw_balances,
         'canonical_balances': canonical_balances,
         'canonical_balance_sources': balance_sources,
+        'balance_agreement': dict(snap.get('economic_balance_agreement') or {}) if 'snap' in locals() else {},
         'cash_components_usd': cash_balances,
         'position_components': position_contributions,
         'equity_components': {
@@ -2921,7 +2987,7 @@ def diagnostics_account_truth():
 def diagnostics_holdings_truth(include_raw: int = 1):
     snap = _merged_balances_snapshot() or {}
     merged = dict(snap.get('merged') or {})
-    canonical_merged = dict(snap.get('canonical_merged') or {})
+    canonical_merged = dict(snap.get('economic_balances') or snap.get('canonical_merged') or {})
     parsed = dict(snap.get('parsed') or {})
     positions_api = dict(snap.get('positions_api') or {})
     plan_syms = set((getattr(state, 'plans', {}) or {}).keys())
@@ -2929,8 +2995,9 @@ def diagnostics_holdings_truth(include_raw: int = 1):
     pending = dict(getattr(state, 'pending_exits', {}) or {})
 
     rows = []
-    parsed_canonical = _canonicalize_balances(parsed)
-    positions_api_canonical = _canonicalize_balances(positions_api)
+    parsed_canonical = dict(snap.get('parsed_canonical') or _canonicalize_balances(parsed, aggregate="max"))
+    positions_api_canonical = dict(snap.get('positions_api_canonical') or _canonicalize_balances(positions_api, aggregate="max"))
+    agreement = dict(snap.get('economic_balance_agreement') or {})
     for asset in sorted(canonical_merged.keys()):
         if str(asset).upper() == 'USD':
             continue
@@ -2959,7 +3026,8 @@ def diagnostics_holdings_truth(include_raw: int = 1):
             'qty_merged': qty,
             'qty_parsed': float(parsed_canonical.get(asset, 0.0) or 0.0),
             'qty_positions_api': float(positions_api_canonical.get(asset, 0.0) or 0.0),
-            'sources': list((snap.get('canonical_sources') or {}).get(asset, [])),
+            'sources': list((snap.get('economic_balance_sources') or snap.get('canonical_sources') or {}).get(asset, [])),
+            'source_agreement': dict(agreement.get(asset) or {}),
             'price': px,
             'notional_usd': notional,
             'qualifies_as_position': qualifies,
@@ -2983,6 +3051,9 @@ def diagnostics_holdings_truth(include_raw: int = 1):
         'canonical_balances': canonical_merged,
         'parsed_balances': parsed,
         'positions_api_balances': positions_api,
+        'parsed_canonical_balances': parsed_canonical,
+        'positions_api_canonical_balances': positions_api_canonical,
+        'balance_agreement': agreement,
         'holdings': rows,
         'raw_balances': snap.get('raw') if int(include_raw or 0) == 1 else None,
     }
