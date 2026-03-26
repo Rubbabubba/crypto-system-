@@ -2962,7 +2962,8 @@ def _reconcile_runtime_state() -> dict:
         if qty <= 0 or px <= 0 or notional <= 0:
             continue
         stop_px, take_px = compute_brackets(px, settings.stop_pct, settings.take_pct)
-        state.set_plan(TradePlan(symbol=sym, side='buy', notional_usd=notional, entry_price=px, stop_price=stop_px, take_price=take_px, strategy='adopted', opened_ts=now_ts, max_hold_sec=_strategy_max_hold_sec('adopted')))
+        adopted_policy = _adopted_lifecycle_policy()
+        state.set_plan(TradePlan(symbol=sym, side='buy', notional_usd=notional, entry_price=px, stop_price=stop_px, take_price=take_px, strategy='adopted', opened_ts=now_ts, max_hold_sec=int(adopted_policy.get('max_hold_sec', 0) or 0), risk_snapshot={'lifecycle_policy': adopted_policy}))
         adopted += 1
     return {
         'ok': True,
@@ -3009,9 +3010,13 @@ def diagnostics_holdings_truth(include_raw: int = 1):
             px = 0.0
         notional = float(qty * px) if qty > 0 and px > 0 else 0.0
         qualifies = bool(notional >= float(getattr(settings, 'min_position_notional_usd', 0.0) or 0.0)) if px > 0 else False
+        plan_obj = state.plans.get(symbol)
+        if plan_obj is not None:
+            plan_obj, _ = _normalize_plan_lifecycle_policy(plan_obj, now_ts=time.time(), persist=False)
         has_plan = symbol in plan_syms
         pending_exit = symbol in pending
         in_state_open = symbol in state_open
+        plan_policy = dict((getattr(plan_obj, 'risk_snapshot', {}) or {}).get('lifecycle_policy') or {}) if plan_obj is not None else {}
         if px <= 0:
             classification = 'unpriced_broker_inventory'
         elif not qualifies:
@@ -3034,6 +3039,10 @@ def diagnostics_holdings_truth(include_raw: int = 1):
             'has_plan': has_plan,
             'state_open': in_state_open,
             'pending_exit': pending_exit,
+            'plan_origin': _plan_origin(plan_obj) if plan_obj is not None else None,
+            'plan_policy_source': str(plan_policy.get('policy_source') or _plan_policy_source(plan_obj) if plan_obj is not None else ''),
+            'time_exit_enabled': bool(plan_policy.get('time_exit_enabled', _effective_plan_max_hold_sec(plan_obj) > 0 if plan_obj is not None else False)),
+            'max_hold_sec': int(plan_policy.get('max_hold_sec', _effective_plan_max_hold_sec(plan_obj) if plan_obj is not None else 0) or 0),
             'classification': classification,
         })
 
@@ -4577,6 +4586,7 @@ def worker_exit(payload: WorkerExitPayload):
             if entry_px <= 0:
                 return None
             stop_px, take_px = compute_brackets(entry_px, settings.stop_pct, settings.take_pct)
+            adopted_policy = _adopted_lifecycle_policy()
             plan_new = TradePlan(
                 symbol=symbol,
                 side="buy",
@@ -4586,7 +4596,8 @@ def worker_exit(payload: WorkerExitPayload):
                 take_price=float(take_px),
                 strategy="adopted",
                 opened_ts=now.timestamp(),
-                max_hold_sec=int(max_hold_default),
+                max_hold_sec=int(adopted_policy.get('max_hold_sec', 0) or 0),
+                risk_snapshot={'lifecycle_policy': adopted_policy},
                 breakeven_armed=False,
                 breakeven_triggered_ts=0.0,
             )
@@ -4702,13 +4713,17 @@ def worker_exit(payload: WorkerExitPayload):
             plan = _ensure_plan(symbol, qty=qty, px=px)
             if not plan:
                 continue
+            plan, _ = _normalize_plan_lifecycle_policy(plan, now_ts=now.timestamp(), persist=True)
+            if not plan:
+                continue
 
             # Phase 3: derived metrics
             entry_px = float(getattr(plan, "entry_price", 0.0) or 0.0) or float(px)
             opened_ts = float(getattr(plan, "opened_ts", 0.0) or 0.0)
             age_sec = (now.timestamp() - opened_ts) if opened_ts > 0 else 0.0
             plan_max = int(getattr(plan, "max_hold_sec", 0) or 0)
-            max_hold = int(plan_max if plan_max > 0 else max_hold_default)
+            max_hold = int(_effective_plan_max_hold_sec(plan) or max_hold_default)
+            lifecycle_policy = dict((getattr(plan, 'risk_snapshot', {}) or {}).get('lifecycle_policy') or {})
 
             # Phase 4: lifecycle updates (state mutation only)
             be_before = bool(getattr(plan, "breakeven_armed", False))
@@ -4732,7 +4747,10 @@ def worker_exit(payload: WorkerExitPayload):
                     "stop_price": float(plan.stop_price),
                     "take_price": float(plan.take_price),
                     "age_sec": round(age_sec, 3),
-                    "max_hold_sec": int(getattr(settings, "max_hold_sec", 0) or 0),
+                    "max_hold_sec": int(max_hold),
+                    "plan_origin": _plan_origin(plan),
+                    "plan_policy_source": str(lifecycle_policy.get('policy_source') or _plan_policy_source(plan)),
+                    "time_exit_enabled": bool(lifecycle_policy.get('time_exit_enabled', max_hold > 0)),
                     "breakeven_before": bool(be_before),
                     "breakeven_after": bool(be_after),
                     "breakeven_set": bool((not be_before) and be_after),
@@ -5089,6 +5107,7 @@ def worker_exit_diagnostics(payload: WorkerExitDiagnosticsPayload):
         sym = normalize_symbol(symbol)
         if selected is not None and sym not in selected:
             continue
+        plan, _ = _normalize_plan_lifecycle_policy(plan, now_ts=time.time(), persist=False)
 
         base = _base_asset(sym)
         qty = float(balances.get(base, 0.0) or 0.0)
@@ -5097,6 +5116,13 @@ def worker_exit_diagnostics(payload: WorkerExitDiagnosticsPayload):
 
         stop_px = float(getattr(plan, "stop_price", 0.0) or 0.0)
         take_px = float(getattr(plan, "take_price", 0.0) or 0.0)
+
+        opened_ts = float(getattr(plan, "opened_ts", 0.0) or 0.0)
+        age_sec = (time.time() - opened_ts) if opened_ts > 0 else 0.0
+        plan_max_hold = int(_effective_plan_max_hold_sec(plan) or 0)
+        grace_sec = int(getattr(settings, "time_exit_grace_sec", 0) or 0)
+        eligible_time_exit = bool(plan_max_hold > 0 and age_sec >= float(plan_max_hold + grace_sec))
+        lifecycle_policy = dict((getattr(plan, 'risk_snapshot', {}) or {}).get('lifecycle_policy') or {})
 
         should_exit = False
         reason = None
@@ -5108,6 +5134,9 @@ def worker_exit_diagnostics(payload: WorkerExitDiagnosticsPayload):
         elif take_px and px >= take_px:
             should_exit = True
             reason = "take_hit"
+        elif eligible_time_exit:
+            should_exit = True
+            reason = "time_exit"
         else:
             reason = "no_exit_signal"
 
@@ -5119,15 +5148,8 @@ def worker_exit_diagnostics(payload: WorkerExitDiagnosticsPayload):
             if notional <= 0:
                 ok_to_place = False
             elif notional < target_notional * 0.98:
-                # likely not enough qty to satisfy a market-notional sell request
                 ok_to_place = False
                 reason = (reason or "exit") + "_insufficient_qty_for_target_notional"
-
-        opened_ts = float(getattr(plan, "opened_ts", 0.0) or 0.0)
-        age_sec = (time.time() - opened_ts) if opened_ts > 0 else 0.0
-        plan_max_hold = int(getattr(plan, "max_hold_sec", 0) or 0)
-        grace_sec = int(getattr(settings, "time_exit_grace_sec", 0) or 0)
-        eligible_time_exit = bool(plan_max_hold > 0 and age_sec >= float(plan_max_hold + grace_sec))
 
         diagnostics.append({
             "symbol": sym,
@@ -5141,6 +5163,9 @@ def worker_exit_diagnostics(payload: WorkerExitDiagnosticsPayload):
                 "stop_price": stop_px,
                 "take_price": take_px,
                 "strategy": getattr(plan, "strategy", None),
+                "origin": _plan_origin(plan),
+                "policy_source": str(lifecycle_policy.get('policy_source') or _plan_policy_source(plan)),
+                "time_exit_enabled": bool(lifecycle_policy.get('time_exit_enabled', plan_max_hold > 0)),
                 "opened_ts": getattr(plan, "opened_ts", None),
                 "max_hold_sec": plan_max_hold,
             },
@@ -5210,6 +5235,7 @@ def worker_adopt_positions(payload: WorkerAdoptPositionsPayload):
             stop_pct=float(settings.stop_pct),
             take_pct=float(settings.take_pct),
         )
+        adopted_policy = _adopted_lifecycle_policy()
         plan = TradePlan(
             symbol=sym,
             side="buy",
@@ -5219,6 +5245,8 @@ def worker_adopt_positions(payload: WorkerAdoptPositionsPayload):
             take_price=float(take_px),
             strategy="adopted",
             opened_ts=time.time(),
+            max_hold_sec=int(adopted_policy.get('max_hold_sec', 0) or 0),
+            risk_snapshot={'lifecycle_policy': adopted_policy},
         )
         state.plans[sym] = plan
         adopted.append({

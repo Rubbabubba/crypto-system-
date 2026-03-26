@@ -86,6 +86,8 @@ class Settings:
     max_hold_sec: int  # 0 disables
     rb1_max_hold_sec: int
     tc1_max_hold_sec: int
+    adopted_time_exit_enabled: bool
+    adopted_max_hold_sec: int
 
     # Brackets
     atr_brackets_enabled: bool
@@ -260,6 +262,8 @@ def load_settings() -> Settings:
         max_hold_sec=int(float(_getenv("MAX_HOLD_SEC", "0") or 0)),
         rb1_max_hold_sec=int(float(_getenv("RB1_MAX_HOLD_SEC", "0") or 0)),
         tc1_max_hold_sec=int(float(_getenv("TC1_MAX_HOLD_SEC", "0") or 0)),
+        adopted_time_exit_enabled=_getbool("ADOPTED_TIME_EXIT_ENABLED", "1"),
+        adopted_max_hold_sec=int(float(_getenv("ADOPTED_MAX_HOLD_SEC", _getenv("MAX_HOLD_SEC", "7200")) or 7200)),
 
         atr_brackets_enabled=_getbool("ATR_BRACKETS_ENABLED", "0"),
         atr_bracket_len=int(float(_getenv("ATR_BRACKET_LEN", "14") or 14)),
