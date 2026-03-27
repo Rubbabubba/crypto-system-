@@ -37,10 +37,31 @@ from .config import load_settings
 from .models import WebhookPayload, WorkerExitPayload, WorkerScanPayload, WorkerExitDiagnosticsPayload, WorkerAdoptPositionsPayload, WorkerRouteTruthPayload
 from .risk import compute_brackets, compute_atr_brackets, compute_effective_stop_pct, compute_rr_ratio, compute_stop_distance_pct
 from .state import InMemoryState, TradePlan
-from .symbol_map import normalize_symbol
+from .symbol_map import normalize_symbol, from_kraken
 
 # Patch 026 hotfix: preserve legacy helper name in active backfill/exit paths.
 _normalize_symbol = normalize_symbol
+
+
+def _canonicalize_trade_symbol(symbol: str) -> str:
+    s = str(symbol or '').strip().upper()
+    if not s:
+        return ''
+    try:
+        norm = normalize_symbol(s)
+        base, quote = norm.split('/', 1)
+        if base in {'XXBTZ', 'XBTZ', 'ZXXBT', 'ZXBT'} or base.startswith(('X', 'Z')) and len(base) > 4:
+            joined = f"{base}{quote}"
+            return from_kraken(joined)
+        return norm
+    except Exception:
+        pass
+    compact = s.replace('/', '').replace('-', '').replace('_', '')
+    try:
+        return from_kraken(compact)
+    except Exception:
+        return s
+
 from .build_info import build_payload
 
 settings = load_settings()
@@ -4741,7 +4762,7 @@ def _find_recent_exit_fill(symbol: str, *, now_ts: float, lookback_sec: float = 
         if side != 'sell':
             continue
         pair_raw = str(item.get('pair') or '')
-        pair_norm = _normalize_symbol(pair_raw) if pair_raw else ''
+        pair_norm = _canonicalize_trade_symbol(pair_raw) if pair_raw else ''
         if pair_norm and pair_norm != symbol:
             continue
         if not pair_norm:
@@ -4798,7 +4819,7 @@ def _backfill_closed_trades_from_broker_history(*, now_ts: float, lookback_sec: 
         if not isinstance(item, dict):
             continue
         pair_raw = str(item.get('pair') or '')
-        pair_norm = _normalize_symbol(pair_raw) if pair_raw else ''
+        pair_norm = _canonicalize_trade_symbol(pair_raw) if pair_raw else ''
         side = str(item.get('type') or '').lower()
         if not pair_norm or side not in {'buy', 'sell'}:
             continue
@@ -7036,15 +7057,39 @@ def _safe_float(value: Any, default: float = 0.0) -> float:
 
 
 def _serialize_recent_trade(row: dict[str, Any]) -> dict[str, Any]:
+    meta = {}
+    try:
+        meta = json.loads(str(row.get("meta_json") or "{}")) if isinstance(row.get("meta_json"), str) else dict(row.get("meta_json") or {})
+    except Exception:
+        meta = {}
+    source_meta = {}
+    try:
+        source_meta = meta.get("source_meta") or {}
+        if not isinstance(source_meta, dict):
+            source_meta = {}
+    except Exception:
+        source_meta = {}
+
+    entry_price = row.get("entry_fill_price")
+    if entry_price is None:
+        entry_price = source_meta.get("entry_price")
+    exit_price = row.get("exit_fill_price")
+    if exit_price is None:
+        exit_price = source_meta.get("exit_price")
+    qty = row.get("exit_qty")
+    if qty is None:
+        qty = row.get("entry_qty")
+    trade_id = row.get("trade_key") or row.get("trade_id")
+
     return {
-        "trade_id": row.get("trade_id"),
-        "symbol": row.get("symbol"),
+        "trade_id": trade_id,
+        "symbol": _canonicalize_trade_symbol(str(row.get("symbol") or "")),
         "strategy": row.get("strategy"),
-        "entry_ts": row.get("entry_ts"),
+        "entry_ts": row.get("opened_ts"),
         "closed_ts": row.get("closed_ts"),
-        "entry_price": row.get("entry_price"),
-        "exit_price": row.get("exit_price"),
-        "qty": row.get("qty"),
+        "entry_price": entry_price,
+        "exit_price": exit_price,
+        "qty": qty,
         "fees_total": row.get("fees_total"),
         "gross_pnl_usd": row.get("gross_pnl_usd"),
         "net_pnl_usd": row.get("net_pnl_usd"),
