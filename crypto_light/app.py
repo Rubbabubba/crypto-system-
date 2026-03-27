@@ -38,6 +38,9 @@ from .models import WebhookPayload, WorkerExitPayload, WorkerScanPayload, Worker
 from .risk import compute_brackets, compute_atr_brackets, compute_effective_stop_pct, compute_rr_ratio, compute_stop_distance_pct
 from .state import InMemoryState, TradePlan
 from .symbol_map import normalize_symbol
+
+# Patch 026 hotfix: preserve legacy helper name in active backfill/exit paths.
+_normalize_symbol = normalize_symbol
 from .build_info import build_payload
 
 settings = load_settings()
@@ -2974,6 +2977,7 @@ def _recovery_reconcile_summary(*, apply: bool = False) -> dict:
     closed_trade_plans = []
     live_runtime_plan_syms = set((getattr(state, 'plans', {}) or {}).keys())
     intent_plan_ids = {str(it.get('trade_plan_id') or '') for it in openish_intents if str(it.get('trade_plan_id') or '')}
+    open_trade_symbols = {str(r.get('symbol') or '') for r in (trade_journal.list_open_trades(limit=5000) or []) if str(r.get('symbol') or '')}
     now_ts = time.time()
     orphan_plan_age_sec = max(int(ORDER_RECONCILE_TIMEOUT_SEC or 10) * 6, 120)
     for tp in openish_trade_plans:
@@ -2985,6 +2989,7 @@ def _recovery_reconcile_summary(*, apply: bool = False) -> dict:
         has_open_intent = trade_plan_id in intent_plan_ids
         has_live_position = bool(sym) and (sym in live_syms)
         has_runtime_plan = bool(sym) and (sym in live_runtime_plan_syms)
+        has_open_trade = bool(sym) and (sym in open_trade_symbols)
         is_orphan_plan = (not has_open_intent) and (not has_live_position) and (not has_runtime_plan)
         if is_orphan_plan:
             orphan_trade_plans.append({
@@ -2993,11 +2998,13 @@ def _recovery_reconcile_summary(*, apply: bool = False) -> dict:
                 'status': status,
                 'updated_ts': updated_ts,
                 'age_sec': age_sec,
+                'has_open_trade': has_open_trade,
             })
-            if apply and age_sec is not None and age_sec >= orphan_plan_age_sec and trade_plan_id:
+            close_now = bool(apply and trade_plan_id and (not has_open_trade) and age_sec is not None and age_sec >= 0.0)
+            if close_now:
                 try:
                     lifecycle_db.close_trade_plan(trade_plan_id, 'failed_reconcile')
-                    lifecycle_db.record_anomaly('orphan_trade_plan', 'warn', symbol=sym or None, trade_plan_id=trade_plan_id, details={'previous_status': status, 'age_sec': age_sec})
+                    lifecycle_db.record_anomaly('orphan_trade_plan', 'warn', symbol=sym or None, trade_plan_id=trade_plan_id, details={'previous_status': status, 'age_sec': age_sec, 'closed_by_patch': 'patch_026'})
                     closed_trade_plans.append(trade_plan_id)
                 except Exception:
                     pass
@@ -3012,6 +3019,34 @@ def _recovery_reconcile_summary(*, apply: bool = False) -> dict:
                 try:
                     state.clear_pending_exit(sym)
                     cleared_pending_exit_symbols.append(sym)
+                except Exception:
+                    pass
+
+    orphan_open_trades = []
+    cleared_open_trade_symbols = []
+    for ot in trade_journal.list_open_trades(limit=5000) or []:
+        sym = str(ot.get('symbol') or '')
+        if not sym:
+            continue
+        has_live_position = sym in live_syms
+        has_runtime_plan = sym in live_runtime_plan_syms
+        has_open_intent = False
+        for it in openish_intents:
+            if str(it.get('symbol') or '') == sym:
+                has_open_intent = True
+                break
+        has_open_trade_plan = False
+        for tp in openish_trade_plans:
+            if str(tp.get('symbol') or '') == sym:
+                has_open_trade_plan = True
+                break
+        if (not has_live_position) and (not has_runtime_plan) and (not has_open_intent) and (not has_open_trade_plan):
+            orphan_open_trades.append({'symbol': sym, 'opened_ts': float(ot.get('opened_ts') or 0.0)})
+            if apply:
+                try:
+                    trade_journal.delete_open_trade(sym)
+                    cleared_open_trade_symbols.append(sym)
+                    lifecycle_db.record_anomaly('orphan_open_trade', 'warn', symbol=sym or None, details={'closed_by_patch': 'patch_026'})
                 except Exception:
                     pass
 
@@ -3053,6 +3088,15 @@ def _recovery_reconcile_summary(*, apply: bool = False) -> dict:
             except Exception:
                 pass
 
+    # Patch 026 hotfix: always define broker_trade_backfill before returning.
+    if apply:
+        try:
+            broker_trade_backfill = _backfill_closed_trades_from_broker_history(now_ts=now_ts)
+        except Exception as e:
+            broker_trade_backfill = {'ok': False, 'error': str(e), 'backfilled': [], 'skipped': [], 'matched_sell_count': 0}
+    else:
+        broker_trade_backfill = {'ok': True, 'skipped_apply_false': True, 'backfilled': [], 'skipped': [], 'matched_sell_count': 0}
+
     return {
         'ok': True,
         'utc': utc_now_iso(),
@@ -3065,12 +3109,15 @@ def _recovery_reconcile_summary(*, apply: bool = False) -> dict:
         'orphan_internal_intent_count': len(orphan_internal_intents),
         'orphan_trade_plans': orphan_trade_plans,
         'orphan_trade_plan_count': len(orphan_trade_plans),
+        'orphan_open_trades': orphan_open_trades,
+        'orphan_open_trade_count': len(orphan_open_trades),
         'stale_pending_exit_symbols': stale_pending_exit_symbols,
         'stale_pending_exit_count': len(stale_pending_exit_symbols),
         'apply_changes': bool(apply),
         'applied': {
             'marked_failed_reconcile_intents': marked_failed,
             'closed_orphan_trade_plans': closed_trade_plans,
+            'cleared_open_trade_symbols': cleared_open_trade_symbols,
             'cleared_pending_exit_symbols': cleared_pending_exit_symbols,
             'resolved_anomaly_ids': resolved_anomaly_ids,
             'resolved_anomaly_count': resolved_anomaly_count,
