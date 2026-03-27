@@ -21,26 +21,6 @@ def _csv(key: str, default: str = "") -> List[str]:
     return parts
 
 
-def _pilot_expand_symbols(symbols: List[str]) -> List[str]:
-    """
-    Controlled Patch 030 pilot expansion:
-    - preserve explicit multi-symbol configs
-    - when the active locked universe is exactly BTC/USD, expand it to
-      BTC/USD, ETH/USD, SOL/USD
-    """
-    cleaned: List[str] = []
-    seen = set()
-    for item in symbols or []:
-        sym = str(item or "").strip().upper()
-        if not sym or sym in seen:
-            continue
-        seen.add(sym)
-        cleaned.append(sym)
-    if cleaned == ["BTC/USD"]:
-        return ["BTC/USD", "ETH/USD", "SOL/USD"]
-    return cleaned
-
-
 @dataclass(frozen=True)
 class Settings:
     # Security
@@ -226,7 +206,7 @@ def load_settings() -> Settings:
         worker_secret=_getenv("WORKER_SECRET", ""),
 
         # Universe
-        allowed_symbols=_pilot_expand_symbols(_csv("ALLOWED_SYMBOLS", "BTC/USD")),
+        allowed_symbols=_csv("ALLOWED_SYMBOLS", "BTC/USD,ETH/USD,SOL/USD"),
 
         # Core
         trading_enabled=_getbool("TRADING_ENABLED", "1"),

@@ -1974,11 +1974,11 @@ def _fee_churn_truth_snapshot(scanner_contract: dict[str, Any], *, max_active_sy
     slippage_bps_each_side = _env_float("EXPECTED_SLIPPAGE_BPS", _env_float("SLIPPAGE_BPS", 0.0))
     spread_bps_each_side = _env_float("PATH_B_SPREAD_BPS_EACH_SIDE", _spread_bps_from_guardrails(scanner_guardrails) / 2.0)
     estimated_round_trip_bps = float(entry_fee_bps + exit_fee_bps + (2.0 * slippage_bps_each_side) + (2.0 * spread_bps_each_side))
-    max_est_round_trip_bps = _env_float("PATH_B_MAX_EST_ROUND_TRIP_BPS", 60.0)
+    max_est_round_trip_bps = _env_float("PATH_B_MAX_EST_ROUND_TRIP_BPS", 80.0)
     fee_over_limit_bps = max(0.0, estimated_round_trip_bps - max_est_round_trip_bps)
     signal_dedupe_ttl_sec = _env_int("SIGNAL_DEDUPE_TTL_SEC", 0)
-    bar_lock_sec = _env_int("SCANNER_BAR_LOCK_SEC", int((scanner_guardrails or {}).get("bar_lock_sec") or 0))
-    inflight_holdoff_sec = _env_int("SCANNER_INFLIGHT_HOLDOFF_SEC", int((scanner_guardrails or {}).get("inflight_holdoff_sec") or 0))
+    bar_lock_sec = max(60, _env_int("SCANNER_BAR_LOCK_SEC", int((scanner_guardrails or {}).get("bar_lock_sec") or 60)))
+    inflight_holdoff_sec = max(60, _env_int("SCANNER_INFLIGHT_HOLDOFF_SEC", int((scanner_guardrails or {}).get("inflight_holdoff_sec") or 60)))
     churn_thresholds = {
         "max_open_positions_lte": 1,
         "max_entries_per_day_lte": 3,
@@ -2142,12 +2142,12 @@ def _scanner_contract_snapshot() -> dict[str, Any]:
 
 
 def _path_b_admission_snapshot(scanner_contract: dict[str, Any]) -> dict[str, Any]:
-    admission_enabled = _env_bool("PATH_B_ADMISSION_ENABLED", False)
+    admission_enabled = _env_bool("PATH_B_ADMISSION_ENABLED", True)
     pilot_gate_enabled = _env_bool("PATH_B_PILOT_GATE_ENABLED", True)
 
     env_allowlist = _env_symbol_list("PATH_B_PILOT_ALLOWLIST")
     legacy_allowlist = _env_symbol_list("PATH_B_ALLOWED_SYMBOLS")
-    allowed_pilot_symbols = env_allowlist or legacy_allowlist
+    allowed_pilot_symbols = env_allowlist or legacy_allowlist or ["BTC/USD", "ETH/USD", "SOL/USD"]
 
     max_active_symbols = max(1, _env_int("PATH_B_PILOT_MAX_ADMITTED_SYMBOLS", _env_int("PATH_B_MAX_ACTIVE_SYMBOLS", 3)))
     scanner_rank_cap = max(1, _env_int("PATH_B_PILOT_SCANNER_RANK_CAP", _env_int("PATH_B_SCANNER_RANK_CAP", max_active_symbols)))
