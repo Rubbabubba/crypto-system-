@@ -9,6 +9,49 @@ from typing import Any, Dict, List, Optional
 from . import trade_journal
 
 
+def _canonical_trade_symbol(symbol: str) -> str:
+    s = str(symbol or '').strip().upper()
+    if not s:
+        return ''
+    compact = s.replace('/', '').replace('-', '').replace('_', '')
+    for q in ('USDT', 'USDC', 'USD', 'EUR'):
+        if compact.endswith(q):
+            base = compact[:-len(q)]
+            alias_map = {'XXBT': 'BTC', 'XBT': 'BTC', 'XXBTZ': 'BTC', 'XBTZ': 'BTC', 'ZXXBT': 'BTC', 'ZXBT': 'BTC'}
+            base = alias_map.get(base, base)
+            if base == 'XBT':
+                base = 'BTC'
+            return f'{base}/{q}'
+    return s
+
+
+def _journal_row_key(row: Dict[str, Any]) -> str:
+    exit_txid = str(row.get('exit_txid') or '').strip()
+    if exit_txid:
+        return f'exit:{exit_txid}'
+    return '|'.join([
+        _canonical_trade_symbol(str(row.get('symbol') or '')),
+        str(row.get('opened_ts') or ''),
+        str(row.get('closed_ts') or ''),
+        str(row.get('entry_txid') or ''),
+        str(row.get('exit_txid') or ''),
+        str(row.get('entry_qty') or ''),
+        str(row.get('exit_qty') or ''),
+    ])
+
+
+def _dedupe_journal_rows(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    seen = set()
+    out: List[Dict[str, Any]] = []
+    for row in rows:
+        key = _journal_row_key(row)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(row)
+    return out
+
+
 def _db_path() -> str:
     return os.getenv("TELEMETRY_DB_PATH", "/var/data/telemetry.sqlite3")
 
@@ -107,13 +150,7 @@ def _env_int(name: str, default: int) -> int:
 
 
 def _trade_key(row: Dict[str, Any]) -> str:
-    return "|".join([
-        str(row.get("symbol") or ""),
-        str(row.get("opened_ts") or ""),
-        str(row.get("closed_ts") or ""),
-        str(row.get("entry_txid") or ""),
-        str(row.get("exit_txid") or ""),
-    ])
+    return _journal_row_key(row)
 
 
 def _slippage_bps(fill_px: Optional[float], ref_px: Optional[float]) -> Optional[float]:
@@ -134,13 +171,14 @@ def _fee_bps(fee: Optional[float], cost: Optional[float]) -> Optional[float]:
 
 def sync_from_trade_journal(limit: int = 500) -> Dict[str, Any]:
     init_db()
-    rows = trade_journal.list_closed_trades(limit=max(1, int(limit)))
+    rows = _dedupe_journal_rows(trade_journal.list_closed_trades(limit=max(1, int(limit))))
     expected_slippage_bps = _env_float("EXPECTED_SLIPPAGE_BPS", _env_float("SLIPPAGE_BPS", 8.0))
     max_realized_slippage_bps_alert = _env_float("MAX_REALIZED_SLIPPAGE_BPS_ALERT", 35.0)
     max_entry_fee_bps_alert = _env_float("MAX_ENTRY_FEE_BPS_ALERT", 40.0)
     max_exit_fee_bps_alert = _env_float("MAX_EXIT_FEE_BPS_ALERT", 40.0)
     inserted = 0
     with _connect() as conn:
+        conn.execute("DELETE FROM trade_telemetry")
         for r in rows:
             meta = _safe_json_loads(r.get("meta_json"))
             order_result = _safe_json_loads(meta.get("order_result"))
@@ -173,7 +211,7 @@ def sync_from_trade_journal(limit: int = 500) -> Dict[str, Any]:
             clean_trade = int(len(alerts) == 0 and bool(r.get("exit_txid")) and bool(r.get("entry_txid")))
             payload = {
                 "trade_key": _trade_key(r),
-                "symbol": str(r.get("symbol") or ""),
+                "symbol": _canonical_trade_symbol(str(r.get("symbol") or "")),
                 "strategy": r.get("strategy"),
                 "source": r.get("source"),
                 "signal_name": r.get("signal_name"),

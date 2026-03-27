@@ -47,18 +47,50 @@ def _canonicalize_trade_symbol(symbol: str) -> str:
     s = str(symbol or '').strip().upper()
     if not s:
         return ''
+
+    compact = s.replace('/', '').replace('-', '').replace('_', '')
+    if ':' in compact:
+        compact = compact.split(':', 1)[1]
+
+    quote = ''
+    base = compact
+    for q in ('USDT', 'USDC', 'USD', 'EUR'):
+        if compact.endswith(q):
+            quote = q
+            base = compact[:-len(q)]
+            break
+
+    alias_map = {
+        'XXBT': 'BTC',
+        'XBT': 'BTC',
+        'XXBTZ': 'BTC',
+        'XBTZ': 'BTC',
+        'ZXXBT': 'BTC',
+        'ZXBT': 'BTC',
+        'XETH': 'ETH',
+    }
+    base = alias_map.get(base, base)
+    if base.startswith(('X', 'Z')) and len(base) > 3:
+        base = alias_map.get(base[1:], base[1:])
+    if base.endswith(('X', 'Z')) and len(base) > 3:
+        base = alias_map.get(base[:-1], base[:-1])
+
+    if quote and base:
+        if base == 'XBT':
+            base = 'BTC'
+        return f'{base}/{quote}'
+
     try:
         norm = normalize_symbol(s)
-        base, quote = norm.split('/', 1)
-        if base in {'XXBTZ', 'XBTZ', 'ZXXBT', 'ZXBT'} or base.startswith(('X', 'Z')) and len(base) > 4:
-            joined = f"{base}{quote}"
-            return from_kraken(joined)
-        return norm
+        b, q = norm.split('/', 1)
+        return f"{'BTC' if b == 'XBT' else b}/{q}"
     except Exception:
         pass
-    compact = s.replace('/', '').replace('-', '').replace('_', '')
     try:
-        return from_kraken(compact)
+        norm = from_kraken(compact)
+        if norm == 'BT/USD':
+            return 'BTC/USD'
+        return norm
     except Exception:
         return s
 

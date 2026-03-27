@@ -88,6 +88,49 @@ def _rowdict(row: sqlite3.Row | None) -> Optional[Dict[str, Any]]:
     return dict(row) if row is not None else None
 
 
+def _canonical_trade_symbol(symbol: str) -> str:
+    s = str(symbol or '').strip().upper()
+    if not s:
+        return ''
+    compact = s.replace('/', '').replace('-', '').replace('_', '')
+    for q in ('USDT', 'USDC', 'USD', 'EUR'):
+        if compact.endswith(q):
+            base = compact[:-len(q)]
+            alias_map = {'XXBT': 'BTC', 'XBT': 'BTC', 'XXBTZ': 'BTC', 'XBTZ': 'BTC', 'ZXXBT': 'BTC', 'ZXBT': 'BTC'}
+            base = alias_map.get(base, base)
+            if base == 'XBT':
+                base = 'BTC'
+            return f'{base}/{q}'
+    return s
+
+
+def _closed_trade_fingerprint(row: Dict[str, Any]) -> str:
+    exit_txid = str(row.get('exit_txid') or '').strip()
+    if exit_txid:
+        return f'exit:{exit_txid}'
+    return '|'.join([
+        _canonical_trade_symbol(str(row.get('symbol') or '')),
+        str(row.get('opened_ts') or ''),
+        str(row.get('closed_ts') or ''),
+        str(row.get('entry_txid') or ''),
+        str(row.get('exit_txid') or ''),
+        str(row.get('entry_qty') or ''),
+        str(row.get('exit_qty') or ''),
+    ])
+
+
+def _dedupe_closed_trade_rows(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    seen = set()
+    out: List[Dict[str, Any]] = []
+    for row in rows:
+        fp = _closed_trade_fingerprint(row)
+        if fp in seen:
+            continue
+        seen.add(fp)
+        out.append(row)
+    return out
+
+
 def get_open_trade(symbol: str) -> Optional[Dict[str, Any]]:
     init_db()
     with _connect() as conn:
@@ -101,7 +144,7 @@ def list_open_trades(limit: int = 200) -> List[Dict[str, Any]]:
         rows = conn.execute(
             "SELECT * FROM open_trades ORDER BY opened_ts DESC LIMIT ?", (max(1, int(limit)),)
         ).fetchall()
-    return [dict(r) for r in rows]
+    return _dedupe_closed_trade_rows([dict(r) for r in rows])
 
 
 def delete_open_trade(symbol: str) -> Dict[str, Any]:
