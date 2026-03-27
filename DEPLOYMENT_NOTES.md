@@ -1,3 +1,4 @@
-Patch 024: reconciled trade journaling + P&L fix
+# patch-032-scanner-candidate-alias-mapping-eth-sol-fallback
 
-Patch 026: startup/recovery wiring hotfix + orphan cleanup.
+Main: build identity only on top of patch-031.
+No behavior changes.
