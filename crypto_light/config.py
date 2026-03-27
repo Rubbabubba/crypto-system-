@@ -206,7 +206,7 @@ def load_settings() -> Settings:
         worker_secret=_getenv("WORKER_SECRET", ""),
 
         # Universe
-        allowed_symbols=_csv("ALLOWED_SYMBOLS", "BTC/USD,ETH/USD"),
+        allowed_symbols=_pilot_expand_symbols(_csv("ALLOWED_SYMBOLS", "BTC/USD,ETH/USD,SOL/USD")),
 
         # Core
         trading_enabled=_getbool("TRADING_ENABLED", "1"),
