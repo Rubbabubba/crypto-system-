@@ -859,13 +859,15 @@ RB1_NEAR_UP_MODE = (os.getenv("RB1_NEAR_UP_MODE", "gt") or "gt").strip().lower()
 
 # TC0 params (5m)
 TC0_LOOKBACK_BARS = int(float(os.getenv("TC0_LOOKBACK_BARS", "8") or 8))
-TC0_BREAKOUT_BUFFER_PCT = float(os.getenv("TC0_BREAKOUT_BUFFER_PCT", "0.0") or 0.0)
+TC0_BREAKOUT_BUFFER_PCT = max(float(os.getenv("TC0_BREAKOUT_BUFFER_PCT", "0.0") or 0.0), 0.0005)
 TC0_ATR_LEN = int(float(os.getenv("TC0_ATR_LEN", "14") or 14))
-TC0_MIN_ATR_PCT = float(os.getenv("TC0_MIN_ATR_PCT", "0.0005") or 0.0005)
+TC0_MIN_ATR_PCT = max(float(os.getenv("TC0_MIN_ATR_PCT", "0.0005") or 0.0005), 0.0010)
 TC0_REQUIRE_VWAP = (os.getenv("TC0_REQUIRE_VWAP", "0").strip().lower() in ("1", "true", "yes", "on"))
 TC0_VWAP_LOOKBACK_BARS = int(float(os.getenv("TC0_VWAP_LOOKBACK_BARS", "20") or 20))
 TC0_MAX_SPREAD_PCT = float(os.getenv("TC0_MAX_SPREAD_PCT", os.getenv("MAX_SPREAD_PCT", "0.004")) or 0.004)
-TC0_MAX_HOLD_SEC = int(float(os.getenv("TC0_MAX_HOLD_SEC", "1800") or 1800))
+TC0_MAX_HOLD_SEC = max(int(float(os.getenv("TC0_MAX_HOLD_SEC", "1800") or 1800)), 5400)
+TC0_TIME_EXIT_EXTENSION_SEC = int(float(os.getenv("TC0_TIME_EXIT_EXTENSION_SEC", "5400") or 5400))
+TC0_TIME_EXIT_MIN_FEE_MULT = float(os.getenv("TC0_TIME_EXIT_MIN_FEE_MULT", "1.25") or 1.25)
 
 # TC1 params
 TC1_LTF_EMA = int(float(os.getenv("TC1_LTF_EMA", "20") or 20))
@@ -5402,6 +5404,24 @@ def worker_exit(payload: WorkerExitPayload):
             if eligible["eligible_take"]:
                 return "take", eligible
             if eligible["eligible_time"]:
+                strategy = str(getattr(plan, "strategy", "") or "").strip().lower()
+                if strategy == "tc0":
+                    entry_px = float(getattr(plan, "entry_price", 0.0) or 0.0)
+                    plan_notional = float(getattr(plan, "notional_usd", 0.0) or 0.0)
+                    est_qty = (plan_notional / entry_px) if (entry_px > 0 and plan_notional > 0) else 0.0
+                    gross_now = ((float(px) - entry_px) * est_qty) if est_qty > 0 else 0.0
+                    fee_bps = float(getattr(settings, "entry_fee_bps", 0.0) or 0.0) + float(getattr(settings, "exit_fee_bps", 0.0) or 0.0)
+                    est_fee_usd = (plan_notional * fee_bps / 10000.0) if (plan_notional > 0 and fee_bps > 0) else 0.0
+                    extended_time_ok = age_sec >= float(max_hold_sec + grace + TC0_TIME_EXIT_EXTENSION_SEC)
+                    eligible["tc0_est_gross_pnl_usd"] = round(gross_now, 6)
+                    eligible["tc0_est_roundtrip_fee_usd"] = round(est_fee_usd, 6)
+                    eligible["tc0_time_exit_extension_sec"] = int(TC0_TIME_EXIT_EXTENSION_SEC)
+                    eligible["tc0_time_exit_fee_mult"] = float(TC0_TIME_EXIT_MIN_FEE_MULT)
+                    eligible["tc0_extended_time_exit"] = bool(extended_time_ok)
+                    if (not extended_time_ok) and gross_now < (est_fee_usd * float(TC0_TIME_EXIT_MIN_FEE_MULT)):
+                        eligible["eligible_time"] = False
+                        eligible["tc0_time_exit_deferred"] = True
+                        return None, eligible
                 return "time", eligible
             return None, eligible
 
@@ -5977,8 +5997,22 @@ def worker_exit_diagnostics(payload: WorkerExitDiagnosticsPayload):
             should_exit = True
             reason = "take_hit"
         elif eligible_time_exit:
-            should_exit = True
-            reason = "time_exit"
+            strategy = str(getattr(plan, "strategy", "") or "").strip().lower()
+            if strategy == "tc0":
+                plan_notional = float(getattr(plan, "notional_usd", 0.0) or 0.0)
+                est_qty = (plan_notional / float(getattr(plan, "entry_price", 0.0) or 0.0)) if (float(getattr(plan, "entry_price", 0.0) or 0.0) > 0 and plan_notional > 0) else 0.0
+                gross_now = ((float(px) - float(getattr(plan, "entry_price", 0.0) or 0.0)) * est_qty) if est_qty > 0 else 0.0
+                fee_bps = float(getattr(settings, "entry_fee_bps", 0.0) or 0.0) + float(getattr(settings, "exit_fee_bps", 0.0) or 0.0)
+                est_fee_usd = (plan_notional * fee_bps / 10000.0) if (plan_notional > 0 and fee_bps > 0) else 0.0
+                extended_time_ok = age_sec >= float(plan_max_hold + grace_sec + TC0_TIME_EXIT_EXTENSION_SEC)
+                if (not extended_time_ok) and gross_now < (est_fee_usd * float(TC0_TIME_EXIT_MIN_FEE_MULT)):
+                    reason = "tc0_time_exit_deferred_for_edge"
+                else:
+                    should_exit = True
+                    reason = "time_exit"
+            else:
+                should_exit = True
+                reason = "time_exit"
         else:
             reason = "no_exit_signal"
 
