@@ -1,4 +1,3 @@
-# patch-032-scanner-candidate-alias-mapping-eth-sol-fallback
+# patch-033-tc0-trade-quality-tuning
 
-Main: build identity only on top of patch-031.
-No behavior changes.
+TC0 trade quality tuning only. No scanner, journaling, lifecycle, or risk drift.
