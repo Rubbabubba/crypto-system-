@@ -1986,11 +1986,11 @@ def _fee_churn_truth_snapshot(scanner_contract: dict[str, Any], *, max_active_sy
     churn_thresholds = {
         "max_open_positions_lte": 1,
         "max_entries_per_day_lte": 3,
-        "max_active_symbols_lte": 10,
+        "max_active_symbols_lte": 7,
         "signal_dedupe_ttl_sec_gte": 120,
         "scanner_bar_lock_sec_gte": 60,
         "scanner_inflight_holdoff_sec_gte": 60,
-        "scanner_rank_cap_lte": 10,
+        "scanner_rank_cap_lte": 7,
     }
     churn_inputs = {
         "max_open_positions": int(MAX_OPEN_POSITIONS),
@@ -2151,9 +2151,15 @@ def _path_b_admission_snapshot(scanner_contract: dict[str, Any]) -> dict[str, An
 
     env_allowlist = _env_symbol_list("PATH_B_PILOT_ALLOWLIST")
     legacy_allowlist = _env_symbol_list("PATH_B_ALLOWED_SYMBOLS")
-    allowed_pilot_symbols = env_allowlist or legacy_allowlist or ["BTC/USD", "ETH/USD", "SOL/USD", "ADA/USD", "XRP/USD", "DOGE/USD", "LINK/USD", "AVAX/USD", "LTC/USD", "DOT/USD"]
+    allowed_pilot_symbols = env_allowlist or legacy_allowlist or ["BTC/USD", "ETH/USD", "SOL/USD", "ADA/USD", "LINK/USD", "AVAX/USD", "DOT/USD"]
+    _contract_safe_lock_7 = {"BTC/USD", "ETH/USD", "SOL/USD", "ADA/USD", "LINK/USD", "AVAX/USD", "DOT/USD"}
+    _contract_unsafe_10 = {"BTC/USD", "ETH/USD", "SOL/USD", "ADA/USD", "XRP/USD", "DOGE/USD", "LINK/USD", "AVAX/USD", "LTC/USD", "DOT/USD"}
+    if set(allowed_pilot_symbols) == _contract_unsafe_10:
+        allowed_pilot_symbols = [s for s in ["BTC/USD", "ETH/USD", "SOL/USD", "ADA/USD", "LINK/USD", "AVAX/USD", "DOT/USD"] if s in _contract_safe_lock_7]
+    if set(ALLOWED_SYMBOLS) == _contract_unsafe_10:
+        ALLOWED_SYMBOLS = set(_contract_safe_lock_7)
 
-    max_active_symbols = max(1, _env_int("PATH_B_PILOT_MAX_ADMITTED_SYMBOLS", _env_int("PATH_B_MAX_ACTIVE_SYMBOLS", 10)))
+    max_active_symbols = max(1, _env_int("PATH_B_PILOT_MAX_ADMITTED_SYMBOLS", _env_int("PATH_B_MAX_ACTIVE_SYMBOLS", 7)))
     scanner_rank_cap = max(1, _env_int("PATH_B_PILOT_SCANNER_RANK_CAP", _env_int("PATH_B_SCANNER_RANK_CAP", max_active_symbols)))
 
     fee_churn_truth = _fee_churn_truth_snapshot(
