@@ -3952,7 +3952,11 @@ def _execute_long_entry(
     utc_date = _utc_date_str(now)
     state.reset_daily_counters_if_needed(utc_date)
 
-    if signal_id and state.seen_recent_signal(signal_id, int(settings.signal_dedupe_ttl_sec)):
+    rb1_fingerprint_only_dedupe = (
+        str(strategy or '').strip().lower() == 'rb1'
+        and os.getenv("RB1_FINGERPRINT_ONLY_DEDUPE", "1").strip().lower() in ("1", "true", "yes", "on")
+    )
+    if signal_id and (not rb1_fingerprint_only_dedupe) and state.seen_recent_signal(signal_id, int(settings.signal_dedupe_ttl_sec)):
         return ignored("duplicate_signal_id", symbol=symbol, strategy=strategy, signal=signal_name, signal_id=signal_id)
 
     fp_ttl = _fingerprint_ttl_sec()
