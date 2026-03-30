@@ -2152,12 +2152,13 @@ def _path_b_admission_snapshot(scanner_contract: dict[str, Any]) -> dict[str, An
     env_allowlist = _env_symbol_list("PATH_B_PILOT_ALLOWLIST")
     legacy_allowlist = _env_symbol_list("PATH_B_ALLOWED_SYMBOLS")
     allowed_pilot_symbols = env_allowlist or legacy_allowlist or ["BTC/USD", "ETH/USD", "SOL/USD", "ADA/USD", "LINK/USD", "AVAX/USD", "DOT/USD"]
-    _contract_safe_lock_7 = {"BTC/USD", "ETH/USD", "SOL/USD", "ADA/USD", "LINK/USD", "AVAX/USD", "DOT/USD"}
+    _contract_safe_lock_7 = ["BTC/USD", "ETH/USD", "SOL/USD", "ADA/USD", "LINK/USD", "AVAX/USD", "DOT/USD"]
+    _contract_safe_lock_7_set = set(_contract_safe_lock_7)
     _contract_unsafe_10 = {"BTC/USD", "ETH/USD", "SOL/USD", "ADA/USD", "XRP/USD", "DOGE/USD", "LINK/USD", "AVAX/USD", "LTC/USD", "DOT/USD"}
+    configured_allowed_symbols = set(ALLOWED_SYMBOLS)
     if set(allowed_pilot_symbols) == _contract_unsafe_10:
-        allowed_pilot_symbols = [s for s in ["BTC/USD", "ETH/USD", "SOL/USD", "ADA/USD", "LINK/USD", "AVAX/USD", "DOT/USD"] if s in _contract_safe_lock_7]
-    if set(ALLOWED_SYMBOLS) == _contract_unsafe_10:
-        ALLOWED_SYMBOLS = set(_contract_safe_lock_7)
+        allowed_pilot_symbols = list(_contract_safe_lock_7)
+    effective_allowed_symbols = _contract_safe_lock_7_set if configured_allowed_symbols == _contract_unsafe_10 else configured_allowed_symbols
 
     max_active_symbols = max(1, _env_int("PATH_B_PILOT_MAX_ADMITTED_SYMBOLS", _env_int("PATH_B_MAX_ACTIVE_SYMBOLS", 7)))
     scanner_rank_cap = max(1, _env_int("PATH_B_PILOT_SCANNER_RANK_CAP", _env_int("PATH_B_SCANNER_RANK_CAP", max_active_symbols)))
@@ -2180,6 +2181,8 @@ def _path_b_admission_snapshot(scanner_contract: dict[str, Any]) -> dict[str, An
     ranked_symbols = list((scanner_contract or {}).get("ranked_active_symbols") or [])
     candidate_symbols = ranked_symbols or active_symbols
     admitted_symbols = candidate_symbols[:scanner_rank_cap]
+    if not allowed_pilot_symbols and effective_allowed_symbols == _contract_safe_lock_7_set:
+        allowed_pilot_symbols = list(_contract_safe_lock_7)
     if allowed_pilot_symbols:
         allowed_set = set(allowed_pilot_symbols)
         admitted_symbols = [s for s in admitted_symbols if s in allowed_set]
