@@ -795,7 +795,9 @@ def _risk_admission_check(*, symbol: str, strategy: str, px: float, stop_price: 
 
 # ---------- Entry engine (optional; replaces TradingView) ----------
 ENTRY_ENGINE_ENABLED = (os.getenv("ENTRY_ENGINE_ENABLED", "1").strip().lower() in ("1", "true", "yes", "on"))
-ENTRY_ENGINE_STRATEGIES_LIST = [s.strip().lower() for s in os.getenv("ENTRY_ENGINE_STRATEGIES", "tc0,tc1").split(",") if s.strip()]
+ENTRY_ENGINE_STRATEGIES_LIST = [s.strip().lower() for s in os.getenv("ENTRY_ENGINE_STRATEGIES", "tc0,rb1").split(",") if s.strip()]
+if ENTRY_ENGINE_STRATEGIES_LIST == ["tc0"]:
+    ENTRY_ENGINE_STRATEGIES_LIST = ["tc0", "rb1"]
 ENTRY_ENGINE_STRATEGIES = set(ENTRY_ENGINE_STRATEGIES_LIST)
 ENTRY_ENGINE_TIMEFRAME = os.getenv("ENTRY_ENGINE_TIMEFRAME", "5Min").strip() or "5Min"   # must match broker get_bars
 ENTRY_ENGINE_LIMIT_BARS = int(float(os.getenv("ENTRY_ENGINE_LIMIT_BARS", "300") or 300))
@@ -805,7 +807,7 @@ ENTRY_ENGINE_LIMIT_BARS = int(float(os.getenv("ENTRY_ENGINE_LIMIT_BARS", "300") 
 # auto:  preserve legacy preference ordering across eligible strategies
 # legacy: rb1/tc1 only, old preference behavior
 STRATEGY_MODE = (os.getenv("STRATEGY_MODE", "auto") or "auto").strip().lower()  # fixed|auto|legacy
-ENABLE_RB1 = (os.getenv("ENABLE_RB1", "1").strip().lower() in ("1", "true", "yes", "on"))
+ENABLE_RB1 = ("rb1" in ENTRY_ENGINE_STRATEGIES_LIST) or (os.getenv("ENABLE_RB1", "1").strip().lower() in ("1", "true", "yes", "on"))
 ENABLE_TC0 = (os.getenv("ENABLE_TC0", "1").strip().lower() in ("1", "true", "yes", "on"))
 ENABLE_TC1 = (os.getenv("ENABLE_TC1", "1").strip().lower() in ("1", "true", "yes", "on"))
 ENABLE_CR1 = (os.getenv("ENABLE_CR1", "0").strip().lower() in ("1", "true", "yes", "on"))
@@ -1984,11 +1986,11 @@ def _fee_churn_truth_snapshot(scanner_contract: dict[str, Any], *, max_active_sy
     churn_thresholds = {
         "max_open_positions_lte": 1,
         "max_entries_per_day_lte": 3,
-        "max_active_symbols_lte": 3,
+        "max_active_symbols_lte": 10,
         "signal_dedupe_ttl_sec_gte": 120,
         "scanner_bar_lock_sec_gte": 60,
         "scanner_inflight_holdoff_sec_gte": 60,
-        "scanner_rank_cap_lte": 3,
+        "scanner_rank_cap_lte": 10,
     }
     churn_inputs = {
         "max_open_positions": int(MAX_OPEN_POSITIONS),
@@ -2149,9 +2151,9 @@ def _path_b_admission_snapshot(scanner_contract: dict[str, Any]) -> dict[str, An
 
     env_allowlist = _env_symbol_list("PATH_B_PILOT_ALLOWLIST")
     legacy_allowlist = _env_symbol_list("PATH_B_ALLOWED_SYMBOLS")
-    allowed_pilot_symbols = env_allowlist or legacy_allowlist or ["BTC/USD", "ETH/USD", "SOL/USD"]
+    allowed_pilot_symbols = env_allowlist or legacy_allowlist or ["BTC/USD", "ETH/USD", "SOL/USD", "ADA/USD", "XRP/USD", "DOGE/USD", "LINK/USD", "AVAX/USD", "LTC/USD", "DOT/USD"]
 
-    max_active_symbols = max(1, _env_int("PATH_B_PILOT_MAX_ADMITTED_SYMBOLS", _env_int("PATH_B_MAX_ACTIVE_SYMBOLS", 3)))
+    max_active_symbols = max(1, _env_int("PATH_B_PILOT_MAX_ADMITTED_SYMBOLS", _env_int("PATH_B_MAX_ACTIVE_SYMBOLS", 10)))
     scanner_rank_cap = max(1, _env_int("PATH_B_PILOT_SCANNER_RANK_CAP", _env_int("PATH_B_SCANNER_RANK_CAP", max_active_symbols)))
 
     fee_churn_truth = _fee_churn_truth_snapshot(
