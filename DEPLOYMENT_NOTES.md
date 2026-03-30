@@ -1,8 +1,7 @@
-# patch-035-contract-safe-7-symbol-lock-rb1-preservation
+# patch-036-readiness-compatibility-hotfix
 
 Changes:
-- Lock live universe to the 7 symbols proven resolvable by scanner alignment:
-  BTC/USD,ETH/USD,SOL/USD,ADA/USD,LINK/USD,AVAX/USD,DOT/USD
-- Preserve tc0 + rb1 strategy defaults and behavior.
-- Lower default Path B admitted symbol cap and scanner rank cap from 10 back to 7.
-- Preserve lifecycle, exits, journaling, backfill, worker routing, and sizing behavior.
+- Hotfix Patch 035 readiness/compatibility regression caused by local rebinding of `ALLOWED_SYMBOLS`.
+- Preserve the contract-safe 7-symbol admitted live set without mutating global allowlist state.
+- Restore `/compatibility` and `/ready` endpoint stability.
+- Preserve scanner behavior, tc0 + rb1 strategy behavior, lifecycle, exits, journaling, worker routing, and sizing.
