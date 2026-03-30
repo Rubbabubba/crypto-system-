@@ -1,7 +1,7 @@
-# patch-036-readiness-compatibility-hotfix
+# patch-037-rb1-dedupe-repeat-entry-tolerance-tuning
 
 Changes:
-- Hotfix Patch 035 readiness/compatibility regression caused by local rebinding of `ALLOWED_SYMBOLS`.
-- Preserve the contract-safe 7-symbol admitted live set without mutating global allowlist state.
-- Restore `/compatibility` and `/ready` endpoint stability.
-- Preserve scanner behavior, tc0 + rb1 strategy behavior, lifecycle, exits, journaling, worker routing, and sizing.
+- Tune RB1 repeat-entry tolerance by bypassing state signal-id dedupe for RB1 only.
+- Preserve lifecycle signal fingerprint dedupe and workflow locking as the active anti-duplication controls for RB1.
+- Leave TC0 and all non-RB1 strategies on the existing signal-id dedupe path.
+- No changes to sizing, exposure, exits, journaling, worker routing, scanner alignment, or lifecycle state.
