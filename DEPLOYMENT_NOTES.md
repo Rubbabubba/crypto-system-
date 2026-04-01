@@ -1,7 +1,7 @@
-# patch-042-journal-strategy-rewrite-backfill-rehydration-lifecycle-history
+# patch-043-explicit-journal-lifecycle-provenance-bridge-forced-strategy-rewrite
 
 Changes:
-- Add journal strategy rewrite pass that rewrites already-journaled open/closed trades from lifecycle history.
-- Add unmatched backfill rehydration from broker history to reconstruct missing closes when lifecycle-provenanced strategy can be resolved.
-- Preserve Patch 040 journal persistence and Patch 041 lifecycle/intents lookup logic.
+- Add explicit journal↔lifecycle provenance bridge that inspects actual lifecycle tables/columns and resolves strategy by txid bridge first, then symbol/timestamp proximity.
+- Add forced rewrite pass for already-journaled adopted rows in both closed_trades and open_trades.
+- Preserve journal persistence and P&L truth fixes.
 - No scanner behavior changes beyond paired build identity.
