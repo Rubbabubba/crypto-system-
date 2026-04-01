@@ -519,7 +519,7 @@ def _startup_self_check(*, rerun: bool = False, apply: bool | None = None) -> di
         }
         return dict(STARTUP_SELF_CHECK_RESULT)
 
-    lifecycle_repairs = {'expired_workflow_locks_released': 0, 'legacy_trade_lifecycle_events_backfilled': 0, 'expired_signal_fingerprints_purged': 0, 'reconciled_exit_truth_repaired': 0, 'reconciled_exit_duplicates_removed': 0, 'reconciled_strategy_attribution_repaired': 0, 'trade_journal_persistence_path_verified': 0}
+    lifecycle_repairs = {'expired_workflow_locks_released': 0, 'legacy_trade_lifecycle_events_backfilled': 0, 'expired_signal_fingerprints_purged': 0, 'reconciled_exit_truth_repaired': 0, 'reconciled_exit_duplicates_removed': 0, 'reconciled_strategy_attribution_repaired': 0, 'trade_journal_persistence_path_verified': 0, 'journal_strategy_rewrite_repaired': 0, 'journal_backfill_rehydrated': 0}
     try:
         _repair = trade_journal.repair_reconciled_exit_truth(lookback_days=30.0)
         lifecycle_repairs['reconciled_exit_truth_repaired'] = int(_repair.get('repaired_count') or 0)
@@ -529,6 +529,16 @@ def _startup_self_check(*, rerun: bool = False, apply: bool | None = None) -> di
     try:
         _strategy_repair = trade_journal.repair_reconciled_strategy_attribution(lookback_days=30.0)
         lifecycle_repairs['reconciled_strategy_attribution_repaired'] = int(_strategy_repair.get('updated_count') or 0)
+    except Exception:
+        pass
+    try:
+        _rewrite = trade_journal.rewrite_journal_strategies_from_lifecycle(lookback_days=30.0)
+        lifecycle_repairs['journal_strategy_rewrite_repaired'] = int(_rewrite.get('updated_count') or 0)
+    except Exception:
+        pass
+    try:
+        _rehydrate = trade_journal.rehydrate_unmatched_backfill_from_broker_history(lookback_days=30.0)
+        lifecycle_repairs['journal_backfill_rehydrated'] = int(_rehydrate.get('rehydrated_count') or 0)
     except Exception:
         pass
     dependency_guard = _startup_dependency_guard()

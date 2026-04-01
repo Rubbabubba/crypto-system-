@@ -232,6 +232,170 @@ def _resolve_strategy_provenance(conn: sqlite3.Connection, symbol: str, open_row
     return "adopted"
 
 
+
+def _resolve_journal_strategy_from_lifecycle(symbol: str, entry_txid: str = "", exit_txid: str = "", opened_ts: float = 0.0, closed_ts: float = 0.0) -> str:
+    sym = str(symbol or "").strip().upper()
+    st = _lifecycle_strategy_from_trade_plans(sym, entry_txid=entry_txid, plan_id=entry_txid)
+    if st and st.lower() != "adopted":
+        return st
+    st = _lifecycle_strategy_from_intents(sym, entry_txid=entry_txid, exit_txid=exit_txid)
+    if st and st.lower() != "adopted":
+        return st
+    # time-adjacent fallback from lifecycle trade_plans/intents by symbol
+    try:
+        with _connect_lifecycle() as lconn:
+            for table_name, ts_col in (("trade_plans", "created_ts"), ("trade_intents", "created_ts"), ("entry_intents", "created_ts")):
+                try:
+                    target_ts = float(opened_ts or closed_ts or 0.0)
+                    rows = lconn.execute(
+                        f"SELECT strategy, COALESCE({ts_col},0) AS ev_ts FROM {table_name} WHERE symbol=? AND COALESCE(strategy,'') <> '' ORDER BY ABS(COALESCE({ts_col},0)-?) ASC, id DESC LIMIT 5",
+                        (sym, target_ts),
+                    ).fetchall()
+                    for row in rows:
+                        cand = str(row[0] or "").strip()
+                        if cand and cand.lower() != "adopted":
+                            return cand
+                except Exception:
+                    pass
+    except Exception:
+        pass
+    return "adopted"
+
+
+def rewrite_journal_strategies_from_lifecycle(*, lookback_days: float = 30.0) -> Dict[str, Any]:
+    init_db()
+    now = time.time()
+    since_ts = max(0.0, float(now) - float(lookback_days) * 86400.0)
+    updated = []
+    checked = 0
+    with _connect() as conn:
+        # closed trades
+        rows = conn.execute(
+            "SELECT id, symbol, strategy, entry_txid, exit_txid, entry_ts, closed_ts FROM closed_trades WHERE closed_ts >= ? ORDER BY id DESC",
+            (since_ts,),
+        ).fetchall()
+        for r in rows:
+            row = dict(r)
+            checked += 1
+            current = str(row.get("strategy") or "").strip()
+            if current and current.lower() != "adopted":
+                continue
+            resolved = _resolve_journal_strategy_from_lifecycle(
+                row.get("symbol") or "",
+                entry_txid=str(row.get("entry_txid") or ""),
+                exit_txid=str(row.get("exit_txid") or ""),
+                opened_ts=_to_float(row.get("entry_ts")) or 0.0,
+                closed_ts=_to_float(row.get("closed_ts")) or 0.0,
+            )
+            if resolved and resolved.lower() != "adopted":
+                conn.execute("UPDATE closed_trades SET strategy=? WHERE id=?", (resolved, int(row["id"])))
+                updated.append({"table": "closed_trades", "id": int(row["id"]), "symbol": row.get("symbol"), "to": resolved})
+        # open trades
+        rows = conn.execute(
+            "SELECT id, symbol, strategy, entry_txid, opened_ts FROM open_trades ORDER BY id DESC"
+        ).fetchall()
+        for r in rows:
+            row = dict(r)
+            checked += 1
+            current = str(row.get("strategy") or "").strip()
+            if current and current.lower() != "adopted":
+                continue
+            resolved = _resolve_journal_strategy_from_lifecycle(
+                row.get("symbol") or "",
+                entry_txid=str(row.get("entry_txid") or ""),
+                opened_ts=_to_float(row.get("opened_ts")) or 0.0,
+            )
+            if resolved and resolved.lower() != "adopted":
+                conn.execute("UPDATE open_trades SET strategy=? WHERE id=?", (resolved, int(row["id"])))
+                updated.append({"table": "open_trades", "id": int(row["id"]), "symbol": row.get("symbol"), "to": resolved})
+        conn.commit()
+    return {"ok": True, "checked": checked, "updated_count": len(updated), "updated_rows": updated[:100]}
+
+
+def rehydrate_unmatched_backfill_from_broker_history(*, lookback_days: float = 30.0) -> Dict[str, Any]:
+    init_db()
+    now = time.time()
+    lookback_sec = float(lookback_days) * 86400.0
+    repaired = []
+    skipped = []
+    try:
+        from crypto_light import broker_kraken  # type: ignore
+        fills = broker_kraken.fetch_recent_fills(lookback_sec=int(lookback_sec)) or []
+    except Exception as e:
+        return {"ok": False, "error": f"fetch_recent_fills_failed:{e}"}
+    by_symbol = {}
+    for f in fills:
+        sym = str(f.get("symbol") or "").strip().upper()
+        by_symbol.setdefault(sym, []).append(f)
+    with _connect() as conn:
+        for sym, fs in by_symbol.items():
+            sells = [f for f in fs if str(f.get("side") or "").lower() == "sell"]
+            buys = [f for f in fs if str(f.get("side") or "").lower() == "buy"]
+            for sell in sells:
+                sell_txid = str(sell.get("txid") or "").strip()
+                if not sell_txid:
+                    continue
+                existing = conn.execute("SELECT id FROM closed_trades WHERE symbol=? AND exit_txid=? LIMIT 1", (sym, sell_txid)).fetchone()
+                if existing is not None:
+                    continue
+                candidates = [b for b in buys if float(b.get("time") or 0.0) <= float(sell.get("time") or 0.0)]
+                if not candidates:
+                    recovered = _find_nearest_prior_buy(sym, sell_txid, float(sell.get("time") or 0.0), float(sell.get("qty") or 0.0))
+                    if recovered:
+                        buy = {"txid": recovered.get("txid"), "qty": recovered.get("qty"), "price": recovered.get("price"), "cost": recovered.get("cost"), "fee": recovered.get("fee"), "time": recovered.get("ts")}
+                    else:
+                        skipped.append({"symbol": sym, "txid": sell_txid, "reason": "no_prior_buy_match"})
+                        continue
+                else:
+                    candidates.sort(key=lambda x: float(x.get("time") or 0.0))
+                    buy = candidates[-1]
+                entry_qty = min(float(sell.get("qty") or 0.0), float(buy.get("qty") or 0.0))
+                if entry_qty <= 0:
+                    skipped.append({"symbol": sym, "txid": sell_txid, "reason": "invalid_qty_match"})
+                    continue
+                strategy = _resolve_journal_strategy_from_lifecycle(sym, entry_txid=str(buy.get("txid") or ""), exit_txid=sell_txid, opened_ts=float(buy.get("time") or 0.0), closed_ts=float(sell.get("time") or 0.0))
+                open_payload = {
+                    "symbol": sym,
+                    "opened_ts": float(buy.get("time") or now),
+                    "strategy": strategy or "adopted",
+                    "source": "broker_trade_history_rehydration",
+                    "entry_txid": str(buy.get("txid") or ""),
+                    "entry_price": float(buy.get("price") or 0.0),
+                    "entry_qty": float(entry_qty),
+                    "entry_cost": float(buy.get("cost") or 0.0) * (entry_qty / max(float(buy.get("qty") or entry_qty), 1e-9)),
+                    "entry_fee": float(buy.get("fee") or 0.0) * (entry_qty / max(float(buy.get("qty") or entry_qty), 1e-9)),
+                    "requested_notional_usd": float(buy.get("cost") or 0.0) * (entry_qty / max(float(buy.get("qty") or entry_qty), 1e-9)),
+                    "meta": {"rehydrated": True, "sell_txid": sell_txid},
+                }
+                try:
+                    conn.execute("DELETE FROM open_trades WHERE symbol=?", (sym,))
+                    conn.commit()
+                except Exception:
+                    pass
+                opened = open_trade(open_payload)
+                if not opened or not opened.get("ok"):
+                    skipped.append({"symbol": sym, "txid": sell_txid, "reason": "open_trade_failed", "result": opened})
+                    continue
+                closed = close_trade(sym, {
+                    "closed_ts": float(sell.get("time") or now),
+                    "exit_txid": sell_txid,
+                    "exit_price": float(sell.get("price") or 0.0),
+                    "exit_qty": float(entry_qty),
+                    "exit_cost": float(sell.get("cost") or 0.0) * (entry_qty / max(float(sell.get("qty") or entry_qty), 1e-9)),
+                    "exit_fee": float(sell.get("fee") or 0.0) * (entry_qty / max(float(sell.get("qty") or entry_qty), 1e-9)),
+                    "exit_reason": "reconciled_fill_rehydrated",
+                    "meta": {"rehydrated": True, "matched_buy_txid": str(buy.get("txid") or "")},
+                })
+                if closed and closed.get("ok"):
+                    repaired.append({"symbol": sym, "entry_txid": str(buy.get("txid") or ""), "exit_txid": sell_txid, "strategy": strategy or "adopted"})
+                else:
+                    skipped.append({"symbol": sym, "txid": sell_txid, "reason": "close_trade_failed", "result": closed})
+        try:
+            from crypto_light import telemetry_db  # type: ignore
+            telemetry_db.sync_from_trade_journal(limit=500)
+        except Exception:
+            pass
+    return {"ok": True, "rehydrated_count": len(repaired), "rehydrated_rows": repaired[:100], "skipped": skipped[:100]}
 def repair_reconciled_strategy_attribution(*, lookback_days: float = 30.0) -> Dict[str, Any]:
     init_db()
     now = time.time()
