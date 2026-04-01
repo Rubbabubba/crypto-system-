@@ -98,6 +98,74 @@ def init_db() -> None:
 def _rowdict(row: sqlite3.Row | None) -> Optional[Dict[str, Any]]:
     return dict(row) if row is not None else None
 
+def _lifecycle_strategy_from_intents(symbol: str, entry_txid: str = "", exit_txid: str = "") -> str:
+    sym = str(symbol or "").strip().upper()
+    try:
+        with _connect_lifecycle() as lconn:
+            for table_name, tx_col in (("trade_intents", "entry_txid"), ("entry_intents", "entry_txid")):
+                try:
+                    if entry_txid:
+                        row = lconn.execute(
+                            f"SELECT strategy FROM {table_name} WHERE symbol=? AND COALESCE({tx_col},'')=? AND COALESCE(strategy,'') <> '' ORDER BY id DESC LIMIT 1",
+                            (sym, entry_txid),
+                        ).fetchone()
+                        if row is not None:
+                            return str(row[0] or "").strip()
+                except Exception:
+                    pass
+            for table_name in ("trade_intents", "entry_intents"):
+                try:
+                    row = lconn.execute(
+                        f"SELECT strategy FROM {table_name} WHERE symbol=? AND COALESCE(strategy,'') <> '' ORDER BY id DESC LIMIT 1",
+                        (sym,),
+                    ).fetchone()
+                    if row is not None:
+                        return str(row[0] or "").strip()
+                except Exception:
+                    pass
+    except Exception:
+        return ""
+    return ""
+
+
+def _find_nearest_prior_buy(symbol: str, exit_txid: str, closed_ts: float, sell_qty: float) -> Optional[Dict[str, Any]]:
+    sym = str(symbol or "").strip().upper()
+    if not sym or not exit_txid:
+        return None
+    try:
+        from crypto_light import broker_kraken  # type: ignore
+        fills = broker_kraken.fetch_recent_fills(lookback_sec=7*86400) or []
+    except Exception:
+        return None
+    candidates = []
+    for f in fills:
+        try:
+            fsym = str(f.get("symbol") or "").strip().upper()
+            side = str(f.get("side") or "").strip().lower()
+            txid = str(f.get("txid") or "").strip()
+            ts = _to_float(f.get("ts")) or 0.0
+            qty = _to_float(f.get("qty")) or 0.0
+            if fsym != sym or side != "buy" or txid == exit_txid:
+                continue
+            if ts <= 0.0 or ts > float(closed_ts):
+                continue
+            if sell_qty > 0 and qty > 0 and abs(qty - sell_qty) / max(sell_qty, 1e-9) > 0.10:
+                continue
+            candidates.append({
+                "txid": txid,
+                "qty": qty,
+                "price": _to_float(f.get("price")) or 0.0,
+                "cost": _to_float(f.get("cost")) or 0.0,
+                "fee": _to_float(f.get("fee")) or 0.0,
+                "ts": ts,
+            })
+        except Exception:
+            continue
+    if not candidates:
+        return None
+    candidates.sort(key=lambda x: abs(float(closed_ts) - float(x.get("ts") or 0.0)))
+    return candidates[0]
+
 def _lifecycle_strategy_from_trade_plans(symbol: str, entry_txid: str = "", plan_id: str = "") -> str:
     sym = str(symbol or "").strip().upper()
     try:
@@ -152,7 +220,10 @@ def _resolve_strategy_provenance(conn: sqlite3.Connection, symbol: str, open_row
             if st and st.lower() != "adopted":
                 return st
     st = _lifecycle_strategy_from_trade_plans(sym, entry_txid=entry_txid, plan_id=entry_txid)
-    if st:
+    if st and st.lower() != "adopted":
+        return st
+    st = _lifecycle_strategy_from_intents(sym, entry_txid=entry_txid, exit_txid=exit_txid)
+    if st and st.lower() != "adopted":
         return st
     if open_row:
         st = str(open_row.get("strategy") or "").strip()
@@ -208,6 +279,8 @@ def repair_reconciled_strategy_attribution(*, lookback_days: float = 30.0) -> Di
                     candidate = str(q[0] or "").strip()
             if not candidate or candidate.lower() == "adopted":
                 candidate = _lifecycle_strategy_from_trade_plans(sym, entry_txid=entry_txid, plan_id=entry_txid)
+            if not candidate or candidate.lower() == "adopted":
+                candidate = _lifecycle_strategy_from_intents(sym, entry_txid=entry_txid, exit_txid=exit_txid)
             if candidate and candidate.lower() != "adopted":
                 conn.execute("UPDATE closed_trades SET strategy=? WHERE id=?", (candidate, int(row.get("id") or 0)))
                 updated.append({"id": int(row.get("id") or 0), "symbol": sym, "from": current or "adopted", "to": candidate, "exit_txid": exit_txid})

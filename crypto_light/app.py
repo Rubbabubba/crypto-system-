@@ -4920,9 +4920,17 @@ def _backfill_closed_trades_from_broker_history(*, now_ts: float, lookback_sec: 
                 continue
             candidates = [b for b in buys if float(b.get('time') or 0.0) <= float(sell.get('time') or 0.0) and str(b.get('txid') or '') not in used_buy_ids]
             if not candidates:
-                out['skipped'].append({'symbol': symbol, 'txid': sell_txid, 'reason': 'no_prior_buy_match'})
-                continue
-            buy = candidates[-1]
+                try:
+                    recovered_buy = trade_journal._find_nearest_prior_buy(symbol, sell_txid, float(sell.get('time') or 0.0), float(sell.get('vol') or 0.0))
+                except Exception:
+                    recovered_buy = None
+                if recovered_buy:
+                    buy = {'txid': recovered_buy.get('txid'), 'price': recovered_buy.get('price'), 'cost': recovered_buy.get('cost'), 'fee': recovered_buy.get('fee'), 'vol': recovered_buy.get('qty'), 'time': recovered_buy.get('ts')}
+                else:
+                    out['skipped'].append({'symbol': symbol, 'txid': sell_txid, 'reason': 'no_prior_buy_match'})
+                    continue
+            else:
+                buy = candidates[-1]
             used_buy_ids.add(str(buy.get('txid') or ''))
             sell_qty = float(sell.get('qty') or 0.0)
             buy_qty = float(buy.get('qty') or 0.0)
@@ -4935,7 +4943,7 @@ def _backfill_closed_trades_from_broker_history(*, now_ts: float, lookback_sec: 
             open_payload = {
                 'symbol': symbol,
                 'opened_ts': float(buy.get('time') or now_ts),
-                'strategy': 'adopted',
+                'strategy': (trade_journal._lifecycle_strategy_from_trade_plans(symbol, entry_txid=str(buy.get('txid') or '')) or trade_journal._lifecycle_strategy_from_intents(symbol, entry_txid=str(buy.get('txid') or ''), exit_txid=sell_txid) or 'adopted'),
                 'source': 'broker_trade_history_backfill',
                 'signal_name': None,
                 'signal_id': None,

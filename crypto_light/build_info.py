@@ -6,7 +6,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterable
 
-PATCH_VERSION = "patch-040-journal-persistence-lifecycle-strategy-provenance-fix"
+PATCH_VERSION = "patch-041-backfill-strategy-mapping-unmatched-sell-recovery"
 BUILD_TIMESTAMP_UTC = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 SYSTEM_NAME = "crypto-system"
 DEFAULT_SERVICE_ROLE = "main"
@@ -52,7 +52,7 @@ def build_payload(expected_files: list[str] | None = None) -> dict:
         "crypto_light/config.py",
         "crypto_light/state.py",
         "worker.py",
-        "PATCH_040_MARKER.txt",
+        "PATCH_041_MARKER.txt",
     ]
     manifest = []
     digest_paths: list[Path] = []
