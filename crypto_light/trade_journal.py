@@ -87,6 +87,127 @@ def init_db() -> None:
 def _rowdict(row: sqlite3.Row | None) -> Optional[Dict[str, Any]]:
     return dict(row) if row is not None else None
 
+def _find_closed_by_symbol_exit_txid(conn: sqlite3.Connection, symbol: str, exit_txid: str) -> Optional[Dict[str, Any]]:
+    sym = str(symbol or "").strip().upper()
+    tx = str(exit_txid or "").strip()
+    if not sym or not tx:
+        return None
+    row = conn.execute(
+        "SELECT * FROM closed_trades WHERE symbol=? AND exit_txid=? ORDER BY closed_ts DESC, id DESC LIMIT 1",
+        (sym, tx),
+    ).fetchone()
+    return dict(row) if row is not None else None
+
+
+def repair_reconciled_exit_truth(*, lookback_days: float = 30.0) -> Dict[str, Any]:
+    init_db()
+    now = time.time()
+    since_ts = max(0.0, float(now) - float(lookback_days) * 86400.0)
+    repaired_rows = []
+    deduped_rows = []
+    checked = 0
+    with _connect() as conn:
+        rows = conn.execute(
+            "SELECT * FROM closed_trades WHERE closed_ts >= ? ORDER BY closed_ts DESC, id DESC",
+            (since_ts,),
+        ).fetchall()
+        rows = [dict(r) for r in rows]
+        seen_by_key = {}
+        for r in rows:
+            checked += 1
+            rid = int(r.get("id") or 0)
+            symbol = str(r.get("symbol") or "").strip().upper()
+            exit_txid = str(r.get("exit_txid") or "").strip()
+            exit_reason = str(r.get("exit_reason") or "")
+            try:
+                meta = json.loads(r.get("meta_json") or "{}")
+            except Exception:
+                meta = {}
+            matched_fill = meta.get("matched_fill") if isinstance(meta, dict) else {}
+            # 1) Recompute reconciled exit truth when full fill cost/fee was applied to a tiny residual quantity.
+            if exit_reason.startswith("reconciled_fill") or bool((meta or {}).get("reconciled_close")):
+                exit_qty = _to_float(r.get("exit_qty")) or 0.0
+                exit_price = _to_float(r.get("exit_price")) or 0.0
+                entry_cost = _to_float(r.get("entry_cost")) or 0.0
+                entry_fee = _to_float(r.get("entry_fee")) or 0.0
+                exit_fee = _to_float(r.get("exit_fee")) or 0.0
+                exit_cost = _to_float(r.get("exit_cost")) or 0.0
+                mf_qty = 0.0
+                mf_cost = 0.0
+                mf_fee = 0.0
+                if isinstance(matched_fill, dict):
+                    mf_qty = _to_float(matched_fill.get("qty")) or 0.0
+                    mf_cost = _to_float(matched_fill.get("cost")) or 0.0
+                    mf_fee = _to_float(matched_fill.get("fee")) or 0.0
+                expected_cost = exit_price * exit_qty if exit_price > 0.0 and exit_qty > 0.0 else 0.0
+                suspicious = False
+                new_exit_cost = exit_cost
+                new_exit_fee = exit_fee
+                if mf_qty > 0.0 and exit_qty > 0.0 and exit_qty < (mf_qty * 0.999):
+                    suspicious = True
+                    scale = max(0.0, min(1.0, float(exit_qty) / float(mf_qty)))
+                    if mf_cost > 0.0:
+                        new_exit_cost = mf_cost * scale
+                    elif expected_cost > 0.0:
+                        new_exit_cost = expected_cost
+                    if mf_fee > 0.0:
+                        new_exit_fee = mf_fee * scale
+                elif expected_cost > 0.0 and exit_cost > (expected_cost * 1.5):
+                    suspicious = True
+                    new_exit_cost = expected_cost
+                if suspicious:
+                    gross = float(new_exit_cost) - float(entry_cost)
+                    net = float(gross) - float(entry_fee) - float(new_exit_fee)
+                    fees_total = float(entry_fee) + float(new_exit_fee)
+                    conn.execute(
+                        "UPDATE closed_trades SET exit_cost=?, exit_fee=?, fees_total=?, gross_pnl_usd=?, net_pnl_usd=? WHERE id=?",
+                        (_to_float(new_exit_cost), _to_float(new_exit_fee), _to_float(fees_total), _to_float(gross), _to_float(net), rid),
+                    )
+                    repaired_rows.append({
+                        "id": rid,
+                        "symbol": symbol,
+                        "exit_txid": exit_txid,
+                        "old_exit_cost": exit_cost,
+                        "new_exit_cost": new_exit_cost,
+                        "old_exit_fee": exit_fee,
+                        "new_exit_fee": new_exit_fee,
+                        "old_net_pnl_usd": _to_float(r.get("net_pnl_usd")),
+                        "new_net_pnl_usd": net,
+                    })
+            # 2) Remove duplicate reconciled rows for the same broker exit txid and symbol, preserving the latest non-reconciled row when present.
+            if symbol and exit_txid:
+                key = (symbol, exit_txid)
+                incumbent = seen_by_key.get(key)
+                if incumbent is None:
+                    seen_by_key[key] = r
+                else:
+                    incumbent_reason = str(incumbent.get("exit_reason") or "")
+                    incumbent_id = int(incumbent.get("id") or 0)
+                    current_is_reconciled = exit_reason.startswith("reconciled_fill") or bool((meta or {}).get("reconciled_close"))
+                    incumbent_is_reconciled = incumbent_reason.startswith("reconciled_fill")
+                    delete_id = None
+                    if current_is_reconciled and not incumbent_is_reconciled:
+                        delete_id = rid
+                    elif incumbent_is_reconciled and not current_is_reconciled:
+                        delete_id = incumbent_id
+                        seen_by_key[key] = r
+                    elif current_is_reconciled and incumbent_is_reconciled:
+                        delete_id = rid if rid < incumbent_id else incumbent_id
+                        if delete_id == incumbent_id:
+                            seen_by_key[key] = r
+                    if delete_id:
+                        conn.execute("DELETE FROM closed_trades WHERE id=?", (int(delete_id),))
+                        deduped_rows.append({"symbol": symbol, "exit_txid": exit_txid, "deleted_id": int(delete_id)})
+        conn.commit()
+    return {
+        "ok": True,
+        "checked": checked,
+        "repaired_count": len(repaired_rows),
+        "deduped_count": len(deduped_rows),
+        "repaired_rows": repaired_rows[:50],
+        "deduped_rows": deduped_rows[:50],
+    }
+
 
 def _canonical_trade_symbol(symbol: str) -> str:
     s = str(symbol or '').strip().upper()
@@ -233,6 +354,22 @@ def close_trade(symbol: str, exit_data: Dict[str, Any]) -> Dict[str, Any]:
         o = dict(open_row)
         now = time.time()
         closed_ts = _to_float(exit_data.get("closed_ts")) or now
+        exit_txid = str(exit_data.get("exit_txid") or "").strip()
+        meta = exit_data.get("meta") or {}
+        meta = dict(meta)
+        existing_closed = _find_closed_by_symbol_exit_txid(conn, sym, exit_txid) if exit_txid else None
+        if existing_closed is not None and (bool(meta.get("reconciled_close")) or str(exit_data.get("exit_reason") or "").startswith("reconciled_fill")):
+            try:
+                conn.execute("DELETE FROM open_trades WHERE symbol=?", (sym,))
+                conn.commit()
+            except Exception:
+                pass
+            existing_closed["ok"] = True
+            existing_closed["deduped_reconciled_exit"] = True
+            existing_closed["db_path"] = _db_path()
+            existing_closed["remaining_qty"] = 0.0
+            existing_closed["partial_close"] = False
+            return existing_closed
         entry_qty_total = _to_float(o.get("entry_qty")) or 0.0
         exit_qty = _to_float(exit_data.get("exit_qty")) or 0.0
         if exit_qty <= 0.0:
@@ -244,10 +381,25 @@ def close_trade(symbol: str, exit_data: Dict[str, Any]) -> Dict[str, Any]:
         if entry_cost_total is None:
             entry_cost_total = entry_price * entry_qty_total if entry_price > 0 and entry_qty_total > 0 else None
         exit_cost = _to_float(exit_data.get("exit_cost"))
-        if exit_cost is None:
-            exit_cost = exit_price * exit_qty if exit_price > 0 and exit_qty > 0 else None
         entry_fee_total = _to_float(o.get("entry_fee")) or 0.0
         exit_fee = _to_float(exit_data.get("exit_fee")) or 0.0
+        matched_fill = meta.get("matched_fill") if isinstance(meta, dict) else None
+        mf_qty = _to_float((matched_fill or {}).get("qty")) or 0.0 if isinstance(matched_fill, dict) else 0.0
+        mf_cost = _to_float((matched_fill or {}).get("cost")) or 0.0 if isinstance(matched_fill, dict) else 0.0
+        mf_fee = _to_float((matched_fill or {}).get("fee")) or 0.0 if isinstance(matched_fill, dict) else 0.0
+        if bool(meta.get("reconciled_close")) and exit_qty > 0.0:
+            if mf_qty > 0.0 and exit_qty < (mf_qty * 0.999):
+                scale = max(0.0, min(1.0, float(exit_qty) / float(mf_qty)))
+                if mf_cost > 0.0:
+                    exit_cost = mf_cost * scale
+                if mf_fee > 0.0:
+                    exit_fee = mf_fee * scale
+            expected_exit_cost = exit_price * exit_qty if exit_price > 0.0 and exit_qty > 0.0 else None
+            if expected_exit_cost is not None:
+                if exit_cost is None or exit_cost > (expected_exit_cost * 1.5):
+                    exit_cost = expected_exit_cost
+        if exit_cost is None:
+            exit_cost = exit_price * exit_qty if exit_price > 0 and exit_qty > 0 else None
         close_ratio = 1.0
         if entry_qty_total > 0 and exit_qty > 0:
             close_ratio = min(1.0, float(exit_qty) / float(entry_qty_total))
@@ -261,8 +413,6 @@ def close_trade(symbol: str, exit_data: Dict[str, Any]) -> Dict[str, Any]:
             gross = (float(exit_price) - float(entry_price)) * float(entry_qty_closed)
         net = (float(gross) if gross is not None else 0.0) - float(entry_fee_closed) - float(exit_fee)
         hold_sec = max(0.0, float(closed_ts) - float(o.get("opened_ts") or 0.0)) if o.get("opened_ts") else None
-        meta = exit_data.get("meta") or {}
-        meta = dict(meta)
         meta["partial_close"] = bool(close_ratio < 0.999)
         meta["close_ratio"] = float(close_ratio)
         row = {

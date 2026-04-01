@@ -519,7 +519,13 @@ def _startup_self_check(*, rerun: bool = False, apply: bool | None = None) -> di
         }
         return dict(STARTUP_SELF_CHECK_RESULT)
 
-    lifecycle_repairs = {'expired_workflow_locks_released': 0, 'legacy_trade_lifecycle_events_backfilled': 0, 'expired_signal_fingerprints_purged': 0}
+    lifecycle_repairs = {'expired_workflow_locks_released': 0, 'legacy_trade_lifecycle_events_backfilled': 0, 'expired_signal_fingerprints_purged': 0, 'reconciled_exit_truth_repaired': 0, 'reconciled_exit_duplicates_removed': 0}
+    try:
+        _repair = trade_journal.repair_reconciled_exit_truth(lookback_days=30.0)
+        lifecycle_repairs['reconciled_exit_truth_repaired'] = int(_repair.get('repaired_count') or 0)
+        lifecycle_repairs['reconciled_exit_duplicates_removed'] = int(_repair.get('deduped_count') or 0)
+    except Exception:
+        pass
     dependency_guard = _startup_dependency_guard()
     if not bool(dependency_guard.get('ok')):
         STARTUP_SELF_CHECK_TS = time.time()
