@@ -87,6 +87,127 @@ def init_db() -> None:
 def _rowdict(row: sqlite3.Row | None) -> Optional[Dict[str, Any]]:
     return dict(row) if row is not None else None
 
+def _resolve_strategy_provenance(conn: sqlite3.Connection, symbol: str, open_row: Optional[Dict[str, Any]], exit_data: Dict[str, Any]) -> str:
+    sym = str(symbol or "").strip().upper()
+    if open_row:
+        st = str(open_row.get("strategy") or "").strip()
+        if st and st.lower() != "adopted":
+            return st
+    meta = exit_data.get("meta") or {}
+    if isinstance(meta, dict):
+        for key in ("strategy", "source_strategy", "planned_strategy", "entry_strategy"):
+            st = str(meta.get(key) or "").strip()
+            if st and st.lower() != "adopted":
+                return st
+    entry_txid = str(exit_data.get("entry_txid") or "").strip()
+    exit_txid = str(exit_data.get("exit_txid") or "").strip()
+    if entry_txid:
+        row = conn.execute(
+            "SELECT strategy FROM closed_trades WHERE symbol=? AND entry_txid=? AND COALESCE(strategy,'') <> '' ORDER BY id DESC LIMIT 1",
+            (sym, entry_txid),
+        ).fetchone()
+        if row is not None:
+            st = str(row[0] or "").strip()
+            if st and st.lower() != "adopted":
+                return st
+    if exit_txid:
+        row = conn.execute(
+            "SELECT strategy FROM closed_trades WHERE symbol=? AND exit_txid=? AND COALESCE(strategy,'') <> '' ORDER BY id DESC LIMIT 1",
+            (sym, exit_txid),
+        ).fetchone()
+        if row is not None:
+            st = str(row[0] or "").strip()
+            if st and st.lower() != "adopted":
+                return st
+    if entry_txid:
+        row = conn.execute(
+            "SELECT strategy FROM trade_plans WHERE symbol=? AND (entry_txid=? OR plan_id=?) AND COALESCE(strategy,'') <> '' ORDER BY id DESC LIMIT 1",
+            (sym, entry_txid, entry_txid),
+        ).fetchone()
+        if row is not None:
+            st = str(row[0] or "").strip()
+            if st:
+                return st
+    row = conn.execute(
+        "SELECT strategy FROM trade_plans WHERE symbol=? AND COALESCE(strategy,'') <> '' ORDER BY id DESC LIMIT 1",
+        (sym,),
+    ).fetchone()
+    if row is not None:
+        st = str(row[0] or "").strip()
+        if st and st.lower() != "adopted":
+            return st
+    if open_row:
+        st = str(open_row.get("strategy") or "").strip()
+        if st:
+            return st
+    return "adopted"
+
+
+def repair_reconciled_strategy_attribution(*, lookback_days: float = 30.0) -> Dict[str, Any]:
+    init_db()
+    now = time.time()
+    since_ts = max(0.0, float(now) - float(lookback_days) * 86400.0)
+    updated = []
+    checked = 0
+    with _connect() as conn:
+        rows = conn.execute(
+            "SELECT * FROM closed_trades WHERE closed_ts >= ? ORDER BY closed_ts DESC, id DESC",
+            (since_ts,),
+        ).fetchall()
+        for r in rows:
+            checked += 1
+            row = dict(r)
+            current = str(row.get("strategy") or "").strip()
+            if current and current.lower() != "adopted":
+                continue
+            exit_reason = str(row.get("exit_reason") or "")
+            if not (exit_reason.startswith("reconciled_fill") or exit_reason == "reconciled_fill_backfill" or current.lower() == "adopted"):
+                continue
+            sym = str(row.get("symbol") or "").strip().upper()
+            entry_txid = str(row.get("entry_txid") or "").strip()
+            exit_txid = str(row.get("exit_txid") or "").strip()
+            candidate = ""
+            if entry_txid:
+                o = conn.execute(
+                    "SELECT strategy FROM open_trades WHERE symbol=? AND entry_txid=? AND COALESCE(strategy,'') <> '' ORDER BY id DESC LIMIT 1",
+                    (sym, entry_txid),
+                ).fetchone()
+                if o is not None:
+                    candidate = str(o[0] or "").strip()
+            if (not candidate or candidate.lower() == "adopted") and entry_txid:
+                q = conn.execute(
+                    "SELECT strategy FROM closed_trades WHERE symbol=? AND entry_txid=? AND id <> ? AND COALESCE(strategy,'') <> '' ORDER BY id DESC LIMIT 1",
+                    (sym, entry_txid, int(row.get("id") or 0)),
+                ).fetchone()
+                if q is not None:
+                    candidate = str(q[0] or "").strip()
+            if (not candidate or candidate.lower() == "adopted") and exit_txid:
+                q = conn.execute(
+                    "SELECT strategy FROM closed_trades WHERE symbol=? AND exit_txid=? AND id <> ? AND COALESCE(strategy,'') <> '' ORDER BY id DESC LIMIT 1",
+                    (sym, exit_txid, int(row.get("id") or 0)),
+                ).fetchone()
+                if q is not None:
+                    candidate = str(q[0] or "").strip()
+            if (not candidate or candidate.lower() == "adopted") and entry_txid:
+                q = conn.execute(
+                    "SELECT strategy FROM trade_plans WHERE symbol=? AND (entry_txid=? OR plan_id=?) AND COALESCE(strategy,'') <> '' ORDER BY id DESC LIMIT 1",
+                    (sym, entry_txid, entry_txid),
+                ).fetchone()
+                if q is not None:
+                    candidate = str(q[0] or "").strip()
+            if (not candidate or candidate.lower() == "adopted"):
+                q = conn.execute(
+                    "SELECT strategy FROM trade_plans WHERE symbol=? AND COALESCE(strategy,'') <> '' ORDER BY id DESC LIMIT 1",
+                    (sym,),
+                ).fetchone()
+                if q is not None:
+                    candidate = str(q[0] or "").strip()
+            if candidate and candidate.lower() != "adopted":
+                conn.execute("UPDATE closed_trades SET strategy=? WHERE id=?", (candidate, int(row.get("id") or 0)))
+                updated.append({"id": int(row.get("id") or 0), "symbol": sym, "from": current or "adopted", "to": candidate, "exit_txid": exit_txid})
+        conn.commit()
+    return {"ok": True, "checked": checked, "updated_count": len(updated), "updated_rows": updated[:50]}
+
 def _find_closed_by_symbol_exit_txid(conn: sqlite3.Connection, symbol: str, exit_txid: str) -> Optional[Dict[str, Any]]:
     sym = str(symbol or "").strip().upper()
     tx = str(exit_txid or "").strip()
@@ -357,6 +478,7 @@ def close_trade(symbol: str, exit_data: Dict[str, Any]) -> Dict[str, Any]:
         exit_txid = str(exit_data.get("exit_txid") or "").strip()
         meta = exit_data.get("meta") or {}
         meta = dict(meta)
+        resolved_strategy = _resolve_strategy_provenance(conn, sym, o, exit_data)
         existing_closed = _find_closed_by_symbol_exit_txid(conn, sym, exit_txid) if exit_txid else None
         if existing_closed is not None and (bool(meta.get("reconciled_close")) or str(exit_data.get("exit_reason") or "").startswith("reconciled_fill")):
             try:
@@ -364,6 +486,13 @@ def close_trade(symbol: str, exit_data: Dict[str, Any]) -> Dict[str, Any]:
                 conn.commit()
             except Exception:
                 pass
+            if str(existing_closed.get("strategy") or "").strip().lower() == "adopted" and resolved_strategy and resolved_strategy.lower() != "adopted":
+                try:
+                    conn.execute("UPDATE closed_trades SET strategy=? WHERE id=?", (resolved_strategy, int(existing_closed.get("id") or 0)))
+                    conn.commit()
+                    existing_closed["strategy"] = resolved_strategy
+                except Exception:
+                    pass
             existing_closed["ok"] = True
             existing_closed["deduped_reconciled_exit"] = True
             existing_closed["db_path"] = _db_path()
@@ -420,7 +549,7 @@ def close_trade(symbol: str, exit_data: Dict[str, Any]) -> Dict[str, Any]:
             "opened_ts": _to_float(o.get("opened_ts")),
             "closed_ts": float(closed_ts),
             "hold_sec": _to_float(hold_sec),
-            "strategy": o.get("strategy"),
+            "strategy": resolved_strategy or o.get("strategy") or "adopted",
             "source": o.get("source"),
             "signal_name": o.get("signal_name"),
             "signal_id": o.get("signal_id"),
