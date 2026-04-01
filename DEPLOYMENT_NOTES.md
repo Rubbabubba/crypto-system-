@@ -1,7 +1,7 @@
-# patch-043-explicit-journal-lifecycle-provenance-bridge-forced-strategy-rewrite
+# patch-044-backfill-family-specific-provenance-mapping
 
 Changes:
-- Add explicit journal↔lifecycle provenance bridge that inspects actual lifecycle tables/columns and resolves strategy by txid bridge first, then symbol/timestamp proximity.
-- Add forced rewrite pass for already-journaled adopted rows in both closed_trades and open_trades.
-- Preserve journal persistence and P&L truth fixes.
+- Add family-specific provenance mapping for backfilled trade families, especially reconciled_fill_backfill rows.
+- Resolve strategy using table-specific ranking across lifecycle sources, favoring txid-linked and time-adjacent matches.
+- Preserve journal persistence, P&L truth, and existing explicit provenance bridge behavior.
 - No scanner behavior changes beyond paired build identity.
