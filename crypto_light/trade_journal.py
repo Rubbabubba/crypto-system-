@@ -233,8 +233,93 @@ def _resolve_strategy_provenance(conn: sqlite3.Connection, symbol: str, open_row
 
 
 
+
+def _lifecycle_table_columns(conn: sqlite3.Connection, table_name: str) -> List[str]:
+    try:
+        rows = conn.execute(f"PRAGMA table_info({table_name})").fetchall()
+        return [str(r[1]) for r in rows if len(r) > 1]
+    except Exception:
+        return []
+
+def _pick_first(cols: List[str], candidates: List[str]) -> str:
+    lower = {c.lower(): c for c in cols}
+    for cand in candidates:
+        if cand.lower() in lower:
+            return lower[cand.lower()]
+    return ""
+
+def _fetch_bridge_candidates_from_table(conn: sqlite3.Connection, table_name: str, symbol: str, entry_txid: str = "", exit_txid: str = "", opened_ts: float = 0.0, closed_ts: float = 0.0, limit: int = 20) -> List[Dict[str, Any]]:
+    cols = _lifecycle_table_columns(conn, table_name)
+    if not cols:
+        return []
+    sym_col = _pick_first(cols, ["symbol", "pair", "market"])
+    strat_col = _pick_first(cols, ["strategy", "entry_strategy", "signal_strategy", "planned_strategy"])
+    created_col = _pick_first(cols, ["created_ts", "created_at_ts", "opened_ts", "entry_ts", "ts", "created_at"])
+    entry_col = _pick_first(cols, ["entry_txid", "buy_txid", "open_txid", "txid", "entry_order_txid"])
+    exit_col = _pick_first(cols, ["exit_txid", "sell_txid", "close_txid", "exit_order_txid"])
+    if not sym_col or not strat_col:
+        return []
+    where = [f"COALESCE({sym_col},'') = ?"]
+    params = [symbol]
+    tx_parts = []
+    if entry_txid and entry_col:
+        tx_parts.append(f"COALESCE({entry_col},'') = ?")
+        params.append(entry_txid)
+    if exit_txid and exit_col:
+        tx_parts.append(f"COALESCE({exit_col},'') = ?")
+        params.append(exit_txid)
+    target_ts = float(opened_ts or closed_ts or 0.0)
+    sql = f"SELECT * FROM {table_name}"
+    if tx_parts:
+        sql += " WHERE " + " AND ".join(where) + " AND (" + " OR ".join(tx_parts) + ")"
+    else:
+        sql += " WHERE " + " AND ".join(where)
+    order_parts = []
+    if created_col and target_ts > 0:
+        order_parts.append(f"ABS(COALESCE({created_col},0)-{target_ts}) ASC")
+    order_parts.append("rowid DESC")
+    sql += " ORDER BY " + ", ".join(order_parts) + f" LIMIT {int(limit)}"
+    try:
+        return [dict(r) for r in conn.execute(sql, tuple(params)).fetchall()]
+    except Exception:
+        return []
+
+def _extract_strategy_from_bridge_row(row: Dict[str, Any]) -> str:
+    for key in ("strategy", "entry_strategy", "signal_strategy", "planned_strategy"):
+        val = str(row.get(key) or "").strip()
+        if val and val.lower() != "adopted":
+            return val
+    return ""
+
+def _explicit_lifecycle_provenance_bridge(symbol: str, entry_txid: str = "", exit_txid: str = "", opened_ts: float = 0.0, closed_ts: float = 0.0) -> Dict[str, Any]:
+    sym = str(symbol or "").strip().upper()
+    if not sym:
+        return {"strategy": "", "source": "", "row": {}}
+    lifecycle_tables = ["trade_plans", "trade_intents", "entry_intents", "trade_lifecycle_events", "trade_workflow_locks"]
+    try:
+        with _connect_lifecycle() as lconn:
+            for table_name in lifecycle_tables:
+                rows = _fetch_bridge_candidates_from_table(lconn, table_name, sym, entry_txid=entry_txid, exit_txid=exit_txid, opened_ts=opened_ts, closed_ts=closed_ts, limit=20)
+                for row in rows:
+                    st = _extract_strategy_from_bridge_row(row)
+                    if st:
+                        return {"strategy": st, "source": table_name + ":txid_bridge", "row": row}
+            for table_name in lifecycle_tables:
+                rows = _fetch_bridge_candidates_from_table(lconn, table_name, sym, opened_ts=opened_ts, closed_ts=closed_ts, limit=20)
+                for row in rows:
+                    st = _extract_strategy_from_bridge_row(row)
+                    if st:
+                        return {"strategy": st, "source": table_name + ":time_bridge", "row": row}
+    except Exception:
+        pass
+    return {"strategy": "", "source": "", "row": {}}
+
 def _resolve_journal_strategy_from_lifecycle(symbol: str, entry_txid: str = "", exit_txid: str = "", opened_ts: float = 0.0, closed_ts: float = 0.0) -> str:
     sym = str(symbol or "").strip().upper()
+    bridge = _explicit_lifecycle_provenance_bridge(sym, entry_txid=entry_txid, exit_txid=exit_txid, opened_ts=opened_ts, closed_ts=closed_ts)
+    st = str((bridge or {}).get("strategy") or "").strip()
+    if st and st.lower() != "adopted":
+        return st
     st = _lifecycle_strategy_from_trade_plans(sym, entry_txid=entry_txid, plan_id=entry_txid)
     if st and st.lower() != "adopted":
         return st
@@ -261,6 +346,51 @@ def _resolve_journal_strategy_from_lifecycle(symbol: str, entry_txid: str = "", 
         pass
     return "adopted"
 
+
+
+def force_rewrite_adopted_journal_strategies(*, lookback_days: float = 30.0) -> Dict[str, Any]:
+    init_db()
+    now = time.time()
+    since_ts = max(0.0, float(now) - float(lookback_days) * 86400.0)
+    updated = []
+    checked = 0
+    with _connect() as conn:
+        rows = conn.execute("SELECT id, symbol, strategy, entry_txid, exit_txid, entry_ts, closed_ts FROM closed_trades WHERE closed_ts >= ? ORDER BY id DESC", (since_ts,)).fetchall()
+        for r in rows:
+            row = dict(r)
+            checked += 1
+            current = str(row.get("strategy") or "").strip().lower()
+            if current and current != "adopted":
+                continue
+            bridge = _explicit_lifecycle_provenance_bridge(
+                str(row.get("symbol") or ""),
+                entry_txid=str(row.get("entry_txid") or ""),
+                exit_txid=str(row.get("exit_txid") or ""),
+                opened_ts=_to_float(row.get("entry_ts")) or 0.0,
+                closed_ts=_to_float(row.get("closed_ts")) or 0.0,
+            )
+            new_strategy = str((bridge or {}).get("strategy") or "").strip()
+            if new_strategy and new_strategy.lower() != "adopted":
+                conn.execute("UPDATE closed_trades SET strategy=? WHERE id=?", (new_strategy, int(row["id"])))
+                updated.append({"table": "closed_trades", "id": int(row["id"]), "symbol": row.get("symbol"), "to": new_strategy, "source": bridge.get("source")})
+        rows = conn.execute("SELECT id, symbol, strategy, entry_txid, opened_ts FROM open_trades ORDER BY id DESC").fetchall()
+        for r in rows:
+            row = dict(r)
+            checked += 1
+            current = str(row.get("strategy") or "").strip().lower()
+            if current and current != "adopted":
+                continue
+            bridge = _explicit_lifecycle_provenance_bridge(
+                str(row.get("symbol") or ""),
+                entry_txid=str(row.get("entry_txid") or ""),
+                opened_ts=_to_float(row.get("opened_ts")) or 0.0,
+            )
+            new_strategy = str((bridge or {}).get("strategy") or "").strip()
+            if new_strategy and new_strategy.lower() != "adopted":
+                conn.execute("UPDATE open_trades SET strategy=? WHERE id=?", (new_strategy, int(row["id"])))
+                updated.append({"table": "open_trades", "id": int(row["id"]), "symbol": row.get("symbol"), "to": new_strategy, "source": bridge.get("source")})
+        conn.commit()
+    return {"ok": True, "checked": checked, "updated_count": len(updated), "updated_rows": updated[:100]}
 
 def rewrite_journal_strategies_from_lifecycle(*, lookback_days: float = 30.0) -> Dict[str, Any]:
     init_db()
