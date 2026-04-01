@@ -1,7 +1,7 @@
-# patch-038-reconciled-exit-dedupe-qty-truth-pnl-truth-fix
+# patch-039-reconciled-strategy-attribution-preservation
 
 Changes:
-- Fix reconciled exit quantity/cost/fee truth for partial residual closes so tiny residual quantities cannot inherit full-fill cash value.
-- Deduplicate reconciled close journaling by symbol + broker exit txid, preferring the pre-existing closed row and suppressing duplicate reconciled inserts.
-- Add startup repair pass to correct recent reconciled exit P&L truth and remove duplicate reconciled exit rows from the trade journal.
-- Preserve scanner behavior, entry logic, worker loops, lifecycle coordination, sizing mode, and risk gates.
+- Preserve original strategy attribution for reconciled/backfilled closes by resolving strategy provenance from open trade, meta, matching journal rows, and trade plan before falling back to adopted.
+- Repair recent reconciled rows wrongly labeled as adopted when strategy provenance exists.
+- Preserve all Patch 038 qty truth / exit dedupe / P&L truth behavior.
+- No scanner behavior changes.
