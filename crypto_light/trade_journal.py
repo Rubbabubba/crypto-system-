@@ -291,7 +291,95 @@ def _extract_strategy_from_bridge_row(row: Dict[str, Any]) -> str:
             return val
     return ""
 
-def _explicit_lifecycle_provenance_bridge(symbol: str, entry_txid: str = "", exit_txid: str = "", opened_ts: float = 0.0, closed_ts: float = 0.0) -> Dict[str, Any]:
+def 
+def _fetch_family_rows_from_table(conn: sqlite3.Connection, table_name: str, symbol: str, target_ts: float, entry_txid: str = "", exit_txid: str = "", limit: int = 50) -> List[Dict[str, Any]]:
+    cols = _lifecycle_table_columns(conn, table_name)
+    if not cols:
+        return []
+    sym_col = _pick_first(cols, ["symbol", "pair", "market"])
+    strat_col = _pick_first(cols, ["strategy", "entry_strategy", "signal_strategy", "planned_strategy"])
+    if not sym_col or not strat_col:
+        return []
+    created_col = _pick_first(cols, ["created_ts", "created_at_ts", "opened_ts", "entry_ts", "closed_ts", "ts", "created_at"])
+    entry_col = _pick_first(cols, ["entry_txid", "buy_txid", "open_txid", "txid", "entry_order_txid"])
+    exit_col = _pick_first(cols, ["exit_txid", "sell_txid", "close_txid", "exit_order_txid"])
+    where = [f"COALESCE({sym_col},'')=?"]
+    params = [symbol]
+    tx_clauses = []
+    if entry_txid and entry_col:
+        tx_clauses.append(f"COALESCE({entry_col},'')=?")
+        params.append(entry_txid)
+    if exit_txid and exit_col:
+        tx_clauses.append(f"COALESCE({exit_col},'')=?")
+        params.append(exit_txid)
+    sql = f"SELECT * FROM {table_name} WHERE " + " AND ".join(where)
+    if tx_clauses:
+        sql += " AND (" + " OR ".join(tx_clauses) + ")"
+    order_parts = []
+    if created_col and target_ts > 0:
+        order_parts.append(f"ABS(COALESCE({created_col},0)-{target_ts}) ASC")
+    order_parts.append("rowid DESC")
+    sql += " ORDER BY " + ", ".join(order_parts) + f" LIMIT {int(limit)}"
+    try:
+        return [dict(r) for r in conn.execute(sql, tuple(params)).fetchall()]
+    except Exception:
+        return []
+
+def _score_family_candidate(row: Dict[str, Any], target_ts: float, entry_txid: str = "", exit_txid: str = "") -> float:
+    score = 0.0
+    strat = _extract_strategy_from_bridge_row(row)
+    if strat and strat.lower() != "adopted":
+        score += 100.0
+    joined = " ".join([str(v or "") for v in row.values()]).lower()
+    if entry_txid and entry_txid.lower() in joined:
+        score += 40.0
+    if exit_txid and exit_txid.lower() in joined:
+        score += 40.0
+    closest = None
+    for k in ("created_ts", "created_at_ts", "opened_ts", "entry_ts", "closed_ts", "ts"):
+        try:
+            if k in row and row.get(k) is not None:
+                dist = abs(float(row.get(k) or 0.0) - float(target_ts or 0.0))
+                closest = dist if closest is None else min(closest, dist)
+        except Exception:
+            pass
+    if closest is not None:
+        if closest <= 120:
+            score += 25.0
+        elif closest <= 600:
+            score += 18.0
+        elif closest <= 1800:
+            score += 10.0
+        elif closest <= 7200:
+            score += 5.0
+    return score
+
+def _family_specific_backfill_strategy_map(symbol: str, entry_txid: str = "", exit_txid: str = "", opened_ts: float = 0.0, closed_ts: float = 0.0, exit_reason: str = "") -> Dict[str, Any]:
+    sym = str(symbol or "").strip().upper()
+    target_ts = float(closed_ts or opened_ts or 0.0)
+    if str(exit_reason or "").startswith("reconciled_fill_backfill"):
+        families = ["trade_lifecycle_events", "trade_plans", "trade_intents", "entry_intents"]
+    elif str(exit_reason or "").startswith("reconciled_fill"):
+        families = ["trade_plans", "trade_lifecycle_events", "trade_intents", "entry_intents"]
+    else:
+        families = ["trade_plans", "trade_intents", "entry_intents", "trade_lifecycle_events"]
+    best = {"strategy": "", "source": "", "row": {}, "score": -1.0}
+    try:
+        with _connect_lifecycle() as lconn:
+            for table_name in families:
+                rows = _fetch_family_rows_from_table(lconn, table_name, sym, target_ts=target_ts, entry_txid=entry_txid, exit_txid=exit_txid, limit=50)
+                for row in rows:
+                    strat = _extract_strategy_from_bridge_row(row)
+                    if not strat or strat.lower() == "adopted":
+                        continue
+                    score = _score_family_candidate(row, target_ts, entry_txid=entry_txid, exit_txid=exit_txid)
+                    if score > float(best["score"]):
+                        best = {"strategy": strat, "source": f"{table_name}:family_map", "row": row, "score": score}
+    except Exception:
+        pass
+    return best
+
+_explicit_lifecycle_provenance_bridge(symbol: str, entry_txid: str = "", exit_txid: str = "", opened_ts: float = 0.0, closed_ts: float = 0.0) -> Dict[str, Any]:
     sym = str(symbol or "").strip().upper()
     if not sym:
         return {"strategy": "", "source": "", "row": {}}
@@ -314,9 +402,9 @@ def _explicit_lifecycle_provenance_bridge(symbol: str, entry_txid: str = "", exi
         pass
     return {"strategy": "", "source": "", "row": {}}
 
-def _resolve_journal_strategy_from_lifecycle(symbol: str, entry_txid: str = "", exit_txid: str = "", opened_ts: float = 0.0, closed_ts: float = 0.0) -> str:
+def _resolve_journal_strategy_from_lifecycle(symbol: str, entry_txid: str = "", exit_txid: str = "", opened_ts: float = 0.0, closed_ts: float = 0.0, exit_reason: str = "") -> str:
     sym = str(symbol or "").strip().upper()
-    bridge = _explicit_lifecycle_provenance_bridge(sym, entry_txid=entry_txid, exit_txid=exit_txid, opened_ts=opened_ts, closed_ts=closed_ts)
+    bridge = _explicit_lifecycle_provenance_bridge(sym, entry_txid=entry_txid, exit_txid=exit_txid, opened_ts=opened_ts, closed_ts=closed_ts, exit_reason=exit_reason)
     st = str((bridge or {}).get("strategy") or "").strip()
     if st and st.lower() != "adopted":
         return st
@@ -368,6 +456,7 @@ def force_rewrite_adopted_journal_strategies(*, lookback_days: float = 30.0) -> 
                 exit_txid=str(row.get("exit_txid") or ""),
                 opened_ts=_to_float(row.get("entry_ts")) or 0.0,
                 closed_ts=_to_float(row.get("closed_ts")) or 0.0,
+                exit_reason=str(row.get("exit_reason") or ""),
             )
             new_strategy = str((bridge or {}).get("strategy") or "").strip()
             if new_strategy and new_strategy.lower() != "adopted":
