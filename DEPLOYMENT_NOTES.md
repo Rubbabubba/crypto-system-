@@ -1,7 +1,7 @@
-# patch-041-backfill-strategy-mapping-unmatched-sell-recovery
+# patch-042-journal-strategy-rewrite-backfill-rehydration-lifecycle-history
 
 Changes:
-- Preserve backfilled strategy attribution using lifecycle trade plans and lifecycle intent tables before falling back to adopted.
-- Add unmatched sell recovery by finding nearest prior broker buy when an exact prior buy match is unavailable.
-- Preserve Patch 040 journal persistence and lifecycle-backed provenance fixes.
+- Add journal strategy rewrite pass that rewrites already-journaled open/closed trades from lifecycle history.
+- Add unmatched backfill rehydration from broker history to reconstruct missing closes when lifecycle-provenanced strategy can be resolved.
+- Preserve Patch 040 journal persistence and Patch 041 lifecycle/intents lookup logic.
 - No scanner behavior changes beyond paired build identity.
