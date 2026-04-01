@@ -1,7 +1,7 @@
-# patch-037-rb1-dedupe-repeat-entry-tolerance-tuning
+# patch-038-reconciled-exit-dedupe-qty-truth-pnl-truth-fix
 
 Changes:
-- Tune RB1 repeat-entry tolerance by bypassing state signal-id dedupe for RB1 only.
-- Preserve lifecycle signal fingerprint dedupe and workflow locking as the active anti-duplication controls for RB1.
-- Leave TC0 and all non-RB1 strategies on the existing signal-id dedupe path.
-- No changes to sizing, exposure, exits, journaling, worker routing, scanner alignment, or lifecycle state.
+- Fix reconciled exit quantity/cost/fee truth for partial residual closes so tiny residual quantities cannot inherit full-fill cash value.
+- Deduplicate reconciled close journaling by symbol + broker exit txid, preferring the pre-existing closed row and suppressing duplicate reconciled inserts.
+- Add startup repair pass to correct recent reconciled exit P&L truth and remove duplicate reconciled exit rows from the trade journal.
+- Preserve scanner behavior, entry logic, worker loops, lifecycle coordination, sizing mode, and risk gates.
