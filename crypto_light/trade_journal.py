@@ -291,7 +291,7 @@ def _extract_strategy_from_bridge_row(row: Dict[str, Any]) -> str:
             return val
     return ""
 
-def 
+
 def _fetch_family_rows_from_table(conn: sqlite3.Connection, table_name: str, symbol: str, target_ts: float, entry_txid: str = "", exit_txid: str = "", limit: int = 50) -> List[Dict[str, Any]]:
     cols = _lifecycle_table_columns(conn, table_name)
     if not cols:
@@ -379,7 +379,7 @@ def _family_specific_backfill_strategy_map(symbol: str, entry_txid: str = "", ex
         pass
     return best
 
-_explicit_lifecycle_provenance_bridge(symbol: str, entry_txid: str = "", exit_txid: str = "", opened_ts: float = 0.0, closed_ts: float = 0.0) -> Dict[str, Any]:
+def _explicit_lifecycle_provenance_bridge(symbol: str, entry_txid: str = "", exit_txid: str = "", opened_ts: float = 0.0, closed_ts: float = 0.0) -> Dict[str, Any]:
     sym = str(symbol or "").strip().upper()
     if not sym:
         return {"strategy": "", "source": "", "row": {}}
