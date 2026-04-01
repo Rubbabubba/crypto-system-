@@ -7,8 +7,19 @@ import time
 from typing import Any, Dict, List, Optional
 
 
+def _lifecycle_db_path() -> str:
+    return os.getenv("LIFECYCLE_DB_PATH", "/var/data/lifecycle.sqlite3")
+
+
+def _connect_lifecycle() -> sqlite3.Connection:
+    path = _lifecycle_db_path()
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(path)
+    conn.row_factory = sqlite3.Row
+    return conn
+
 def _db_path() -> str:
-    return os.getenv("TRADE_JOURNAL_DB_PATH", ".data/trade_journal.sqlite3")
+    return os.getenv("TRADE_JOURNAL_DB_PATH", "/var/data/trade_journal.sqlite3")
 
 
 def _connect() -> sqlite3.Connection:
@@ -87,6 +98,27 @@ def init_db() -> None:
 def _rowdict(row: sqlite3.Row | None) -> Optional[Dict[str, Any]]:
     return dict(row) if row is not None else None
 
+def _lifecycle_strategy_from_trade_plans(symbol: str, entry_txid: str = "", plan_id: str = "") -> str:
+    sym = str(symbol or "").strip().upper()
+    try:
+        with _connect_lifecycle() as lconn:
+            if entry_txid:
+                row = lconn.execute(
+                    "SELECT strategy FROM trade_plans WHERE symbol=? AND (entry_txid=? OR plan_id=?) AND COALESCE(strategy,'') <> '' ORDER BY id DESC LIMIT 1",
+                    (sym, entry_txid, plan_id or entry_txid),
+                ).fetchone()
+                if row is not None:
+                    return str(row[0] or "").strip()
+            row = lconn.execute(
+                "SELECT strategy FROM trade_plans WHERE symbol=? AND COALESCE(strategy,'') <> '' ORDER BY id DESC LIMIT 1",
+                (sym,),
+            ).fetchone()
+            if row is not None:
+                return str(row[0] or "").strip()
+    except Exception:
+        return ""
+    return ""
+
 def _resolve_strategy_provenance(conn: sqlite3.Connection, symbol: str, open_row: Optional[Dict[str, Any]], exit_data: Dict[str, Any]) -> str:
     sym = str(symbol or "").strip().upper()
     if open_row:
@@ -119,23 +151,9 @@ def _resolve_strategy_provenance(conn: sqlite3.Connection, symbol: str, open_row
             st = str(row[0] or "").strip()
             if st and st.lower() != "adopted":
                 return st
-    if entry_txid:
-        row = conn.execute(
-            "SELECT strategy FROM trade_plans WHERE symbol=? AND (entry_txid=? OR plan_id=?) AND COALESCE(strategy,'') <> '' ORDER BY id DESC LIMIT 1",
-            (sym, entry_txid, entry_txid),
-        ).fetchone()
-        if row is not None:
-            st = str(row[0] or "").strip()
-            if st:
-                return st
-    row = conn.execute(
-        "SELECT strategy FROM trade_plans WHERE symbol=? AND COALESCE(strategy,'') <> '' ORDER BY id DESC LIMIT 1",
-        (sym,),
-    ).fetchone()
-    if row is not None:
-        st = str(row[0] or "").strip()
-        if st and st.lower() != "adopted":
-            return st
+    st = _lifecycle_strategy_from_trade_plans(sym, entry_txid=entry_txid, plan_id=entry_txid)
+    if st:
+        return st
     if open_row:
         st = str(open_row.get("strategy") or "").strip()
         if st:
@@ -188,20 +206,8 @@ def repair_reconciled_strategy_attribution(*, lookback_days: float = 30.0) -> Di
                 ).fetchone()
                 if q is not None:
                     candidate = str(q[0] or "").strip()
-            if (not candidate or candidate.lower() == "adopted") and entry_txid:
-                q = conn.execute(
-                    "SELECT strategy FROM trade_plans WHERE symbol=? AND (entry_txid=? OR plan_id=?) AND COALESCE(strategy,'') <> '' ORDER BY id DESC LIMIT 1",
-                    (sym, entry_txid, entry_txid),
-                ).fetchone()
-                if q is not None:
-                    candidate = str(q[0] or "").strip()
-            if (not candidate or candidate.lower() == "adopted"):
-                q = conn.execute(
-                    "SELECT strategy FROM trade_plans WHERE symbol=? AND COALESCE(strategy,'') <> '' ORDER BY id DESC LIMIT 1",
-                    (sym,),
-                ).fetchone()
-                if q is not None:
-                    candidate = str(q[0] or "").strip()
+            if not candidate or candidate.lower() == "adopted":
+                candidate = _lifecycle_strategy_from_trade_plans(sym, entry_txid=entry_txid, plan_id=entry_txid)
             if candidate and candidate.lower() != "adopted":
                 conn.execute("UPDATE closed_trades SET strategy=? WHERE id=?", (candidate, int(row.get("id") or 0)))
                 updated.append({"id": int(row.get("id") or 0), "symbol": sym, "from": current or "adopted", "to": candidate, "exit_txid": exit_txid})
