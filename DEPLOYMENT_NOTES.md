@@ -1,7 +1,7 @@
-# patch-039-reconciled-strategy-attribution-preservation
+# patch-040-journal-persistence-lifecycle-strategy-provenance-fix
 
 Changes:
-- Preserve original strategy attribution for reconciled/backfilled closes by resolving strategy provenance from open trade, meta, matching journal rows, and trade plan before falling back to adopted.
-- Repair recent reconciled rows wrongly labeled as adopted when strategy provenance exists.
-- Preserve all Patch 038 qty truth / exit dedupe / P&L truth behavior.
-- No scanner behavior changes.
+- Force trade journal persistence default to `/var/data/trade_journal.sqlite3` when `TRADE_JOURNAL_DB_PATH` is not provided.
+- Fix reconciled strategy provenance lookups to read `trade_plans` from the lifecycle DB, not the journal DB.
+- Preserve Patch 038 qty truth / P&L truth and Patch 039 strategy attribution behavior.
+- No scanner behavior changes beyond paired build identity.
