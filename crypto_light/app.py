@@ -898,6 +898,15 @@ TC0_MAX_HOLD_SEC = max(int(float(os.getenv("TC0_MAX_HOLD_SEC", "1800") or 1800))
 TC0_TIME_EXIT_EXTENSION_SEC = int(float(os.getenv("TC0_TIME_EXIT_EXTENSION_SEC", "5400") or 5400))
 TC0_TIME_EXIT_MIN_FEE_MULT = float(os.getenv("TC0_TIME_EXIT_MIN_FEE_MULT", "1.25") or 1.25)
 
+# Profitability enforcement (Patch 045)
+PROFIT_FILTER_ENABLED = (os.getenv("PROFIT_FILTER_ENABLED", "1").strip().lower() in ("1", "true", "yes", "on"))
+PROFIT_FILTER_MIN_MOVE_TO_COST_MULT = float(os.getenv("PROFIT_FILTER_MIN_MOVE_TO_COST_MULT", "1.10") or 1.10)
+PROFIT_FILTER_USE_LIVE_SPREAD = (os.getenv("PROFIT_FILTER_USE_LIVE_SPREAD", "1").strip().lower() in ("1", "true", "yes", "on"))
+RB1_REQUIRE_UP = (os.getenv("RB1_REQUIRE_UP", "1").strip().lower() in ("1", "true", "yes", "on"))
+RB1_MAX_DIST_TO_LEVEL_PCT = float(os.getenv("RB1_MAX_DIST_TO_LEVEL_PCT", "0.0040") or 0.0040)
+RB1_MIN_ATR_PCT = float(os.getenv("RB1_MIN_ATR_PCT", "0.0020") or 0.0020)
+RB1_DISABLE_NEAR = (os.getenv("RB1_DISABLE_NEAR", "0").strip().lower() in ("1", "true", "yes", "on"))
+
 # TC1 params
 TC1_LTF_EMA = int(float(os.getenv("TC1_LTF_EMA", "20") or 20))
 TC1_HTF_TIMEFRAME = os.getenv("TC1_HTF_TIMEFRAME", "60Min").strip() or "60Min"
@@ -1571,9 +1580,35 @@ def _normalize_plan_lifecycle_policy(plan: TradePlan | None, *, now_ts: float | 
     return plan, changed
 
 
+
+def _estimated_round_trip_cost_bps(spread_pct: float | None = None) -> float:
+    base = float(ENTRY_FEE_BPS) + float(EXIT_FEE_BPS) + (2.0 * float(EXPECTED_SLIPPAGE_BPS))
+    if PROFIT_FILTER_USE_LIVE_SPREAD and spread_pct is not None:
+        try:
+            base += max(float(spread_pct), 0.0) * 10000.0
+        except Exception:
+            pass
+    return float(base)
+
+def _profitability_gate(expected_move_bps: float | None, spread_pct: float | None = None) -> tuple[bool, dict]:
+    cost_bps = _estimated_round_trip_cost_bps(spread_pct)
+    if expected_move_bps is None:
+        return False, {"profit_filter_enabled": bool(PROFIT_FILTER_ENABLED), "reason": "expected_move_unknown", "expected_move_bps": None, "cost_bps": float(cost_bps), "min_move_to_cost_mult": float(PROFIT_FILTER_MIN_MOVE_TO_COST_MULT)}
+    needed = float(cost_bps) * float(PROFIT_FILTER_MIN_MOVE_TO_COST_MULT)
+    ok = float(expected_move_bps) >= float(needed)
+    return ok, {
+        "profit_filter_enabled": bool(PROFIT_FILTER_ENABLED),
+        "expected_move_bps": float(expected_move_bps),
+        "cost_bps": float(cost_bps),
+        "required_move_bps": float(needed),
+        "min_move_to_cost_mult": float(PROFIT_FILTER_MIN_MOVE_TO_COST_MULT),
+        "pass": bool(ok),
+    }
+
 def _rb1_long_signal(symbol: str) -> tuple[bool, dict]:
     """True breakout: close crosses above prior N-bar high (edge-trigger)."""
-    bars = _get_bars(symbol, timeframe=ENTRY_ENGINE_TIMEFRAME, limit=max(ENTRY_ENGINE_LIMIT_BARS, RB1_LOOKBACK_BARS + 5))
+    need = max(RB1_LOOKBACK_BARS + 5, TC0_ATR_LEN + 5)
+    bars = _get_bars(symbol, timeframe=ENTRY_ENGINE_TIMEFRAME, limit=max(ENTRY_ENGINE_LIMIT_BARS, need))
     if not bars or len(bars) < (RB1_LOOKBACK_BARS + 3):
         return False, {"reason": "insufficient_bars", "bars": len(bars) if bars else 0}
     fresh_ok, fresh_meta = _guard_fresh_bars(bars, ENTRY_ENGINE_TIMEFRAME)
@@ -1589,24 +1624,50 @@ def _rb1_long_signal(symbol: str) -> tuple[bool, dict]:
     range_high = max(look)
     prev_close = closes[-2]
     cur_close = closes[-1]
-
     level = range_high * (1.0 + RB1_BREAKOUT_BUFFER_PCT)
 
-    # Primary breakout (edge-trigger)
     breakout = (prev_close <= level) and (cur_close > level)
 
-    # Optional near-breakout: allow early entry when close is within X% of the level.
     near = False
     near_threshold = None
     dist_pct = None
-    if RB1_NEAR_BREAKOUT_PCT and RB1_NEAR_BREAKOUT_PCT > 0:
-        near_threshold = level * (1.0 - RB1_NEAR_BREAKOUT_PCT)
+    momentum_ok = ((cur_close >= prev_close) if RB1_NEAR_UP_MODE == 'ge' else (cur_close > prev_close))
+    if (not bool(RB1_DISABLE_NEAR)) and RB1_NEAR_BREAKOUT_PCT and RB1_NEAR_BREAKOUT_PCT > 0:
+        effective_near_pct = min(float(RB1_NEAR_BREAKOUT_PCT), float(RB1_MAX_DIST_TO_LEVEL_PCT)) if RB1_MAX_DIST_TO_LEVEL_PCT > 0 else float(RB1_NEAR_BREAKOUT_PCT)
+        near_threshold = level * (1.0 - effective_near_pct)
         dist_pct = (level - cur_close) / level if level else None
-        momentum_ok = ((cur_close >= prev_close) if RB1_NEAR_UP_MODE == 'ge' else (cur_close > prev_close)) if RB1_NEAR_REQUIRE_UP else True
-        # Still require we haven't already broken out in prior bar to avoid repeated triggers.
-        near = (prev_close < level) and (cur_close >= near_threshold) and momentum_ok
+        distance_ok = (dist_pct is not None and dist_pct <= float(RB1_MAX_DIST_TO_LEVEL_PCT))
+        near = (prev_close < level) and (cur_close >= near_threshold) and momentum_ok and distance_ok
+
+    atr_now, _ = _atr_from_bars(bars, length=int(TC0_ATR_LEN))
+    atr_pct = (float(atr_now) / float(cur_close)) if atr_now and cur_close > 0 else None
+    atr_ok = (atr_pct is not None and atr_pct >= float(RB1_MIN_ATR_PCT))
+
+    bid = ask = spread_pct = None
+    try:
+        bid, ask = _best_bid_ask(symbol)
+        bid = float(bid or 0.0)
+        ask = float(ask or 0.0)
+        mid = ((bid + ask) / 2.0) if (bid > 0 and ask > 0) else 0.0
+        spread_pct = ((ask - bid) / mid) if mid > 0 else None
+    except Exception:
+        spread_pct = None
+
+    expected_move_bps = (float(atr_pct) * 10000.0) if atr_pct is not None else None
+    profit_ok, profit_meta = _profitability_gate(expected_move_bps, spread_pct=spread_pct) if PROFIT_FILTER_ENABLED else (True, {"profit_filter_enabled": False})
+    require_up_effective = bool(RB1_REQUIRE_UP) or bool(RB1_NEAR_REQUIRE_UP)
+    up_ok = momentum_ok if require_up_effective else True
 
     fired = breakout or near
+    reason = None
+    if not fired:
+        reason = "below_breakout"
+    elif not up_ok:
+        reason = "momentum_not_up"
+    elif not atr_ok:
+        reason = "atr_too_low"
+    elif not profit_ok:
+        reason = "profit_filter_blocked"
 
     meta = {
         "range_high": range_high,
@@ -1619,17 +1680,24 @@ def _rb1_long_signal(symbol: str) -> tuple[bool, dict]:
         "near_pct": RB1_NEAR_BREAKOUT_PCT,
         "near_threshold": near_threshold,
         "dist_to_level_pct": dist_pct,
-        "require_up": RB1_NEAR_REQUIRE_UP,
+        "require_up": require_up_effective,
         "up_mode": RB1_NEAR_UP_MODE,
+        "momentum_ok": bool(momentum_ok),
+        "atr": float(atr_now) if atr_now is not None else None,
+        "atr_pct": float(atr_pct) if atr_pct is not None else None,
+        "atr_ok": bool(atr_ok),
+        "spread_pct": float(spread_pct) if spread_pct is not None else None,
+        "profit_filter": profit_meta,
+        "reason": reason or "signal",
     }
-    return fired, meta
+    return (bool(fired and up_ok and atr_ok and profit_ok), meta)
 
 
 def _tc0_long_signal(symbol: str) -> tuple[bool, dict]:
     """Simple breakout continuation (TC0-lite).
 
     Fires when the latest closed 5m bar closes above the prior N-bar high,
-    subject to optional ATR, VWAP, and spread filters.
+    subject to optional ATR, VWAP, spread, and profitability filters.
     """
     need = max(TC0_LOOKBACK_BARS + 5, TC0_ATR_LEN + 5, TC0_VWAP_LOOKBACK_BARS + 5)
     bars = _get_bars(symbol, timeframe=ENTRY_ENGINE_TIMEFRAME, limit=max(ENTRY_ENGINE_LIMIT_BARS, need))
@@ -1670,6 +1738,9 @@ def _tc0_long_signal(symbol: str) -> tuple[bool, dict]:
     except Exception:
         spread_ok = True
 
+    expected_move_bps = (float(atr_pct) * 10000.0) if atr_pct is not None else None
+    profit_ok, profit_meta = _profitability_gate(expected_move_bps, spread_pct=spread_pct) if PROFIT_FILTER_ENABLED else (True, {"profit_filter_enabled": False})
+
     reason = None
     if not breakout:
         reason = "below_breakout"
@@ -1679,6 +1750,8 @@ def _tc0_long_signal(symbol: str) -> tuple[bool, dict]:
         reason = "below_vwap"
     elif not spread_ok:
         reason = "spread_too_wide"
+    elif not profit_ok:
+        reason = "profit_filter_blocked"
 
     meta = {
         "reason": reason or "signal",
@@ -1703,8 +1776,9 @@ def _tc0_long_signal(symbol: str) -> tuple[bool, dict]:
         "ask": ask,
         "spread_pct": float(spread_pct) if spread_pct is not None else None,
         "spread_ok": bool(spread_ok),
+        "profit_filter": profit_meta,
     }
-    return (bool(breakout and atr_ok and vwap_ok and spread_ok), meta)
+    return (bool(breakout and atr_ok and vwap_ok and spread_ok and profit_ok), meta)
 
 
 def _tc1_long_signal(symbol: str) -> tuple[bool, dict]:
