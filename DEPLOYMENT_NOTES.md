@@ -1,7 +1,7 @@
-# patch-044-hotfix-backfill-family-specific-provenance-mapping
+# patch-045-profitability-enforcement-filters
 
 Changes:
-- Add family-specific provenance mapping for backfilled trade families, especially reconciled_fill_backfill rows.
-- Resolve strategy using table-specific ranking across lifecycle sources, favoring txid-linked and time-adjacent matches.
-- Preserve journal persistence, P&L truth, and existing explicit provenance bridge behavior.
-- No scanner behavior changes beyond paired build identity.
+- Add profitability enforcement filters to tc0 and rb1.
+- Add fee-aware move-to-cost gate using fees, slippage, and optional live spread.
+- Tighten rb1 with required upward momentum, ATR floor, and narrower near-breakout distance cap.
+- Preserve journal persistence, P&L truth, and prior provenance mapping behavior.
