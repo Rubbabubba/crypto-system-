@@ -1582,7 +1582,10 @@ def _normalize_plan_lifecycle_policy(plan: TradePlan | None, *, now_ts: float | 
 
 
 def _estimated_round_trip_cost_bps(spread_pct: float | None = None) -> float:
-    base = float(ENTRY_FEE_BPS) + float(EXIT_FEE_BPS) + (2.0 * float(EXPECTED_SLIPPAGE_BPS))
+    entry_fee_bps = _env_float("ENTRY_FEE_BPS", 26.0)
+    exit_fee_bps = _env_float("EXIT_FEE_BPS", 26.0)
+    slippage_bps_each_side = _env_float("EXPECTED_SLIPPAGE_BPS", _env_float("SLIPPAGE_BPS", 8.0))
+    base = float(entry_fee_bps) + float(exit_fee_bps) + (2.0 * float(slippage_bps_each_side))
     if PROFIT_FILTER_USE_LIVE_SPREAD and spread_pct is not None:
         try:
             base += max(float(spread_pct), 0.0) * 10000.0
