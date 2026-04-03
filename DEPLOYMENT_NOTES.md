@@ -1,11 +1,7 @@
-# patch-047-profitability-filter-bugfix-and-min-edge-enforcement
+# patch-048-universe-quality-expansion-adopted-hard-disable-invalid-active-symbols-fix
 
 Changes:
-- Fix profitability filter NameError by removing dependency on undefined globals and using dedicated env-backed fee/slippage inputs.
-- Add controlled min-edge enforcement:
-  - `PROFIT_FILTER_MIN_MOVE_TO_COST_MULT=0.45`
-  - `PROFIT_FILTER_MIN_EXPECTED_MOVE_BPS=28.0`
-  - `RB1_MAX_DIST_TO_LEVEL_PCT=0.0045`
-  - `RB1_MIN_ATR_PCT=0.0018`
-- Add `DISABLE_ADOPTED_STRATEGY` env flag plumbing for legacy/future compatibility without changing current journal behavior.
-- Preserve all persistence, reconciliation, journaling, and scanner behavior.
+- Controlled universe-quality expansion via env-backed allowlist augmentation.
+- `DISABLE_ADOPTED_STRATEGY` now defaults to enabled for live entry suppression.
+- Normalize stale `invalid_active_symbols` scan payload reporting when compatibility fallback confirms admissible active symbols.
+- Preserve journaling, persistence, reconciliation, sizing, and worker behavior.
