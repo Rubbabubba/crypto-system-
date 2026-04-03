@@ -911,7 +911,10 @@ RB1_REQUIRE_UP = (os.getenv("RB1_REQUIRE_UP", "1").strip().lower() in ("1", "tru
 RB1_MAX_DIST_TO_LEVEL_PCT = float(os.getenv("RB1_MAX_DIST_TO_LEVEL_PCT", "0.0045") or 0.0045)
 RB1_MIN_ATR_PCT = float(os.getenv("RB1_MIN_ATR_PCT", "0.0018") or 0.0018)
 RB1_DISABLE_NEAR = (os.getenv("RB1_DISABLE_NEAR", "0").strip().lower() in ("1", "true", "yes", "on"))
-DISABLE_ADOPTED_STRATEGY = (os.getenv("DISABLE_ADOPTED_STRATEGY", "0").strip().lower() in ("1", "true", "yes", "on"))
+DISABLE_ADOPTED_STRATEGY = (os.getenv("DISABLE_ADOPTED_STRATEGY", "1").strip().lower() in ("1", "true", "yes", "on"))
+QUALITY_EXPANSION_ENABLED = (os.getenv("QUALITY_EXPANSION_ENABLED", "1").strip().lower() in ("1", "true", "yes", "on"))
+QUALITY_EXPANSION_SYMBOLS = [s.strip().upper() for s in os.getenv("QUALITY_EXPANSION_SYMBOLS", "BCH/USD,ALGO/USD,FET/USD").split(",") if s.strip()]
+QUALITY_EXPANSION_MAX_TOTAL = max(int(float(os.getenv("QUALITY_EXPANSION_MAX_TOTAL", "10") or 10)), 7)
 
 # TC1 params
 TC1_LTF_EMA = int(float(os.getenv("TC1_LTF_EMA", "20") or 20))
@@ -1587,6 +1590,23 @@ def _normalize_plan_lifecycle_policy(plan: TradePlan | None, *, now_ts: float | 
 
 
 
+def _effective_allowed_symbols(base_symbols: list[str]) -> list[str]:
+    base = [str(s or "").strip().upper() for s in (base_symbols or []) if str(s or "").strip()]
+    seen = set()
+    out = []
+    for sym in base:
+        if sym not in seen:
+            seen.add(sym)
+            out.append(sym)
+    if bool(QUALITY_EXPANSION_ENABLED):
+        for sym in QUALITY_EXPANSION_SYMBOLS:
+            if sym and sym not in seen:
+                seen.add(sym)
+                out.append(sym)
+                if len(out) >= int(QUALITY_EXPANSION_MAX_TOTAL):
+                    break
+    return out
+
 def _estimated_round_trip_cost_bps(spread_pct: float | None = None) -> float:
     base = float(PROFIT_FILTER_ENTRY_FEE_BPS) + float(PROFIT_FILTER_EXIT_FEE_BPS) + (2.0 * float(PROFIT_FILTER_EXPECTED_SLIPPAGE_BPS))
     if PROFIT_FILTER_USE_LIVE_SPREAD and spread_pct is not None:
@@ -1996,7 +2016,13 @@ def _scanner_fetch_active_symbols_and_meta() -> tuple[bool, str | None, dict, li
 
         raw_syms = data.get("active_symbols")
         if not isinstance(raw_syms, list):
-            return False, "invalid_active_symbols", meta, []
+            compat = data.get("compatibility") or {}
+            compat_syms = compat.get("active_symbols") or compat.get("active_symbols_sample") or []
+            if isinstance(compat_syms, list) and compat_syms:
+                meta["active_symbols_source"] = "compatibility_fallback"
+                raw_syms = compat_syms
+            else:
+                return False, "invalid_active_symbols", meta, []
 
         clean: list[str] = []
         for s in raw_syms:
@@ -2274,7 +2300,7 @@ def _path_b_admission_snapshot(scanner_contract: dict[str, Any]) -> dict[str, An
     _contract_safe_lock_7 = ["BTC/USD", "ETH/USD", "SOL/USD", "ADA/USD", "LINK/USD", "AVAX/USD", "DOT/USD"]
     _contract_safe_lock_7_set = set(_contract_safe_lock_7)
     _contract_unsafe_10 = {"BTC/USD", "ETH/USD", "SOL/USD", "ADA/USD", "XRP/USD", "DOGE/USD", "LINK/USD", "AVAX/USD", "LTC/USD", "DOT/USD"}
-    configured_allowed_symbols = set(ALLOWED_SYMBOLS)
+    configured_allowed_symbols = set(_effective_allowed_symbols(list(ALLOWED_SYMBOLS)))
     if set(allowed_pilot_symbols) == _contract_unsafe_10:
         allowed_pilot_symbols = list(_contract_safe_lock_7)
     effective_allowed_symbols = _contract_safe_lock_7_set if configured_allowed_symbols == _contract_unsafe_10 else configured_allowed_symbols
@@ -7073,7 +7099,7 @@ def scan_entries(payload: WorkerScanPayload):
             "config": {
                 "scanner_url": SCANNER_URL,
                 "scanner_soft_allow": SCANNER_SOFT_ALLOW,
-                "allowed_symbols_count": len(ALLOWED_SYMBOLS),
+                "allowed_symbols_count": len(_effective_allowed_symbols(list(ALLOWED_SYMBOLS))),
                 "allowed_symbols_sample": sorted(list(ALLOWED_SYMBOLS))[:50],
                 "scanner_driven_universe": SCANNER_DRIVEN_UNIVERSE,
                 "scanner_target_n": SCANNER_TARGET_N,
