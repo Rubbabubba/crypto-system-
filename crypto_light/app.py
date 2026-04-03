@@ -900,11 +900,13 @@ TC0_TIME_EXIT_MIN_FEE_MULT = float(os.getenv("TC0_TIME_EXIT_MIN_FEE_MULT", "1.25
 
 # Profitability enforcement (Patch 045)
 PROFIT_FILTER_ENABLED = (os.getenv("PROFIT_FILTER_ENABLED", "1").strip().lower() in ("1", "true", "yes", "on"))
-PROFIT_FILTER_MIN_MOVE_TO_COST_MULT = float(os.getenv("PROFIT_FILTER_MIN_MOVE_TO_COST_MULT", "1.10") or 1.10)
-PROFIT_FILTER_USE_LIVE_SPREAD = (os.getenv("PROFIT_FILTER_USE_LIVE_SPREAD", "1").strip().lower() in ("1", "true", "yes", "on"))
+PROFIT_FILTER_MIN_MOVE_TO_COST_MULT = float(os.getenv("PROFIT_FILTER_MIN_MOVE_TO_COST_MULT", "0.35") or 0.35)
+PROFIT_FILTER_MIN_EXPECTED_MOVE_BPS = float(os.getenv("PROFIT_FILTER_MIN_EXPECTED_MOVE_BPS", "20.0") or 20.0)
+PROFIT_FILTER_USE_LIVE_SPREAD = (os.getenv("PROFIT_FILTER_USE_LIVE_SPREAD", "0").strip().lower() in ("1", "true", "yes", "on"))
+PROFIT_FILTER_COST_FLOOR_BPS = float(os.getenv("PROFIT_FILTER_COST_FLOOR_BPS", "68.0") or 68.0)
 RB1_REQUIRE_UP = (os.getenv("RB1_REQUIRE_UP", "1").strip().lower() in ("1", "true", "yes", "on"))
-RB1_MAX_DIST_TO_LEVEL_PCT = float(os.getenv("RB1_MAX_DIST_TO_LEVEL_PCT", "0.0040") or 0.0040)
-RB1_MIN_ATR_PCT = float(os.getenv("RB1_MIN_ATR_PCT", "0.0020") or 0.0020)
+RB1_MAX_DIST_TO_LEVEL_PCT = float(os.getenv("RB1_MAX_DIST_TO_LEVEL_PCT", "0.0050") or 0.0050)
+RB1_MIN_ATR_PCT = float(os.getenv("RB1_MIN_ATR_PCT", "0.0015") or 0.0015)
 RB1_DISABLE_NEAR = (os.getenv("RB1_DISABLE_NEAR", "0").strip().lower() in ("1", "true", "yes", "on"))
 
 # TC1 params
@@ -1582,29 +1584,38 @@ def _normalize_plan_lifecycle_policy(plan: TradePlan | None, *, now_ts: float | 
 
 
 def _estimated_round_trip_cost_bps(spread_pct: float | None = None) -> float:
-    entry_fee_bps = _env_float("ENTRY_FEE_BPS", 26.0)
-    exit_fee_bps = _env_float("EXIT_FEE_BPS", 26.0)
-    slippage_bps_each_side = _env_float("EXPECTED_SLIPPAGE_BPS", _env_float("SLIPPAGE_BPS", 8.0))
-    base = float(entry_fee_bps) + float(exit_fee_bps) + (2.0 * float(slippage_bps_each_side))
+    base = float(ENTRY_FEE_BPS) + float(EXIT_FEE_BPS) + (2.0 * float(EXPECTED_SLIPPAGE_BPS))
     if PROFIT_FILTER_USE_LIVE_SPREAD and spread_pct is not None:
         try:
             base += max(float(spread_pct), 0.0) * 10000.0
         except Exception:
             pass
+    base = max(float(base), float(PROFIT_FILTER_COST_FLOOR_BPS))
     return float(base)
 
 def _profitability_gate(expected_move_bps: float | None, spread_pct: float | None = None) -> tuple[bool, dict]:
     cost_bps = _estimated_round_trip_cost_bps(spread_pct)
     if expected_move_bps is None:
-        return False, {"profit_filter_enabled": bool(PROFIT_FILTER_ENABLED), "reason": "expected_move_unknown", "expected_move_bps": None, "cost_bps": float(cost_bps), "min_move_to_cost_mult": float(PROFIT_FILTER_MIN_MOVE_TO_COST_MULT)}
-    needed = float(cost_bps) * float(PROFIT_FILTER_MIN_MOVE_TO_COST_MULT)
+        return False, {
+            "profit_filter_enabled": bool(PROFIT_FILTER_ENABLED),
+            "reason": "expected_move_unknown",
+            "expected_move_bps": None,
+            "cost_bps": float(cost_bps),
+            "required_move_bps": None,
+            "min_move_to_cost_mult": float(PROFIT_FILTER_MIN_MOVE_TO_COST_MULT),
+            "min_expected_move_bps": float(PROFIT_FILTER_MIN_EXPECTED_MOVE_BPS),
+        }
+    mult_needed = float(cost_bps) * float(PROFIT_FILTER_MIN_MOVE_TO_COST_MULT)
+    needed = max(float(mult_needed), float(PROFIT_FILTER_MIN_EXPECTED_MOVE_BPS))
     ok = float(expected_move_bps) >= float(needed)
     return ok, {
         "profit_filter_enabled": bool(PROFIT_FILTER_ENABLED),
         "expected_move_bps": float(expected_move_bps),
         "cost_bps": float(cost_bps),
         "required_move_bps": float(needed),
+        "required_move_bps_from_mult": float(mult_needed),
         "min_move_to_cost_mult": float(PROFIT_FILTER_MIN_MOVE_TO_COST_MULT),
+        "min_expected_move_bps": float(PROFIT_FILTER_MIN_EXPECTED_MOVE_BPS),
         "pass": bool(ok),
     }
 
