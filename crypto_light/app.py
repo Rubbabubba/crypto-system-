@@ -900,14 +900,18 @@ TC0_TIME_EXIT_MIN_FEE_MULT = float(os.getenv("TC0_TIME_EXIT_MIN_FEE_MULT", "1.25
 
 # Profitability enforcement (Patch 045)
 PROFIT_FILTER_ENABLED = (os.getenv("PROFIT_FILTER_ENABLED", "1").strip().lower() in ("1", "true", "yes", "on"))
-PROFIT_FILTER_MIN_MOVE_TO_COST_MULT = float(os.getenv("PROFIT_FILTER_MIN_MOVE_TO_COST_MULT", "0.35") or 0.35)
-PROFIT_FILTER_MIN_EXPECTED_MOVE_BPS = float(os.getenv("PROFIT_FILTER_MIN_EXPECTED_MOVE_BPS", "20.0") or 20.0)
+PROFIT_FILTER_MIN_MOVE_TO_COST_MULT = float(os.getenv("PROFIT_FILTER_MIN_MOVE_TO_COST_MULT", "0.45") or 0.45)
+PROFIT_FILTER_MIN_EXPECTED_MOVE_BPS = float(os.getenv("PROFIT_FILTER_MIN_EXPECTED_MOVE_BPS", "28.0") or 28.0)
 PROFIT_FILTER_USE_LIVE_SPREAD = (os.getenv("PROFIT_FILTER_USE_LIVE_SPREAD", "0").strip().lower() in ("1", "true", "yes", "on"))
 PROFIT_FILTER_COST_FLOOR_BPS = float(os.getenv("PROFIT_FILTER_COST_FLOOR_BPS", "68.0") or 68.0)
+PROFIT_FILTER_ENTRY_FEE_BPS = float(os.getenv("PROFIT_FILTER_ENTRY_FEE_BPS", os.getenv("ENTRY_FEE_BPS", "26")) or 26.0)
+PROFIT_FILTER_EXIT_FEE_BPS = float(os.getenv("PROFIT_FILTER_EXIT_FEE_BPS", os.getenv("EXIT_FEE_BPS", "26")) or 26.0)
+PROFIT_FILTER_EXPECTED_SLIPPAGE_BPS = float(os.getenv("PROFIT_FILTER_EXPECTED_SLIPPAGE_BPS", os.getenv("EXPECTED_SLIPPAGE_BPS", "8")) or 8.0)
 RB1_REQUIRE_UP = (os.getenv("RB1_REQUIRE_UP", "1").strip().lower() in ("1", "true", "yes", "on"))
-RB1_MAX_DIST_TO_LEVEL_PCT = float(os.getenv("RB1_MAX_DIST_TO_LEVEL_PCT", "0.0050") or 0.0050)
-RB1_MIN_ATR_PCT = float(os.getenv("RB1_MIN_ATR_PCT", "0.0015") or 0.0015)
+RB1_MAX_DIST_TO_LEVEL_PCT = float(os.getenv("RB1_MAX_DIST_TO_LEVEL_PCT", "0.0045") or 0.0045)
+RB1_MIN_ATR_PCT = float(os.getenv("RB1_MIN_ATR_PCT", "0.0018") or 0.0018)
 RB1_DISABLE_NEAR = (os.getenv("RB1_DISABLE_NEAR", "0").strip().lower() in ("1", "true", "yes", "on"))
+DISABLE_ADOPTED_STRATEGY = (os.getenv("DISABLE_ADOPTED_STRATEGY", "0").strip().lower() in ("1", "true", "yes", "on"))
 
 # TC1 params
 TC1_LTF_EMA = int(float(os.getenv("TC1_LTF_EMA", "20") or 20))
@@ -1584,7 +1588,7 @@ def _normalize_plan_lifecycle_policy(plan: TradePlan | None, *, now_ts: float | 
 
 
 def _estimated_round_trip_cost_bps(spread_pct: float | None = None) -> float:
-    base = float(ENTRY_FEE_BPS) + float(EXIT_FEE_BPS) + (2.0 * float(EXPECTED_SLIPPAGE_BPS))
+    base = float(PROFIT_FILTER_ENTRY_FEE_BPS) + float(PROFIT_FILTER_EXIT_FEE_BPS) + (2.0 * float(PROFIT_FILTER_EXPECTED_SLIPPAGE_BPS))
     if PROFIT_FILTER_USE_LIVE_SPREAD and spread_pct is not None:
         try:
             base += max(float(spread_pct), 0.0) * 10000.0
