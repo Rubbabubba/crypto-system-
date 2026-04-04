@@ -897,7 +897,6 @@ TC0_MAX_SPREAD_PCT = float(os.getenv("TC0_MAX_SPREAD_PCT", os.getenv("MAX_SPREAD
 TC0_MAX_HOLD_SEC = int(float(os.getenv("TC0_MAX_HOLD_SEC", "1800") or 1800))
 TC0_TIME_EXIT_EXTENSION_SEC = int(float(os.getenv("TC0_TIME_EXIT_EXTENSION_SEC", "5400") or 5400))
 TC0_TIME_EXIT_MIN_FEE_MULT = float(os.getenv("TC0_TIME_EXIT_MIN_FEE_MULT", "1.25") or 1.25)
-TC0_EXPECTED_MOVE_ATR_MULT = float(os.getenv("TC0_EXPECTED_MOVE_ATR_MULT", "1.75") or 1.75)
 
 # Profitability enforcement (Patch 045)
 PROFIT_FILTER_ENABLED = (os.getenv("PROFIT_FILTER_ENABLED", "1").strip().lower() in ("1", "true", "yes", "on"))
@@ -908,13 +907,15 @@ PROFIT_FILTER_COST_FLOOR_BPS = float(os.getenv("PROFIT_FILTER_COST_FLOOR_BPS", "
 PROFIT_FILTER_ENTRY_FEE_BPS = float(os.getenv("PROFIT_FILTER_ENTRY_FEE_BPS", os.getenv("ENTRY_FEE_BPS", "26")) or 26.0)
 PROFIT_FILTER_EXIT_FEE_BPS = float(os.getenv("PROFIT_FILTER_EXIT_FEE_BPS", os.getenv("EXIT_FEE_BPS", "26")) or 26.0)
 PROFIT_FILTER_EXPECTED_SLIPPAGE_BPS = float(os.getenv("PROFIT_FILTER_EXPECTED_SLIPPAGE_BPS", os.getenv("EXPECTED_SLIPPAGE_BPS", "8")) or 8.0)
-PROFIT_FILTER_SOFT_PASS_ENABLED = (os.getenv("PROFIT_FILTER_SOFT_PASS_ENABLED", "1").strip().lower() in ("1", "true", "yes", "on"))
-PROFIT_FILTER_SOFT_PASS_MIN_MOVE_TO_COST_MULT = float(os.getenv("PROFIT_FILTER_SOFT_PASS_MIN_MOVE_TO_COST_MULT", "0.22") or 0.22)
-PROFIT_FILTER_SOFT_PASS_MIN_EXPECTED_MOVE_BPS = float(os.getenv("PROFIT_FILTER_SOFT_PASS_MIN_EXPECTED_MOVE_BPS", "12.0") or 12.0)
+PROFIT_FILTER_SOFT_PASS_ENABLED = (os.getenv("PROFIT_FILTER_SOFT_PASS_ENABLED", "0").strip().lower() in ("1", "true", "yes", "on"))
+PROFIT_FILTER_SOFT_PASS_MIN_MOVE_TO_COST_MULT = float(os.getenv("PROFIT_FILTER_SOFT_PASS_MIN_MOVE_TO_COST_MULT", str(PROFIT_FILTER_MIN_MOVE_TO_COST_MULT)) or PROFIT_FILTER_MIN_MOVE_TO_COST_MULT)
+PROFIT_FILTER_SOFT_PASS_MIN_EXPECTED_MOVE_BPS = float(os.getenv("PROFIT_FILTER_SOFT_PASS_MIN_EXPECTED_MOVE_BPS", str(PROFIT_FILTER_MIN_EXPECTED_MOVE_BPS)) or PROFIT_FILTER_MIN_EXPECTED_MOVE_BPS)
+RB1_EXPECTED_MOVE_ATR_MULT = float(os.getenv("RB1_EXPECTED_MOVE_ATR_MULT", "1.0") or 1.0)
+TC0_EXPECTED_MOVE_ATR_MULT = float(os.getenv("TC0_EXPECTED_MOVE_ATR_MULT", "1.0") or 1.0)
+BLOCKED_TRADES_LIMIT = int(float(os.getenv("BLOCKED_TRADES_LIMIT", "200") or 200))
 RB1_REQUIRE_UP = (os.getenv("RB1_REQUIRE_UP", "1").strip().lower() in ("1", "true", "yes", "on"))
 RB1_MAX_DIST_TO_LEVEL_PCT = float(os.getenv("RB1_MAX_DIST_TO_LEVEL_PCT", "0.0045") or 0.0045)
 RB1_MIN_ATR_PCT = float(os.getenv("RB1_MIN_ATR_PCT", "0.0018") or 0.0018)
-RB1_EXPECTED_MOVE_ATR_MULT = float(os.getenv("RB1_EXPECTED_MOVE_ATR_MULT", "1.35") or 1.35)
 RB1_DISABLE_NEAR = (os.getenv("RB1_DISABLE_NEAR", "0").strip().lower() in ("1", "true", "yes", "on"))
 DISABLE_ADOPTED_STRATEGY = (os.getenv("DISABLE_ADOPTED_STRATEGY", "1").strip().lower() in ("1", "true", "yes", "on"))
 QUALITY_EXPANSION_ENABLED = (os.getenv("QUALITY_EXPANSION_ENABLED", "1").strip().lower() in ("1", "true", "yes", "on"))
@@ -946,7 +947,6 @@ SCANNER_TARGET_N = int(float(os.getenv('SCANNER_TARGET_N', os.getenv('TOP_N', '5
 UNIVERSE_USD_ONLY = (os.getenv('UNIVERSE_USD_ONLY', '0').strip().lower() in ('1','true','yes','on'))
 UNIVERSE_PREFER_USD_FOR_STABLES = (os.getenv('UNIVERSE_PREFER_USD_FOR_STABLES', '0').strip().lower() in ('1','true','yes','on'))
 FILTER_UNIVERSE_BY_ALLOWED_SYMBOLS = (os.getenv('FILTER_UNIVERSE_BY_ALLOWED_SYMBOLS', '0').strip().lower() in ('1','true','yes','on'))
-ALLOW_SCANNER_NEW_SYMBOLS = (os.getenv('ALLOW_SCANNER_NEW_SYMBOLS', '0').strip().lower() in ('1','true','yes','on'))
 
 MAX_OPEN_POSITIONS = int(float(os.getenv('MAX_OPEN_POSITIONS', '2') or 2))
 MAX_ENTRIES_PER_SCAN = int(float(os.getenv('MAX_ENTRIES_PER_SCAN', '1') or 1))
@@ -1632,29 +1632,32 @@ def _profitability_gate(expected_move_bps: float | None, spread_pct: float | Non
             "expected_move_bps": None,
             "cost_bps": float(cost_bps),
             "required_move_bps": None,
+            "required_move_bps_from_mult": None,
             "min_move_to_cost_mult": float(PROFIT_FILTER_MIN_MOVE_TO_COST_MULT),
             "min_expected_move_bps": float(PROFIT_FILTER_MIN_EXPECTED_MOVE_BPS),
             "soft_pass_enabled": bool(PROFIT_FILTER_SOFT_PASS_ENABLED),
             "soft_required_move_bps": None,
+            "soft_required_move_bps_from_mult": None,
             "soft_min_move_to_cost_mult": float(PROFIT_FILTER_SOFT_PASS_MIN_MOVE_TO_COST_MULT),
             "soft_min_expected_move_bps": float(PROFIT_FILTER_SOFT_PASS_MIN_EXPECTED_MOVE_BPS),
+            "pass": False,
+            "pass_tier": "blocked",
         }
-    mult_needed = float(cost_bps) * float(PROFIT_FILTER_MIN_MOVE_TO_COST_MULT)
-    needed = max(float(mult_needed), float(PROFIT_FILTER_MIN_EXPECTED_MOVE_BPS))
-    hard_ok = float(expected_move_bps) >= float(needed)
-
+    expected_move_bps = float(expected_move_bps)
+    hard_mult_needed = float(cost_bps) * float(PROFIT_FILTER_MIN_MOVE_TO_COST_MULT)
+    hard_needed = max(float(hard_mult_needed), float(PROFIT_FILTER_MIN_EXPECTED_MOVE_BPS))
     soft_mult_needed = float(cost_bps) * float(PROFIT_FILTER_SOFT_PASS_MIN_MOVE_TO_COST_MULT)
     soft_needed = max(float(soft_mult_needed), float(PROFIT_FILTER_SOFT_PASS_MIN_EXPECTED_MOVE_BPS))
-    soft_ok = bool(PROFIT_FILTER_SOFT_PASS_ENABLED) and float(expected_move_bps) >= float(soft_needed)
-
-    ok = bool(hard_ok or soft_ok)
-    pass_tier = "hard" if hard_ok else ("soft" if soft_ok else "blocked")
-    return ok, {
+    hard_pass = expected_move_bps >= float(hard_needed)
+    soft_pass = bool(PROFIT_FILTER_SOFT_PASS_ENABLED) and expected_move_bps >= float(soft_needed)
+    passed = bool(hard_pass or soft_pass)
+    pass_tier = "hard" if hard_pass else ("soft" if soft_pass else "blocked")
+    return passed, {
         "profit_filter_enabled": bool(PROFIT_FILTER_ENABLED),
-        "expected_move_bps": float(expected_move_bps),
+        "expected_move_bps": expected_move_bps,
         "cost_bps": float(cost_bps),
-        "required_move_bps": float(needed),
-        "required_move_bps_from_mult": float(mult_needed),
+        "required_move_bps": float(hard_needed),
+        "required_move_bps_from_mult": float(hard_mult_needed),
         "min_move_to_cost_mult": float(PROFIT_FILTER_MIN_MOVE_TO_COST_MULT),
         "min_expected_move_bps": float(PROFIT_FILTER_MIN_EXPECTED_MOVE_BPS),
         "soft_pass_enabled": bool(PROFIT_FILTER_SOFT_PASS_ENABLED),
@@ -1662,8 +1665,10 @@ def _profitability_gate(expected_move_bps: float | None, spread_pct: float | Non
         "soft_required_move_bps_from_mult": float(soft_mult_needed),
         "soft_min_move_to_cost_mult": float(PROFIT_FILTER_SOFT_PASS_MIN_MOVE_TO_COST_MULT),
         "soft_min_expected_move_bps": float(PROFIT_FILTER_SOFT_PASS_MIN_EXPECTED_MOVE_BPS),
+        "hard_pass": bool(hard_pass),
+        "soft_pass": bool(soft_pass),
+        "pass": bool(passed),
         "pass_tier": pass_tier,
-        "pass": bool(ok),
     }
 
 def _rb1_long_signal(symbol: str) -> tuple[bool, dict]:
@@ -1714,7 +1719,7 @@ def _rb1_long_signal(symbol: str) -> tuple[bool, dict]:
     except Exception:
         spread_pct = None
 
-    expected_move_bps = (float(atr_pct) * float(RB1_EXPECTED_MOVE_ATR_MULT) * 10000.0) if atr_pct is not None else None
+    expected_move_bps = (float(atr_pct) * 10000.0 * float(RB1_EXPECTED_MOVE_ATR_MULT)) if atr_pct is not None else None
     profit_ok, profit_meta = _profitability_gate(expected_move_bps, spread_pct=spread_pct) if PROFIT_FILTER_ENABLED else (True, {"profit_filter_enabled": False})
     require_up_effective = bool(RB1_REQUIRE_UP) or bool(RB1_NEAR_REQUIRE_UP)
     up_ok = momentum_ok if require_up_effective else True
@@ -1799,7 +1804,7 @@ def _tc0_long_signal(symbol: str) -> tuple[bool, dict]:
     except Exception:
         spread_ok = True
 
-    expected_move_bps = (float(atr_pct) * float(TC0_EXPECTED_MOVE_ATR_MULT) * 10000.0) if atr_pct is not None else None
+    expected_move_bps = (float(atr_pct) * 10000.0 * float(TC0_EXPECTED_MOVE_ATR_MULT)) if atr_pct is not None else None
     profit_ok, profit_meta = _profitability_gate(expected_move_bps, spread_pct=spread_pct) if PROFIT_FILTER_ENABLED else (True, {"profit_filter_enabled": False})
 
     reason = None
@@ -2349,9 +2354,13 @@ def _path_b_admission_snapshot(scanner_contract: dict[str, Any]) -> dict[str, An
     ranked_symbols = list((scanner_contract or {}).get("ranked_active_symbols") or [])
     candidate_symbols = ranked_symbols or active_symbols
     admitted_symbols = candidate_symbols[:scanner_rank_cap]
-    if not allowed_pilot_symbols and effective_allowed_symbols == _contract_safe_lock_7_set:
+    allow_scanner_new_symbols = _env_bool("ALLOW_SCANNER_NEW_SYMBOLS", False)
+    scanner_driven_universe = bool(SCANNER_DRIVEN_UNIVERSE)
+    explicit_pilot_allowlist = bool(env_allowlist or legacy_allowlist)
+    default_static_pilot_only = (not explicit_pilot_allowlist) and (not allow_scanner_new_symbols) and (not scanner_driven_universe)
+    if not allowed_pilot_symbols and effective_allowed_symbols == _contract_safe_lock_7_set and default_static_pilot_only:
         allowed_pilot_symbols = list(_contract_safe_lock_7)
-    if allowed_pilot_symbols:
+    if explicit_pilot_allowlist or default_static_pilot_only:
         allowed_set = set(allowed_pilot_symbols)
         admitted_symbols = [s for s in admitted_symbols if s in allowed_set]
     admitted_symbols = admitted_symbols[:max_active_symbols]
@@ -2374,6 +2383,8 @@ def _path_b_admission_snapshot(scanner_contract: dict[str, Any]) -> dict[str, An
         "pilot_gate_enabled": pilot_gate_enabled,
         "admission_enabled": admission_enabled,
         "allowlist_source": allowlist_source,
+        "explicit_allowlist": bool(explicit_pilot_allowlist),
+        "default_static_pilot_only": bool(default_static_pilot_only),
         "allowlist_count": len(allowed_pilot_symbols),
         "allowlist_sample": allowed_pilot_symbols[:12],
         "max_admitted_symbols": max_active_symbols,
@@ -2651,7 +2662,7 @@ def _build_universe(payload, scanner_syms: list[str]) -> list[str]:
 
     # Allowed-symbol filtering (off by default for scanner-driven universe)
     allowed = set(getattr(settings, "allowed_symbols", []) or [])
-    if allowed and FILTER_UNIVERSE_BY_ALLOWED_SYMBOLS and not ALLOW_SCANNER_NEW_SYMBOLS and not (force_scan and SCANNER_SOFT_ALLOW):
+    if allowed and FILTER_UNIVERSE_BY_ALLOWED_SYMBOLS and not (force_scan and SCANNER_SOFT_ALLOW):
         universe = [s for s in universe if s in allowed]
 
     # Stable fallback: if universe empty but allowed configured, use allowed
@@ -6795,11 +6806,22 @@ def diagnostics_last_exit():
 def diagnostics_blocked_trades(limit: int = 50):
     lim = max(1, min(int(limit or 50), int(BLOCKED_TRADES_LIMIT)))
     items = list(getattr(state, 'blocked_trades', []) or [])[-lim:]
+    reason_counts: Dict[str, int] = {}
+    strategy_counts: Dict[str, int] = {}
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        reason = str(item.get("reason") or item.get("block_reason") or "unknown")
+        strategy = str(item.get("strategy") or item.get("chosen_strategy") or "unknown")
+        reason_counts[reason] = int(reason_counts.get(reason, 0)) + 1
+        strategy_counts[strategy] = int(strategy_counts.get(strategy, 0)) + 1
     return {
         "ok": True,
         "utc": utc_now_iso(),
         "limit": lim,
         "count": len(items),
+        "reason_counts": reason_counts,
+        "strategy_counts": strategy_counts,
         "items": items,
     }
 
@@ -7145,6 +7167,21 @@ def scan_entries(payload: WorkerScanPayload):
                     "vwap_lookback_bars": TC0_VWAP_LOOKBACK_BARS,
                     "max_spread_pct": TC0_MAX_SPREAD_PCT,
                     "max_hold_sec": TC0_MAX_HOLD_SEC,
+                },
+                "rb1_params": {
+                    "min_atr_pct": RB1_MIN_ATR_PCT,
+                    "breakout_buffer_pct": RB1_BREAKOUT_BUFFER_PCT,
+                    "expected_move_atr_mult": RB1_EXPECTED_MOVE_ATR_MULT,
+                },
+                "profit_filter": {
+                    "enabled": PROFIT_FILTER_ENABLED,
+                    "min_move_to_cost_mult": PROFIT_FILTER_MIN_MOVE_TO_COST_MULT,
+                    "min_expected_move_bps": PROFIT_FILTER_MIN_EXPECTED_MOVE_BPS,
+                    "soft_pass_enabled": PROFIT_FILTER_SOFT_PASS_ENABLED,
+                    "soft_pass_min_move_to_cost_mult": PROFIT_FILTER_SOFT_PASS_MIN_MOVE_TO_COST_MULT,
+                    "soft_pass_min_expected_move_bps": PROFIT_FILTER_SOFT_PASS_MIN_EXPECTED_MOVE_BPS,
+                    "rb1_expected_move_atr_mult": RB1_EXPECTED_MOVE_ATR_MULT,
+                    "tc0_expected_move_atr_mult": TC0_EXPECTED_MOVE_ATR_MULT,
                 },
                 "max_open_positions": MAX_OPEN_POSITIONS,
                 "max_entries_per_scan": MAX_ENTRIES_PER_SCAN,
