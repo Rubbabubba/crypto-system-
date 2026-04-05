@@ -933,6 +933,14 @@ TC1_RECLAIM_BUFFER_PCT = float(os.getenv("TC1_RECLAIM_BUFFER_PCT", "0.0005") or 
 # TC1 trend-soften epsilon (optional)
 # If >0, allow HTF uptrend when EMA_fast is within epsilon below EMA_slow (still requires EMA_fast rising).
 TC1_TREND_SOFTEN_EPSILON = float(os.getenv("TC1_TREND_SOFTEN_EPSILON", "0") or 0)  # e.g. 0.002 = 0.2%
+TC1_ATR_LEN = int(float(os.getenv("TC1_ATR_LEN", str(TC0_ATR_LEN)) or TC0_ATR_LEN))
+TC1_MIN_ATR_PCT = float(os.getenv("TC1_MIN_ATR_PCT", "0.0007") or 0.0007)
+TC1_PULLBACK_LOOKBACK_BARS = int(float(os.getenv("TC1_PULLBACK_LOOKBACK_BARS", "6") or 6))
+TC1_PULLBACK_ATR_MIN = float(os.getenv("TC1_PULLBACK_ATR_MIN", "0.35") or 0.35)
+TC1_PULLBACK_ATR_MAX = float(os.getenv("TC1_PULLBACK_ATR_MAX", "1.75") or 1.75)
+TC1_REQUIRE_VWAP = os.getenv("TC1_REQUIRE_VWAP", "1").strip().lower() in ("1", "true", "yes", "on")
+TC1_MAX_SPREAD_PCT = float(os.getenv("TC1_MAX_SPREAD_PCT", "0.003") or 0.003)
+TC1_EXPECTED_MOVE_ATR_MULT = float(os.getenv("TC1_EXPECTED_MOVE_ATR_MULT", "2.4") or 2.4)
 
 
 # ---------- Scanner config (soft allow) ----------
@@ -1848,12 +1856,16 @@ def _tc0_long_signal(symbol: str) -> tuple[bool, dict]:
 
 
 def _tc1_long_signal(symbol: str) -> tuple[bool, dict]:
-    """Trend pullback continuation:
-    - HTF uptrend: EMA_fast > EMA_slow AND EMA_fast rising
-    - LTF reclaim: close crosses back above LTF EMA after being below
+    """TPC1 (Trend Pullback Continuation).
+
+    Entry concept:
+    - HTF trend confirmation via EMA fast > EMA slow and EMA fast rising
+    - LTF pullback into EMA zone
+    - Reclaim confirmation on the latest closed bar
+    - ATR / spread / profitability guardrails
     """
-    # HTF trend
-    htf = _get_bars(symbol, timeframe=TC1_HTF_TIMEFRAME, limit=max(TC1_HTF_LIMIT_BARS, TC1_HTF_SLOW + 5))
+    htf_need = max(TC1_HTF_LIMIT_BARS, TC1_HTF_SLOW + 5)
+    htf = _get_bars(symbol, timeframe=TC1_HTF_TIMEFRAME, limit=htf_need)
     if not htf or len(htf) < (TC1_HTF_SLOW + 3):
         return False, {"reason": "insufficient_htf_bars", "bars": len(htf) if htf else 0}
     htf_fresh_ok, htf_fresh_meta = _guard_fresh_bars(htf, TC1_HTF_TIMEFRAME)
@@ -1865,18 +1877,18 @@ def _tc1_long_signal(symbol: str) -> tuple[bool, dict]:
     ema_slow = _ema(htf_closes, TC1_HTF_SLOW)
     raw_uptrend = (ema_fast[-1] > ema_slow[-1]) and (ema_fast[-1] > ema_fast[-2])
     eps = TC1_TREND_SOFTEN_EPSILON if TC1_TREND_SOFTEN_EPSILON and TC1_TREND_SOFTEN_EPSILON > 0 else 0.0
-    softened = (ema_fast[-1] >= (ema_slow[-1] * (1.0 - eps))) and (ema_fast[-1] > ema_fast[-2])
-    uptrend = softened
+    uptrend = (ema_fast[-1] >= (ema_slow[-1] * (1.0 - eps))) and (ema_fast[-1] > ema_fast[-2])
 
-    # LTF reclaim
-    ltf = _get_bars(symbol, timeframe=ENTRY_ENGINE_TIMEFRAME, limit=max(ENTRY_ENGINE_LIMIT_BARS, TC1_LTF_EMA + 10))
-    if not ltf or len(ltf) < (TC1_LTF_EMA + 5):
+    need = max(ENTRY_ENGINE_LIMIT_BARS, TC1_LTF_EMA + 10, TC1_ATR_LEN + 10, TC1_PULLBACK_LOOKBACK_BARS + 5)
+    ltf = _get_bars(symbol, timeframe=ENTRY_ENGINE_TIMEFRAME, limit=need)
+    if not ltf or len(ltf) < need:
         return False, {"reason": "insufficient_ltf_bars", "bars": len(ltf) if ltf else 0, "uptrend": uptrend}
     ltf_fresh_ok, ltf_fresh_meta = _guard_fresh_bars(ltf, ENTRY_ENGINE_TIMEFRAME)
     if not ltf_fresh_ok:
         return False, {"reason": "stale_ltf_bars", "bars": len(ltf), "uptrend": uptrend, "freshness": ltf_fresh_meta}
 
     ltf_closes = [float(b["c"]) for b in ltf]
+    ltf_highs = [float(b["h"]) for b in ltf]
     ltf_ts = [int(float(b["t"])) for b in ltf]
     ltf_ema = _ema(ltf_closes, TC1_LTF_EMA)
 
@@ -1884,23 +1896,94 @@ def _tc1_long_signal(symbol: str) -> tuple[bool, dict]:
     cur_close = ltf_closes[-1]
     prev_ema = ltf_ema[-2]
     cur_ema = ltf_ema[-1]
+    prev_high = ltf_highs[-2]
+    recent_high = max(ltf_highs[-(TC1_PULLBACK_LOOKBACK_BARS + 1):-1])
 
-    buffer = cur_ema * TC1_RECLAIM_BUFFER_PCT
-    fired = uptrend and (prev_close < (prev_ema - buffer)) and (cur_close > (cur_ema + buffer))
+    atr_now, _ = _atr_from_bars(ltf, length=int(TC1_ATR_LEN))
+    atr_pct = (float(atr_now) / float(cur_close)) if atr_now and cur_close > 0 else None
+    atr_ok = (atr_pct is not None and atr_pct >= float(TC1_MIN_ATR_PCT))
+
+    pullback_depth_atr = None
+    if atr_now and atr_now > 0:
+        pullback_depth_atr = max(0.0, (recent_high - prev_close) / float(atr_now))
+    pullback_ok = (pullback_depth_atr is not None and pullback_depth_atr >= float(TC1_PULLBACK_ATR_MIN) and pullback_depth_atr <= float(TC1_PULLBACK_ATR_MAX))
+
+    reclaim_buffer = cur_ema * TC1_RECLAIM_BUFFER_PCT
+    reclaim = (prev_close <= (prev_ema - reclaim_buffer)) and (cur_close >= (cur_ema + reclaim_buffer))
+    trigger = cur_close > prev_high
+
+    vwap = _vwap_from_bars(ltf, lookback=max(TC1_LTF_EMA, TC0_VWAP_LOOKBACK_BARS))
+    vwap_ok = (not bool(TC1_REQUIRE_VWAP)) or (vwap is not None and cur_close >= float(vwap))
+
+    bid = ask = spread_pct = None
+    spread_ok = True
+    try:
+        bid, ask = _best_bid_ask(symbol)
+        bid = float(bid or 0.0)
+        ask = float(ask or 0.0)
+        mid = ((bid + ask) / 2.0) if (bid > 0 and ask > 0) else 0.0
+        spread_pct = ((ask - bid) / mid) if mid > 0 else None
+        if TC1_MAX_SPREAD_PCT and spread_pct is not None:
+            spread_ok = spread_pct <= float(TC1_MAX_SPREAD_PCT)
+    except Exception:
+        spread_ok = True
+
+    expected_move_bps = (float(atr_pct) * 10000.0 * float(TC1_EXPECTED_MOVE_ATR_MULT)) if atr_pct is not None else None
+    profit_ok, profit_meta = _profitability_gate(expected_move_bps, spread_pct=spread_pct) if PROFIT_FILTER_ENABLED else (True, {"profit_filter_enabled": False})
+
+    reason = None
+    if not uptrend:
+        reason = "trend_not_up"
+    elif not reclaim:
+        reason = "pullback_not_reclaimed"
+    elif not trigger:
+        reason = "no_trigger_break"
+    elif not pullback_ok:
+        reason = "pullback_depth_invalid"
+    elif not atr_ok:
+        reason = "atr_too_low"
+    elif not vwap_ok:
+        reason = "below_vwap"
+    elif not spread_ok:
+        reason = "spread_too_wide"
+    elif not profit_ok:
+        reason = "profit_filter_blocked"
 
     meta = {
-        "uptrend": uptrend,
-        "uptrend_raw": raw_uptrend,
-        "trend_soften_epsilon": eps,
-        "htf_fast": ema_fast[-1],
-        "htf_fast_prev": ema_fast[-2],
-        "htf_slow": ema_slow[-1],
-        "ltf_ema": cur_ema,
-        "prev_close": prev_close,
-        "close": cur_close,
+        "strategy_name": "tpc1",
+        "reason": reason or "signal",
+        "uptrend": bool(uptrend),
+        "uptrend_raw": bool(raw_uptrend),
+        "trend_soften_epsilon": float(eps),
+        "htf_fast": float(ema_fast[-1]),
+        "htf_fast_prev": float(ema_fast[-2]),
+        "htf_slow": float(ema_slow[-1]),
+        "ltf_ema": float(cur_ema),
+        "prev_close": float(prev_close),
+        "close": float(cur_close),
+        "prev_high": float(prev_high),
+        "recent_high": float(recent_high),
         "bar_ts": ltf_ts[-1],
+        "reclaim": bool(reclaim),
+        "trigger": bool(trigger),
+        "pullback_depth_atr": float(pullback_depth_atr) if pullback_depth_atr is not None else None,
+        "pullback_ok": bool(pullback_ok),
+        "pullback_atr_min": float(TC1_PULLBACK_ATR_MIN),
+        "pullback_atr_max": float(TC1_PULLBACK_ATR_MAX),
+        "atr": float(atr_now) if atr_now is not None else None,
+        "atr_pct": float(atr_pct) if atr_pct is not None else None,
+        "atr_ok": bool(atr_ok),
+        "vwap": float(vwap) if vwap is not None else None,
+        "vwap_ok": bool(vwap_ok),
+        "require_vwap": bool(TC1_REQUIRE_VWAP),
+        "spread_pct": float(spread_pct) if spread_pct is not None else None,
+        "spread_ok": bool(spread_ok),
+        "max_spread_pct": float(TC1_MAX_SPREAD_PCT),
+        "profit_filter": profit_meta,
+        "expected_move_bps": float(expected_move_bps) if expected_move_bps is not None else None,
+        "expected_move_atr_mult": float(TC1_EXPECTED_MOVE_ATR_MULT),
     }
-    return fired, meta
+    return (bool(uptrend and reclaim and trigger and pullback_ok and atr_ok and vwap_ok and spread_ok and profit_ok), meta)
 
 
 
@@ -6552,6 +6635,24 @@ def diagnostics_live_config():
             "vwap_lookback_bars": int(TC0_VWAP_LOOKBACK_BARS),
             "max_spread_pct": float(TC0_MAX_SPREAD_PCT),
             "max_hold_sec": int(TC0_MAX_HOLD_SEC),
+        },
+        "tc1_params": {
+            "strategy_name": "tpc1",
+            "ltf_ema": int(TC1_LTF_EMA),
+            "htf_timeframe": str(TC1_HTF_TIMEFRAME),
+            "htf_fast": int(TC1_HTF_FAST),
+            "htf_slow": int(TC1_HTF_SLOW),
+            "reclaim_buffer_pct": float(TC1_RECLAIM_BUFFER_PCT),
+            "trend_soften_epsilon": float(TC1_TREND_SOFTEN_EPSILON),
+            "atr_len": int(TC1_ATR_LEN),
+            "min_atr_pct": float(TC1_MIN_ATR_PCT),
+            "pullback_lookback_bars": int(TC1_PULLBACK_LOOKBACK_BARS),
+            "pullback_atr_min": float(TC1_PULLBACK_ATR_MIN),
+            "pullback_atr_max": float(TC1_PULLBACK_ATR_MAX),
+            "require_vwap": bool(TC1_REQUIRE_VWAP),
+            "max_spread_pct": float(TC1_MAX_SPREAD_PCT),
+            "expected_move_atr_mult": float(TC1_EXPECTED_MOVE_ATR_MULT),
+            "max_hold_sec": int(getattr(settings, "tc1_max_hold_sec", 0) or 0),
         },
     }
 
