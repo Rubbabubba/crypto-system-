@@ -4464,6 +4464,15 @@ def _execute_long_entry(
     risk_snapshot = _risk_snapshot_for_entry(symbol=symbol, strategy=strategy, px=float(px), stop_price=float(stop_price), take_price=float(take_price), notional=float(_notional))
     risk_snapshot["risk_admission"] = risk_admission
     risk_snapshot["sizing"] = sizing_meta or {}
+    risk_snapshot["candidate_meta"] = dict(candidate_meta or {})
+    risk_snapshot["signal_meta"] = dict((candidate_meta or {}).get("signal_meta") or {})
+    risk_snapshot["rank"] = dict((candidate_meta or {}).get("rank") or {})
+    risk_snapshot["observability"] = {
+        "ranking_score": _safe_float((candidate_meta or {}).get("ranking_score")),
+        "spread_pct": _safe_float((candidate_meta or {}).get("spread_pct")),
+        "regime_quiet": bool((candidate_meta or {}).get("regime_quiet")),
+        "captured_utc": utc_now_iso(),
+    }
     plan_created_ts = time.time()
     plan_time_stop_sec = int(_strategy_max_hold_sec(strategy) or 0)
     plan_expires_ts = plan_created_ts + float(plan_time_stop_sec if plan_time_stop_sec > 0 else 3600)
@@ -7223,7 +7232,7 @@ def scan_entries(payload: WorkerScanPayload):
     except Exception:
         pass
 
-    return {
+    scan_response = {
         "ok": True,
         "utc": utc_now_iso(),
         "universe_count": len(universe),
@@ -7625,4 +7634,97 @@ def diagnostics_recent_trades(limit: int = 25):
         "utc": utc_now_iso(),
         "build": PATCH_BUILD,
         "recent_trades": snapshot.get("recent_trades") or {"count": 0, "trades": []},
+    }
+
+
+
+def _tc1_scan_observability_snapshot(limit_symbols: int = 25) -> dict[str, Any]:
+    scan = dict(getattr(state, "last_scan_result", {}) or {})
+    diagnostics = dict(scan.get("diagnostics") or {})
+    per_symbol = dict(diagnostics.get("per_symbol") or {})
+    filtered = []
+    for sym, payload in per_symbol.items():
+        meta = dict(((payload or {}).get("signal_debug") or {}).get("tc1") or {})
+        if not payload or not meta:
+            continue
+        filtered.append({
+            "symbol": sym,
+            "eligible": bool((payload or {}).get("eligible")),
+            "chosen_strategy": (payload or {}).get("chosen_strategy"),
+            "skip": list((payload or {}).get("skip") or []),
+            "signals": dict((payload or {}).get("signals") or {}),
+            "tc1": meta,
+        })
+    filtered = filtered[: max(1, int(limit_symbols))]
+    strategy_summary = dict(diagnostics.get("strategy_summary") or {})
+    candidates = [c for c in list(diagnostics.get("candidates") or []) if str((c or {}).get("strategy") or "") == "tc1"]
+    results = [r for r in list(scan.get("results") or []) if str((r or {}).get("strategy") or "") == "tc1"]
+    return {
+        "ok": True,
+        "utc": utc_now_iso(),
+        "build": PATCH_BUILD,
+        "last_scan_utc": scan.get("utc"),
+        "universe_count": scan.get("universe_count"),
+        "scanner": dict(scan.get("scanner") or {}),
+        "strategy_summary": {"tc1": strategy_summary.get("tc1") or {"signals": 0, "chosen": 0, "executed": 0}},
+        "tc1_candidates": candidates,
+        "tc1_results": results,
+        "tc1_per_symbol": filtered,
+    }
+
+
+@app.get("/diagnostics/tc1_scan_observability")
+def diagnostics_tc1_scan_observability(limit_symbols: int = 25):
+    return _tc1_scan_observability_snapshot(limit_symbols=limit_symbols)
+
+
+@app.get("/diagnostics/tc1_trade_observability")
+def diagnostics_tc1_trade_observability(limit: int = 25, include_open: int = 1):
+    snapshot = _performance_snapshot(days=30.0, recent_limit=max(25, int(limit)))
+    all_trades = list(((snapshot.get("recent_trades") or {}).get("trades") or []))
+    tc1_trades = [t for t in all_trades if str((t or {}).get("strategy") or "") == "tc1"][: max(1, int(limit))]
+    net = sum(_safe_float(t.get("net_pnl_usd")) for t in tc1_trades)
+    gross = sum(_safe_float(t.get("gross_pnl_usd")) for t in tc1_trades)
+    fees = sum(_safe_float(t.get("fees_total")) for t in tc1_trades)
+    wins = sum(1 for t in tc1_trades if _safe_float(t.get("net_pnl_usd")) > 0)
+    losses = sum(1 for t in tc1_trades if _safe_float(t.get("net_pnl_usd")) < 0)
+    open_plans = []
+    if int(include_open):
+        try:
+            from dataclasses import asdict, is_dataclass
+            for plan in getattr(state, "plans", {}).values():
+                strategy = str(getattr(plan, "strategy", "") or "")
+                if strategy != "tc1":
+                    continue
+                payload = asdict(plan) if is_dataclass(plan) else dict(plan)
+                rs = dict((payload.get("risk_snapshot") or payload.get("risk_snapshot_json") or {}))
+                open_plans.append({
+                    "symbol": payload.get("symbol"),
+                    "status": payload.get("status"),
+                    "opened_ts": payload.get("opened_ts"),
+                    "entry_price": payload.get("entry_price"),
+                    "stop_price": payload.get("stop_price"),
+                    "take_price": payload.get("take_price"),
+                    "max_hold_sec": payload.get("max_hold_sec"),
+                    "risk_snapshot": rs,
+                    "signal_meta": dict(rs.get("signal_meta") or {}),
+                    "rank": dict(rs.get("rank") or {}),
+                    "observability": dict(rs.get("observability") or {}),
+                })
+        except Exception:
+            open_plans = []
+    return {
+        "ok": True,
+        "utc": utc_now_iso(),
+        "build": PATCH_BUILD,
+        "summary": {
+            "trade_count": len(tc1_trades),
+            "wins": wins,
+            "losses": losses,
+            "net_pnl_usd": net,
+            "gross_pnl_usd": gross,
+            "fees_total_usd": fees,
+        },
+        "recent_tc1_trades": tc1_trades,
+        "open_tc1_plans": open_plans,
     }
