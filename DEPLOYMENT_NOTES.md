@@ -1,6 +1,6 @@
-# Patch 059
+# Patch 060
 
-No-drift baseline sync built from Patch 058 reference.
+True breakout entry logic for tc1 built from Patch 059 baseline.
 
-Build marker updated to `patch-059-tc1-momentum-breakout-confirmation`.
+Build marker updated to `patch-060-tc1-true-breakout-entry-logic`.
 Use the env changes listed in chat.
