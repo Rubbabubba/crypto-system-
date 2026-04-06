@@ -1,10 +1,6 @@
-# Patch 053
+# Patch 059
 
-Baseline sync patch for TPC1 unlock rollout.
-No code logic drift from Patch 052.
-Use updated env calibration block in chat.
+No-drift baseline sync built from Patch 058 reference.
 
-
-## Patch 055
-- Build marker updated to `patch-058-tc1-selective-re-entry-calibration`.
-- No-drift baseline sync for long-only TPC1 quality hardening env calibration.
+Build marker updated to `patch-059-tc1-momentum-breakout-confirmation`.
+Use the env changes listed in chat.
