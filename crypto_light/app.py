@@ -942,6 +942,12 @@ TC1_REQUIRE_VWAP = os.getenv("TC1_REQUIRE_VWAP", "1").strip().lower() in ("1", "
 TC1_MAX_SPREAD_PCT = float(os.getenv("TC1_MAX_SPREAD_PCT", "0.003") or 0.003)
 TC1_EXPECTED_MOVE_ATR_MULT = float(os.getenv("TC1_EXPECTED_MOVE_ATR_MULT", "2.4") or 2.4)
 
+# TC1 breakout-confirmation params
+TC1_BREAKOUT_LOOKBACK_BARS = int(float(os.getenv("TC1_BREAKOUT_LOOKBACK_BARS", "12") or 12))
+TC1_BREAKOUT_BUFFER_PCT = float(os.getenv("TC1_BREAKOUT_BUFFER_PCT", "0.0003") or 0.0003)
+TC1_BREAKOUT_MIN_RANGE_ATR = float(os.getenv("TC1_BREAKOUT_MIN_RANGE_ATR", "0.8") or 0.8)
+TC1_BREAKOUT_MIN_CLOSE_FRACTION = float(os.getenv("TC1_BREAKOUT_MIN_CLOSE_FRACTION", "0.7") or 0.7)
+
 
 # ---------- Scanner config (soft allow) ----------
 SCANNER_URL = os.getenv("SCANNER_URL", "").strip()
@@ -1856,12 +1862,12 @@ def _tc0_long_signal(symbol: str) -> tuple[bool, dict]:
 
 
 def _tc1_long_signal(symbol: str) -> tuple[bool, dict]:
-    """TPC1 (Trend Pullback Continuation).
+    """TC1 true breakout entry logic.
 
     Entry concept:
     - HTF trend confirmation via EMA fast > EMA slow and EMA fast rising
-    - LTF pullback into EMA zone
-    - Reclaim confirmation on the latest closed bar
+    - LTF breakout above recent structure high
+    - Expansion confirmation on the latest closed bar
     - ATR / spread / profitability guardrails
     """
     htf_need = max(TC1_HTF_LIMIT_BARS, TC1_HTF_SLOW + 5)
@@ -1879,7 +1885,12 @@ def _tc1_long_signal(symbol: str) -> tuple[bool, dict]:
     eps = TC1_TREND_SOFTEN_EPSILON if TC1_TREND_SOFTEN_EPSILON and TC1_TREND_SOFTEN_EPSILON > 0 else 0.0
     uptrend = (ema_fast[-1] >= (ema_slow[-1] * (1.0 - eps))) and (ema_fast[-1] > ema_fast[-2])
 
-    need = max(ENTRY_ENGINE_LIMIT_BARS, TC1_LTF_EMA + 10, TC1_ATR_LEN + 10, TC1_PULLBACK_LOOKBACK_BARS + 5)
+    need = max(
+        ENTRY_ENGINE_LIMIT_BARS,
+        TC1_LTF_EMA + 10,
+        TC1_ATR_LEN + 10,
+        TC1_BREAKOUT_LOOKBACK_BARS + 5,
+    )
     ltf = _get_bars(symbol, timeframe=ENTRY_ENGINE_TIMEFRAME, limit=need)
     if not ltf or len(ltf) < need:
         return False, {"reason": "insufficient_ltf_bars", "bars": len(ltf) if ltf else 0, "uptrend": uptrend}
@@ -1887,31 +1898,37 @@ def _tc1_long_signal(symbol: str) -> tuple[bool, dict]:
     if not ltf_fresh_ok:
         return False, {"reason": "stale_ltf_bars", "bars": len(ltf), "uptrend": uptrend, "freshness": ltf_fresh_meta}
 
+    ltf_opens = [float(b["o"]) for b in ltf]
     ltf_closes = [float(b["c"]) for b in ltf]
     ltf_highs = [float(b["h"]) for b in ltf]
+    ltf_lows = [float(b["l"]) for b in ltf]
     ltf_ts = [int(float(b["t"])) for b in ltf]
     ltf_ema = _ema(ltf_closes, TC1_LTF_EMA)
 
-    prev_close = ltf_closes[-2]
+    cur_open = ltf_opens[-1]
     cur_close = ltf_closes[-1]
-    prev_ema = ltf_ema[-2]
+    cur_high = ltf_highs[-1]
+    cur_low = ltf_lows[-1]
     cur_ema = ltf_ema[-1]
-    prev_high = ltf_highs[-2]
-    recent_high = max(ltf_highs[-(TC1_PULLBACK_LOOKBACK_BARS + 1):-1])
+
+    breakout_level = max(ltf_highs[-(TC1_BREAKOUT_LOOKBACK_BARS + 1):-1])
+    breakout_buffer_px = breakout_level * TC1_BREAKOUT_BUFFER_PCT
+    breakout = cur_close >= (breakout_level + breakout_buffer_px)
 
     atr_now, _ = _atr_from_bars(ltf, length=int(TC1_ATR_LEN))
     atr_pct = (float(atr_now) / float(cur_close)) if atr_now and cur_close > 0 else None
     atr_ok = (atr_pct is not None and atr_pct >= float(TC1_MIN_ATR_PCT))
 
-    pullback_depth_atr = None
-    if atr_now and atr_now > 0:
-        pullback_depth_atr = max(0.0, (recent_high - prev_close) / float(atr_now))
-    pullback_ok = (pullback_depth_atr is not None and pullback_depth_atr >= float(TC1_PULLBACK_ATR_MIN) and pullback_depth_atr <= float(TC1_PULLBACK_ATR_MAX))
+    bar_range = max(0.0, cur_high - cur_low)
+    breakout_range_atr = (bar_range / float(atr_now)) if atr_now and atr_now > 0 else None
+    expansion_ok = (breakout_range_atr is not None and breakout_range_atr >= float(TC1_BREAKOUT_MIN_RANGE_ATR))
 
-    reclaim_buffer = cur_ema * TC1_RECLAIM_BUFFER_PCT
-    reclaim = (prev_close <= (prev_ema - reclaim_buffer)) and (cur_close >= (cur_ema + reclaim_buffer))
-    trigger = cur_close > prev_high
+    close_fraction = None
+    if bar_range > 0:
+        close_fraction = (cur_close - cur_low) / bar_range
+    close_strength_ok = (close_fraction is not None and close_fraction >= float(TC1_BREAKOUT_MIN_CLOSE_FRACTION))
 
+    ema_confirm = cur_close >= cur_ema
     vwap = _vwap_from_bars(ltf, lookback=max(TC1_LTF_EMA, TC0_VWAP_LOOKBACK_BARS))
     vwap_ok = (not bool(TC1_REQUIRE_VWAP)) or (vwap is not None and cur_close >= float(vwap))
 
@@ -1934,12 +1951,14 @@ def _tc1_long_signal(symbol: str) -> tuple[bool, dict]:
     reason = None
     if not uptrend:
         reason = "trend_not_up"
-    elif not reclaim:
-        reason = "pullback_not_reclaimed"
-    elif not trigger:
-        reason = "no_trigger_break"
-    elif not pullback_ok:
-        reason = "pullback_depth_invalid"
+    elif not breakout:
+        reason = "no_structure_breakout"
+    elif not expansion_ok:
+        reason = "breakout_no_expansion"
+    elif not close_strength_ok:
+        reason = "weak_breakout_close"
+    elif not ema_confirm:
+        reason = "below_ltf_ema"
     elif not atr_ok:
         reason = "atr_too_low"
     elif not vwap_ok:
@@ -1950,7 +1969,7 @@ def _tc1_long_signal(symbol: str) -> tuple[bool, dict]:
         reason = "profit_filter_blocked"
 
     meta = {
-        "strategy_name": "tpc1",
+        "strategy_name": "tpc1_breakout",
         "reason": reason or "signal",
         "uptrend": bool(uptrend),
         "uptrend_raw": bool(raw_uptrend),
@@ -1959,17 +1978,23 @@ def _tc1_long_signal(symbol: str) -> tuple[bool, dict]:
         "htf_fast_prev": float(ema_fast[-2]),
         "htf_slow": float(ema_slow[-1]),
         "ltf_ema": float(cur_ema),
-        "prev_close": float(prev_close),
+        "open": float(cur_open),
         "close": float(cur_close),
-        "prev_high": float(prev_high),
-        "recent_high": float(recent_high),
+        "high": float(cur_high),
+        "low": float(cur_low),
+        "breakout_level": float(breakout_level),
+        "breakout_buffer_pct": float(TC1_BREAKOUT_BUFFER_PCT),
         "bar_ts": ltf_ts[-1],
-        "reclaim": bool(reclaim),
-        "trigger": bool(trigger),
-        "pullback_depth_atr": float(pullback_depth_atr) if pullback_depth_atr is not None else None,
-        "pullback_ok": bool(pullback_ok),
-        "pullback_atr_min": float(TC1_PULLBACK_ATR_MIN),
-        "pullback_atr_max": float(TC1_PULLBACK_ATR_MAX),
+        "breakout": bool(breakout),
+        "breakout_lookback_bars": int(TC1_BREAKOUT_LOOKBACK_BARS),
+        "bar_range": float(bar_range),
+        "breakout_range_atr": float(breakout_range_atr) if breakout_range_atr is not None else None,
+        "expansion_ok": bool(expansion_ok),
+        "breakout_min_range_atr": float(TC1_BREAKOUT_MIN_RANGE_ATR),
+        "close_fraction": float(close_fraction) if close_fraction is not None else None,
+        "close_strength_ok": bool(close_strength_ok),
+        "breakout_min_close_fraction": float(TC1_BREAKOUT_MIN_CLOSE_FRACTION),
+        "ema_confirm": bool(ema_confirm),
         "atr": float(atr_now) if atr_now is not None else None,
         "atr_pct": float(atr_pct) if atr_pct is not None else None,
         "atr_ok": bool(atr_ok),
@@ -1983,7 +2008,7 @@ def _tc1_long_signal(symbol: str) -> tuple[bool, dict]:
         "expected_move_bps": float(expected_move_bps) if expected_move_bps is not None else None,
         "expected_move_atr_mult": float(TC1_EXPECTED_MOVE_ATR_MULT),
     }
-    return (bool(uptrend and reclaim and trigger and pullback_ok and atr_ok and vwap_ok and spread_ok and profit_ok), meta)
+    return (bool(uptrend and breakout and expansion_ok and close_strength_ok and ema_confirm and atr_ok and vwap_ok and spread_ok and profit_ok), meta)
 
 
 
@@ -6646,7 +6671,7 @@ def diagnostics_live_config():
             "max_hold_sec": int(TC0_MAX_HOLD_SEC),
         },
         "tc1_params": {
-            "strategy_name": "tpc1",
+            "strategy_name": "tpc1_breakout",
             "ltf_ema": int(TC1_LTF_EMA),
             "htf_timeframe": str(TC1_HTF_TIMEFRAME),
             "htf_fast": int(TC1_HTF_FAST),
@@ -6658,6 +6683,10 @@ def diagnostics_live_config():
             "pullback_lookback_bars": int(TC1_PULLBACK_LOOKBACK_BARS),
             "pullback_atr_min": float(TC1_PULLBACK_ATR_MIN),
             "pullback_atr_max": float(TC1_PULLBACK_ATR_MAX),
+            "breakout_lookback_bars": int(TC1_BREAKOUT_LOOKBACK_BARS),
+            "breakout_buffer_pct": float(TC1_BREAKOUT_BUFFER_PCT),
+            "breakout_min_range_atr": float(TC1_BREAKOUT_MIN_RANGE_ATR),
+            "breakout_min_close_fraction": float(TC1_BREAKOUT_MIN_CLOSE_FRACTION),
             "require_vwap": bool(TC1_REQUIRE_VWAP),
             "max_spread_pct": float(TC1_MAX_SPREAD_PCT),
             "expected_move_atr_mult": float(TC1_EXPECTED_MOVE_ATR_MULT),
