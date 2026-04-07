@@ -943,10 +943,10 @@ TC1_MAX_SPREAD_PCT = float(os.getenv("TC1_MAX_SPREAD_PCT", "0.003") or 0.003)
 TC1_EXPECTED_MOVE_ATR_MULT = float(os.getenv("TC1_EXPECTED_MOVE_ATR_MULT", "2.4") or 2.4)
 
 # TC1 breakout-confirmation params
-TC1_BREAKOUT_LOOKBACK_BARS = int(float(os.getenv("TC1_BREAKOUT_LOOKBACK_BARS", "12") or 12))
-TC1_BREAKOUT_BUFFER_PCT = float(os.getenv("TC1_BREAKOUT_BUFFER_PCT", "0.0003") or 0.0003)
-TC1_BREAKOUT_MIN_RANGE_ATR = float(os.getenv("TC1_BREAKOUT_MIN_RANGE_ATR", "0.8") or 0.8)
-TC1_BREAKOUT_MIN_CLOSE_FRACTION = float(os.getenv("TC1_BREAKOUT_MIN_CLOSE_FRACTION", "0.7") or 0.7)
+TC1_BREAKOUT_LOOKBACK_BARS = int(float(os.getenv("TC1_BREAKOUT_LOOKBACK_BARS", "10") or 10))
+TC1_BREAKOUT_BUFFER_PCT = float(os.getenv("TC1_BREAKOUT_BUFFER_PCT", "0.00015") or 0.00015)
+TC1_BREAKOUT_MIN_RANGE_ATR = float(os.getenv("TC1_BREAKOUT_MIN_RANGE_ATR", "0.65") or 0.65)
+TC1_BREAKOUT_MIN_CLOSE_FRACTION = float(os.getenv("TC1_BREAKOUT_MIN_CLOSE_FRACTION", "0.6") or 0.6)
 
 
 # ---------- Scanner config (soft allow) ----------
@@ -1969,7 +1969,7 @@ def _tc1_long_signal(symbol: str) -> tuple[bool, dict]:
         reason = "profit_filter_blocked"
 
     meta = {
-        "strategy_name": "tpc1_breakout",
+        "strategy_name": "tpc1_breakout_unlock",
         "reason": reason or "signal",
         "uptrend": bool(uptrend),
         "uptrend_raw": bool(raw_uptrend),
@@ -2007,6 +2007,17 @@ def _tc1_long_signal(symbol: str) -> tuple[bool, dict]:
         "profit_filter": profit_meta,
         "expected_move_bps": float(expected_move_bps) if expected_move_bps is not None else None,
         "expected_move_atr_mult": float(TC1_EXPECTED_MOVE_ATR_MULT),
+        "gate_summary": {
+            "trend": bool(uptrend),
+            "breakout": bool(breakout),
+            "expansion": bool(expansion_ok),
+            "close_strength": bool(close_strength_ok),
+            "ema_confirm": bool(ema_confirm),
+            "atr": bool(atr_ok),
+            "vwap": bool(vwap_ok),
+            "spread": bool(spread_ok),
+            "profit": bool(profit_ok),
+        },
     }
     return (bool(uptrend and breakout and expansion_ok and close_strength_ok and ema_confirm and atr_ok and vwap_ok and spread_ok and profit_ok), meta)
 
@@ -6671,7 +6682,7 @@ def diagnostics_live_config():
             "max_hold_sec": int(TC0_MAX_HOLD_SEC),
         },
         "tc1_params": {
-            "strategy_name": "tpc1_breakout",
+            "strategy_name": "tpc1_breakout_unlock",
             "ltf_ema": int(TC1_LTF_EMA),
             "htf_timeframe": str(TC1_HTF_TIMEFRAME),
             "htf_fast": int(TC1_HTF_FAST),
