@@ -1,6 +1,6 @@
-# Patch 060
+# Patch 061
 
-True breakout entry logic for tc1 built from Patch 059 baseline.
+TC1 breakout observability + selective unlock built from Patch 060 baseline.
 
-Build marker updated to `patch-060-tc1-true-breakout-entry-logic`.
+Build marker updated to `patch-061-tc1-breakout-observability-selective-unlock`.
 Use the env changes listed in chat.
