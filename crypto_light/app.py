@@ -2019,7 +2019,20 @@ def _tc1_long_signal(symbol: str) -> tuple[bool, dict]:
             "profit": bool(profit_ok),
         },
     }
-    return (bool(uptrend and breakout and expansion_ok and close_strength_ok and ema_confirm and atr_ok and vwap_ok and spread_ok and profit_ok), meta)
+    return (
+        bool(
+            uptrend
+            and breakout
+            and expansion_ok
+            and close_strength_ok
+            and ema_confirm
+            and atr_ok
+            and vwap_ok
+            and spread_ok
+            and profit_ok
+        ),
+        meta,
+    )
 
 
 
