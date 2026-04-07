@@ -1,6 +1,6 @@
-# Patch 062
+# Patch 063
 
-Scan-entry 500 fix while preserving Patch 061 breakout observability and selective unlock.
+Candidate-meta scope fix for scan-entry while preserving Patch 062 breakout observability.
 
-Build marker updated to `patch-062-scan-entry-500-fix-preserve-breakout-observability`.
-Use the env changes listed in chat.
+Build marker updated to `patch-063-candidate-meta-scope-fix-preserve-breakout-observability`.
+No env changes required.
