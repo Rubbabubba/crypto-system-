@@ -4234,6 +4234,7 @@ def _execute_long_entry(
     dry_run: bool = False,
     client_ip: str | None = None,
     extra: dict | None = None,
+    candidate_meta: dict | None = None,
     px_override: float | None = None,
     stop_price: float | None = None,
     take_price: float | None = None,
@@ -6268,6 +6269,7 @@ def place_entry(symbol: str, *, strategy: str, req_id: str | None = None, client
         req_id=rid,
         client_ip=client_ip,
         extra={"strategy": strategy, **(candidate_meta or {})},
+        candidate_meta=candidate_meta,
     )
     # _execute_long_entry returns a dict like:
     #   {"ok": True, "executed": True|False, "reason": "..."} or {"ok": False, "error": "..."}
