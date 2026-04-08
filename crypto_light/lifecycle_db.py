@@ -770,6 +770,11 @@ def upsert_position_ledger(position: Dict[str, Any]) -> None:
     payload.setdefault('status', 'open')
     payload.setdefault('opened_ts', now)
     payload['updated_ts'] = now
+    payload.setdefault('closed_ts', None)
+    payload.setdefault('realized_pnl_usd', None)
+    payload.setdefault('unrealized_pnl_usd', None)
+    payload.setdefault('fees_usd', None)
+    payload.setdefault('broker_position_qty', None)
     payload.setdefault('raw_json', _json(payload.get('raw_json') or payload))
     payload = _sanitize_payload(payload, json_fields={'raw_json'})
     con = _connect()
