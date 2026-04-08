@@ -900,8 +900,8 @@ TC0_TIME_EXIT_MIN_FEE_MULT = float(os.getenv("TC0_TIME_EXIT_MIN_FEE_MULT", "1.25
 
 # Profitability enforcement (Patch 045)
 PROFIT_FILTER_ENABLED = (os.getenv("PROFIT_FILTER_ENABLED", "1").strip().lower() in ("1", "true", "yes", "on"))
-PROFIT_FILTER_MIN_MOVE_TO_COST_MULT = float(os.getenv("PROFIT_FILTER_MIN_MOVE_TO_COST_MULT", "0.45") or 0.45)
-PROFIT_FILTER_MIN_EXPECTED_MOVE_BPS = float(os.getenv("PROFIT_FILTER_MIN_EXPECTED_MOVE_BPS", "28.0") or 28.0)
+PROFIT_FILTER_MIN_MOVE_TO_COST_MULT = float(os.getenv("PROFIT_FILTER_MIN_MOVE_TO_COST_MULT", "1.5") or 1.5)
+PROFIT_FILTER_MIN_EXPECTED_MOVE_BPS = float(os.getenv("PROFIT_FILTER_MIN_EXPECTED_MOVE_BPS", "80.0") or 80.0)
 PROFIT_FILTER_USE_LIVE_SPREAD = (os.getenv("PROFIT_FILTER_USE_LIVE_SPREAD", "0").strip().lower() in ("1", "true", "yes", "on"))
 PROFIT_FILTER_COST_FLOOR_BPS = float(os.getenv("PROFIT_FILTER_COST_FLOOR_BPS", "68.0") or 68.0)
 PROFIT_FILTER_ENTRY_FEE_BPS = float(os.getenv("PROFIT_FILTER_ENTRY_FEE_BPS", os.getenv("ENTRY_FEE_BPS", "26")) or 26.0)
@@ -940,12 +940,12 @@ TC1_PULLBACK_ATR_MIN = float(os.getenv("TC1_PULLBACK_ATR_MIN", "0.35") or 0.35)
 TC1_PULLBACK_ATR_MAX = float(os.getenv("TC1_PULLBACK_ATR_MAX", "1.75") or 1.75)
 TC1_REQUIRE_VWAP = os.getenv("TC1_REQUIRE_VWAP", "1").strip().lower() in ("1", "true", "yes", "on")
 TC1_MAX_SPREAD_PCT = float(os.getenv("TC1_MAX_SPREAD_PCT", "0.003") or 0.003)
-TC1_EXPECTED_MOVE_ATR_MULT = float(os.getenv("TC1_EXPECTED_MOVE_ATR_MULT", "2.4") or 2.4)
+TC1_EXPECTED_MOVE_ATR_MULT = float(os.getenv("TC1_EXPECTED_MOVE_ATR_MULT", "4.5") or 4.5)
 
 # TC1 breakout-confirmation params
 TC1_BREAKOUT_LOOKBACK_BARS = int(float(os.getenv("TC1_BREAKOUT_LOOKBACK_BARS", "10") or 10))
 TC1_BREAKOUT_BUFFER_PCT = float(os.getenv("TC1_BREAKOUT_BUFFER_PCT", "0.00015") or 0.00015)
-TC1_BREAKOUT_MIN_RANGE_ATR = float(os.getenv("TC1_BREAKOUT_MIN_RANGE_ATR", "0.65") or 0.65)
+TC1_BREAKOUT_MIN_RANGE_ATR = float(os.getenv("TC1_BREAKOUT_MIN_RANGE_ATR", "0.9") or 0.9)
 TC1_BREAKOUT_MIN_CLOSE_FRACTION = float(os.getenv("TC1_BREAKOUT_MIN_CLOSE_FRACTION", "0.6") or 0.6)
 
 
@@ -964,7 +964,7 @@ FILTER_UNIVERSE_BY_ALLOWED_SYMBOLS = (os.getenv('FILTER_UNIVERSE_BY_ALLOWED_SYMB
 
 MAX_OPEN_POSITIONS = int(float(os.getenv('MAX_OPEN_POSITIONS', '2') or 2))
 MAX_ENTRIES_PER_SCAN = int(float(os.getenv('MAX_ENTRIES_PER_SCAN', '1') or 1))
-MAX_ENTRIES_PER_DAY = int(float(os.getenv('MAX_ENTRIES_PER_DAY', '5') or 5))
+MAX_ENTRIES_PER_DAY = int(float(os.getenv('MAX_ENTRIES_PER_DAY', '3') or 3))
 
 ENABLE_CANDIDATE_RANKING = (os.getenv('ENABLE_CANDIDATE_RANKING', '1').strip().lower() in ('1','true','yes','on'))
 MAX_SPREAD_PCT = float(os.getenv('MAX_SPREAD_PCT', '0.004') or 0.004)  # 0 disables
@@ -1666,17 +1666,23 @@ def _profitability_gate(expected_move_bps: float | None, spread_pct: float | Non
     soft_pass = bool(PROFIT_FILTER_SOFT_PASS_ENABLED) and expected_move_bps >= float(soft_needed)
     passed = bool(hard_pass or soft_pass)
     pass_tier = "hard" if hard_pass else ("soft" if soft_pass else "blocked")
+    edge_surplus_bps = float(expected_move_bps - float(cost_bps))
+    required_edge_surplus_bps = float(hard_needed - float(cost_bps))
+    soft_required_edge_surplus_bps = float(soft_needed - float(cost_bps))
     return passed, {
         "profit_filter_enabled": bool(PROFIT_FILTER_ENABLED),
         "expected_move_bps": expected_move_bps,
         "cost_bps": float(cost_bps),
+        "edge_surplus_bps": float(edge_surplus_bps),
         "required_move_bps": float(hard_needed),
         "required_move_bps_from_mult": float(hard_mult_needed),
+        "required_edge_surplus_bps": float(required_edge_surplus_bps),
         "min_move_to_cost_mult": float(PROFIT_FILTER_MIN_MOVE_TO_COST_MULT),
         "min_expected_move_bps": float(PROFIT_FILTER_MIN_EXPECTED_MOVE_BPS),
         "soft_pass_enabled": bool(PROFIT_FILTER_SOFT_PASS_ENABLED),
         "soft_required_move_bps": float(soft_needed),
         "soft_required_move_bps_from_mult": float(soft_mult_needed),
+        "soft_required_edge_surplus_bps": float(soft_required_edge_surplus_bps),
         "soft_min_move_to_cost_mult": float(PROFIT_FILTER_SOFT_PASS_MIN_MOVE_TO_COST_MULT),
         "soft_min_expected_move_bps": float(PROFIT_FILTER_SOFT_PASS_MIN_EXPECTED_MOVE_BPS),
         "hard_pass": bool(hard_pass),
