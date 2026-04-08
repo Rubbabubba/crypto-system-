@@ -1,6 +1,6 @@
-# Patch 064
+# Patch 065
 
-Lifecycle position-ledger open-row fix while preserving Patch 063 breakout observability.
+TC1 zero-result observability refinement while preserving Patch 064 lifecycle fixes.
 
-Build marker updated to `patch-064-lifecycle-position-ledger-open-row-fix`.
+Build marker updated to `patch-065-tc1-zero-result-observability-refinement`.
 No env changes required.
