@@ -1,6 +1,6 @@
-# Patch 066
+# Patch 067
 
-Forced-edge profitability gate and wider-target tc1 defaults built from Patch 065 baseline.
+TC1 forced-edge observability and legacy-plan isolation built from Patch 066 baseline.
 
-Build marker updated to `patch-066-forced-edge-profitability-gate`.
-Apply the env delta listed in chat.
+Build marker updated to `patch-067-tc1-forced-edge-observability-legacy-plan-isolation`.
+No env changes required.
