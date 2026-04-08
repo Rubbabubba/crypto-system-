@@ -7673,7 +7673,7 @@ def dashboard(recent_limit: int = 15):
         "pretrade_health_gate": gate,
         "promotion_guardrails": promotion,
         "performance": perf,
-        "open_plans": open_plans,
+        "open_plans": [_annotate_open_plan_legacy_state(p) if ((p or {}).get("strategy") == "tc1") else p for p in open_plans],
         "snapshot_consistency": {
             "ok": True,
             "shared_snapshot_inputs": ["compatibility", "pretrade_health_gate", "promotion_guardrails"],
