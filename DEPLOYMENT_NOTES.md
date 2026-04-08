@@ -1,6 +1,6 @@
-# Patch 063
+# Patch 064
 
-Candidate-meta scope fix for scan-entry while preserving Patch 062 breakout observability.
+Lifecycle position-ledger open-row fix while preserving Patch 063 breakout observability.
 
-Build marker updated to `patch-063-candidate-meta-scope-fix-preserve-breakout-observability`.
+Build marker updated to `patch-064-lifecycle-position-ledger-open-row-fix`.
 No env changes required.
