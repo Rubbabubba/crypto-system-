@@ -1,6 +1,6 @@
-# Patch 067
+# Patch 068
 
-TC1 forced-edge observability and legacy-plan isolation built from Patch 066 baseline.
+Kraken balance-rate-limit hardening and tc1 exit quality upgrade built from Patch 067 baseline.
 
-Build marker updated to `patch-067-tc1-forced-edge-observability-legacy-plan-isolation`.
-No env changes required.
+Build marker updated to `patch-068-kraken-rate-limit-hardening-tc1-exit-quality-upgrade`.
+Apply the env delta listed in chat.
