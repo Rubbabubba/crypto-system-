@@ -950,6 +950,9 @@ TC1_BREAKOUT_MIN_CLOSE_FRACTION = float(os.getenv("TC1_BREAKOUT_MIN_CLOSE_FRACTI
 TC1_MIN_TAKE_PROFIT_BPS = float(os.getenv("TC1_MIN_TAKE_PROFIT_BPS", "90") or 90.0)
 TC1_BREAK_EVEN_AFTER_BPS = float(os.getenv("TC1_BREAK_EVEN_AFTER_BPS", "45") or 45.0)
 TC1_TIME_EXIT_MIN_GROSS_BPS = float(os.getenv("TC1_TIME_EXIT_MIN_GROSS_BPS", "35") or 35.0)
+TC1_POST_ENTRY_PROTECT_AFTER_BPS = float(os.getenv("TC1_POST_ENTRY_PROTECT_AFTER_BPS", "25") or 25.0)
+TC1_POST_ENTRY_MAX_GIVEBACK_BPS = float(os.getenv("TC1_POST_ENTRY_MAX_GIVEBACK_BPS", "18") or 18.0)
+TC1_ORPHAN_PLAN_CLOSE_MIN_AGE_SEC = float(os.getenv("TC1_ORPHAN_PLAN_CLOSE_MIN_AGE_SEC", "86400") or 86400.0)
 
 
 # ---------- Scanner config (soft allow) ----------
@@ -6725,6 +6728,8 @@ def diagnostics_live_config():
             "min_take_profit_bps": float(TC1_MIN_TAKE_PROFIT_BPS),
             "break_even_after_bps": float(TC1_BREAK_EVEN_AFTER_BPS),
             "time_exit_min_gross_bps": float(TC1_TIME_EXIT_MIN_GROSS_BPS),
+            "post_entry_protect_after_bps": float(TC1_POST_ENTRY_PROTECT_AFTER_BPS),
+            "post_entry_max_giveback_bps": float(TC1_POST_ENTRY_MAX_GIVEBACK_BPS),
             "require_vwap": bool(TC1_REQUIRE_VWAP),
             "max_spread_pct": float(TC1_MAX_SPREAD_PCT),
             "expected_move_atr_mult": float(TC1_EXPECTED_MOVE_ATR_MULT),
