@@ -1,6 +1,6 @@
-# Patch 068
+# Patch 069
 
-Kraken balance-rate-limit hardening and tc1 exit quality upgrade built from Patch 067 baseline.
+Broker-state cache enforcement and worker route timeout hardening built from Patch 068 baseline.
 
-Build marker updated to `patch-068-kraken-rate-limit-hardening-tc1-exit-quality-upgrade`.
+Build marker updated to `patch-069-broker-state-cache-enforcement-worker-timeout-hardening`.
 Apply the env delta listed in chat.
