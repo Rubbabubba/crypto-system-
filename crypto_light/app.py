@@ -947,6 +947,9 @@ TC1_BREAKOUT_LOOKBACK_BARS = int(float(os.getenv("TC1_BREAKOUT_LOOKBACK_BARS", "
 TC1_BREAKOUT_BUFFER_PCT = float(os.getenv("TC1_BREAKOUT_BUFFER_PCT", "0.00015") or 0.00015)
 TC1_BREAKOUT_MIN_RANGE_ATR = float(os.getenv("TC1_BREAKOUT_MIN_RANGE_ATR", "0.9") or 0.9)
 TC1_BREAKOUT_MIN_CLOSE_FRACTION = float(os.getenv("TC1_BREAKOUT_MIN_CLOSE_FRACTION", "0.6") or 0.6)
+TC1_MIN_TAKE_PROFIT_BPS = float(os.getenv("TC1_MIN_TAKE_PROFIT_BPS", "90") or 90.0)
+TC1_BREAK_EVEN_AFTER_BPS = float(os.getenv("TC1_BREAK_EVEN_AFTER_BPS", "45") or 45.0)
+TC1_TIME_EXIT_MIN_GROSS_BPS = float(os.getenv("TC1_TIME_EXIT_MIN_GROSS_BPS", "35") or 35.0)
 
 
 # ---------- Scanner config (soft allow) ----------
@@ -6719,6 +6722,9 @@ def diagnostics_live_config():
             "breakout_buffer_pct": float(TC1_BREAKOUT_BUFFER_PCT),
             "breakout_min_range_atr": float(TC1_BREAKOUT_MIN_RANGE_ATR),
             "breakout_min_close_fraction": float(TC1_BREAKOUT_MIN_CLOSE_FRACTION),
+            "min_take_profit_bps": float(TC1_MIN_TAKE_PROFIT_BPS),
+            "break_even_after_bps": float(TC1_BREAK_EVEN_AFTER_BPS),
+            "time_exit_min_gross_bps": float(TC1_TIME_EXIT_MIN_GROSS_BPS),
             "require_vwap": bool(TC1_REQUIRE_VWAP),
             "max_spread_pct": float(TC1_MAX_SPREAD_PCT),
             "expected_move_atr_mult": float(TC1_EXPECTED_MOVE_ATR_MULT),
