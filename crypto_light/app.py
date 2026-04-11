@@ -994,6 +994,52 @@ _SCANNER_CACHE: Dict[str, Any] = {
     "raw": None,
 }
 
+_ACCOUNT_TRUTH_CACHE: Dict[str, Any] = {
+    "snapshot": None,
+    "snapshot_ts": 0.0,
+    "last_success_snapshot": None,
+    "last_success_ts": 0.0,
+}
+
+
+def _safe_env_float(name: str, default: float) -> float:
+    try:
+        return float(os.getenv(name, str(default)) or default)
+    except Exception:
+        return float(default)
+
+
+def _account_truth_cache_ttl_sec() -> float:
+    ttl_candidates = [v for v in (
+        _safe_env_float("BALANCE_CACHE_TTL_SEC", 0.0),
+        _safe_env_float("BROKER_STATE_CACHE_TTL_SEC", 0.0),
+    ) if v > 0]
+    return float(min(ttl_candidates)) if ttl_candidates else 0.0
+
+
+def _account_truth_cache_grace_sec() -> float:
+    grace_candidates = [v for v in (
+        _safe_env_float("BALANCE_STALE_GRACE_SEC", 0.0),
+        _safe_env_float("BROKER_STATE_CACHE_GRACE_SEC", 0.0),
+    ) if v > 0]
+    return float(max(grace_candidates)) if grace_candidates else 0.0
+
+
+def _account_truth_cached_response(snapshot: dict, *, source: str, age_sec: float, last_live_error: str | None = None) -> dict:
+    out = dict(snapshot or {})
+    out["utc"] = utc_now_iso()
+    out["snapshot_source"] = source
+    out["broker_snapshot_age_sec"] = round(max(0.0, float(age_sec or 0.0)), 3)
+    out["broker_snapshot_fresh"] = bool(float(age_sec or 0.0) <= _account_truth_cache_ttl_sec()) if _account_truth_cache_ttl_sec() > 0 else False
+    out["stale_within_grace"] = bool(source == "stale_cache_grace")
+    out["balance_live_ok"] = bool(source == "live")
+    out["entry_balance_ok"] = bool(out.get("balance_live_ok") or source in {"cached_ttl", "stale_cache_grace"})
+    out["balance_ok"] = bool(out.get("entry_balance_ok"))
+    out["last_live_balance_error"] = last_live_error
+    if source != "live" and last_live_error:
+        out["balance_error"] = last_live_error
+    return out
+
 
 def _log_event(level: str, event: Dict[str, Any]) -> None:
     try:
@@ -3096,13 +3142,23 @@ def _sum_open_order_notional_usd(summary: dict, *, side: str | None = None) -> f
     return float(total)
 
 
-def _account_truth_snapshot() -> dict:
+def _account_truth_snapshot(force_refresh: bool = False) -> dict:
+    now = time.time()
+    ttl_sec = _account_truth_cache_ttl_sec()
+    grace_sec = _account_truth_cache_grace_sec()
+
+    cached_snapshot = dict(_ACCOUNT_TRUTH_CACHE.get('snapshot') or {})
+    cached_ts = float(_ACCOUNT_TRUTH_CACHE.get('snapshot_ts') or 0.0)
+    if (not force_refresh) and cached_snapshot and ttl_sec > 0 and (now - cached_ts) <= ttl_sec:
+        return _account_truth_cached_response(cached_snapshot, source='cached_ttl', age_sec=(now - cached_ts), last_live_error=cached_snapshot.get('last_live_balance_error'))
+
     balances = {}
     raw_balances = {}
     canonical_balances = {}
     balance_sources = {}
-    balance_ok = True
+    balance_live_ok = True
     balance_error = None
+    snap: dict[str, Any] = {}
     try:
         snap = _merged_balances_snapshot() or {}
         raw_balances = dict(snap.get('merged') or {})
@@ -3111,9 +3167,9 @@ def _account_truth_snapshot() -> dict:
         balances = canonical_balances or _merged_balances_by_asset() or {}
         balance_error = _last_balance_error()
         if balance_error:
-            balance_ok = False
+            balance_live_ok = False
     except Exception as e:
-        balance_ok = False
+        balance_live_ok = False
         balance_error = str(e)
         balances = {}
 
@@ -3141,11 +3197,15 @@ def _account_truth_snapshot() -> dict:
             'notional_usd': float(p.get('notional_usd', 0.0) or 0.0),
             'balance_sources': list(p.get('balance_sources') or []),
         })
-    return {
+
+    live_snapshot = {
         'ok': True,
         'utc': utc_now_iso(),
-        'balance_ok': bool(balance_ok),
+        'balance_ok': bool(balance_live_ok),
+        'balance_live_ok': bool(balance_live_ok),
+        'entry_balance_ok': bool(balance_live_ok),
         'balance_error': balance_error,
+        'last_live_balance_error': balance_error,
         'cash_usd': float(cash_usd),
         'position_exposure_usd': float(position_exposure_usd),
         'open_buy_order_notional_usd': float(open_buy_order_notional_usd),
@@ -3160,15 +3220,45 @@ def _account_truth_snapshot() -> dict:
         'raw_merged_balances': raw_balances,
         'canonical_balances': canonical_balances,
         'canonical_balance_sources': balance_sources,
-        'balance_agreement': dict(snap.get('economic_balance_agreement') or {}) if 'snap' in locals() else {},
+        'balance_agreement': dict(snap.get('economic_balance_agreement') or {}) if isinstance(snap, dict) else {},
         'cash_components_usd': cash_balances,
         'position_components': position_contributions,
         'equity_components': {
             'cash_usd': float(cash_usd),
             'position_exposure_usd': float(position_exposure_usd),
         },
+        'snapshot_source': 'live',
+        'broker_snapshot_age_sec': 0.0,
+        'broker_snapshot_fresh': bool(balance_live_ok),
+        'stale_within_grace': False,
     }
 
+    if balance_live_ok:
+        _ACCOUNT_TRUTH_CACHE['snapshot'] = dict(live_snapshot)
+        _ACCOUNT_TRUTH_CACHE['snapshot_ts'] = now
+        _ACCOUNT_TRUTH_CACHE['last_success_snapshot'] = dict(live_snapshot)
+        _ACCOUNT_TRUTH_CACHE['last_success_ts'] = now
+        return live_snapshot
+
+    last_success_snapshot = dict(_ACCOUNT_TRUTH_CACHE.get('last_success_snapshot') or {})
+    last_success_ts = float(_ACCOUNT_TRUTH_CACHE.get('last_success_ts') or 0.0)
+    age_sec = max(0.0, now - last_success_ts) if last_success_ts > 0 else None
+    if last_success_snapshot and grace_sec > 0 and age_sec is not None and age_sec <= grace_sec:
+        cached = _account_truth_cached_response(last_success_snapshot, source='stale_cache_grace', age_sec=age_sec, last_live_error=balance_error)
+        _ACCOUNT_TRUTH_CACHE['snapshot'] = dict(cached)
+        _ACCOUNT_TRUTH_CACHE['snapshot_ts'] = now
+        return cached
+
+    failed = dict(live_snapshot)
+    failed['snapshot_source'] = 'live_error'
+    failed['broker_snapshot_age_sec'] = round(age_sec, 3) if age_sec is not None else None
+    failed['broker_snapshot_fresh'] = False
+    failed['stale_within_grace'] = False
+    failed['entry_balance_ok'] = False
+    failed['balance_ok'] = False
+    _ACCOUNT_TRUTH_CACHE['snapshot'] = dict(failed)
+    _ACCOUNT_TRUTH_CACHE['snapshot_ts'] = now
+    return failed
 
 
 
@@ -3199,7 +3289,7 @@ def _pretrade_health_gate_summary(*, rerun_startup_check: bool = False) -> dict:
             if bool(worker_health['exit'].get('stale')):
                 violations.append('exit_worker_stale')
 
-        if bool(getattr(settings, 'pretrade_block_on_balance_error', True)) and not bool(account_truth.get('balance_ok')):
+        if bool(getattr(settings, 'pretrade_block_on_balance_error', True)) and not bool(account_truth.get('entry_balance_ok')):
             violations.append('broker_balance_unavailable')
 
         if bool(getattr(settings, 'pretrade_block_on_reconcile_anomaly', True)):
@@ -3229,6 +3319,7 @@ def _pretrade_health_gate_summary(*, rerun_startup_check: bool = False) -> dict:
         'startup_self_check': startup,
         'account_truth': {
             'balance_ok': bool(account_truth.get('balance_ok')),
+            'balance_live_ok': bool(account_truth.get('balance_live_ok')),
             'balance_error': account_truth.get('balance_error'),
             'cash_usd': float(account_truth.get('cash_usd', 0.0) or 0.0),
             'equity_usd': float(account_truth.get('equity_usd', 0.0) or 0.0),
@@ -4384,7 +4475,7 @@ def _execute_long_entry(
                 stop_price, take_price = compute_brackets(px, settings.stop_pct, settings.take_pct)
 
     account_truth = _account_truth_snapshot()
-    if bool(getattr(settings, 'require_broker_balance_ok_for_entry', True)) and not bool(account_truth.get('balance_ok')):
+    if bool(getattr(settings, 'require_broker_balance_ok_for_entry', True)) and not bool(account_truth.get('entry_balance_ok')):
         return ignored('broker_balance_unavailable', symbol=symbol, strategy=strategy, balance_error=account_truth.get('balance_error'), reconcile=reconcile_meta)
 
     ops_remaining = int(state.ops_lockout_remaining_sec() if hasattr(state, 'ops_lockout_remaining_sec') else 0)
