@@ -19,30 +19,13 @@ DRY_RUN = os.getenv("SCAN_DRY_RUN", "0").strip().lower() in ("1", "true", "yes",
 HOSTNAME = os.getenv("HOSTNAME", socket.gethostname() or "unknown")
 PID = os.getpid()
 ROUTE_TRUTH_PATH = os.getenv("ROUTE_TRUTH_PATH", "/worker/route_truth")
-WORKER_ROUTE_CONNECT_TIMEOUT_SEC = float(os.getenv("WORKER_ROUTE_CONNECT_TIMEOUT_SEC", "10") or 10)
-WORKER_ROUTE_TIMEOUT_SEC = float(os.getenv("WORKER_ROUTE_TIMEOUT_SEC", "90") or 90)
-ROUTE_TRUTH_CONNECT_TIMEOUT_SEC = float(os.getenv("ROUTE_TRUTH_CONNECT_TIMEOUT_SEC", str(WORKER_ROUTE_CONNECT_TIMEOUT_SEC)) or WORKER_ROUTE_CONNECT_TIMEOUT_SEC)
-ROUTE_TRUTH_TIMEOUT_SEC = float(os.getenv("ROUTE_TRUTH_TIMEOUT_SEC", "10") or 10)
 
 
-def _timeout_tuple(read_timeout: float | None = None) -> tuple[float, float]:
-    connect_timeout = max(1.0, float(WORKER_ROUTE_CONNECT_TIMEOUT_SEC or 10))
-    final_read_timeout = max(connect_timeout, float(read_timeout if read_timeout is not None else WORKER_ROUTE_TIMEOUT_SEC or 90))
-    return (connect_timeout, final_read_timeout)
-
-
-def _route_truth_timeout_tuple() -> tuple[float, float]:
-    connect_timeout = max(1.0, float(ROUTE_TRUTH_CONNECT_TIMEOUT_SEC or WORKER_ROUTE_CONNECT_TIMEOUT_SEC or 10))
-    read_timeout = max(connect_timeout, float(ROUTE_TRUTH_TIMEOUT_SEC or 10))
-    return (connect_timeout, read_timeout)
-
-
-def _post(path: str, payload: dict, timeout: float | tuple[float, float] | None = None):
+def _post(path: str, payload: dict, timeout: int = 30):
     url = f"{BASE_URL}{path}"
     headers = {"x-request-id": f"worker-{int(time.time()*1000)}"}
     started = time.time()
-    req_timeout = timeout if timeout is not None else _timeout_tuple()
-    r = requests.post(url, json=payload, timeout=req_timeout, headers=headers)
+    r = requests.post(url, json=payload, timeout=timeout, headers=headers)
     elapsed_ms = round((time.time() - started) * 1000.0, 3)
     try:
         body = r.json()
@@ -87,7 +70,7 @@ def _post_route_truth(base_payload: dict, *, phase: str, target_path: str, statu
         "route_truth_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
     })
     try:
-        _post(ROUTE_TRUTH_PATH, payload, timeout=_route_truth_timeout_tuple())
+        _post(ROUTE_TRUTH_PATH, payload, timeout=10)
     except Exception as e:
         print(json.dumps({"kind": "route_truth_post", "phase": phase, "target_path": target_path, "error": str(e)}, default=str)[:2000])
 
@@ -95,7 +78,7 @@ def tick_exit(seq: int):
     payload = _base_payload("exit", seq, EXIT_INTERVAL_SEC)
     _post_route_truth(payload, phase="attempt", target_path=EXIT_PATH, ok=True)
     try:
-        code, body, elapsed_ms = _post(EXIT_PATH, payload, timeout=_timeout_tuple())
+        code, body, elapsed_ms = _post(EXIT_PATH, payload, timeout=20)
         _post_route_truth(payload, phase="result", target_path=EXIT_PATH, status_code=code, elapsed_ms=elapsed_ms, ok=(200 <= int(code) < 300), response_excerpt=json.dumps(body, default=str)[:400])
         print(json.dumps({"kind": "exit_tick", "seq": seq, "code": code, "elapsed_ms": elapsed_ms, "body": body}, default=str)[:4000])
     except Exception as e:
@@ -108,7 +91,7 @@ def tick_scan(seq: int):
     payload["dry_run"] = DRY_RUN
     _post_route_truth(payload, phase="attempt", target_path=SCAN_PATH, ok=True)
     try:
-        code, body, elapsed_ms = _post(SCAN_PATH, payload, timeout=_timeout_tuple())
+        code, body, elapsed_ms = _post(SCAN_PATH, payload, timeout=60)
         _post_route_truth(payload, phase="result", target_path=SCAN_PATH, status_code=code, elapsed_ms=elapsed_ms, ok=(200 <= int(code) < 300), response_excerpt=json.dumps(body, default=str)[:400])
         print(json.dumps({"kind": "scan_tick", "seq": seq, "code": code, "elapsed_ms": elapsed_ms, "body": body}, default=str)[:4000])
     except Exception as e:
