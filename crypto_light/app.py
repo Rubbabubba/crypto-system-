@@ -3207,6 +3207,83 @@ def _account_truth_snapshot(*, refresh: bool = True) -> dict:
         return snapshot
 
 
+def _broker_warmup_empty_state_admission(account_truth: dict | None, reconcile: dict | None, startup: dict | None = None) -> dict:
+    account_truth = dict(account_truth or {})
+    reconcile = dict(reconcile or {})
+    startup = dict(startup or {})
+    reasons: list[str] = []
+    safe_empty = True
+
+    startup_snapshot = dict(startup.get('startup_self_check') or startup)
+    if not bool(startup.get('ok', True)):
+        safe_empty = False
+        reasons.append('startup_not_ok')
+    if bool(startup_snapshot.get('critical')):
+        safe_empty = False
+        reasons.append('startup_critical')
+
+    positions_count = int(account_truth.get('positions_count', 0) or 0)
+    open_order_count = int(account_truth.get('open_order_count', 0) or 0)
+    snapshot_source = str(account_truth.get('snapshot_source') or '')
+    balance_error = str(account_truth.get('balance_error') or '')
+    open_orders_ok = bool(account_truth.get('open_orders_ok'))
+    open_orders_snapshot_source = str(account_truth.get('open_orders_snapshot_source') or '')
+    broker_open_order_count = int(reconcile.get('broker_open_order_count') or 0)
+
+    if positions_count > 0:
+        safe_empty = False
+        reasons.append('positions_present')
+    if open_order_count > 0:
+        safe_empty = False
+        reasons.append('open_orders_present')
+
+    if int(reconcile.get('orphan_broker_order_count') or 0) > 0:
+        safe_empty = False
+        reasons.append('orphan_broker_orders_present')
+    if int(reconcile.get('orphan_internal_intent_count') or 0) > 0:
+        safe_empty = False
+        reasons.append('orphan_internal_intents_present')
+    if int(reconcile.get('stale_pending_exit_count') or 0) > 0:
+        safe_empty = False
+        reasons.append('stale_pending_exits_present')
+    if broker_open_order_count > 0:
+        safe_empty = False
+        reasons.append('broker_open_orders_present')
+    if not bool(reconcile.get('ok', True)):
+        safe_empty = False
+        reasons.append('reconcile_not_ok')
+
+    broker_open_orders_ok = bool(reconcile.get('broker_open_orders_ok'))
+    cooldownish = ('cooldown active' in balance_error.lower()) or ('rate limit exceeded' in balance_error.lower())
+    staleish_snapshot = snapshot_source in {'stale_within_grace', 'cache', 'cache_only'}
+    empty_open_orders_state = (not open_orders_ok) and broker_open_order_count == 0 and positions_count == 0 and open_order_count == 0
+
+    allowed_balance_soft_fail = cooldownish or staleish_snapshot or positions_count == 0
+    allowed_open_orders_soft_fail = (not broker_open_orders_ok) and empty_open_orders_state
+
+    if not allowed_balance_soft_fail and not bool(account_truth.get('balance_ok')):
+        safe_empty = False
+        reasons.append('balance_state_not_soft_admissible')
+    if not broker_open_orders_ok and not allowed_open_orders_soft_fail:
+        safe_empty = False
+        reasons.append('open_orders_state_not_soft_admissible')
+
+    if safe_empty:
+        reasons.append('safe_empty_state')
+
+    return {
+        'ok': True,
+        'safe_empty_state': bool(safe_empty),
+        'positions_count': positions_count,
+        'open_order_count': open_order_count,
+        'broker_open_orders_ok': broker_open_orders_ok,
+        'snapshot_source': snapshot_source,
+        'open_orders_snapshot_source': open_orders_snapshot_source,
+        'balance_error': balance_error,
+        'reasons': reasons,
+    }
+
+
 def _pretrade_health_gate_summary(*, rerun_startup_check: bool = False, use_cached_broker_truth: bool = False, use_cached_reconcile: bool = False) -> dict:
     enabled = bool(getattr(settings, 'pretrade_health_gate_enabled', True))
     worker_health = {'scan': _worker_status_meta(getattr(state, 'last_scan_status', {}) or {}, route_truth=getattr(state, 'last_scan_route_truth', {}) or {}),'exit': _worker_status_meta(getattr(state, 'last_exit_status', {}) or {}, route_truth=getattr(state, 'last_exit_route_truth', {}) or {}),}
@@ -3214,6 +3291,7 @@ def _pretrade_health_gate_summary(*, rerun_startup_check: bool = False, use_cach
     startup = _startup_self_check(rerun=bool(rerun_startup_check), apply=None)
     account_truth = _account_truth_snapshot(refresh=not use_cached_broker_truth)
     reconcile = _recovery_reconcile_summary(apply=False, refresh=not use_cached_reconcile)
+    empty_state_admission = _broker_warmup_empty_state_admission(account_truth, reconcile, startup)
     ops_remaining = int(state.ops_lockout_remaining_sec() if hasattr(state, 'ops_lockout_remaining_sec') else 0)
     violations: list[str] = []
     if enabled:
@@ -3228,9 +3306,10 @@ def _pretrade_health_gate_summary(*, rerun_startup_check: bool = False, use_cach
             if bool(worker_health['exit'].get('stale')):
                 violations.append('exit_worker_stale')
         if bool(getattr(settings, 'pretrade_block_on_balance_error', True)) and not bool(account_truth.get('entry_balance_ok', account_truth.get('balance_ok'))):
-            violations.append('broker_balance_unavailable')
+            if not bool(empty_state_admission.get('safe_empty_state')):
+                violations.append('broker_balance_unavailable')
         if bool(getattr(settings, 'pretrade_block_on_reconcile_anomaly', True)):
-            if not bool(reconcile.get('broker_open_orders_ok')):
+            if not bool(reconcile.get('broker_open_orders_ok')) and not bool(empty_state_admission.get('safe_empty_state')):
                 violations.append('broker_open_orders_unavailable')
             if int(reconcile.get('orphan_broker_order_count') or 0) > 0:
                 violations.append('orphan_broker_orders_present')
@@ -3240,7 +3319,7 @@ def _pretrade_health_gate_summary(*, rerun_startup_check: bool = False, use_cach
                 violations.append('stale_pending_exits_present')
         if ops_remaining > 0:
             violations.append('ops_risk_lockout_active')
-    return {'ok': True,'utc': utc_now_iso(),'enabled': enabled,'gate_open': bool((not enabled) or (len(violations) == 0)),'violations': violations,'worker_health': worker_health,'worker_route_truth': {'scan': _route_truth_summary('scan'),'exit': _route_truth_summary('exit'),},'startup_self_check': startup,'account_truth': {'balance_ok': bool(account_truth.get('balance_ok')),'entry_balance_ok': bool(account_truth.get('entry_balance_ok', account_truth.get('balance_ok'))),'balance_error': account_truth.get('balance_error'),'cash_usd': float(account_truth.get('cash_usd', 0.0) or 0.0),'equity_usd': float(account_truth.get('equity_usd', 0.0) or 0.0),'utilization_pct': float(account_truth.get('utilization_pct', 0.0) or 0.0),'open_order_count': int(account_truth.get('open_order_count', 0) or 0),'positions_count': int(account_truth.get('positions_count', 0) or 0),'snapshot_source': account_truth.get('snapshot_source'),'cache_age_sec': account_truth.get('cache_age_sec'),},'recovery_reconcile': {'ok': bool(reconcile.get('ok')),'broker_open_orders_ok': bool(reconcile.get('broker_open_orders_ok')),'broker_open_order_count': int(reconcile.get('broker_open_order_count', 0) or 0),'orphan_broker_order_count': int(reconcile.get('orphan_broker_order_count') or 0),'orphan_internal_intent_count': int(reconcile.get('orphan_internal_intent_count') or 0),'stale_pending_exit_count': int(reconcile.get('stale_pending_exit_count') or 0),'snapshot_source': reconcile.get('snapshot_source'),'cache_age_sec': reconcile.get('cache_age_sec'),},'ops_risk': {'ops_lockout_remaining_sec': ops_remaining,'ops_lockout_reason': str(getattr(state, 'last_ops_lock_reason', '') or ''),},'settings': {'pretrade_require_startup_self_check_ok': bool(getattr(settings, 'pretrade_require_startup_self_check_ok', True)),'pretrade_block_on_worker_stale': bool(getattr(settings, 'pretrade_block_on_worker_stale', True)),'pretrade_block_on_balance_error': bool(getattr(settings, 'pretrade_block_on_balance_error', True)),'pretrade_block_on_reconcile_anomaly': bool(getattr(settings, 'pretrade_block_on_reconcile_anomaly', True)),},}
+    return {'ok': True,'utc': utc_now_iso(),'enabled': enabled,'gate_open': bool((not enabled) or (len(violations) == 0)),'violations': violations,'worker_health': worker_health,'worker_route_truth': {'scan': _route_truth_summary('scan'),'exit': _route_truth_summary('exit'),},'startup_self_check': startup,'account_truth': {'balance_ok': bool(account_truth.get('balance_ok')),'entry_balance_ok': bool(account_truth.get('entry_balance_ok', account_truth.get('balance_ok'))),'balance_error': account_truth.get('balance_error'),'cash_usd': float(account_truth.get('cash_usd', 0.0) or 0.0),'equity_usd': float(account_truth.get('equity_usd', 0.0) or 0.0),'utilization_pct': float(account_truth.get('utilization_pct', 0.0) or 0.0),'open_order_count': int(account_truth.get('open_order_count', 0) or 0),'positions_count': int(account_truth.get('positions_count', 0) or 0),'snapshot_source': account_truth.get('snapshot_source'),'cache_age_sec': account_truth.get('cache_age_sec'),},'recovery_reconcile': {'ok': bool(reconcile.get('ok')),'broker_open_orders_ok': bool(reconcile.get('broker_open_orders_ok')),'broker_open_order_count': int(reconcile.get('broker_open_order_count', 0) or 0),'orphan_broker_order_count': int(reconcile.get('orphan_broker_order_count') or 0),'orphan_internal_intent_count': int(reconcile.get('orphan_internal_intent_count') or 0),'stale_pending_exit_count': int(reconcile.get('stale_pending_exit_count') or 0),'snapshot_source': reconcile.get('snapshot_source'),'cache_age_sec': reconcile.get('cache_age_sec'),},'broker_warmup_empty_state_admission': empty_state_admission,'ops_risk': {'ops_lockout_remaining_sec': ops_remaining,'ops_lockout_reason': str(getattr(state, 'last_ops_lock_reason', '') or ''),},'settings': {'pretrade_require_startup_self_check_ok': bool(getattr(settings, 'pretrade_require_startup_self_check_ok', True)),'pretrade_block_on_worker_stale': bool(getattr(settings, 'pretrade_block_on_worker_stale', True)),'pretrade_block_on_balance_error': bool(getattr(settings, 'pretrade_block_on_balance_error', True)),'pretrade_block_on_reconcile_anomaly': bool(getattr(settings, 'pretrade_block_on_reconcile_anomaly', True)),},}
 
 def _maybe_reconcile_state_before_entry() -> dict | None:
     if not bool(getattr(settings, 'auto_reconcile_state_on_entry', True)):
@@ -4251,8 +4330,12 @@ def _execute_long_entry(
                 stop_price, take_price = compute_brackets(px, settings.stop_pct, settings.take_pct)
 
     account_truth = _account_truth_snapshot()
+    pretrade_reconcile = _recovery_reconcile_summary(apply=False, refresh=False)
+    startup_truth = _startup_self_check(rerun=False, apply=None)
+    empty_state_admission = _broker_warmup_empty_state_admission(account_truth, pretrade_reconcile, startup_truth)
     if bool(getattr(settings, 'require_broker_balance_ok_for_entry', True)) and not bool(account_truth.get('balance_ok')):
-        return ignored('broker_balance_unavailable', symbol=symbol, strategy=strategy, balance_error=account_truth.get('balance_error'), reconcile=reconcile_meta)
+        if not bool(empty_state_admission.get('safe_empty_state')):
+            return ignored('broker_balance_unavailable', symbol=symbol, strategy=strategy, balance_error=account_truth.get('balance_error'), reconcile=reconcile_meta, broker_warmup_empty_state_admission=empty_state_admission)
 
     ops_remaining = int(state.ops_lockout_remaining_sec() if hasattr(state, 'ops_lockout_remaining_sec') else 0)
     if ops_remaining > 0:
