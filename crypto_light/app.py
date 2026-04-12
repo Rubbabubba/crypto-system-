@@ -292,6 +292,112 @@ _ACCOUNT_TRUTH_LOCK = Lock()
 _RECONCILE_SUMMARY_CACHE: dict[str, Any] = {"ts": 0.0, "apply": None, "snapshot": None}
 _RECONCILE_SUMMARY_LOCK = Lock()
 
+
+BALANCE_TRUTH_SNAPSHOT_PATH = str(os.getenv("BALANCE_TRUTH_SNAPSHOT_PATH", "/var/data/balance_truth_snapshot.json") or "/var/data/balance_truth_snapshot.json")
+
+def _read_json_file(path: str) -> dict[str, Any]:
+    try:
+        from pathlib import Path as _Path
+        fp = _Path(path)
+        if not fp.exists():
+            return {}
+        data = json.loads(fp.read_text())
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def _write_json_file(path: str, payload: dict[str, Any]) -> None:
+    try:
+        from pathlib import Path as _Path
+        fp = _Path(path)
+        fp.parent.mkdir(parents=True, exist_ok=True)
+        tmp = fp.with_suffix(fp.suffix + ".tmp")
+        tmp.write_text(json.dumps(payload, default=str))
+        tmp.replace(fp)
+    except Exception:
+        pass
+
+
+def _read_balance_truth_snapshot() -> dict[str, Any]:
+    return _read_json_file(BALANCE_TRUTH_SNAPSHOT_PATH)
+
+
+def _write_balance_truth_snapshot(snapshot: dict[str, Any]) -> None:
+    payload = {
+        "utc": snapshot.get("utc"),
+        "cash_usd": float(snapshot.get("cash_usd", 0.0) or 0.0),
+        "equity_usd": float(snapshot.get("equity_usd", 0.0) or 0.0),
+        "raw_merged_balances": dict(snapshot.get("raw_merged_balances") or {}),
+        "canonical_balances": dict(snapshot.get("canonical_balances") or {}),
+        "canonical_balance_sources": dict(snapshot.get("canonical_balance_sources") or {}),
+        "cash_components_usd": dict(snapshot.get("cash_components_usd") or {}),
+        "snapshot_source": snapshot.get("snapshot_source") or "live",
+        "balance_live_ok": bool(snapshot.get("balance_live_ok", False)),
+    }
+    _write_json_file(BALANCE_TRUTH_SNAPSHOT_PATH, payload)
+
+
+def _apply_last_known_good_balance_fallback(snapshot: dict[str, Any], *, positions_count: int, open_order_count: int) -> dict[str, Any]:
+    out = dict(snapshot or {})
+    try:
+        max_age_sec = float(os.getenv("BALANCE_TRUTH_MAX_AGE_SEC", "86400") or 86400)
+    except Exception:
+        max_age_sec = 86400.0
+    persisted = _read_balance_truth_snapshot()
+    if not isinstance(persisted, dict) or not persisted:
+        out["balance_fallback_applied"] = False
+        out["balance_fallback_reason"] = "no_persisted_snapshot"
+        out["last_known_good_balance_utc"] = None
+        out["last_known_good_cash_usd"] = 0.0
+        out["last_known_good_balance_age_sec"] = None
+        return out
+    persisted_cash = float(persisted.get("cash_usd", 0.0) or 0.0)
+    persisted_utc = str(persisted.get("utc") or "")
+    age_sec = None
+    try:
+        if persisted_utc:
+            age_sec = max(0.0, time.time() - datetime.fromisoformat(persisted_utc.replace("Z", "+00:00")).timestamp())
+    except Exception:
+        age_sec = None
+    can_apply = True
+    reasons = []
+    if persisted_cash <= 0:
+        can_apply = False
+        reasons.append("persisted_cash_nonpositive")
+    if positions_count > 0:
+        can_apply = False
+        reasons.append("positions_present")
+    if open_order_count > 0:
+        can_apply = False
+        reasons.append("open_orders_present")
+    if age_sec is not None and age_sec > max_age_sec:
+        can_apply = False
+        reasons.append("persisted_snapshot_too_old")
+    if can_apply:
+        out["cash_usd"] = float(persisted_cash)
+        out["equity_usd"] = max(float(out.get("equity_usd", 0.0) or 0.0), float(persisted.get("equity_usd", persisted_cash) or persisted_cash))
+        out["raw_merged_balances"] = dict(persisted.get("raw_merged_balances") or out.get("raw_merged_balances") or {})
+        out["canonical_balances"] = dict(persisted.get("canonical_balances") or out.get("canonical_balances") or {})
+        out["canonical_balance_sources"] = dict(persisted.get("canonical_balance_sources") or out.get("canonical_balance_sources") or {})
+        out["cash_components_usd"] = dict(persisted.get("cash_components_usd") or out.get("cash_components_usd") or {"USD": persisted_cash})
+        out["balance_fallback_applied"] = True
+        out["balance_fallback_reason"] = "last_known_good_cash_snapshot"
+        out["last_known_good_balance_utc"] = persisted_utc or None
+        out["last_known_good_cash_usd"] = float(persisted_cash)
+        out["last_known_good_balance_age_sec"] = round(float(age_sec), 3) if age_sec is not None else None
+        out["cash_snapshot_authoritative"] = False
+        if str(out.get("snapshot_source") or "") in ("live", "stale_within_grace", "cache", "cache_only"):
+            out["snapshot_source"] = "last_known_good_balance_fallback"
+        return out
+    out["balance_fallback_applied"] = False
+    out["balance_fallback_reason"] = ",".join(reasons) if reasons else "fallback_not_needed"
+    out["last_known_good_balance_utc"] = persisted_utc or None
+    out["last_known_good_cash_usd"] = float(persisted_cash)
+    out["last_known_good_balance_age_sec"] = round(float(age_sec), 3) if age_sec is not None else None
+    out["cash_snapshot_authoritative"] = bool(out.get("balance_live_ok", False) and float(out.get("cash_usd", 0.0) or 0.0) > 0)
+    return out
+
 def _cache_ttl_seconds(env_name: str, default: float) -> float:
     try:
         return float(os.getenv(env_name, str(default)) or default)
@@ -3201,7 +3307,19 @@ def _account_truth_snapshot(*, refresh: bool = True) -> dict:
             if cooldown_remaining > 0:
                 snapshot_source = 'stale_within_grace'
                 entry_balance_ok = False
-        snapshot = {'ok': True,'utc': utc_now_iso(),'balance_ok': bool(balance_ok),'entry_balance_ok': bool(entry_balance_ok and balance_ok),'balance_error': balance_error,'cash_usd': float(cash_usd),'position_exposure_usd': float(position_exposure_usd),'open_buy_order_notional_usd': float(open_buy_order_notional_usd),'equity_usd': float(equity_usd),'utilization_pct': float(utilization_pct),'positions_count': len(positions),'open_order_count': len(open_orders.get('items') or []),'buy_order_symbols': sorted(list(open_orders.get('buy_symbols') or [])),'sell_order_symbols': sorted(list(open_orders.get('sell_symbols') or [])),'realized_today_usd': float(realized_today),'last_reconcile': dict(getattr(state, 'last_reconcile_result', {}) or {}),'raw_merged_balances': raw_balances,'canonical_balances': canonical_balances,'canonical_balance_sources': balance_sources,'balance_agreement': dict(snap.get('economic_balance_agreement') or {}) if isinstance(snap, dict) else {},'cash_components_usd': cash_balances,'position_components': position_contributions,'equity_components': {'cash_usd': float(cash_usd),'position_exposure_usd': float(position_exposure_usd),},'snapshot_source': snapshot_source,'open_orders_ok': bool(open_orders.get('ok')),'open_orders_error': open_orders.get('error'),'open_orders_snapshot_source': open_orders.get('snapshot_source'),'open_orders_cache_age_sec': open_orders.get('cache_age_sec'),'balance_live_ok': bool(not balance_error),'cache_age_sec': 0.0,}
+        positions_count = len(positions)
+        open_order_count = len(open_orders.get('items') or [])
+        snapshot = {'ok': True,'utc': utc_now_iso(),'balance_ok': bool(balance_ok),'entry_balance_ok': bool(entry_balance_ok and balance_ok),'balance_error': balance_error,'cash_usd': float(cash_usd),'position_exposure_usd': float(position_exposure_usd),'open_buy_order_notional_usd': float(open_buy_order_notional_usd),'equity_usd': float(equity_usd),'utilization_pct': float(utilization_pct),'positions_count': positions_count,'open_order_count': open_order_count,'buy_order_symbols': sorted(list(open_orders.get('buy_symbols') or [])),'sell_order_symbols': sorted(list(open_orders.get('sell_symbols') or [])),'realized_today_usd': float(realized_today),'last_reconcile': dict(getattr(state, 'last_reconcile_result', {}) or {}),'raw_merged_balances': raw_balances,'canonical_balances': canonical_balances,'canonical_balance_sources': balance_sources,'balance_agreement': dict(snap.get('economic_balance_agreement') or {}) if isinstance(snap, dict) else {},'cash_components_usd': cash_balances,'position_components': position_contributions,'equity_components': {'cash_usd': float(cash_usd),'position_exposure_usd': float(position_exposure_usd),},'snapshot_source': snapshot_source,'open_orders_ok': bool(open_orders.get('ok')),'open_orders_error': open_orders.get('error'),'open_orders_snapshot_source': open_orders.get('snapshot_source'),'open_orders_cache_age_sec': open_orders.get('cache_age_sec'),'balance_live_ok': bool(not balance_error),'cache_age_sec': 0.0,}
+        if bool(not balance_error) and float(cash_usd) > 0:
+            snapshot['cash_snapshot_authoritative'] = True
+            snapshot['balance_fallback_applied'] = False
+            snapshot['balance_fallback_reason'] = None
+            snapshot['last_known_good_balance_utc'] = snapshot.get('utc')
+            snapshot['last_known_good_cash_usd'] = float(cash_usd)
+            snapshot['last_known_good_balance_age_sec'] = 0.0
+            _write_balance_truth_snapshot(snapshot)
+        else:
+            snapshot = _apply_last_known_good_balance_fallback(snapshot, positions_count=positions_count, open_order_count=open_order_count)
         _ACCOUNT_TRUTH_CACHE["ts"] = time.time()
         _ACCOUNT_TRUTH_CACHE["snapshot"] = dict(snapshot)
         return snapshot
@@ -3319,7 +3437,7 @@ def _pretrade_health_gate_summary(*, rerun_startup_check: bool = False, use_cach
                 violations.append('stale_pending_exits_present')
         if ops_remaining > 0:
             violations.append('ops_risk_lockout_active')
-    return {'ok': True,'utc': utc_now_iso(),'enabled': enabled,'gate_open': bool((not enabled) or (len(violations) == 0)),'violations': violations,'worker_health': worker_health,'worker_route_truth': {'scan': _route_truth_summary('scan'),'exit': _route_truth_summary('exit'),},'startup_self_check': startup,'account_truth': {'balance_ok': bool(account_truth.get('balance_ok')),'entry_balance_ok': bool(account_truth.get('entry_balance_ok', account_truth.get('balance_ok'))),'balance_error': account_truth.get('balance_error'),'cash_usd': float(account_truth.get('cash_usd', 0.0) or 0.0),'equity_usd': float(account_truth.get('equity_usd', 0.0) or 0.0),'utilization_pct': float(account_truth.get('utilization_pct', 0.0) or 0.0),'open_order_count': int(account_truth.get('open_order_count', 0) or 0),'positions_count': int(account_truth.get('positions_count', 0) or 0),'snapshot_source': account_truth.get('snapshot_source'),'cache_age_sec': account_truth.get('cache_age_sec'),},'recovery_reconcile': {'ok': bool(reconcile.get('ok')),'broker_open_orders_ok': bool(reconcile.get('broker_open_orders_ok')),'broker_open_order_count': int(reconcile.get('broker_open_order_count', 0) or 0),'orphan_broker_order_count': int(reconcile.get('orphan_broker_order_count') or 0),'orphan_internal_intent_count': int(reconcile.get('orphan_internal_intent_count') or 0),'stale_pending_exit_count': int(reconcile.get('stale_pending_exit_count') or 0),'snapshot_source': reconcile.get('snapshot_source'),'cache_age_sec': reconcile.get('cache_age_sec'),},'broker_warmup_empty_state_admission': empty_state_admission,'ops_risk': {'ops_lockout_remaining_sec': ops_remaining,'ops_lockout_reason': str(getattr(state, 'last_ops_lock_reason', '') or ''),},'settings': {'pretrade_require_startup_self_check_ok': bool(getattr(settings, 'pretrade_require_startup_self_check_ok', True)),'pretrade_block_on_worker_stale': bool(getattr(settings, 'pretrade_block_on_worker_stale', True)),'pretrade_block_on_balance_error': bool(getattr(settings, 'pretrade_block_on_balance_error', True)),'pretrade_block_on_reconcile_anomaly': bool(getattr(settings, 'pretrade_block_on_reconcile_anomaly', True)),},}
+    return {'ok': True,'utc': utc_now_iso(),'enabled': enabled,'gate_open': bool((not enabled) or (len(violations) == 0)),'violations': violations,'worker_health': worker_health,'worker_route_truth': {'scan': _route_truth_summary('scan'),'exit': _route_truth_summary('exit'),},'startup_self_check': startup,'account_truth': {'balance_ok': bool(account_truth.get('balance_ok')),'entry_balance_ok': bool(account_truth.get('entry_balance_ok', account_truth.get('balance_ok'))),'balance_error': account_truth.get('balance_error'),'cash_usd': float(account_truth.get('cash_usd', 0.0) or 0.0),'equity_usd': float(account_truth.get('equity_usd', 0.0) or 0.0),'utilization_pct': float(account_truth.get('utilization_pct', 0.0) or 0.0),'open_order_count': int(account_truth.get('open_order_count', 0) or 0),'positions_count': int(account_truth.get('positions_count', 0) or 0),'snapshot_source': account_truth.get('snapshot_source'),'cache_age_sec': account_truth.get('cache_age_sec'),'cash_snapshot_authoritative': bool(account_truth.get('cash_snapshot_authoritative', False)),'balance_fallback_applied': bool(account_truth.get('balance_fallback_applied', False)),'balance_fallback_reason': account_truth.get('balance_fallback_reason'),'last_known_good_balance_utc': account_truth.get('last_known_good_balance_utc'),'last_known_good_cash_usd': float(account_truth.get('last_known_good_cash_usd', 0.0) or 0.0),'last_known_good_balance_age_sec': account_truth.get('last_known_good_balance_age_sec'),},'recovery_reconcile': {'ok': bool(reconcile.get('ok')),'broker_open_orders_ok': bool(reconcile.get('broker_open_orders_ok')),'broker_open_order_count': int(reconcile.get('broker_open_order_count', 0) or 0),'orphan_broker_order_count': int(reconcile.get('orphan_broker_order_count') or 0),'orphan_internal_intent_count': int(reconcile.get('orphan_internal_intent_count') or 0),'stale_pending_exit_count': int(reconcile.get('stale_pending_exit_count') or 0),'snapshot_source': reconcile.get('snapshot_source'),'cache_age_sec': reconcile.get('cache_age_sec'),},'broker_warmup_empty_state_admission': empty_state_admission,'ops_risk': {'ops_lockout_remaining_sec': ops_remaining,'ops_lockout_reason': str(getattr(state, 'last_ops_lock_reason', '') or ''),},'settings': {'pretrade_require_startup_self_check_ok': bool(getattr(settings, 'pretrade_require_startup_self_check_ok', True)),'pretrade_block_on_worker_stale': bool(getattr(settings, 'pretrade_block_on_worker_stale', True)),'pretrade_block_on_balance_error': bool(getattr(settings, 'pretrade_block_on_balance_error', True)),'pretrade_block_on_reconcile_anomaly': bool(getattr(settings, 'pretrade_block_on_reconcile_anomaly', True)),},}
 
 def _maybe_reconcile_state_before_entry() -> dict | None:
     if not bool(getattr(settings, 'auto_reconcile_state_on_entry', True)):
