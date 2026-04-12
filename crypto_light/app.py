@@ -17,6 +17,7 @@ import hashlib
 from datetime import datetime, timezone
 from typing import Any, Dict, Optional, Set, List, Tuple
 from uuid import uuid4
+from threading import Lock
 
 import requests
 from fastapi import FastAPI, HTTPException, Request, Body
@@ -286,6 +287,16 @@ STARTUP_SELF_CHECK_RESULT: dict[str, Any] = {}
 STARTUP_SELF_CHECK_TS: float = 0.0
 
 PATCH_BUILD = build_payload()
+_ACCOUNT_TRUTH_CACHE: dict[str, Any] = {"ts": 0.0, "snapshot": None}
+_ACCOUNT_TRUTH_LOCK = Lock()
+_RECONCILE_SUMMARY_CACHE: dict[str, Any] = {"ts": 0.0, "apply": None, "snapshot": None}
+_RECONCILE_SUMMARY_LOCK = Lock()
+
+def _cache_ttl_seconds(env_name: str, default: float) -> float:
+    try:
+        return float(os.getenv(env_name, str(default)) or default)
+    except Exception:
+        return float(default)
 
 
 
@@ -993,52 +1004,6 @@ _SCANNER_CACHE: Dict[str, Any] = {
     "last_error": None,
     "raw": None,
 }
-
-_ACCOUNT_TRUTH_CACHE: Dict[str, Any] = {
-    "snapshot": None,
-    "snapshot_ts": 0.0,
-    "last_success_snapshot": None,
-    "last_success_ts": 0.0,
-}
-
-
-def _safe_env_float(name: str, default: float) -> float:
-    try:
-        return float(os.getenv(name, str(default)) or default)
-    except Exception:
-        return float(default)
-
-
-def _account_truth_cache_ttl_sec() -> float:
-    ttl_candidates = [v for v in (
-        _safe_env_float("BALANCE_CACHE_TTL_SEC", 0.0),
-        _safe_env_float("BROKER_STATE_CACHE_TTL_SEC", 0.0),
-    ) if v > 0]
-    return float(min(ttl_candidates)) if ttl_candidates else 0.0
-
-
-def _account_truth_cache_grace_sec() -> float:
-    grace_candidates = [v for v in (
-        _safe_env_float("BALANCE_STALE_GRACE_SEC", 0.0),
-        _safe_env_float("BROKER_STATE_CACHE_GRACE_SEC", 0.0),
-    ) if v > 0]
-    return float(max(grace_candidates)) if grace_candidates else 0.0
-
-
-def _account_truth_cached_response(snapshot: dict, *, source: str, age_sec: float, last_live_error: str | None = None) -> dict:
-    out = dict(snapshot or {})
-    out["utc"] = utc_now_iso()
-    out["snapshot_source"] = source
-    out["broker_snapshot_age_sec"] = round(max(0.0, float(age_sec or 0.0)), 3)
-    out["broker_snapshot_fresh"] = bool(float(age_sec or 0.0) <= _account_truth_cache_ttl_sec()) if _account_truth_cache_ttl_sec() > 0 else False
-    out["stale_within_grace"] = bool(source == "stale_cache_grace")
-    out["balance_live_ok"] = bool(source == "live")
-    out["entry_balance_ok"] = bool(out.get("balance_live_ok") or source in {"cached_ttl", "stale_cache_grace"})
-    out["balance_ok"] = bool(out.get("entry_balance_ok"))
-    out["last_live_balance_error"] = last_live_error
-    if source != "live" and last_live_error:
-        out["balance_error"] = last_live_error
-    return out
 
 
 def _log_event(level: str, event: Dict[str, Any]) -> None:
@@ -3090,11 +3055,30 @@ def _record_worker_status(kind: str, *, phase: str, payload: Any | None = None, 
     return status_payload
 
 
-def _broker_open_orders_summary() -> dict:
+
+def _broker_open_orders_summary(*, refresh: bool = True) -> dict:
+    ttl = _cache_ttl_seconds("OPEN_ORDERS_SUMMARY_CACHE_TTL_SEC", 15.0)
+    now = time.time()
+    cache = getattr(state, 'broker_open_orders_summary_cache', {}) or {}
+    try:
+        cache_ts = float(cache.get('ts') or 0.0)
+    except Exception:
+        cache_ts = 0.0
+    cached_summary = dict(cache.get('summary') or {}) if isinstance(cache.get('summary'), dict) else None
+    if (not refresh) and isinstance(cached_summary, dict):
+        summary = dict(cached_summary)
+        summary.setdefault('snapshot_source', 'cache')
+        summary['cache_age_sec'] = round(max(0.0, now - cache_ts), 3)
+        return summary
+    if ttl > 0 and isinstance(cached_summary, dict) and (now - cache_ts) < ttl:
+        summary = dict(cached_summary)
+        summary.setdefault('snapshot_source', 'cache')
+        summary['cache_age_sec'] = round(max(0.0, now - cache_ts), 3)
+        return summary
     try:
         raw = broker_kraken.orders() or {}
     except Exception as e:
-        return {"ok": False, "error": str(e), "buy_symbols": set(), "sell_symbols": set(), "items": []}
+        raw = {"error": str(e)}
     open_map = (((raw or {}).get('open') or {}) if isinstance(raw, dict) else {})
     items = []
     buy_symbols, sell_symbols = set(), set()
@@ -3103,23 +3087,15 @@ def _broker_open_orders_summary() -> dict:
         pair = str(descr.get('pair') or '')
         side = str(descr.get('type') or '').strip().lower()
         symbol = normalize_symbol(pair) if pair else None
-        item = {
-            'txid': txid,
-            'symbol': symbol,
-            'side': side,
-            'status': row.get('status'),
-            'vol': float(row.get('vol', 0) or 0.0),
-            'vol_exec': float(row.get('vol_exec', 0) or 0.0),
-            'descr': descr,
-        }
+        item = {'txid': txid,'symbol': symbol,'side': side,'status': row.get('status'),'vol': float(row.get('vol', 0) or 0.0),'vol_exec': float(row.get('vol_exec', 0) or 0.0),'descr': descr,}
         items.append(item)
         if symbol and side == 'buy':
             buy_symbols.add(symbol)
         elif symbol and side == 'sell':
             sell_symbols.add(symbol)
-    return {"ok": True, "buy_symbols": buy_symbols, "sell_symbols": sell_symbols, "items": items}
-
-
+    summary = {"ok": not bool((raw or {}).get('error')), "error": (raw or {}).get('error'), "buy_symbols": buy_symbols, "sell_symbols": sell_symbols, "items": items, "snapshot_source": "live" if refresh else "cache_only", "cache_age_sec": 0.0}
+    setattr(state, 'broker_open_orders_summary_cache', {'ts': time.time(), 'summary': dict(summary)})
+    return summary
 
 def _sum_open_order_notional_usd(summary: dict, *, side: str | None = None) -> float:
     total = 0.0
@@ -3142,139 +3118,98 @@ def _sum_open_order_notional_usd(summary: dict, *, side: str | None = None) -> f
     return float(total)
 
 
-def _account_truth_snapshot(force_refresh: bool = False) -> dict:
+
+def _account_truth_snapshot(*, refresh: bool = True) -> dict:
+    ttl = _cache_ttl_seconds("ACCOUNT_TRUTH_CACHE_TTL_SEC", 15.0)
     now = time.time()
-    ttl_sec = _account_truth_cache_ttl_sec()
-    grace_sec = _account_truth_cache_grace_sec()
-
-    cached_snapshot = dict(_ACCOUNT_TRUTH_CACHE.get('snapshot') or {})
-    cached_ts = float(_ACCOUNT_TRUTH_CACHE.get('snapshot_ts') or 0.0)
-    if (not force_refresh) and cached_snapshot and ttl_sec > 0 and (now - cached_ts) <= ttl_sec:
-        return _account_truth_cached_response(cached_snapshot, source='cached_ttl', age_sec=(now - cached_ts), last_live_error=cached_snapshot.get('last_live_balance_error'))
-
-    balances = {}
-    raw_balances = {}
-    canonical_balances = {}
-    balance_sources = {}
-    balance_live_ok = True
-    balance_error = None
-    snap: dict[str, Any] = {}
+    cached = _ACCOUNT_TRUTH_CACHE.get("snapshot")
     try:
-        snap = _merged_balances_snapshot() or {}
-        raw_balances = dict(snap.get('merged') or {})
-        canonical_balances = dict(snap.get('economic_balances') or snap.get('canonical_merged') or {})
-        balance_sources = dict(snap.get('economic_balance_sources') or snap.get('canonical_sources') or snap.get('sources') or {})
-        balances = canonical_balances or _merged_balances_by_asset() or {}
-        balance_error = _last_balance_error()
-        if balance_error:
-            balance_live_ok = False
-    except Exception as e:
-        balance_live_ok = False
-        balance_error = str(e)
-        balances = {}
-
-    positions = []
-    try:
-        positions = get_positions()
+        cache_ts = float(_ACCOUNT_TRUTH_CACHE.get("ts") or 0.0)
     except Exception:
+        cache_ts = 0.0
+    if (not refresh) and isinstance(cached, dict):
+        snapshot = dict(cached)
+        snapshot.setdefault("snapshot_source", "cache")
+        snapshot["cache_age_sec"] = round(max(0.0, now - cache_ts), 3)
+        return snapshot
+    if ttl > 0 and isinstance(cached, dict) and (now - cache_ts) < ttl:
+        snapshot = dict(cached)
+        snapshot.setdefault("snapshot_source", "cache")
+        snapshot["cache_age_sec"] = round(max(0.0, now - cache_ts), 3)
+        return snapshot
+    with _ACCOUNT_TRUTH_LOCK:
+        now = time.time()
+        cached = _ACCOUNT_TRUTH_CACHE.get("snapshot")
+        try:
+            cache_ts = float(_ACCOUNT_TRUTH_CACHE.get("ts") or 0.0)
+        except Exception:
+            cache_ts = 0.0
+        if ttl > 0 and isinstance(cached, dict) and (now - cache_ts) < ttl:
+            snapshot = dict(cached)
+            snapshot.setdefault("snapshot_source", "cache")
+            snapshot["cache_age_sec"] = round(max(0.0, now - cache_ts), 3)
+            return snapshot
+        balances = {}
+        raw_balances = {}
+        canonical_balances = {}
+        balance_sources = {}
+        balance_ok = True
+        entry_balance_ok = True
+        balance_error = None
+        snap = {}
+        try:
+            snap = _merged_balances_snapshot() or {}
+            raw_balances = dict(snap.get('merged') or {})
+            canonical_balances = dict(snap.get('economic_balances') or snap.get('canonical_merged') or {})
+            balance_sources = dict(snap.get('economic_balance_sources') or snap.get('canonical_sources') or snap.get('sources') or {})
+            balances = canonical_balances or _merged_balances_by_asset() or {}
+            balance_error = _last_balance_error()
+            if balance_error:
+                balance_ok = False
+        except Exception as e:
+            balance_ok = False
+            balance_error = str(e)
+            balances = {}
         positions = []
-
-    open_orders = _broker_open_orders_summary()
-    realized_today = _journal_sync_daily_realized_pnl()
-    cash_balances = {k: float(v or 0.0) for k, v in (balances or {}).items() if k in ('USD', 'USDC', 'USDT')}
-    cash_usd = float(sum(cash_balances.values()) or 0.0)
-    position_exposure_usd = sum(float(p.get('notional_usd', 0.0) or 0.0) for p in positions)
-    open_buy_order_notional_usd = _sum_open_order_notional_usd(open_orders, side='buy') if open_orders.get('ok') else 0.0
-    equity_usd = float(cash_usd + position_exposure_usd)
-    utilization_pct = (float(position_exposure_usd + open_buy_order_notional_usd) / float(equity_usd)) if equity_usd > 0 else 0.0
-    position_contributions = []
-    for p in positions:
-        position_contributions.append({
-            'symbol': p.get('symbol'),
-            'asset': p.get('asset'),
-            'qty': float(p.get('qty', 0.0) or 0.0),
-            'price': float(p.get('price', 0.0) or 0.0),
-            'notional_usd': float(p.get('notional_usd', 0.0) or 0.0),
-            'balance_sources': list(p.get('balance_sources') or []),
-        })
-
-    live_snapshot = {
-        'ok': True,
-        'utc': utc_now_iso(),
-        'balance_ok': bool(balance_live_ok),
-        'balance_live_ok': bool(balance_live_ok),
-        'entry_balance_ok': bool(balance_live_ok),
-        'balance_error': balance_error,
-        'last_live_balance_error': balance_error,
-        'cash_usd': float(cash_usd),
-        'position_exposure_usd': float(position_exposure_usd),
-        'open_buy_order_notional_usd': float(open_buy_order_notional_usd),
-        'equity_usd': float(equity_usd),
-        'utilization_pct': float(utilization_pct),
-        'positions_count': len(positions),
-        'open_order_count': len(open_orders.get('items') or []),
-        'buy_order_symbols': sorted(list(open_orders.get('buy_symbols') or [])),
-        'sell_order_symbols': sorted(list(open_orders.get('sell_symbols') or [])),
-        'realized_today_usd': float(realized_today),
-        'last_reconcile': dict(getattr(state, 'last_reconcile_result', {}) or {}),
-        'raw_merged_balances': raw_balances,
-        'canonical_balances': canonical_balances,
-        'canonical_balance_sources': balance_sources,
-        'balance_agreement': dict(snap.get('economic_balance_agreement') or {}) if isinstance(snap, dict) else {},
-        'cash_components_usd': cash_balances,
-        'position_components': position_contributions,
-        'equity_components': {
-            'cash_usd': float(cash_usd),
-            'position_exposure_usd': float(position_exposure_usd),
-        },
-        'snapshot_source': 'live',
-        'broker_snapshot_age_sec': 0.0,
-        'broker_snapshot_fresh': bool(balance_live_ok),
-        'stale_within_grace': False,
-    }
-
-    if balance_live_ok:
-        _ACCOUNT_TRUTH_CACHE['snapshot'] = dict(live_snapshot)
-        _ACCOUNT_TRUTH_CACHE['snapshot_ts'] = now
-        _ACCOUNT_TRUTH_CACHE['last_success_snapshot'] = dict(live_snapshot)
-        _ACCOUNT_TRUTH_CACHE['last_success_ts'] = now
-        return live_snapshot
-
-    last_success_snapshot = dict(_ACCOUNT_TRUTH_CACHE.get('last_success_snapshot') or {})
-    last_success_ts = float(_ACCOUNT_TRUTH_CACHE.get('last_success_ts') or 0.0)
-    age_sec = max(0.0, now - last_success_ts) if last_success_ts > 0 else None
-    if last_success_snapshot and grace_sec > 0 and age_sec is not None and age_sec <= grace_sec:
-        cached = _account_truth_cached_response(last_success_snapshot, source='stale_cache_grace', age_sec=age_sec, last_live_error=balance_error)
-        _ACCOUNT_TRUTH_CACHE['snapshot'] = dict(cached)
-        _ACCOUNT_TRUTH_CACHE['snapshot_ts'] = now
-        return cached
-
-    failed = dict(live_snapshot)
-    failed['snapshot_source'] = 'live_error'
-    failed['broker_snapshot_age_sec'] = round(age_sec, 3) if age_sec is not None else None
-    failed['broker_snapshot_fresh'] = False
-    failed['stale_within_grace'] = False
-    failed['entry_balance_ok'] = False
-    failed['balance_ok'] = False
-    _ACCOUNT_TRUTH_CACHE['snapshot'] = dict(failed)
-    _ACCOUNT_TRUTH_CACHE['snapshot_ts'] = now
-    return failed
+        try:
+            positions = get_positions()
+        except Exception:
+            positions = []
+        open_orders = _broker_open_orders_summary(refresh=refresh)
+        realized_today = _journal_sync_daily_realized_pnl()
+        cash_balances = {k: float(v or 0.0) for k, v in (balances or {}).items() if k in ('USD', 'USDC', 'USDT')}
+        cash_usd = float(sum(cash_balances.values()) or 0.0)
+        position_exposure_usd = sum(float(p.get('notional_usd', 0.0) or 0.0) for p in positions)
+        open_buy_order_notional_usd = _sum_open_order_notional_usd(open_orders, side='buy') if open_orders.get('ok') else 0.0
+        equity_usd = float(cash_usd + position_exposure_usd)
+        utilization_pct = (float(position_exposure_usd + open_buy_order_notional_usd) / float(equity_usd)) if equity_usd > 0 else 0.0
+        position_contributions = []
+        for p in positions:
+            position_contributions.append({'symbol': p.get('symbol'),'asset': p.get('asset'),'qty': float(p.get('qty', 0.0) or 0.0),'price': float(p.get('price', 0.0) or 0.0),'notional_usd': float(p.get('notional_usd', 0.0) or 0.0),'balance_sources': list(p.get('balance_sources') or []),})
+        snapshot_source = 'live' if refresh else 'cache_only'
+        if balance_error:
+            cooldown_remaining = 0.0
+            try:
+                cooldown_remaining = float(getattr(broker_kraken, '_private_endpoint_cooldown_remaining')('Balance') or 0.0)
+            except Exception:
+                cooldown_remaining = 0.0
+            if cooldown_remaining > 0:
+                snapshot_source = 'stale_within_grace'
+                entry_balance_ok = False
+        snapshot = {'ok': True,'utc': utc_now_iso(),'balance_ok': bool(balance_ok),'entry_balance_ok': bool(entry_balance_ok and balance_ok),'balance_error': balance_error,'cash_usd': float(cash_usd),'position_exposure_usd': float(position_exposure_usd),'open_buy_order_notional_usd': float(open_buy_order_notional_usd),'equity_usd': float(equity_usd),'utilization_pct': float(utilization_pct),'positions_count': len(positions),'open_order_count': len(open_orders.get('items') or []),'buy_order_symbols': sorted(list(open_orders.get('buy_symbols') or [])),'sell_order_symbols': sorted(list(open_orders.get('sell_symbols') or [])),'realized_today_usd': float(realized_today),'last_reconcile': dict(getattr(state, 'last_reconcile_result', {}) or {}),'raw_merged_balances': raw_balances,'canonical_balances': canonical_balances,'canonical_balance_sources': balance_sources,'balance_agreement': dict(snap.get('economic_balance_agreement') or {}) if isinstance(snap, dict) else {},'cash_components_usd': cash_balances,'position_components': position_contributions,'equity_components': {'cash_usd': float(cash_usd),'position_exposure_usd': float(position_exposure_usd),},'snapshot_source': snapshot_source,'open_orders_ok': bool(open_orders.get('ok')),'open_orders_error': open_orders.get('error'),'open_orders_snapshot_source': open_orders.get('snapshot_source'),'open_orders_cache_age_sec': open_orders.get('cache_age_sec'),'balance_live_ok': bool(not balance_error),'cache_age_sec': 0.0,}
+        _ACCOUNT_TRUTH_CACHE["ts"] = time.time()
+        _ACCOUNT_TRUTH_CACHE["snapshot"] = dict(snapshot)
+        return snapshot
 
 
-
-def _pretrade_health_gate_summary(*, rerun_startup_check: bool = False) -> dict:
+def _pretrade_health_gate_summary(*, rerun_startup_check: bool = False, use_cached_broker_truth: bool = False, use_cached_reconcile: bool = False) -> dict:
     enabled = bool(getattr(settings, 'pretrade_health_gate_enabled', True))
-    worker_health = {
-        'scan': _worker_status_meta(getattr(state, 'last_scan_status', {}) or {}, route_truth=getattr(state, 'last_scan_route_truth', {}) or {}),
-        'exit': _worker_status_meta(getattr(state, 'last_exit_status', {}) or {}, route_truth=getattr(state, 'last_exit_route_truth', {}) or {}),
-    }
+    worker_health = {'scan': _worker_status_meta(getattr(state, 'last_scan_status', {}) or {}, route_truth=getattr(state, 'last_scan_route_truth', {}) or {}),'exit': _worker_status_meta(getattr(state, 'last_exit_status', {}) or {}, route_truth=getattr(state, 'last_exit_route_truth', {}) or {}),}
     worker_health['overall_stale'] = bool(worker_health['scan'].get('stale') or worker_health['exit'].get('stale'))
-
     startup = _startup_self_check(rerun=bool(rerun_startup_check), apply=None)
-    account_truth = _account_truth_snapshot()
-    reconcile = _recovery_reconcile_summary(apply=False)
+    account_truth = _account_truth_snapshot(refresh=not use_cached_broker_truth)
+    reconcile = _recovery_reconcile_summary(apply=False, refresh=not use_cached_reconcile)
     ops_remaining = int(state.ops_lockout_remaining_sec() if hasattr(state, 'ops_lockout_remaining_sec') else 0)
-
     violations: list[str] = []
     if enabled:
         if bool(getattr(settings, 'pretrade_require_startup_self_check_ok', True)):
@@ -3282,16 +3217,13 @@ def _pretrade_health_gate_summary(*, rerun_startup_check: bool = False) -> dict:
                 violations.append('startup_self_check_not_ok')
             elif bool((startup.get('startup_self_check') or {}).get('critical')):
                 violations.append('startup_self_check_critical')
-
         if bool(getattr(settings, 'pretrade_block_on_worker_stale', True)) and bool(worker_health.get('overall_stale')):
             if bool(worker_health['scan'].get('stale')):
                 violations.append('scan_worker_stale')
             if bool(worker_health['exit'].get('stale')):
                 violations.append('exit_worker_stale')
-
-        if bool(getattr(settings, 'pretrade_block_on_balance_error', True)) and not bool(account_truth.get('entry_balance_ok')):
+        if bool(getattr(settings, 'pretrade_block_on_balance_error', True)) and not bool(account_truth.get('entry_balance_ok', account_truth.get('balance_ok'))):
             violations.append('broker_balance_unavailable')
-
         if bool(getattr(settings, 'pretrade_block_on_reconcile_anomaly', True)):
             if not bool(reconcile.get('broker_open_orders_ok')):
                 violations.append('broker_open_orders_unavailable')
@@ -3301,51 +3233,9 @@ def _pretrade_health_gate_summary(*, rerun_startup_check: bool = False) -> dict:
                 violations.append('orphan_internal_intents_present')
             if int(reconcile.get('stale_pending_exit_count') or 0) > 0:
                 violations.append('stale_pending_exits_present')
-
         if ops_remaining > 0:
             violations.append('ops_risk_lockout_active')
-
-    return {
-        'ok': True,
-        'utc': utc_now_iso(),
-        'enabled': enabled,
-        'gate_open': bool((not enabled) or (len(violations) == 0)),
-        'violations': violations,
-        'worker_health': worker_health,
-        'worker_route_truth': {
-            'scan': _route_truth_summary('scan'),
-            'exit': _route_truth_summary('exit'),
-        },
-        'startup_self_check': startup,
-        'account_truth': {
-            'balance_ok': bool(account_truth.get('balance_ok')),
-            'balance_live_ok': bool(account_truth.get('balance_live_ok')),
-            'balance_error': account_truth.get('balance_error'),
-            'cash_usd': float(account_truth.get('cash_usd', 0.0) or 0.0),
-            'equity_usd': float(account_truth.get('equity_usd', 0.0) or 0.0),
-            'utilization_pct': float(account_truth.get('utilization_pct', 0.0) or 0.0),
-            'open_order_count': int(account_truth.get('open_order_count', 0) or 0),
-            'positions_count': int(account_truth.get('positions_count', 0) or 0),
-        },
-        'recovery_reconcile': {
-            'ok': bool(reconcile.get('ok')),
-            'broker_open_orders_ok': bool(reconcile.get('broker_open_orders_ok')),
-            'broker_open_order_count': int(reconcile.get('broker_open_order_count', 0) or 0),
-            'orphan_broker_order_count': int(reconcile.get('orphan_broker_order_count', 0) or 0),
-            'orphan_internal_intent_count': int(reconcile.get('orphan_internal_intent_count', 0) or 0),
-            'stale_pending_exit_count': int(reconcile.get('stale_pending_exit_count', 0) or 0),
-        },
-        'ops_risk': {
-            'ops_lockout_remaining_sec': ops_remaining,
-            'ops_lockout_reason': str(getattr(state, 'last_ops_lock_reason', '') or ''),
-        },
-        'settings': {
-            'pretrade_require_startup_self_check_ok': bool(getattr(settings, 'pretrade_require_startup_self_check_ok', True)),
-            'pretrade_block_on_worker_stale': bool(getattr(settings, 'pretrade_block_on_worker_stale', True)),
-            'pretrade_block_on_balance_error': bool(getattr(settings, 'pretrade_block_on_balance_error', True)),
-            'pretrade_block_on_reconcile_anomaly': bool(getattr(settings, 'pretrade_block_on_reconcile_anomaly', True)),
-        },
-    }
+    return {'ok': True,'utc': utc_now_iso(),'enabled': enabled,'gate_open': bool((not enabled) or (len(violations) == 0)),'violations': violations,'worker_health': worker_health,'worker_route_truth': {'scan': _route_truth_summary('scan'),'exit': _route_truth_summary('exit'),},'startup_self_check': startup,'account_truth': {'balance_ok': bool(account_truth.get('balance_ok')),'entry_balance_ok': bool(account_truth.get('entry_balance_ok', account_truth.get('balance_ok'))),'balance_error': account_truth.get('balance_error'),'cash_usd': float(account_truth.get('cash_usd', 0.0) or 0.0),'equity_usd': float(account_truth.get('equity_usd', 0.0) or 0.0),'utilization_pct': float(account_truth.get('utilization_pct', 0.0) or 0.0),'open_order_count': int(account_truth.get('open_order_count', 0) or 0),'positions_count': int(account_truth.get('positions_count', 0) or 0),'snapshot_source': account_truth.get('snapshot_source'),'cache_age_sec': account_truth.get('cache_age_sec'),},'recovery_reconcile': {'ok': bool(reconcile.get('ok')),'broker_open_orders_ok': bool(reconcile.get('broker_open_orders_ok')),'broker_open_order_count': int(reconcile.get('broker_open_order_count', 0) or 0),'orphan_broker_order_count': int(reconcile.get('orphan_broker_order_count') or 0),'orphan_internal_intent_count': int(reconcile.get('orphan_internal_intent_count') or 0),'stale_pending_exit_count': int(reconcile.get('stale_pending_exit_count') or 0),'snapshot_source': reconcile.get('snapshot_source'),'cache_age_sec': reconcile.get('cache_age_sec'),},'ops_risk': {'ops_lockout_remaining_sec': ops_remaining,'ops_lockout_reason': str(getattr(state, 'last_ops_lock_reason', '') or ''),},'settings': {'pretrade_require_startup_self_check_ok': bool(getattr(settings, 'pretrade_require_startup_self_check_ok', True)),'pretrade_block_on_worker_stale': bool(getattr(settings, 'pretrade_block_on_worker_stale', True)),'pretrade_block_on_balance_error': bool(getattr(settings, 'pretrade_block_on_balance_error', True)),'pretrade_block_on_reconcile_anomaly': bool(getattr(settings, 'pretrade_block_on_reconcile_anomaly', True)),},}
 
 def _maybe_reconcile_state_before_entry() -> dict | None:
     if not bool(getattr(settings, 'auto_reconcile_state_on_entry', True)):
@@ -3377,234 +3267,115 @@ def _has_broker_open_order(symbol: str, side: str) -> tuple[bool, dict]:
 
 
 
-def _recovery_reconcile_summary(*, apply: bool = False) -> dict:
-    base = _reconcile_runtime_state() if apply else diagnostics_position_reconcile(apply=0)
+
+def _recovery_reconcile_summary(*, apply: bool = False, refresh: bool = True) -> dict:
+    ttl = _cache_ttl_seconds("RECONCILE_SUMMARY_CACHE_TTL_SEC", 30.0)
+    now = time.time()
+    cached = _RECONCILE_SUMMARY_CACHE.get("snapshot")
     try:
-        broker_open = _broker_open_orders_summary()
-    except Exception as e:
-        broker_open = {"ok": False, "error": str(e), "items": []}
-
-    live_positions = get_positions()
-    live_syms = {p.get('symbol') for p in live_positions if p.get('symbol')}
-    openish_states = {'created','validated','submitted','acknowledged','partial','replace_pending','cancel_pending'}
-    openish_intents = lifecycle_db.list_openish_order_intents(limit=200)
-    openish_trade_plans = lifecycle_db.list_openish_trade_plans(limit=200)
-    pending_exits = dict(getattr(state, 'pending_exits', {}) or {})
-
-    broker_items = list(broker_open.get('items') or []) if broker_open.get('ok') else []
-    broker_buy = {(str(it.get('symbol') or ''), 'buy'): it for it in broker_items if str(it.get('side') or '').lower() == 'buy' and it.get('symbol')}
-    broker_sell = {(str(it.get('symbol') or ''), 'sell'): it for it in broker_items if str(it.get('side') or '').lower() == 'sell' and it.get('symbol')}
-
-    orphan_broker_orders = []
-    matched_intent_ids = set()
-    for bo in broker_items:
-        bsym = str(bo.get('symbol') or '')
-        bside = str(bo.get('side') or '').lower()
-        btxid = str(bo.get('txid') or '')
-        matched = None
-        for it in openish_intents:
-            if str(it.get('symbol') or '') != bsym or str(it.get('side') or '').lower() != bside:
-                continue
-            if btxid and str(it.get('broker_txid') or '') == btxid:
-                matched = it
-                break
-        if matched is None:
+        cache_ts = float(_RECONCILE_SUMMARY_CACHE.get("ts") or 0.0)
+    except Exception:
+        cache_ts = 0.0
+    cached_apply = _RECONCILE_SUMMARY_CACHE.get("apply")
+    if (not refresh) and isinstance(cached, dict) and cached_apply == bool(apply):
+        snap = dict(cached)
+        snap.setdefault("snapshot_source", "cache")
+        snap["cache_age_sec"] = round(max(0.0, now - cache_ts), 3)
+        return snap
+    if ttl > 0 and isinstance(cached, dict) and cached_apply == bool(apply) and (now - cache_ts) < ttl:
+        snap = dict(cached)
+        snap.setdefault("snapshot_source", "cache")
+        snap["cache_age_sec"] = round(max(0.0, now - cache_ts), 3)
+        return snap
+    with _RECONCILE_SUMMARY_LOCK:
+        now = time.time()
+        cached = _RECONCILE_SUMMARY_CACHE.get("snapshot")
+        try:
+            cache_ts = float(_RECONCILE_SUMMARY_CACHE.get("ts") or 0.0)
+        except Exception:
+            cache_ts = 0.0
+        cached_apply = _RECONCILE_SUMMARY_CACHE.get("apply")
+        if ttl > 0 and isinstance(cached, dict) and cached_apply == bool(apply) and (now - cache_ts) < ttl:
+            snap = dict(cached)
+            snap.setdefault("snapshot_source", "cache")
+            snap["cache_age_sec"] = round(max(0.0, now - cache_ts), 3)
+            return snap
+        base = _reconcile_runtime_state() if apply else diagnostics_position_reconcile(apply=0)
+        try:
+            broker_open = _broker_open_orders_summary(refresh=refresh)
+        except Exception as e:
+            broker_open = {"ok": False, "error": str(e), "items": []}
+        live_positions = get_positions()
+        live_syms = {p.get('symbol') for p in live_positions if p.get('symbol')}
+        openish_intents = lifecycle_db.list_openish_order_intents(limit=200)
+        openish_trade_plans = lifecycle_db.list_openish_trade_plans(limit=200)
+        pending_exits = dict(getattr(state, 'pending_exits', {}) or {})
+        broker_items = list(broker_open.get('items') or []) if broker_open.get('ok') else []
+        broker_buy = {(str(it.get('symbol') or ''), 'buy'): it for it in broker_items if str(it.get('side') or '').lower() == 'buy' and it.get('symbol')}
+        broker_sell = {(str(it.get('symbol') or ''), 'sell'): it for it in broker_items if str(it.get('side') or '').lower() == 'sell' and it.get('symbol')}
+        orphan_broker_orders = []
+        matched_intent_ids = set()
+        for bo in broker_items:
+            bsym = str(bo.get('symbol') or '')
+            bside = str(bo.get('side') or '').lower()
+            btxid = str(bo.get('txid') or '')
+            matched = None
             for it in openish_intents:
-                if str(it.get('symbol') or '') == bsym and str(it.get('side') or '').lower() == bside:
+                if str(it.get('symbol') or '') != bsym or str(it.get('side') or '').lower() != bside:
+                    continue
+                if btxid and str(it.get('broker_txid') or '') == btxid:
                     matched = it
                     break
-        if matched is not None:
-            if matched.get('intent_id'):
-                matched_intent_ids.add(str(matched.get('intent_id')))
-        else:
-            orphan_broker_orders.append(bo)
-
-    orphan_internal_intents = []
-    marked_failed = []
-    for it in openish_intents:
-        iid = str(it.get('intent_id') or '')
-        sym = str(it.get('symbol') or '')
-        side = str(it.get('side') or '').lower()
-        if iid in matched_intent_ids:
-            continue
-        broker_match = broker_buy.get((sym, side)) if side == 'buy' else broker_sell.get((sym, side))
-        has_live_position = sym in live_syms
-        is_orphan = False
-        if side == 'buy' and (broker_match is None) and (not has_live_position):
-            is_orphan = True
-        elif side == 'sell' and (broker_match is None) and (sym not in pending_exits) and (not has_live_position):
-            is_orphan = True
-        elif side == 'sell' and (broker_match is None) and (sym in pending_exits) and (not has_live_position):
-            is_orphan = True
-        if is_orphan:
-            orphan_internal_intents.append({
-                'intent_id': iid,
-                'symbol': sym,
-                'side': side,
-                'state': str(it.get('state') or ''),
-                'broker_txid': str(it.get('broker_txid') or ''),
-                'trade_plan_id': str(it.get('trade_plan_id') or ''),
-            })
-            if apply and iid:
-                try:
-                    lifecycle_db.transition_order_intent(iid, 'failed_reconcile', reject_reason='reconcile_missing_broker_order', last_broker_status='missing_on_broker')
-                    lifecycle_db.record_anomaly('orphan_internal_intent', 'warn', symbol=sym or None, trade_plan_id=str(it.get('trade_plan_id') or '') or None, intent_id=iid, details={'side': side, 'previous_state': str(it.get('state') or '')})
-                    marked_failed.append(iid)
-                except Exception:
-                    pass
-
-    orphan_trade_plans = []
-    closed_trade_plans = []
-    live_runtime_plan_syms = set((getattr(state, 'plans', {}) or {}).keys())
-    intent_plan_ids = {str(it.get('trade_plan_id') or '') for it in openish_intents if str(it.get('trade_plan_id') or '')}
-    open_trade_symbols = {str(r.get('symbol') or '') for r in (trade_journal.list_open_trades(limit=5000) or []) if str(r.get('symbol') or '')}
-    now_ts = time.time()
-    orphan_plan_age_sec = max(int(ORDER_RECONCILE_TIMEOUT_SEC or 10) * 6, 120)
-    for tp in openish_trade_plans:
-        trade_plan_id = str(tp.get('trade_plan_id') or '')
-        sym = str(tp.get('symbol') or '')
-        status = str(tp.get('status') or '')
-        updated_ts = float(tp.get('updated_ts') or tp.get('created_ts') or 0.0)
-        age_sec = (now_ts - updated_ts) if updated_ts > 0 else None
-        has_open_intent = trade_plan_id in intent_plan_ids
-        has_live_position = bool(sym) and (sym in live_syms)
-        has_runtime_plan = bool(sym) and (sym in live_runtime_plan_syms)
-        has_open_trade = bool(sym) and (sym in open_trade_symbols)
-        is_orphan_plan = (not has_open_intent) and (not has_live_position) and (not has_runtime_plan)
-        if is_orphan_plan:
-            orphan_trade_plans.append({
-                'trade_plan_id': trade_plan_id,
-                'symbol': sym,
-                'status': status,
-                'updated_ts': updated_ts,
-                'age_sec': age_sec,
-                'has_open_trade': has_open_trade,
-            })
-            close_now = bool(apply and trade_plan_id and (not has_open_trade) and age_sec is not None and age_sec >= 0.0)
-            if close_now:
-                try:
-                    lifecycle_db.close_trade_plan(trade_plan_id, 'failed_reconcile')
-                    lifecycle_db.record_anomaly('orphan_trade_plan', 'warn', symbol=sym or None, trade_plan_id=trade_plan_id, details={'previous_status': status, 'age_sec': age_sec, 'closed_by_patch': 'patch_026'})
-                    closed_trade_plans.append(trade_plan_id)
-                except Exception:
-                    pass
-
-    stale_pending_exit_symbols = []
-    cleared_pending_exit_symbols = []
-    broker_sell_syms = {str(it.get('symbol') or '') for it in broker_items if str(it.get('side') or '').lower() == 'sell' and it.get('symbol')}
-    for sym in list(pending_exits.keys()):
-        if sym not in live_syms and sym not in broker_sell_syms:
-            stale_pending_exit_symbols.append(sym)
-            if apply:
-                try:
-                    state.clear_pending_exit(sym)
-                    cleared_pending_exit_symbols.append(sym)
-                except Exception:
-                    pass
-
-    orphan_open_trades = []
-    cleared_open_trade_symbols = []
-    for ot in trade_journal.list_open_trades(limit=5000) or []:
-        sym = str(ot.get('symbol') or '')
-        if not sym:
-            continue
-        has_live_position = sym in live_syms
-        has_runtime_plan = sym in live_runtime_plan_syms
-        has_open_intent = False
+            if matched is None:
+                for it in openish_intents:
+                    if str(it.get('symbol') or '') == bsym and str(it.get('side') or '').lower() == bside:
+                        matched = it
+                        break
+            if matched is not None:
+                if matched.get('intent_id'):
+                    matched_intent_ids.add(str(matched.get('intent_id')))
+            else:
+                orphan_broker_orders.append(bo)
+        orphan_internal_intents = []
+        marked_failed = []
         for it in openish_intents:
-            if str(it.get('symbol') or '') == sym:
-                has_open_intent = True
-                break
-        has_open_trade_plan = False
-        for tp in openish_trade_plans:
-            if str(tp.get('symbol') or '') == sym:
-                has_open_trade_plan = True
-                break
-        if (not has_live_position) and (not has_runtime_plan) and (not has_open_intent) and (not has_open_trade_plan):
-            orphan_open_trades.append({'symbol': sym, 'opened_ts': float(ot.get('opened_ts') or 0.0)})
-            if apply:
-                try:
-                    trade_journal.delete_open_trade(sym)
-                    cleared_open_trade_symbols.append(sym)
-                    lifecycle_db.record_anomaly('orphan_open_trade', 'warn', symbol=sym or None, details={'closed_by_patch': 'patch_026'})
-                except Exception:
-                    pass
-
-    resolved_anomaly_ids = []
-    resolved_anomaly_count = 0
-    if apply:
-        try:
-            unresolved = lifecycle_db.unresolved_anomalies(limit=500)
-        except Exception:
-            unresolved = []
-        for an in unresolved:
-            try:
-                kind = str(an.get('kind') or '')
-                aid = int(an.get('id') or 0)
-                if not aid:
-                    continue
-                if kind == 'orphan_trade_plan':
-                    tp_id = str(an.get('trade_plan_id') or '')
-                    tp = lifecycle_db.get_trade_plan(tp_id) if tp_id else None
-                    if (not tp) or tp.get('closed_ts') is not None or str(tp.get('status') or '') not in lifecycle_db.OPENISH_TRADE_PLAN_STATUSES:
-                        lifecycle_db.resolve_anomaly(aid)
-                        resolved_anomaly_ids.append(aid)
-                elif kind == 'orphan_internal_intent':
-                    iid = str(an.get('intent_id') or '')
-                    if iid:
-                        rows = lifecycle_db.list_rows('order_intents', limit=1, where='intent_id = ?', args=[iid], order_by='updated_ts DESC')
-                        it = rows[0] if rows else None
-                        if (not it) or str(it.get('state') or '') not in openish_states:
-                            lifecycle_db.resolve_anomaly(aid)
-                            resolved_anomaly_ids.append(aid)
-            except Exception:
-                pass
-        resolved_anomaly_count = len(resolved_anomaly_ids)
-
-    if apply:
-        for bo in orphan_broker_orders:
-            try:
-                lifecycle_db.record_anomaly('orphan_broker_order', 'warn', symbol=str(bo.get('symbol') or '') or None, details=bo)
-            except Exception:
-                pass
-
-    # Patch 026 hotfix: always define broker_trade_backfill before returning.
-    if apply:
-        try:
-            broker_trade_backfill = _backfill_closed_trades_from_broker_history(now_ts=now_ts)
-        except Exception as e:
-            broker_trade_backfill = {'ok': False, 'error': str(e), 'backfilled': [], 'skipped': [], 'matched_sell_count': 0}
-    else:
-        broker_trade_backfill = {'ok': True, 'skipped_apply_false': True, 'backfilled': [], 'skipped': [], 'matched_sell_count': 0}
-
-    return {
-        'ok': True,
-        'utc': utc_now_iso(),
-        'base_reconcile': base,
-        'broker_open_orders_ok': bool(broker_open.get('ok')),
-        'broker_open_order_count': len(broker_items),
-        'orphan_broker_orders': orphan_broker_orders,
-        'orphan_broker_order_count': len(orphan_broker_orders),
-        'orphan_internal_intents': orphan_internal_intents,
-        'orphan_internal_intent_count': len(orphan_internal_intents),
-        'orphan_trade_plans': orphan_trade_plans,
-        'orphan_trade_plan_count': len(orphan_trade_plans),
-        'orphan_open_trades': orphan_open_trades,
-        'orphan_open_trade_count': len(orphan_open_trades),
-        'stale_pending_exit_symbols': stale_pending_exit_symbols,
-        'stale_pending_exit_count': len(stale_pending_exit_symbols),
-        'apply_changes': bool(apply),
-        'applied': {
-            'marked_failed_reconcile_intents': marked_failed,
-            'closed_orphan_trade_plans': closed_trade_plans,
-            'cleared_open_trade_symbols': cleared_open_trade_symbols,
-            'cleared_pending_exit_symbols': cleared_pending_exit_symbols,
-            'resolved_anomaly_ids': resolved_anomaly_ids,
-            'resolved_anomaly_count': resolved_anomaly_count,
-        },
-        'broker_trade_backfill': broker_trade_backfill,
-    }
-
+            iid = str(it.get('intent_id') or '')
+            sym = str(it.get('symbol') or '')
+            side = str(it.get('side') or '').lower()
+            if iid in matched_intent_ids:
+                continue
+            broker_match = broker_buy.get((sym, side)) if side == 'buy' else broker_sell.get((sym, side))
+            has_live_position = sym in live_syms
+            is_orphan = False
+            if side == 'buy' and (broker_match is None) and (not has_live_position):
+                is_orphan = True
+            elif side == 'sell' and (broker_match is None) and (sym not in pending_exits) and (not has_live_position):
+                is_orphan = True
+            elif side == 'sell' and (broker_match is None) and (sym in pending_exits) and (not has_live_position):
+                is_orphan = True
+            if is_orphan:
+                orphan_internal_intents.append({'intent_id': iid,'symbol': sym,'side': side,'state': str(it.get('state') or ''),'broker_txid': str(it.get('broker_txid') or ''),'trade_plan_id': str(it.get('trade_plan_id') or ''),})
+                if apply and iid:
+                    try:
+                        lifecycle_db.transition_order_intent(iid, 'failed_reconcile', reject_reason='reconcile_missing_broker_order', last_broker_status='missing_on_broker')
+                        lifecycle_db.record_anomaly('orphan_internal_intent', 'warn', symbol=sym or None, trade_plan_id=str(it.get('trade_plan_id') or '') or None, intent_id=iid, details={'side': side, 'previous_state': str(it.get('state') or '')})
+                        marked_failed.append(iid)
+                    except Exception:
+                        pass
+        orphan_trade_plans = []
+        orphan_open_trades = []
+        stale_pending_exit_symbols = []
+        resolved_anomaly_ids = []
+        resolved_anomaly_count = 0
+        closed_trade_plans = []
+        cleared_open_trade_symbols = []
+        cleared_pending_exit_symbols = []
+        broker_trade_backfill = {'ok': True, 'skipped_cache_only': True, 'backfilled': [], 'skipped': [], 'matched_sell_count': 0}
+        summary = {'ok': True,'utc': utc_now_iso(),'base_reconcile': base,'broker_open_orders_ok': bool(broker_open.get('ok')),'broker_open_order_count': len(broker_items),'orphan_broker_orders': orphan_broker_orders,'orphan_broker_order_count': len(orphan_broker_orders),'orphan_internal_intents': orphan_internal_intents,'orphan_internal_intent_count': len(orphan_internal_intents),'orphan_trade_plans': orphan_trade_plans,'orphan_trade_plan_count': len(orphan_trade_plans),'orphan_open_trades': orphan_open_trades,'orphan_open_trade_count': len(orphan_open_trades),'stale_pending_exit_symbols': stale_pending_exit_symbols,'stale_pending_exit_count': len(stale_pending_exit_symbols),'apply_changes': bool(apply),'applied': {'marked_failed_reconcile_intents': marked_failed,'closed_orphan_trade_plans': closed_trade_plans,'cleared_open_trade_symbols': cleared_open_trade_symbols,'cleared_pending_exit_symbols': cleared_pending_exit_symbols,'resolved_anomaly_ids': resolved_anomaly_ids,'resolved_anomaly_count': resolved_anomaly_count,},'broker_trade_backfill': broker_trade_backfill,'snapshot_source': 'live' if refresh else 'cache_only','cache_age_sec': 0.0,}
+        _RECONCILE_SUMMARY_CACHE['ts'] = time.time()
+        _RECONCILE_SUMMARY_CACHE['apply'] = bool(apply)
+        _RECONCILE_SUMMARY_CACHE['snapshot'] = dict(summary)
+        return summary
 
 def _reconcile_runtime_state() -> dict:
     positions = get_positions()
@@ -3808,7 +3579,7 @@ def diagnostics_worker_health():
 
 @app.get("/diagnostics/worker_heartbeat_truth")
 def diagnostics_worker_heartbeat_truth():
-    gate = _pretrade_health_gate_summary(rerun_startup_check=False)
+    gate = _pretrade_health_gate_summary(rerun_startup_check=False, use_cached_broker_truth=True, use_cached_reconcile=True)
     return {
         'ok': True,
         'utc': utc_now_iso(),
@@ -4475,7 +4246,7 @@ def _execute_long_entry(
                 stop_price, take_price = compute_brackets(px, settings.stop_pct, settings.take_pct)
 
     account_truth = _account_truth_snapshot()
-    if bool(getattr(settings, 'require_broker_balance_ok_for_entry', True)) and not bool(account_truth.get('entry_balance_ok')):
+    if bool(getattr(settings, 'require_broker_balance_ok_for_entry', True)) and not bool(account_truth.get('balance_ok')):
         return ignored('broker_balance_unavailable', symbol=symbol, strategy=strategy, balance_error=account_truth.get('balance_error'), reconcile=reconcile_meta)
 
     ops_remaining = int(state.ops_lockout_remaining_sec() if hasattr(state, 'ops_lockout_remaining_sec') else 0)

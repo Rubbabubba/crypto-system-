@@ -141,6 +141,52 @@ _ASSET_CODE_OVERRIDES = {
 
 # Balance cache (seconds) to prevent repeated private Balance calls within a single tick
 _BAL_CACHE: Dict[str, Any] = {"ts": 0.0, "bal": {}}
+_OPEN_ORDERS_CACHE: Dict[str, Any] = {"ts": 0.0, "open": {}}
+_BAL_FETCH_LOCK = threading.Lock()
+_OPEN_ORDERS_FETCH_LOCK = threading.Lock()
+_PRIVATE_COOLDOWN_UNTIL: Dict[str, float] = {"Balance": 0.0, "OpenOrders": 0.0}
+_PRIVATE_COOLDOWN_REASON: Dict[str, str] = {"Balance": "", "OpenOrders": ""}
+
+def _private_endpoint_cooldown_remaining(path: str) -> float:
+    try:
+        return max(0.0, float(_PRIVATE_COOLDOWN_UNTIL.get(str(path or ""), 0.0) or 0.0) - time.time())
+    except Exception:
+        return 0.0
+
+def _set_private_endpoint_cooldown(path: str, *, reason: str, seconds: float) -> None:
+    p = str(path or "")
+    if not p:
+        return
+    try:
+        sec = max(0.0, float(seconds or 0.0))
+    except Exception:
+        sec = 0.0
+    until = time.time() + sec if sec > 0 else 0.0
+    _PRIVATE_COOLDOWN_UNTIL[p] = until
+    _PRIVATE_COOLDOWN_REASON[p] = str(reason or "")
+
+def _clear_private_endpoint_cooldown(path: str) -> None:
+    p = str(path or "")
+    if not p:
+        return
+    _PRIVATE_COOLDOWN_UNTIL[p] = 0.0
+    _PRIVATE_COOLDOWN_REASON[p] = ""
+
+def _private_endpoint_cooldown_reason(path: str) -> str:
+    return str(_PRIVATE_COOLDOWN_REASON.get(str(path or ""), "") or "")
+
+def _private_endpoint_cooldown_seconds(path: str) -> float:
+    env_key = f"KRAKEN_{str(path or "").upper()}_COOLDOWN_SEC"
+    try:
+        val = float(os.getenv(env_key, "") or 0.0)
+    except Exception:
+        val = 0.0
+    if val > 0:
+        return val
+    try:
+        return float(os.getenv("KRAKEN_PRIVATE_COOLDOWN_SEC", "15") or 15.0)
+    except Exception:
+        return 15.0
 
 def _asset_code_candidates(ui_asset: str) -> list:
     a = (ui_asset or "").upper().strip()
@@ -168,31 +214,56 @@ def _get_balance_float(bal: dict, ui_asset: str) -> float:
                 continue
     return 0.0
 
-def _fetch_balances() -> dict:
-    """Fetch Kraken balances (private Balance), with a short TTL cache.
 
-    Kraken returns HTTP 200 even on logical failures; our _priv() helper raises
-    on payload errors. This function therefore returns the *result dict*
-    directly (e.g., {"ZUSD":"123.45","XXBT":"0.01",...}).
-    """
-    # Cache to avoid spamming Balance across a single scheduler tick.
-    ttl = float(os.getenv("KRAKEN_BALANCE_TTL_SEC", "3.0") or 3.0)
+def _fetch_balances() -> dict:
+    """Fetch Kraken balances (private Balance), with cache, singleflight, and grace."""
+    ttl_env = os.getenv("KRAKEN_BALANCE_TTL_SEC", os.getenv("BALANCE_CACHE_TTL_SEC", "3.0"))
+    grace_env = os.getenv("KRAKEN_BALANCE_STALE_GRACE_SEC", os.getenv("BALANCE_STALE_GRACE_SEC", "900"))
+    try:
+        ttl = float(ttl_env or 3.0)
+    except Exception:
+        ttl = 3.0
+    try:
+        stale_grace = float(grace_env or 900.0)
+    except Exception:
+        stale_grace = 900.0
+
     now = time.time()
     try:
         ts = float(_BAL_CACHE.get("ts") or 0.0)
     except Exception:
         ts = 0.0
+    cached_bal = _BAL_CACHE.get("bal") if isinstance(_BAL_CACHE.get("bal"), dict) else {}
 
-    if ttl > 0 and (now - ts) < ttl and isinstance(_BAL_CACHE.get("bal"), dict):
-        return _BAL_CACHE["bal"]  # type: ignore[return-value]
+    if ttl > 0 and (now - ts) < ttl and isinstance(cached_bal, dict):
+        return cached_bal  # type: ignore[return-value]
 
-    bal = _priv("Balance", {}) or {}
-    if not isinstance(bal, dict):
-        bal = {}
+    with _BAL_FETCH_LOCK:
+        now = time.time()
+        try:
+            ts = float(_BAL_CACHE.get("ts") or 0.0)
+        except Exception:
+            ts = 0.0
+        cached_bal = _BAL_CACHE.get("bal") if isinstance(_BAL_CACHE.get("bal"), dict) else {}
+        if ttl > 0 and (now - ts) < ttl and isinstance(cached_bal, dict):
+            return cached_bal  # type: ignore[return-value]
 
-    _BAL_CACHE["ts"] = now
-    _BAL_CACHE["bal"] = bal
-    return bal
+        cooldown_remaining = _private_endpoint_cooldown_remaining("Balance")
+        if cooldown_remaining > 0 and isinstance(cached_bal, dict) and cached_bal and (now - ts) <= stale_grace:
+            return cached_bal  # type: ignore[return-value]
+
+        try:
+            bal = _priv("Balance", {}) or {}
+            if not isinstance(bal, dict):
+                bal = {}
+            _BAL_CACHE["ts"] = time.time()
+            _BAL_CACHE["bal"] = bal
+            _clear_private_endpoint_cooldown("Balance")
+            return bal
+        except Exception:
+            if isinstance(cached_bal, dict) and cached_bal and (now - ts) <= stale_grace:
+                return cached_bal  # type: ignore[return-value]
+            raise
 
 
 # ---------------------------------------------------------------------------
@@ -441,6 +512,13 @@ def _priv(path: str, data: dict | None = None) -> dict:
     data = dict(data or {})
     url = f"{KRAKEN_API_URL}/0/private/{path}"
 
+    managed_path = str(path or "")
+    if managed_path in ("Balance", "OpenOrders"):
+        remaining = _private_endpoint_cooldown_remaining(managed_path)
+        if remaining > 0:
+            reason = _private_endpoint_cooldown_reason(managed_path)
+            raise RuntimeError(f"Kraken private call cooldown active: {managed_path} remaining={round(remaining, 3)}s reason={reason}")
+
     # retry a handful of times for nonce/rate limit errors
     last_err: Exception | None = None
     for attempt in range(1, 6):
@@ -466,6 +544,12 @@ def _priv(path: str, data: dict | None = None) -> dict:
 
                 # Retry specific transient errors
                 transient = any(("Rate limit exceeded" in e) or ("Invalid nonce" in e) for e in errors)
+                if transient and managed_path in ("Balance", "OpenOrders"):
+                    _set_private_endpoint_cooldown(
+                        managed_path,
+                        reason="; ".join([str(e) for e in errors if e]),
+                        seconds=_private_endpoint_cooldown_seconds(managed_path),
+                    )
                 if transient and attempt < 5:
                     # Exponential-ish backoff with jitter
                     sleep_s = min(8.0, 0.4 * (2 ** (attempt - 1))) + (0.05 * attempt)
@@ -475,6 +559,9 @@ def _priv(path: str, data: dict | None = None) -> dict:
                 raise RuntimeError(f"Kraken private call failed: {path} errors={errors}")
 
             result = payload.get("result") or {}
+
+            if managed_path in ("Balance", "OpenOrders"):
+                _clear_private_endpoint_cooldown(managed_path)
 
             if path == "AddOrder":
                 txid = None
@@ -1473,6 +1560,7 @@ def limit_notional(
     }
 
 
+
 def cancel_order(txid: str) -> Dict[str, Any]:
     """Best-effort cancel by txid."""
     t = str(txid or "").strip()
@@ -1484,9 +1572,58 @@ def cancel_order(txid: str) -> Dict[str, Any]:
     except Exception as e:
         return {"ok": False, "txid": t, "error": str(e)}
 
+def _fetch_open_orders() -> dict:
+    ttl_env = os.getenv("KRAKEN_OPEN_ORDERS_TTL_SEC", os.getenv("BROKER_STATE_CACHE_TTL_SEC", "180"))
+    grace_env = os.getenv("KRAKEN_OPEN_ORDERS_STALE_GRACE_SEC", os.getenv("BROKER_STATE_CACHE_GRACE_SEC", "1800"))
+    try:
+        ttl = float(ttl_env or 180.0)
+    except Exception:
+        ttl = 180.0
+    try:
+        stale_grace = float(grace_env or 1800.0)
+    except Exception:
+        stale_grace = 1800.0
+
+    now = time.time()
+    try:
+        ts = float(_OPEN_ORDERS_CACHE.get("ts") or 0.0)
+    except Exception:
+        ts = 0.0
+    cached_open = _OPEN_ORDERS_CACHE.get("open") if isinstance(_OPEN_ORDERS_CACHE.get("open"), dict) else {}
+
+    if ttl > 0 and (now - ts) < ttl and isinstance(cached_open, dict):
+        return cached_open  # type: ignore[return-value]
+
+    with _OPEN_ORDERS_FETCH_LOCK:
+        now = time.time()
+        try:
+            ts = float(_OPEN_ORDERS_CACHE.get("ts") or 0.0)
+        except Exception:
+            ts = 0.0
+        cached_open = _OPEN_ORDERS_CACHE.get("open") if isinstance(_OPEN_ORDERS_CACHE.get("open"), dict) else {}
+        if ttl > 0 and (now - ts) < ttl and isinstance(cached_open, dict):
+            return cached_open  # type: ignore[return-value]
+
+        cooldown_remaining = _private_endpoint_cooldown_remaining("OpenOrders")
+        if cooldown_remaining > 0 and isinstance(cached_open, dict) and (cached_open or ts > 0) and (now - ts) <= stale_grace:
+            return cached_open  # type: ignore[return-value]
+
+        try:
+            open_orders = _priv("OpenOrders", {}) or {}
+            if not isinstance(open_orders, dict):
+                open_orders = {}
+            _OPEN_ORDERS_CACHE["ts"] = time.time()
+            _OPEN_ORDERS_CACHE["open"] = open_orders
+            _clear_private_endpoint_cooldown("OpenOrders")
+            return open_orders
+        except Exception:
+            if isinstance(cached_open, dict) and (cached_open or ts > 0) and (now - ts) <= stale_grace:
+                return cached_open  # type: ignore[return-value]
+            raise
+
 def orders() -> Any:
     try:
-        return _priv("OpenOrders", {})
+        return _fetch_open_orders()
     except Exception as e:
         return {"error": str(e)}
 
@@ -1498,7 +1635,7 @@ def positions() -> List[Dict[str, Any]]:
     """
     out: List[Dict[str, Any]] = []
     try:
-        bal = _priv("Balance", {})  # {"ZUSD":"123.45","XXBT":"0.01","SOL.F":"0.12",...}
+        bal = _fetch_balances()  # {"ZUSD":"123.45","XXBT":"0.01","SOL.F":"0.12",...}
         for k, v in (bal or {}).items():
             try:
                 qty = float(v)
