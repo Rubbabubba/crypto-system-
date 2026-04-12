@@ -524,6 +524,7 @@ def _startup_self_check(*, rerun: bool = False, apply: bool | None = None) -> di
             'apply_changes': False,
             'critical': False,
             'critical_reasons': [],
+            'warning_reasons': [],
             'lockout_applied': False,
             'lockout_reason': '',
             'recovery_reconcile': None,
@@ -568,6 +569,7 @@ def _startup_self_check(*, rerun: bool = False, apply: bool | None = None) -> di
             'apply_changes': bool(apply),
             'critical': True,
             'critical_reasons': ['startup_dependency_guard_failed'],
+            'warning_reasons': [],
             'lockout_applied': False,
             'lockout_reason': '',
             'lockout_remaining_sec': int(state.ops_lockout_remaining_sec() if hasattr(state, 'ops_lockout_remaining_sec') else 0),
@@ -583,10 +585,11 @@ def _startup_self_check(*, rerun: bool = False, apply: bool | None = None) -> di
         )
         recovery = _recovery_reconcile_summary(apply=bool(apply))
         critical_reasons: list[str] = []
+        warning_reasons: list[str] = []
         if not bool(recovery.get('ok')):
             critical_reasons.append('recovery_reconcile_failed')
         if not bool(recovery.get('broker_open_orders_ok', True)):
-            critical_reasons.append('broker_open_orders_unavailable')
+            warning_reasons.append('broker_open_orders_unavailable')
         if int(recovery.get('orphan_broker_order_count', 0) or 0) > int(getattr(settings, 'startup_max_orphan_broker_orders', 0) or 0):
             critical_reasons.append('orphan_broker_orders_present')
         if int(recovery.get('orphan_internal_intent_count', 0) or 0) > int(getattr(settings, 'startup_max_orphan_internal_intents', 0) or 0):
@@ -616,6 +619,7 @@ def _startup_self_check(*, rerun: bool = False, apply: bool | None = None) -> di
             'apply_changes': bool(apply),
             'critical': len(critical_reasons) > 0,
             'critical_reasons': critical_reasons,
+            'warning_reasons': warning_reasons,
             'lockout_applied': lockout_applied,
             'lockout_reason': lockout_reason,
             'lockout_remaining_sec': int(state.ops_lockout_remaining_sec() if hasattr(state, 'ops_lockout_remaining_sec') else 0),
@@ -638,6 +642,7 @@ def _startup_self_check(*, rerun: bool = False, apply: bool | None = None) -> di
             'apply_changes': bool(apply),
             'critical': True,
             'critical_reasons': ['startup_self_check_exception'],
+            'warning_reasons': [],
             'lockout_applied': lockout_applied,
             'lockout_reason': lockout_reason,
             'lockout_remaining_sec': int(state.ops_lockout_remaining_sec() if hasattr(state, 'ops_lockout_remaining_sec') else 0),
