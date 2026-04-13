@@ -1,1 +1,0 @@
-Patch 057: tc1 long momentum confirmation + no-trade floor
