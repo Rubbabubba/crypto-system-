@@ -144,7 +144,7 @@ def cancel_order(txid: str) -> Dict:
 def balances_by_asset() -> Dict[str, float]:
     """Return spot balances by asset code.
 
-    Uses Kraken private Balance endpoint (via broker_kraken._fetch_balances()).
+    Uses cached Kraken Balance truth seeded by the background balance refresher.
 
     On failure, returns an empty dict but records the error string in
     LAST_BALANCE_ERROR for surfacing in /worker diagnostics.
@@ -154,7 +154,7 @@ def balances_by_asset() -> Dict[str, float]:
 
     out: Dict[str, float] = {}
     try:
-        bal = broker_kraken.get_cached_balances_snapshot(stale_ok=True)  # cache-only; live refresh owned elsewhere
+        bal = broker_kraken.get_cached_balances()  # cache-only read
     except Exception as e:
         LAST_BALANCE_ERROR = f"{type(e).__name__}: {e}"
         bal = {}

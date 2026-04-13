@@ -763,14 +763,14 @@ def _startup_self_check(*, rerun: bool = False, apply: bool | None = None) -> di
 @app.on_event("startup")
 def _run_startup_self_check():
     try:
-        broker_kraken.start_balance_refresh_daemon()
-    except Exception:
-        pass
-    try:
         lifecycle_db.repair_lifecycle_integrity(
             stale_age_sec=int(getattr(settings, 'workflow_lock_ttl_sec', 300) or 300),
             backfill_limit=5000,
         )
+    except Exception:
+        pass
+    try:
+        broker_kraken.start_balance_refresh_daemon()
     except Exception:
         pass
     _startup_self_check(rerun=True)
@@ -1136,24 +1136,10 @@ def _log_event(level: str, event: Dict[str, Any]) -> None:
 
 
 def _merged_balances_snapshot() -> dict[str, Any]:
-    """Return broker holdings truth merged across multiple Kraken balance views.
+    """Return broker holdings truth merged across cached Kraken balance views.
 
-    Why this exists:
-    - The main system historically trusted only `balances_by_asset()`.
-    - In live trading we observed cases where broker-held BTC existed, but the
-      runtime position model did not see it.
-    - Broker truth must win over local/runtime state.
-
-    Output shape:
-      {
-        "parsed": {"BTC": 0.01, "USD": 1000.0},
-        "positions_api": {"BTC": 0.01, "USD": 1000.0},
-        "merged": {"BTC": 0.01, "USD": 1000.0},
-        "sources": {"BTC": ["parsed", "positions_api"]},
-        "raw": {...},
-        "raw_ok": True,
-        "raw_error": None,
-      }
+    Request-time readers must stay cache-only so live Balance refresh has a
+    single owner in the background refresher.
     """
     parsed: dict[str, float] = {}
     positions_api: dict[str, float] = {}
@@ -1170,7 +1156,7 @@ def _merged_balances_snapshot() -> dict[str, Any]:
         parsed = {}
 
     try:
-        raw = broker_kraken.get_cached_balances_snapshot(stale_ok=True) or {}
+        raw = broker_kraken.get_cached_balances() or {}
         if not isinstance(raw, dict):
             raw = {}
     except Exception as e:
@@ -1179,18 +1165,32 @@ def _merged_balances_snapshot() -> dict[str, Any]:
         raw = {}
 
     try:
-        for row in (broker_kraken.positions() or []):
-            if not isinstance(row, dict):
-                continue
-            asset = str(row.get("asset") or "").upper().strip()
-            if not asset:
-                continue
+        for k, v in (raw or {}).items():
             try:
-                qty = float(row.get("qty") or 0.0)
+                qty = float(v or 0.0)
             except Exception:
                 qty = 0.0
             if qty <= 0:
                 continue
+            asset = str(k or "").upper().strip()
+            if not asset:
+                continue
+            if asset.endswith(".F"):
+                asset = asset[:-2]
+            if asset in ("ZUSD", "USD"):
+                asset = "USD"
+            elif asset in ("XXBT", "XBT"):
+                asset = "BTC"
+            elif asset in ("XETH", "ETH"):
+                asset = "ETH"
+            elif asset in ("XDG", "DOGE"):
+                asset = "DOGE"
+            elif asset in ("XXRP", "XRP"):
+                asset = "XRP"
+            elif asset in ("XLTC", "LTC"):
+                asset = "LTC"
+            elif asset in ("XBCH", "BCH"):
+                asset = "BCH"
             positions_api[asset] = max(float(positions_api.get(asset, 0.0) or 0.0), qty)
     except Exception as e:
         positions_error = f"{type(e).__name__}: {e}"

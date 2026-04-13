@@ -115,40 +115,6 @@ logger = logging.getLogger("broker_kraken")
 
 
 _BALANCE_BOOTSTRAP_PATH = Path(os.getenv("BALANCE_BOOTSTRAP_SNAPSHOT_PATH", "/var/data/kraken_balance_bootstrap.json"))
-_BALANCE_REFRESH_THREAD: threading.Thread | None = None
-_BALANCE_REFRESH_THREAD_STARTED = False
-_BALANCE_REFRESH_THREAD_LOCK = threading.Lock()
-
-def _cached_balance_dict(*, stale_ok: bool = True) -> dict:
-    now = time.time()
-    try:
-        ts = float(_BAL_CACHE.get("ts") or 0.0)
-    except Exception:
-        ts = 0.0
-    bal = _BAL_CACHE.get("bal") if isinstance(_BAL_CACHE.get("bal"), dict) else {}
-    if not isinstance(bal, dict):
-        return {}
-    if stale_ok:
-        grace_env = os.getenv("KRAKEN_BALANCE_STALE_GRACE_SEC", os.getenv("BALANCE_STALE_GRACE_SEC", "900"))
-        try:
-            stale_grace = float(grace_env or 900.0)
-        except Exception:
-            stale_grace = 900.0
-        if ts > 0 and (now - ts) > stale_grace:
-            return {}
-    else:
-        ttl_env = os.getenv("KRAKEN_BALANCE_TTL_SEC", os.getenv("BALANCE_CACHE_TTL_SEC", "3.0"))
-        try:
-            ttl = float(ttl_env or 3.0)
-        except Exception:
-            ttl = 3.0
-        if ttl > 0 and (now - ts) >= ttl:
-            return {}
-    return dict(bal)
-
-def get_cached_balances_snapshot(*, stale_ok: bool = True) -> dict:
-    return _cached_balance_dict(stale_ok=stale_ok)
-
 
 def _write_balance_bootstrap_event(payload: Dict[str, Any]) -> None:
     try:
@@ -238,6 +204,51 @@ _OPEN_ORDERS_FETCH_LOCK = threading.Lock()
 _PRIVATE_COOLDOWN_UNTIL: Dict[str, float] = {"Balance": 0.0, "OpenOrders": 0.0}
 _PRIVATE_COOLDOWN_REASON: Dict[str, str] = {"Balance": "", "OpenOrders": ""}
 
+
+_BALANCE_REFRESH_THREAD: Optional[threading.Thread] = None
+_BALANCE_REFRESH_STOP = threading.Event()
+_BALANCE_REFRESH_STARTED = False
+
+def get_cached_balances() -> dict:
+    """Return cached Balance snapshot only; never performs a live private call."""
+    bal = _BAL_CACHE.get("bal")
+    return dict(bal) if isinstance(bal, dict) else {}
+
+def refresh_balances_once() -> dict:
+    """Single-owner live Balance refresh used by the background refresher."""
+    return _fetch_balances()
+
+def _balance_refresh_loop() -> None:
+    try:
+        startup_delay = float(os.getenv("BALANCE_BOOTSTRAP_STARTUP_DELAY_SEC", "20") or 20.0)
+    except Exception:
+        startup_delay = 20.0
+    try:
+        interval = float(os.getenv("BALANCE_REFRESH_INTERVAL_SEC", os.getenv("BALANCE_CACHE_TTL_SEC", "120")) or 120.0)
+    except Exception:
+        interval = 120.0
+    interval = max(15.0, float(interval))
+    if startup_delay > 0:
+        _BALANCE_REFRESH_STOP.wait(startup_delay)
+    while not _BALANCE_REFRESH_STOP.is_set():
+        try:
+            refresh_balances_once()
+        except Exception:
+            pass
+        _BALANCE_REFRESH_STOP.wait(interval)
+
+def start_balance_refresh_daemon() -> bool:
+    """Start the single-owner background Balance refresher once per process."""
+    global _BALANCE_REFRESH_THREAD, _BALANCE_REFRESH_STARTED
+    if _BALANCE_REFRESH_STARTED and _BALANCE_REFRESH_THREAD and _BALANCE_REFRESH_THREAD.is_alive():
+        return False
+    _BALANCE_REFRESH_STOP.clear()
+    t = threading.Thread(target=_balance_refresh_loop, name="kraken-balance-refresh", daemon=True)
+    t.start()
+    _BALANCE_REFRESH_THREAD = t
+    _BALANCE_REFRESH_STARTED = True
+    return True
+
 def _private_endpoint_cooldown_remaining(path: str) -> float:
     try:
         return max(0.0, float(_PRIVATE_COOLDOWN_UNTIL.get(str(path or ""), 0.0) or 0.0) - time.time())
@@ -306,8 +317,8 @@ def _get_balance_float(bal: dict, ui_asset: str) -> float:
     return 0.0
 
 
-def _refresh_balances_owner_once() -> dict:
-    """Single owner live Balance refresh. Request paths should use cache-only reads."""
+def _fetch_balances() -> dict:
+    """Fetch Kraken balances (private Balance), with cache, singleflight, and grace."""
     ttl_env = os.getenv("KRAKEN_BALANCE_TTL_SEC", os.getenv("BALANCE_CACHE_TTL_SEC", "3.0"))
     grace_env = os.getenv("KRAKEN_BALANCE_STALE_GRACE_SEC", os.getenv("BALANCE_STALE_GRACE_SEC", "900"))
     try:
@@ -327,7 +338,7 @@ def _refresh_balances_owner_once() -> dict:
     cached_bal = _BAL_CACHE.get("bal") if isinstance(_BAL_CACHE.get("bal"), dict) else {}
 
     if ttl > 0 and (now - ts) < ttl and isinstance(cached_bal, dict):
-        return cached_bal
+        return cached_bal  # type: ignore[return-value]
 
     with _BAL_FETCH_LOCK:
         now = time.time()
@@ -337,17 +348,16 @@ def _refresh_balances_owner_once() -> dict:
             ts = 0.0
         cached_bal = _BAL_CACHE.get("bal") if isinstance(_BAL_CACHE.get("bal"), dict) else {}
         if ttl > 0 and (now - ts) < ttl and isinstance(cached_bal, dict):
-            return cached_bal
+            return cached_bal  # type: ignore[return-value]
 
         cooldown_remaining = _private_endpoint_cooldown_remaining("Balance")
         if cooldown_remaining > 0 and isinstance(cached_bal, dict) and cached_bal and (now - ts) <= stale_grace:
-            return cached_bal
+            return cached_bal  # type: ignore[return-value]
         if cooldown_remaining > 0:
             try:
                 _record_balance_bootstrap_event(status="cooldown_blocked", result=cached_bal if isinstance(cached_bal, dict) else {}, cooldown_remaining=cooldown_remaining)
             except Exception:
                 pass
-            raise RuntimeError(f"Kraken private call cooldown active: Balance remaining={round(cooldown_remaining, 3)}s reason={_private_endpoint_cooldown_reason('Balance')}")
 
         try:
             bal = _priv("Balance", {}) or {}
@@ -363,45 +373,10 @@ def _refresh_balances_owner_once() -> dict:
             except Exception:
                 pass
             if isinstance(cached_bal, dict) and cached_bal and (now - ts) <= stale_grace:
-                return cached_bal
+                return cached_bal  # type: ignore[return-value]
             raise
 
 
-def _fetch_balances() -> dict:
-    return _refresh_balances_owner_once()
-
-
-def start_balance_refresh_daemon() -> None:
-    global _BALANCE_REFRESH_THREAD_STARTED, _BALANCE_REFRESH_THREAD
-    with _BALANCE_REFRESH_THREAD_LOCK:
-        if _BALANCE_REFRESH_THREAD_STARTED:
-            return
-        _BALANCE_REFRESH_THREAD_STARTED = True
-
-        startup_delay_env = os.getenv("BALANCE_BOOTSTRAP_STARTUP_DELAY_SEC", "20")
-        interval_env = os.getenv("BALANCE_OWNER_REFRESH_INTERVAL_SEC", os.getenv("BALANCE_CACHE_TTL_SEC", "120"))
-        try:
-            startup_delay = max(0.0, float(startup_delay_env or 20.0))
-        except Exception:
-            startup_delay = 20.0
-        try:
-            interval = max(30.0, float(interval_env or 120.0))
-        except Exception:
-            interval = 120.0
-
-        def _loop() -> None:
-            if startup_delay > 0:
-                time.sleep(startup_delay)
-            while True:
-                try:
-                    _refresh_balances_owner_once()
-                except Exception:
-                    pass
-                time.sleep(interval)
-
-        t = threading.Thread(target=_loop, name="kraken-balance-refresh", daemon=True)
-        _BALANCE_REFRESH_THREAD = t
-        t.start()
 # ---------------------------------------------------------------------------
 # Pair metadata (ordermin / lot_decimals) for minimum-volume + precision guards
 # ---------------------------------------------------------------------------
