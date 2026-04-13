@@ -169,9 +169,15 @@ def balances_by_asset() -> Dict[str, float]:
             if asset and qty > 0:
                 out[asset] = qty
 
-    if not out and isinstance(bal, dict) and bal and LAST_BALANCE_ERROR is None:
-        # Balance returned something but nothing parsed as non-zero
-        LAST_BALANCE_ERROR = "Balance parsed empty (all zero or non-numeric)"
+    if LAST_BALANCE_ERROR is None:
+        try:
+            meta = broker_kraken.get_balance_cache_meta()
+        except Exception:
+            meta = {}
+        if not bool(meta.get("seeded")):
+            LAST_BALANCE_ERROR = "balance cache unseeded"
+        elif not out and isinstance(bal, dict) and bal:
+            LAST_BALANCE_ERROR = "Balance parsed empty (all zero or non-numeric)"
 
     return out
 

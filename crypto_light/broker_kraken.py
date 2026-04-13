@@ -197,7 +197,7 @@ _ASSET_CODE_OVERRIDES = {
 }
 
 # Balance cache (seconds) to prevent repeated private Balance calls within a single tick
-_BAL_CACHE: Dict[str, Any] = {"ts": 0.0, "bal": {}}
+_BAL_CACHE: Dict[str, Any] = {"ts": 0.0, "bal": {}, "seeded": False, "last_success_ts": 0.0, "last_error": "", "last_attempt_ts": 0.0, "source": "unseeded"}
 _OPEN_ORDERS_CACHE: Dict[str, Any] = {"ts": 0.0, "open": {}}
 _BAL_FETCH_LOCK = threading.Lock()
 _OPEN_ORDERS_FETCH_LOCK = threading.Lock()
@@ -209,8 +209,37 @@ _BALANCE_REFRESH_THREAD: Optional[threading.Thread] = None
 _BALANCE_REFRESH_STOP = threading.Event()
 _BALANCE_REFRESH_STARTED = False
 
+def get_balance_cache_meta() -> dict:
+    try:
+        ts = float(_BAL_CACHE.get("ts") or 0.0)
+    except Exception:
+        ts = 0.0
+    try:
+        last_success_ts = float(_BAL_CACHE.get("last_success_ts") or 0.0)
+    except Exception:
+        last_success_ts = 0.0
+    try:
+        last_attempt_ts = float(_BAL_CACHE.get("last_attempt_ts") or 0.0)
+    except Exception:
+        last_attempt_ts = 0.0
+    return {
+        "seeded": bool(_BAL_CACHE.get("seeded")),
+        "ts": ts,
+        "last_success_ts": last_success_ts,
+        "last_attempt_ts": last_attempt_ts,
+        "last_error": str(_BAL_CACHE.get("last_error") or ""),
+        "source": str(_BAL_CACHE.get("source") or ""),
+    }
+
+
 def get_cached_balances() -> dict:
-    """Return cached Balance snapshot only; never performs a live private call."""
+    """Return cached Balance snapshot only; never performs a live private call.
+
+    Raises when the cache has never been successfully seeded so request-time readers
+    cannot confuse an unseeded empty cache with a valid zero-balance state.
+    """
+    if not bool(_BAL_CACHE.get("seeded")):
+        raise RuntimeError("balance cache unseeded")
     bal = _BAL_CACHE.get("bal")
     return dict(bal) if isinstance(bal, dict) else {}
 
@@ -336,8 +365,9 @@ def _fetch_balances() -> dict:
     except Exception:
         ts = 0.0
     cached_bal = _BAL_CACHE.get("bal") if isinstance(_BAL_CACHE.get("bal"), dict) else {}
+    seeded = bool(_BAL_CACHE.get("seeded"))
 
-    if ttl > 0 and (now - ts) < ttl and isinstance(cached_bal, dict):
+    if seeded and ttl > 0 and (now - ts) < ttl and isinstance(cached_bal, dict):
         return cached_bal  # type: ignore[return-value]
 
     with _BAL_FETCH_LOCK:
@@ -347,11 +377,12 @@ def _fetch_balances() -> dict:
         except Exception:
             ts = 0.0
         cached_bal = _BAL_CACHE.get("bal") if isinstance(_BAL_CACHE.get("bal"), dict) else {}
-        if ttl > 0 and (now - ts) < ttl and isinstance(cached_bal, dict):
+        seeded = bool(_BAL_CACHE.get("seeded"))
+        if seeded and ttl > 0 and (now - ts) < ttl and isinstance(cached_bal, dict):
             return cached_bal  # type: ignore[return-value]
 
         cooldown_remaining = _private_endpoint_cooldown_remaining("Balance")
-        if cooldown_remaining > 0 and isinstance(cached_bal, dict) and cached_bal and (now - ts) <= stale_grace:
+        if cooldown_remaining > 0 and seeded and isinstance(cached_bal, dict) and (now - ts) <= stale_grace:
             return cached_bal  # type: ignore[return-value]
         if cooldown_remaining > 0:
             try:
@@ -360,19 +391,31 @@ def _fetch_balances() -> dict:
                 pass
 
         try:
+            _BAL_CACHE["last_attempt_ts"] = time.time()
             bal = _priv("Balance", {}) or {}
             if not isinstance(bal, dict):
                 bal = {}
-            _BAL_CACHE["ts"] = time.time()
+            now_success = time.time()
+            _BAL_CACHE["ts"] = now_success
             _BAL_CACHE["bal"] = bal
+            _BAL_CACHE["seeded"] = True
+            _BAL_CACHE["last_success_ts"] = now_success
+            _BAL_CACHE["last_error"] = ""
+            _BAL_CACHE["source"] = "live_success"
+            try:
+                _record_balance_bootstrap_event(status="success", result=bal, cooldown_remaining=0.0)
+            except Exception:
+                pass
             _clear_private_endpoint_cooldown("Balance")
             return bal
         except Exception as e:
+            _BAL_CACHE["last_error"] = str(e)
+            _BAL_CACHE["source"] = "exception"
             try:
                 _record_balance_bootstrap_event(status="exception", exception=e, cooldown_remaining=_private_endpoint_cooldown_remaining("Balance"))
             except Exception:
                 pass
-            if isinstance(cached_bal, dict) and cached_bal and (now - ts) <= stale_grace:
+            if seeded and isinstance(cached_bal, dict) and (now - ts) <= stale_grace:
                 return cached_bal  # type: ignore[return-value]
             raise
 
