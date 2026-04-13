@@ -1,1 +1,0 @@
-Patch 049: profitability unlock without journal/lifecycle regression
