@@ -113,6 +113,63 @@ import requests
 
 logger = logging.getLogger("broker_kraken")
 
+
+_BALANCE_BOOTSTRAP_PATH = Path(os.getenv("BALANCE_BOOTSTRAP_SNAPSHOT_PATH", "/var/data/kraken_balance_bootstrap.json"))
+
+def _write_balance_bootstrap_event(payload: Dict[str, Any]) -> None:
+    try:
+        _BALANCE_BOOTSTRAP_PATH.parent.mkdir(parents=True, exist_ok=True)
+        tmp = _BALANCE_BOOTSTRAP_PATH.with_suffix(_BALANCE_BOOTSTRAP_PATH.suffix + ".tmp")
+        tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        tmp.replace(_BALANCE_BOOTSTRAP_PATH)
+    except Exception:
+        return
+
+def _record_balance_bootstrap_event(*, status: str, result: Any = None, errors: Any = None, exception: Any = None, cooldown_remaining: float | None = None) -> None:
+    try:
+        payload: Dict[str, Any] = {
+            "utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "status": str(status or "unknown"),
+            "result_type": type(result).__name__ if result is not None else None,
+            "result_is_dict": isinstance(result, dict),
+            "result_keys": sorted(list(result.keys()))[:100] if isinstance(result, dict) else [],
+            "result_size": len(result) if isinstance(result, dict) else None,
+            "sample": {},
+            "errors": list(errors or []),
+            "exception": str(exception) if exception else None,
+            "cooldown_remaining": float(cooldown_remaining or 0.0),
+        }
+        if isinstance(result, dict):
+            sample = {}
+            for k in sorted(result.keys())[:20]:
+                try:
+                    v = result.get(k)
+                    if isinstance(v, (str, int, float, bool)) or v is None:
+                        sample[str(k)] = v
+                    else:
+                        sample[str(k)] = str(v)
+                except Exception:
+                    continue
+            payload["sample"] = sample
+            # bootstrap-specific hints
+            usd_keys = [k for k in result.keys() if str(k).upper() in ("USD","ZUSD","USDT","USDC")]
+            payload["usd_keys"] = usd_keys
+            try:
+                payload["usd_values"] = {str(k): result.get(k) for k in usd_keys}
+            except Exception:
+                payload["usd_values"] = {}
+        _write_balance_bootstrap_event(payload)
+    except Exception:
+        return
+
+def read_balance_bootstrap_event() -> Dict[str, Any]:
+    try:
+        if not _BALANCE_BOOTSTRAP_PATH.exists():
+            return {}
+        return json.loads(_BALANCE_BOOTSTRAP_PATH.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
 _NONCE_LOCK = threading.Lock()
 _LAST_NONCE = 0
 
@@ -251,6 +308,11 @@ def _fetch_balances() -> dict:
         cooldown_remaining = _private_endpoint_cooldown_remaining("Balance")
         if cooldown_remaining > 0 and isinstance(cached_bal, dict) and cached_bal and (now - ts) <= stale_grace:
             return cached_bal  # type: ignore[return-value]
+        if cooldown_remaining > 0:
+            try:
+                _record_balance_bootstrap_event(status="cooldown_blocked", result=cached_bal if isinstance(cached_bal, dict) else {}, cooldown_remaining=cooldown_remaining)
+            except Exception:
+                pass
 
         try:
             bal = _priv("Balance", {}) or {}
@@ -260,7 +322,11 @@ def _fetch_balances() -> dict:
             _BAL_CACHE["bal"] = bal
             _clear_private_endpoint_cooldown("Balance")
             return bal
-        except Exception:
+        except Exception as e:
+            try:
+                _record_balance_bootstrap_event(status="exception", exception=e, cooldown_remaining=_private_endpoint_cooldown_remaining("Balance"))
+            except Exception:
+                pass
             if isinstance(cached_bal, dict) and cached_bal and (now - ts) <= stale_grace:
                 return cached_bal  # type: ignore[return-value]
             raise
@@ -550,6 +616,16 @@ def _priv(path: str, data: dict | None = None) -> dict:
                         reason="; ".join([str(e) for e in errors if e]),
                         seconds=_private_endpoint_cooldown_seconds(managed_path),
                     )
+                if managed_path == "Balance":
+                    try:
+                        _record_balance_bootstrap_event(
+                            status="error",
+                            result=payload.get("result"),
+                            errors=errors,
+                            cooldown_remaining=_private_endpoint_cooldown_remaining("Balance"),
+                        )
+                    except Exception:
+                        pass
                 if transient and attempt < 5:
                     # Exponential-ish backoff with jitter
                     sleep_s = min(8.0, 0.4 * (2 ** (attempt - 1))) + (0.05 * attempt)
@@ -559,6 +635,12 @@ def _priv(path: str, data: dict | None = None) -> dict:
                 raise RuntimeError(f"Kraken private call failed: {path} errors={errors}")
 
             result = payload.get("result") or {}
+
+            if managed_path == "Balance":
+                try:
+                    _record_balance_bootstrap_event(status="success", result=result, cooldown_remaining=0.0)
+                except Exception:
+                    pass
 
             if managed_path in ("Balance", "OpenOrders"):
                 _clear_private_endpoint_cooldown(managed_path)

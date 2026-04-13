@@ -3320,6 +3320,10 @@ def _account_truth_snapshot(*, refresh: bool = True) -> dict:
             _write_balance_truth_snapshot(snapshot)
         else:
             snapshot = _apply_last_known_good_balance_fallback(snapshot, positions_count=positions_count, open_order_count=open_order_count)
+        try:
+            snapshot['balance_bootstrap'] = broker_kraken.read_balance_bootstrap_event() or {}
+        except Exception:
+            snapshot['balance_bootstrap'] = {}
         _ACCOUNT_TRUTH_CACHE["ts"] = time.time()
         _ACCOUNT_TRUTH_CACHE["snapshot"] = dict(snapshot)
         return snapshot
@@ -3624,6 +3628,26 @@ def _reconcile_runtime_state() -> dict:
 @app.get("/diagnostics/account_truth")
 def diagnostics_account_truth():
     return _account_truth_snapshot()
+
+
+@app.get("/diagnostics/balance_bootstrap")
+def diagnostics_balance_bootstrap():
+    try:
+        event = broker_kraken.read_balance_bootstrap_event() or {}
+    except Exception as e:
+        event = {"ok": False, "error": f"{type(e).__name__}: {e}"}
+    return {
+        "ok": True,
+        "utc": utc_now_iso(),
+        "build": PATCH_BUILD,
+        "service": {
+            "name": PATCH_BUILD.get("system_name"),
+            "role": PATCH_BUILD.get("service_role"),
+            "env_name": PATCH_BUILD.get("env_name"),
+            "release_stage": PATCH_BUILD.get("release_stage_configured"),
+        },
+        "balance_bootstrap": event,
+    }
 
 
 @app.get("/diagnostics/holdings_truth")
@@ -7338,16 +7362,12 @@ def scan_entries(payload: WorkerScanPayload):
             }
         )
 
-    # --- Balance debug ---
-    # Do not force a live balance refresh from scan diagnostics. Scans run every 60s
-    # and should not consume additional private Kraken budget just to populate
-    # debug-only fields. Reuse cached account truth instead.
-    account_truth_dbg = _account_truth_snapshot(refresh=False)
-    bal_dbg = dict(account_truth_dbg.get("canonical_balances") or account_truth_dbg.get("raw_merged_balances") or {})
-    stable_cash_dbg = float(account_truth_dbg.get("cash_usd", 0.0) or 0.0)
+    # --- Equity debug (helps diagnose no_equity quickly) ---
+    bal_dbg = _balances_by_asset()
+    stable_cash_dbg = _stable_cash_usd(bal_dbg)
     bal_keys_dbg = sorted(list(bal_dbg.keys()))[:20]
-    bal_err_dbg = account_truth_dbg.get("balance_error") or _last_balance_error()
-
+    bal_err_dbg = _last_balance_error()
+    
     # 6) Return diagnostics
     strategy_summary: Dict[str, Any] = {}
     for sym, d in (per_symbol or {}).items():
@@ -7580,31 +7600,9 @@ def ready_endpoint():
 
 @app.get("/diagnostics/scanner_coordination")
 def diagnostics_scanner_coordination(lookback_sec: int = 900, limit: int = 50):
-    try:
-        coordination = _scanner_coordination_snapshot(lookback_sec=lookback_sec, limit=limit)
-        ok = True
-        error = None
-    except Exception as e:
-        coordination = {
-            "ok": False,
-            "reason": f"{type(e).__name__}: {e}",
-            "lookback_sec": max(60, int(lookback_sec or 900)),
-            "active_workflow_locks": [],
-            "recent_admission_passed": [],
-            "active_signal_fingerprints": [],
-            "suppressed_symbols": [],
-            "hard_suppressed_symbols": [],
-            "counts": {
-                "active_workflow_locks": 0,
-                "recent_admission_passed": 0,
-                "active_signal_fingerprints": 0,
-                "suppressed_symbols": 0,
-            },
-        }
-        ok = False
-        error = f"{type(e).__name__}: {e}"
+    coordination = _scanner_coordination_snapshot(lookback_sec=lookback_sec, limit=limit)
     return {
-        "ok": ok,
+        "ok": True,
         "utc": utc_now_iso(),
         "build": PATCH_BUILD,
         "service": {
@@ -7613,7 +7611,6 @@ def diagnostics_scanner_coordination(lookback_sec: int = 900, limit: int = 50):
             "env_name": PATCH_BUILD.get("env_name"),
             "release_stage": PATCH_BUILD.get("release_stage_configured"),
         },
-        "error": error,
         "coordination": coordination,
     }
 
