@@ -166,9 +166,51 @@ def read_balance_bootstrap_event() -> Dict[str, Any]:
     try:
         if not _BALANCE_BOOTSTRAP_PATH.exists():
             return {}
+        if _BALANCE_BOOTSTRAP_PATH.stat().st_mtime < _PROCESS_START_TS:
+            return {}
         return json.loads(_BALANCE_BOOTSTRAP_PATH.read_text(encoding="utf-8"))
     except Exception:
         return {}
+
+
+def _set_bootstrap_liveness(kind: str, **updates: Any) -> None:
+    try:
+        state = _BOOTSTRAP_LIVENESS.setdefault(str(kind or "unknown"), {})
+        state.update(updates)
+    except Exception:
+        return
+
+
+def _serialize_bootstrap_liveness(kind: str) -> Dict[str, Any]:
+    state = dict(_BOOTSTRAP_LIVENESS.get(str(kind or "unknown")) or {})
+    try:
+        tick_ts = float(state.get("last_tick_ts") or 0.0)
+    except Exception:
+        tick_ts = 0.0
+    state["last_tick_ts"] = tick_ts
+    state["last_tick_utc"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(tick_ts)) if tick_ts > 0 else None
+    return state
+
+
+def get_broker_bootstrap_liveness() -> Dict[str, Any]:
+    return {
+        "process_start_ts": float(_PROCESS_START_TS),
+        "process_start_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(_PROCESS_START_TS)),
+        "balance": _serialize_bootstrap_liveness("balance"),
+        "open_orders": _serialize_bootstrap_liveness("open_orders"),
+    }
+
+
+def _invalidate_stale_bootstrap_artifacts() -> Dict[str, bool]:
+    invalidated = {"balance": False}
+    try:
+        if _BALANCE_BOOTSTRAP_PATH.exists() and _BALANCE_BOOTSTRAP_PATH.stat().st_mtime < _PROCESS_START_TS:
+            _BALANCE_BOOTSTRAP_PATH.unlink(missing_ok=True)
+            invalidated["balance"] = True
+    except Exception:
+        pass
+    _set_bootstrap_liveness("balance", stale_file_invalidated=bool(invalidated.get("balance")))
+    return invalidated
 
 _NONCE_LOCK = threading.Lock()
 _LAST_NONCE = 0
@@ -206,6 +248,10 @@ _PRIVATE_COOLDOWN_UNTIL: Dict[str, float] = {"Balance": 0.0, "OpenOrders": 0.0}
 _PRIVATE_COOLDOWN_REASON: Dict[str, str] = {"Balance": "", "OpenOrders": ""}
 _PROCESS_START_TS = time.time()
 
+_BOOTSTRAP_LIVENESS: Dict[str, Dict[str, Any]] = {
+    "balance": {"daemon_started": False, "thread_alive": False, "last_tick_ts": 0.0, "last_phase": "not_started", "last_error": "", "startup_delay_sec": 0.0, "stale_file_invalidated": False},
+    "open_orders": {"daemon_started": False, "thread_alive": False, "last_tick_ts": 0.0, "last_phase": "not_started", "last_error": "", "startup_delay_sec": 0.0, "stale_file_invalidated": False},
+}
 
 _BALANCE_REFRESH_THREAD: Optional[threading.Thread] = None
 _BALANCE_REFRESH_STOP = threading.Event()
@@ -227,7 +273,7 @@ def get_balance_cache_meta() -> dict:
         last_attempt_ts = float(_BAL_CACHE.get("last_attempt_ts") or 0.0)
     except Exception:
         last_attempt_ts = 0.0
-    return {
+    meta = {
         "seeded": bool(_BAL_CACHE.get("seeded")),
         "ts": ts,
         "last_success_ts": last_success_ts,
@@ -235,6 +281,8 @@ def get_balance_cache_meta() -> dict:
         "last_error": str(_BAL_CACHE.get("last_error") or ""),
         "source": str(_BAL_CACHE.get("source") or ""),
     }
+    meta.update({f"daemon_{k}": v for k, v in _serialize_bootstrap_liveness("balance").items()})
+    return meta
 
 
 def get_cached_balances() -> dict:
@@ -254,9 +302,9 @@ def refresh_balances_once() -> dict:
 
 def _balance_refresh_loop() -> None:
     try:
-        startup_delay = float(os.getenv("BALANCE_BOOTSTRAP_STARTUP_DELAY_SEC", "90") or 90.0)
+        startup_delay = float(os.getenv("BALANCE_BOOTSTRAP_STARTUP_DELAY_SEC", "30") or 30.0)
     except Exception:
-        startup_delay = 90.0
+        startup_delay = 30.0
     try:
         interval = float(os.getenv("BALANCE_REFRESH_INTERVAL_SEC", os.getenv("BALANCE_CACHE_TTL_SEC", "120")) or 120.0)
     except Exception:
@@ -266,28 +314,38 @@ def _balance_refresh_loop() -> None:
     except Exception:
         max_backoff = 600.0
     interval = max(30.0, float(interval))
+    _set_bootstrap_liveness("balance", daemon_started=True, thread_alive=True, startup_delay_sec=float(startup_delay), last_tick_ts=time.time(), last_phase="starting")
     if startup_delay > 0:
+        _record_balance_bootstrap_event(status="startup_wait", result={"startup_delay_sec": float(startup_delay), "process_start_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(_PROCESS_START_TS))})
+        _set_bootstrap_liveness("balance", last_tick_ts=time.time(), last_phase="startup_wait")
         _BALANCE_REFRESH_STOP.wait(startup_delay)
     failure_count = 0
     while not _BALANCE_REFRESH_STOP.is_set():
         ok = False
+        _set_bootstrap_liveness("balance", thread_alive=True, last_tick_ts=time.time(), last_phase="attempting", last_error="")
+        _BAL_CACHE["last_attempt_ts"] = time.time()
         try:
             with _BROKER_BOOTSTRAP_LOCK:
                 refresh_balances_once()
             ok = True
             failure_count = 0
-        except Exception:
+            _set_bootstrap_liveness("balance", thread_alive=True, last_tick_ts=time.time(), last_phase="success", last_error="")
+        except Exception as e:
             failure_count += 1
+            _set_bootstrap_liveness("balance", thread_alive=True, last_tick_ts=time.time(), last_phase="error", last_error=str(e))
         wait_s = interval if ok else min(max_backoff, interval * (2 ** min(failure_count, 4)))
         wait_s += min(7.0, 0.5 * failure_count)
         _BALANCE_REFRESH_STOP.wait(wait_s)
+    _set_bootstrap_liveness("balance", thread_alive=False, last_tick_ts=time.time(), last_phase="stopped")
 
 def start_balance_refresh_daemon() -> bool:
     """Start the single-owner background Balance refresher once per process."""
     global _BALANCE_REFRESH_THREAD, _BALANCE_REFRESH_STARTED
     if _BALANCE_REFRESH_STARTED and _BALANCE_REFRESH_THREAD and _BALANCE_REFRESH_THREAD.is_alive():
         return False
+    _invalidate_stale_bootstrap_artifacts()
     _BALANCE_REFRESH_STOP.clear()
+    _set_bootstrap_liveness("balance", daemon_started=True, thread_alive=False, last_tick_ts=time.time(), last_phase="daemon_starting", last_error="")
     t = threading.Thread(target=_balance_refresh_loop, name="kraken-balance-refresh", daemon=True)
     t.start()
     _BALANCE_REFRESH_THREAD = t
@@ -1778,7 +1836,7 @@ def get_open_orders_cache_meta() -> dict:
         last_attempt_ts = float(_OPEN_ORDERS_CACHE.get("last_attempt_ts") or 0.0)
     except Exception:
         last_attempt_ts = 0.0
-    return {
+    meta = {
         "ts": ts,
         "seeded": bool(_OPEN_ORDERS_CACHE.get("seeded")),
         "last_success_ts": last_success_ts,
@@ -1786,6 +1844,8 @@ def get_open_orders_cache_meta() -> dict:
         "last_error": str(_OPEN_ORDERS_CACHE.get("last_error") or ""),
         "source": str(_OPEN_ORDERS_CACHE.get("source") or ""),
     }
+    meta.update({f"daemon_{k}": v for k, v in _serialize_bootstrap_liveness("open_orders").items()})
+    return meta
 
 def refresh_open_orders_once() -> dict:
     """Single-owner live OpenOrders refresh used by the background refresher."""
@@ -1793,9 +1853,9 @@ def refresh_open_orders_once() -> dict:
 
 def _open_orders_refresh_loop() -> None:
     try:
-        startup_delay = float(os.getenv("OPEN_ORDERS_BOOTSTRAP_STARTUP_DELAY_SEC", "240") or 240.0)
+        startup_delay = float(os.getenv("OPEN_ORDERS_BOOTSTRAP_STARTUP_DELAY_SEC", "120") or 120.0)
     except Exception:
-        startup_delay = 240.0
+        startup_delay = 120.0
     try:
         interval = float(os.getenv("OPEN_ORDERS_REFRESH_INTERVAL_SEC", os.getenv("BROKER_STATE_CACHE_TTL_SEC", "180")) or 180.0)
     except Exception:
@@ -1805,30 +1865,38 @@ def _open_orders_refresh_loop() -> None:
     except Exception:
         max_backoff = 600.0
     try:
-        balance_first_delay = float(os.getenv("OPEN_ORDERS_AFTER_BALANCE_DELAY_SEC", "60") or 60.0)
+        balance_first_delay = float(os.getenv("OPEN_ORDERS_AFTER_BALANCE_DELAY_SEC", "45") or 45.0)
     except Exception:
-        balance_first_delay = 60.0
+        balance_first_delay = 45.0
     interval = max(60.0, float(interval))
+    _set_bootstrap_liveness("open_orders", daemon_started=True, thread_alive=True, startup_delay_sec=float(startup_delay), last_tick_ts=time.time(), last_phase="starting")
     if startup_delay > 0:
+        _set_bootstrap_liveness("open_orders", last_tick_ts=time.time(), last_phase="startup_wait")
         _OPEN_ORDERS_REFRESH_STOP.wait(startup_delay)
     failure_count = 0
     while not _OPEN_ORDERS_REFRESH_STOP.is_set():
         balance_seeded = bool(_BAL_CACHE.get("seeded"))
         process_age = max(0.0, time.time() - _PROCESS_START_TS)
         if (not balance_seeded) and process_age < (startup_delay + balance_first_delay):
+            _set_bootstrap_liveness("open_orders", thread_alive=True, last_tick_ts=time.time(), last_phase="waiting_for_balance_seed")
             _OPEN_ORDERS_REFRESH_STOP.wait(min(30.0, balance_first_delay))
             continue
         ok = False
+        _set_bootstrap_liveness("open_orders", thread_alive=True, last_tick_ts=time.time(), last_phase="attempting", last_error="")
+        _OPEN_ORDERS_CACHE["last_attempt_ts"] = time.time()
         try:
             with _BROKER_BOOTSTRAP_LOCK:
                 refresh_open_orders_once()
             ok = True
             failure_count = 0
-        except Exception:
+            _set_bootstrap_liveness("open_orders", thread_alive=True, last_tick_ts=time.time(), last_phase="success", last_error="")
+        except Exception as e:
             failure_count += 1
+            _set_bootstrap_liveness("open_orders", thread_alive=True, last_tick_ts=time.time(), last_phase="error", last_error=str(e))
         wait_s = interval if ok else min(max_backoff, interval * (2 ** min(failure_count, 4)))
         wait_s += min(11.0, 0.75 * failure_count)
         _OPEN_ORDERS_REFRESH_STOP.wait(wait_s)
+    _set_bootstrap_liveness("open_orders", thread_alive=False, last_tick_ts=time.time(), last_phase="stopped")
 
 def start_open_orders_refresh_daemon() -> bool:
     """Start the single-owner background OpenOrders refresher once per process."""
@@ -1836,6 +1904,7 @@ def start_open_orders_refresh_daemon() -> bool:
     if _OPEN_ORDERS_REFRESH_STARTED and _OPEN_ORDERS_REFRESH_THREAD and _OPEN_ORDERS_REFRESH_THREAD.is_alive():
         return False
     _OPEN_ORDERS_REFRESH_STOP.clear()
+    _set_bootstrap_liveness("open_orders", daemon_started=True, thread_alive=False, last_tick_ts=time.time(), last_phase="daemon_starting", last_error="")
     t = threading.Thread(target=_open_orders_refresh_loop, name="kraken-open-orders-refresh", daemon=True)
     t.start()
     _OPEN_ORDERS_REFRESH_THREAD = t
