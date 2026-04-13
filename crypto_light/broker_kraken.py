@@ -198,16 +198,21 @@ _ASSET_CODE_OVERRIDES = {
 
 # Balance cache (seconds) to prevent repeated private Balance calls within a single tick
 _BAL_CACHE: Dict[str, Any] = {"ts": 0.0, "bal": {}, "seeded": False, "last_success_ts": 0.0, "last_error": "", "last_attempt_ts": 0.0, "source": "unseeded"}
-_OPEN_ORDERS_CACHE: Dict[str, Any] = {"ts": 0.0, "open": {}}
+_OPEN_ORDERS_CACHE: Dict[str, Any] = {"ts": 0.0, "open": {}, "seeded": False, "last_success_ts": 0.0, "last_error": "", "last_attempt_ts": 0.0, "source": "unseeded"}
 _BAL_FETCH_LOCK = threading.Lock()
 _OPEN_ORDERS_FETCH_LOCK = threading.Lock()
+_BROKER_BOOTSTRAP_LOCK = threading.Lock()
 _PRIVATE_COOLDOWN_UNTIL: Dict[str, float] = {"Balance": 0.0, "OpenOrders": 0.0}
 _PRIVATE_COOLDOWN_REASON: Dict[str, str] = {"Balance": "", "OpenOrders": ""}
+_PROCESS_START_TS = time.time()
 
 
 _BALANCE_REFRESH_THREAD: Optional[threading.Thread] = None
 _BALANCE_REFRESH_STOP = threading.Event()
 _BALANCE_REFRESH_STARTED = False
+_OPEN_ORDERS_REFRESH_THREAD: Optional[threading.Thread] = None
+_OPEN_ORDERS_REFRESH_STOP = threading.Event()
+_OPEN_ORDERS_REFRESH_STARTED = False
 
 def get_balance_cache_meta() -> dict:
     try:
@@ -249,22 +254,33 @@ def refresh_balances_once() -> dict:
 
 def _balance_refresh_loop() -> None:
     try:
-        startup_delay = float(os.getenv("BALANCE_BOOTSTRAP_STARTUP_DELAY_SEC", "20") or 20.0)
+        startup_delay = float(os.getenv("BALANCE_BOOTSTRAP_STARTUP_DELAY_SEC", "90") or 90.0)
     except Exception:
-        startup_delay = 20.0
+        startup_delay = 90.0
     try:
         interval = float(os.getenv("BALANCE_REFRESH_INTERVAL_SEC", os.getenv("BALANCE_CACHE_TTL_SEC", "120")) or 120.0)
     except Exception:
         interval = 120.0
-    interval = max(15.0, float(interval))
+    try:
+        max_backoff = float(os.getenv("BROKER_BOOTSTRAP_MAX_BACKOFF_SEC", "600") or 600.0)
+    except Exception:
+        max_backoff = 600.0
+    interval = max(30.0, float(interval))
     if startup_delay > 0:
         _BALANCE_REFRESH_STOP.wait(startup_delay)
+    failure_count = 0
     while not _BALANCE_REFRESH_STOP.is_set():
+        ok = False
         try:
-            refresh_balances_once()
+            with _BROKER_BOOTSTRAP_LOCK:
+                refresh_balances_once()
+            ok = True
+            failure_count = 0
         except Exception:
-            pass
-        _BALANCE_REFRESH_STOP.wait(interval)
+            failure_count += 1
+        wait_s = interval if ok else min(max_backoff, interval * (2 ** min(failure_count, 4)))
+        wait_s += min(7.0, 0.5 * failure_count)
+        _BALANCE_REFRESH_STOP.wait(wait_s)
 
 def start_balance_refresh_daemon() -> bool:
     """Start the single-owner background Balance refresher once per process."""
@@ -1777,22 +1793,42 @@ def refresh_open_orders_once() -> dict:
 
 def _open_orders_refresh_loop() -> None:
     try:
-        startup_delay = float(os.getenv("OPEN_ORDERS_BOOTSTRAP_STARTUP_DELAY_SEC", "35") or 35.0)
+        startup_delay = float(os.getenv("OPEN_ORDERS_BOOTSTRAP_STARTUP_DELAY_SEC", "240") or 240.0)
     except Exception:
-        startup_delay = 35.0
+        startup_delay = 240.0
     try:
         interval = float(os.getenv("OPEN_ORDERS_REFRESH_INTERVAL_SEC", os.getenv("BROKER_STATE_CACHE_TTL_SEC", "180")) or 180.0)
     except Exception:
         interval = 180.0
-    interval = max(30.0, float(interval))
+    try:
+        max_backoff = float(os.getenv("BROKER_BOOTSTRAP_MAX_BACKOFF_SEC", "600") or 600.0)
+    except Exception:
+        max_backoff = 600.0
+    try:
+        balance_first_delay = float(os.getenv("OPEN_ORDERS_AFTER_BALANCE_DELAY_SEC", "60") or 60.0)
+    except Exception:
+        balance_first_delay = 60.0
+    interval = max(60.0, float(interval))
     if startup_delay > 0:
         _OPEN_ORDERS_REFRESH_STOP.wait(startup_delay)
+    failure_count = 0
     while not _OPEN_ORDERS_REFRESH_STOP.is_set():
+        balance_seeded = bool(_BAL_CACHE.get("seeded"))
+        process_age = max(0.0, time.time() - _PROCESS_START_TS)
+        if (not balance_seeded) and process_age < (startup_delay + balance_first_delay):
+            _OPEN_ORDERS_REFRESH_STOP.wait(min(30.0, balance_first_delay))
+            continue
+        ok = False
         try:
-            refresh_open_orders_once()
+            with _BROKER_BOOTSTRAP_LOCK:
+                refresh_open_orders_once()
+            ok = True
+            failure_count = 0
         except Exception:
-            pass
-        _OPEN_ORDERS_REFRESH_STOP.wait(interval)
+            failure_count += 1
+        wait_s = interval if ok else min(max_backoff, interval * (2 ** min(failure_count, 4)))
+        wait_s += min(11.0, 0.75 * failure_count)
+        _OPEN_ORDERS_REFRESH_STOP.wait(wait_s)
 
 def start_open_orders_refresh_daemon() -> bool:
     """Start the single-owner background OpenOrders refresher once per process."""
