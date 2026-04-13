@@ -773,6 +773,10 @@ def _run_startup_self_check():
         broker_kraken.start_balance_refresh_daemon()
     except Exception:
         pass
+    try:
+        broker_kraken.start_open_orders_refresh_daemon()
+    except Exception:
+        pass
     _startup_self_check(rerun=True)
 
 
@@ -3194,6 +3198,7 @@ def _broker_open_orders_summary(*, refresh: bool = True) -> dict:
         raw = broker_kraken.orders() or {}
     except Exception as e:
         raw = {"error": str(e)}
+    open_meta = broker_kraken.get_open_orders_cache_meta() if hasattr(broker_kraken, 'get_open_orders_cache_meta') else {}
     open_map = (((raw or {}).get('open') or {}) if isinstance(raw, dict) else {})
     items = []
     buy_symbols, sell_symbols = set(), set()
@@ -3208,7 +3213,7 @@ def _broker_open_orders_summary(*, refresh: bool = True) -> dict:
             buy_symbols.add(symbol)
         elif symbol and side == 'sell':
             sell_symbols.add(symbol)
-    summary = {"ok": not bool((raw or {}).get('error')), "error": (raw or {}).get('error'), "buy_symbols": buy_symbols, "sell_symbols": sell_symbols, "items": items, "snapshot_source": "live" if refresh else "cache_only", "cache_age_sec": 0.0}
+    summary = {"ok": not bool((raw or {}).get('error')), "error": (raw or {}).get('error'), "buy_symbols": buy_symbols, "sell_symbols": sell_symbols, "items": items, "snapshot_source": "cache_only" if refresh else "cache_only", "cache_age_sec": 0.0, "open_orders_cache_seeded": bool(open_meta.get('seeded')), "open_orders_cache_source": open_meta.get('source'), "open_orders_last_success_utc": (datetime.fromtimestamp(float(open_meta.get('last_success_ts') or 0.0), timezone.utc).isoformat().replace('+00:00','Z') if float(open_meta.get('last_success_ts') or 0.0) > 0 else None), "open_orders_last_attempt_utc": (datetime.fromtimestamp(float(open_meta.get('last_attempt_ts') or 0.0), timezone.utc).isoformat().replace('+00:00','Z') if float(open_meta.get('last_attempt_ts') or 0.0) > 0 else None), "open_orders_cache_last_error": open_meta.get('last_error')}
     setattr(state, 'broker_open_orders_summary_cache', {'ts': time.time(), 'summary': dict(summary)})
     return summary
 
@@ -3390,6 +3395,10 @@ def _broker_warmup_empty_state_admission(account_truth: dict | None, reconcile: 
         reasons.append('reconcile_not_ok')
 
     broker_open_orders_ok = bool(reconcile.get('broker_open_orders_ok'))
+    balance_cache_seeded = bool(account_truth.get('balance_cache_seeded', False))
+    if not balance_cache_seeded:
+        safe_empty = False
+        reasons.append('balance_cache_unseeded')
     cooldownish = ('cooldown active' in balance_error.lower()) or ('rate limit exceeded' in balance_error.lower())
     staleish_snapshot = snapshot_source in {'stale_within_grace', 'cache', 'cache_only'}
     empty_open_orders_state = (not open_orders_ok) and broker_open_order_count == 0 and positions_count == 0 and open_order_count == 0
@@ -7586,9 +7595,11 @@ def ready_endpoint():
         if blocker not in issues:
             issues.append(blocker)
     ready = bool(startup_ok and gate_open and bool(compatibility.get("contract_compatible")))
+    entry_ready = bool(gate_open and startup_ok and bool(compatibility.get("contract_compatible")))
     return {
         "ok": True,
         "ready": ready,
+        "entry_ready": entry_ready,
         "utc": utc_now_iso(),
         "build": PATCH_BUILD,
         "service": {

@@ -1742,6 +1742,70 @@ def cancel_order(txid: str) -> Dict[str, Any]:
     except Exception as e:
         return {"ok": False, "txid": t, "error": str(e)}
 
+def get_cached_open_orders() -> dict:
+    """Return cached OpenOrders only; raise when cache has never been seeded."""
+    if not bool(_OPEN_ORDERS_CACHE.get("seeded")):
+        raise RuntimeError("open orders cache unseeded")
+    open_map = _OPEN_ORDERS_CACHE.get("open")
+    return dict(open_map) if isinstance(open_map, dict) else {}
+
+def get_open_orders_cache_meta() -> dict:
+    try:
+        ts = float(_OPEN_ORDERS_CACHE.get("ts") or 0.0)
+    except Exception:
+        ts = 0.0
+    try:
+        last_success_ts = float(_OPEN_ORDERS_CACHE.get("last_success_ts") or 0.0)
+    except Exception:
+        last_success_ts = 0.0
+    try:
+        last_attempt_ts = float(_OPEN_ORDERS_CACHE.get("last_attempt_ts") or 0.0)
+    except Exception:
+        last_attempt_ts = 0.0
+    return {
+        "ts": ts,
+        "seeded": bool(_OPEN_ORDERS_CACHE.get("seeded")),
+        "last_success_ts": last_success_ts,
+        "last_attempt_ts": last_attempt_ts,
+        "last_error": str(_OPEN_ORDERS_CACHE.get("last_error") or ""),
+        "source": str(_OPEN_ORDERS_CACHE.get("source") or ""),
+    }
+
+def refresh_open_orders_once() -> dict:
+    """Single-owner live OpenOrders refresh used by the background refresher."""
+    return _fetch_open_orders()
+
+def _open_orders_refresh_loop() -> None:
+    try:
+        startup_delay = float(os.getenv("OPEN_ORDERS_BOOTSTRAP_STARTUP_DELAY_SEC", "35") or 35.0)
+    except Exception:
+        startup_delay = 35.0
+    try:
+        interval = float(os.getenv("OPEN_ORDERS_REFRESH_INTERVAL_SEC", os.getenv("BROKER_STATE_CACHE_TTL_SEC", "180")) or 180.0)
+    except Exception:
+        interval = 180.0
+    interval = max(30.0, float(interval))
+    if startup_delay > 0:
+        _OPEN_ORDERS_REFRESH_STOP.wait(startup_delay)
+    while not _OPEN_ORDERS_REFRESH_STOP.is_set():
+        try:
+            refresh_open_orders_once()
+        except Exception:
+            pass
+        _OPEN_ORDERS_REFRESH_STOP.wait(interval)
+
+def start_open_orders_refresh_daemon() -> bool:
+    """Start the single-owner background OpenOrders refresher once per process."""
+    global _OPEN_ORDERS_REFRESH_THREAD, _OPEN_ORDERS_REFRESH_STARTED
+    if _OPEN_ORDERS_REFRESH_STARTED and _OPEN_ORDERS_REFRESH_THREAD and _OPEN_ORDERS_REFRESH_THREAD.is_alive():
+        return False
+    _OPEN_ORDERS_REFRESH_STOP.clear()
+    t = threading.Thread(target=_open_orders_refresh_loop, name="kraken-open-orders-refresh", daemon=True)
+    t.start()
+    _OPEN_ORDERS_REFRESH_THREAD = t
+    _OPEN_ORDERS_REFRESH_STARTED = True
+    return True
+
 def _fetch_open_orders() -> dict:
     ttl_env = os.getenv("KRAKEN_OPEN_ORDERS_TTL_SEC", os.getenv("BROKER_STATE_CACHE_TTL_SEC", "180"))
     grace_env = os.getenv("KRAKEN_OPEN_ORDERS_STALE_GRACE_SEC", os.getenv("BROKER_STATE_CACHE_GRACE_SEC", "1800"))
@@ -1760,8 +1824,9 @@ def _fetch_open_orders() -> dict:
     except Exception:
         ts = 0.0
     cached_open = _OPEN_ORDERS_CACHE.get("open") if isinstance(_OPEN_ORDERS_CACHE.get("open"), dict) else {}
+    seeded = bool(_OPEN_ORDERS_CACHE.get("seeded"))
 
-    if ttl > 0 and (now - ts) < ttl and isinstance(cached_open, dict):
+    if seeded and ttl > 0 and (now - ts) < ttl and isinstance(cached_open, dict):
         return cached_open  # type: ignore[return-value]
 
     with _OPEN_ORDERS_FETCH_LOCK:
@@ -1771,29 +1836,38 @@ def _fetch_open_orders() -> dict:
         except Exception:
             ts = 0.0
         cached_open = _OPEN_ORDERS_CACHE.get("open") if isinstance(_OPEN_ORDERS_CACHE.get("open"), dict) else {}
-        if ttl > 0 and (now - ts) < ttl and isinstance(cached_open, dict):
+        seeded = bool(_OPEN_ORDERS_CACHE.get("seeded"))
+        if seeded and ttl > 0 and (now - ts) < ttl and isinstance(cached_open, dict):
             return cached_open  # type: ignore[return-value]
 
         cooldown_remaining = _private_endpoint_cooldown_remaining("OpenOrders")
-        if cooldown_remaining > 0 and isinstance(cached_open, dict) and (cached_open or ts > 0) and (now - ts) <= stale_grace:
+        if cooldown_remaining > 0 and seeded and isinstance(cached_open, dict) and (now - ts) <= stale_grace:
             return cached_open  # type: ignore[return-value]
 
         try:
+            _OPEN_ORDERS_CACHE["last_attempt_ts"] = time.time()
             open_orders = _priv("OpenOrders", {}) or {}
             if not isinstance(open_orders, dict):
                 open_orders = {}
-            _OPEN_ORDERS_CACHE["ts"] = time.time()
+            now_success = time.time()
+            _OPEN_ORDERS_CACHE["ts"] = now_success
             _OPEN_ORDERS_CACHE["open"] = open_orders
+            _OPEN_ORDERS_CACHE["seeded"] = True
+            _OPEN_ORDERS_CACHE["last_success_ts"] = now_success
+            _OPEN_ORDERS_CACHE["last_error"] = ""
+            _OPEN_ORDERS_CACHE["source"] = "live_success"
             _clear_private_endpoint_cooldown("OpenOrders")
             return open_orders
-        except Exception:
-            if isinstance(cached_open, dict) and (cached_open or ts > 0) and (now - ts) <= stale_grace:
+        except Exception as e:
+            _OPEN_ORDERS_CACHE["last_error"] = str(e)
+            _OPEN_ORDERS_CACHE["source"] = "exception"
+            if seeded and isinstance(cached_open, dict) and (now - ts) <= stale_grace:
                 return cached_open  # type: ignore[return-value]
             raise
 
 def orders() -> Any:
     try:
-        return _fetch_open_orders()
+        return get_cached_open_orders()
     except Exception as e:
         return {"error": str(e)}
 
