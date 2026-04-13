@@ -154,7 +154,7 @@ def balances_by_asset() -> Dict[str, float]:
 
     out: Dict[str, float] = {}
     try:
-        bal = broker_kraken._fetch_balances()  # internal cached Balance call
+        bal = broker_kraken.get_cached_balances_snapshot(stale_ok=True)  # cache-only; live refresh owned elsewhere
     except Exception as e:
         LAST_BALANCE_ERROR = f"{type(e).__name__}: {e}"
         bal = {}

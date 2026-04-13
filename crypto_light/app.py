@@ -763,6 +763,10 @@ def _startup_self_check(*, rerun: bool = False, apply: bool | None = None) -> di
 @app.on_event("startup")
 def _run_startup_self_check():
     try:
+        broker_kraken.start_balance_refresh_daemon()
+    except Exception:
+        pass
+    try:
         lifecycle_db.repair_lifecycle_integrity(
             stale_age_sec=int(getattr(settings, 'workflow_lock_ttl_sec', 300) or 300),
             backfill_limit=5000,
@@ -1166,7 +1170,7 @@ def _merged_balances_snapshot() -> dict[str, Any]:
         parsed = {}
 
     try:
-        raw = broker_kraken._fetch_balances() or {}
+        raw = broker_kraken.get_cached_balances_snapshot(stale_ok=True) or {}
         if not isinstance(raw, dict):
             raw = {}
     except Exception as e:
