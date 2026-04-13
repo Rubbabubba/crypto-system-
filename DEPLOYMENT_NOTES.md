@@ -1,1 +1,1 @@
-Patch 080: single-owner balance refresh and startup-delayed bootstrap.
+Patch 085: trade quality override; stricter tc1 admission and allowed-symbol focus.
