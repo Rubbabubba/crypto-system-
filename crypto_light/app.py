@@ -1084,6 +1084,26 @@ TC1_POST_ENTRY_PROTECT_AFTER_BPS = float(os.getenv("TC1_POST_ENTRY_PROTECT_AFTER
 TC1_POST_ENTRY_MAX_GIVEBACK_BPS = float(os.getenv("TC1_POST_ENTRY_MAX_GIVEBACK_BPS", "18") or 18.0)
 TC1_ORPHAN_PLAN_CLOSE_MIN_AGE_SEC = float(os.getenv("TC1_ORPHAN_PLAN_CLOSE_MIN_AGE_SEC", "86400") or 86400.0)
 
+# Trade quality override (Patch 085)
+TRADE_QUALITY_OVERRIDE_ENABLED = (os.getenv("TRADE_QUALITY_OVERRIDE_ENABLED", "1").strip().lower() in ("1", "true", "yes", "on"))
+TRADE_QUALITY_ALLOWED_SYMBOLS = ["BTC/USD", "ETH/USD", "SOL/USD", "ADA/USD", "LINK/USD", "AVAX/USD", "DOT/USD"]
+if TRADE_QUALITY_OVERRIDE_ENABLED:
+    PROFIT_FILTER_MIN_MOVE_TO_COST_MULT = max(float(PROFIT_FILTER_MIN_MOVE_TO_COST_MULT), 2.25)
+    PROFIT_FILTER_MIN_EXPECTED_MOVE_BPS = max(float(PROFIT_FILTER_MIN_EXPECTED_MOVE_BPS), 150.0)
+    PROFIT_FILTER_SOFT_PASS_ENABLED = False
+    TC1_MIN_ATR_PCT = max(float(TC1_MIN_ATR_PCT), 0.0010)
+    TC1_MAX_SPREAD_PCT = min(float(TC1_MAX_SPREAD_PCT), 0.0018)
+    TC1_EXPECTED_MOVE_ATR_MULT = max(float(TC1_EXPECTED_MOVE_ATR_MULT), 6.0)
+    TC1_BREAKOUT_LOOKBACK_BARS = max(int(TC1_BREAKOUT_LOOKBACK_BARS), 20)
+    TC1_BREAKOUT_BUFFER_PCT = max(float(TC1_BREAKOUT_BUFFER_PCT), 0.00035)
+    TC1_BREAKOUT_MIN_RANGE_ATR = max(float(TC1_BREAKOUT_MIN_RANGE_ATR), 1.2)
+    TC1_BREAKOUT_MIN_CLOSE_FRACTION = max(float(TC1_BREAKOUT_MIN_CLOSE_FRACTION), 0.75)
+    TC1_MIN_TAKE_PROFIT_BPS = max(float(TC1_MIN_TAKE_PROFIT_BPS), 160.0)
+    TC1_BREAK_EVEN_AFTER_BPS = max(float(TC1_BREAK_EVEN_AFTER_BPS), 80.0)
+    TC1_TIME_EXIT_MIN_GROSS_BPS = max(float(TC1_TIME_EXIT_MIN_GROSS_BPS), 90.0)
+    TC1_POST_ENTRY_PROTECT_AFTER_BPS = max(float(TC1_POST_ENTRY_PROTECT_AFTER_BPS), 60.0)
+    TC1_POST_ENTRY_MAX_GIVEBACK_BPS = min(float(TC1_POST_ENTRY_MAX_GIVEBACK_BPS), 15.0)
+
 
 # ---------- Scanner config (soft allow) ----------
 SCANNER_URL = os.getenv("SCANNER_URL", "").strip()
@@ -2026,6 +2046,9 @@ def _tc1_long_signal(symbol: str) -> tuple[bool, dict]:
     raw_uptrend = (ema_fast[-1] > ema_slow[-1]) and (ema_fast[-1] > ema_fast[-2])
     eps = TC1_TREND_SOFTEN_EPSILON if TC1_TREND_SOFTEN_EPSILON and TC1_TREND_SOFTEN_EPSILON > 0 else 0.0
     uptrend = (ema_fast[-1] >= (ema_slow[-1] * (1.0 - eps))) and (ema_fast[-1] > ema_fast[-2])
+    trend_sep_bps = (((ema_fast[-1] / ema_slow[-1]) - 1.0) * 10000.0) if ema_slow[-1] > 0 else None
+    trend_sep_min_bps = 12.0 if TRADE_QUALITY_OVERRIDE_ENABLED else 0.0
+    trend_sep_ok = (trend_sep_bps is not None and trend_sep_bps >= trend_sep_min_bps) if TRADE_QUALITY_OVERRIDE_ENABLED else True
 
     need = max(
         ENTRY_ENGINE_LIMIT_BARS,
@@ -2055,7 +2078,11 @@ def _tc1_long_signal(symbol: str) -> tuple[bool, dict]:
 
     breakout_level = max(ltf_highs[-(TC1_BREAKOUT_LOOKBACK_BARS + 1):-1])
     breakout_buffer_px = breakout_level * TC1_BREAKOUT_BUFFER_PCT
-    breakout = cur_close >= (breakout_level + breakout_buffer_px)
+    breakout_trigger_px = breakout_level + breakout_buffer_px
+    breakout = cur_close >= breakout_trigger_px
+    breakout_distance_bps = (((cur_close / breakout_trigger_px) - 1.0) * 10000.0) if breakout_trigger_px > 0 else None
+    breakout_distance_min_bps = 10.0 if TRADE_QUALITY_OVERRIDE_ENABLED else 0.0
+    breakout_distance_ok = (breakout_distance_bps is not None and breakout_distance_bps >= breakout_distance_min_bps) if TRADE_QUALITY_OVERRIDE_ENABLED else True
 
     atr_now, _ = _atr_from_bars(ltf, length=int(TC1_ATR_LEN))
     atr_pct = (float(atr_now) / float(cur_close)) if atr_now and cur_close > 0 else None
@@ -2093,8 +2120,12 @@ def _tc1_long_signal(symbol: str) -> tuple[bool, dict]:
     reason = None
     if not uptrend:
         reason = "trend_not_up"
+    elif not trend_sep_ok:
+        reason = "trend_too_weak"
     elif not breakout:
         reason = "no_structure_breakout"
+    elif not breakout_distance_ok:
+        reason = "breakout_too_shallow"
     elif not expansion_ok:
         reason = "breakout_no_expansion"
     elif not close_strength_ok:
@@ -2116,6 +2147,10 @@ def _tc1_long_signal(symbol: str) -> tuple[bool, dict]:
         "uptrend": bool(uptrend),
         "uptrend_raw": bool(raw_uptrend),
         "trend_soften_epsilon": float(eps),
+        "trade_quality_override_enabled": bool(TRADE_QUALITY_OVERRIDE_ENABLED),
+        "trend_sep_bps": float(trend_sep_bps) if trend_sep_bps is not None else None,
+        "trend_sep_ok": bool(trend_sep_ok),
+        "trend_sep_min_bps": float(trend_sep_min_bps),
         "htf_fast": float(ema_fast[-1]),
         "htf_fast_prev": float(ema_fast[-2]),
         "htf_slow": float(ema_slow[-1]),
@@ -2126,6 +2161,10 @@ def _tc1_long_signal(symbol: str) -> tuple[bool, dict]:
         "low": float(cur_low),
         "breakout_level": float(breakout_level),
         "breakout_buffer_pct": float(TC1_BREAKOUT_BUFFER_PCT),
+        "breakout_trigger_px": float(breakout_trigger_px),
+        "breakout_distance_bps": float(breakout_distance_bps) if breakout_distance_bps is not None else None,
+        "breakout_distance_ok": bool(breakout_distance_ok),
+        "breakout_distance_min_bps": float(breakout_distance_min_bps),
         "bar_ts": ltf_ts[-1],
         "breakout": bool(breakout),
         "breakout_lookback_bars": int(TC1_BREAKOUT_LOOKBACK_BARS),
@@ -2627,6 +2666,10 @@ def _path_b_admission_snapshot(scanner_contract: dict[str, Any]) -> dict[str, An
     active_symbols = list((scanner_contract or {}).get("active_symbols") or [])
     ranked_symbols = list((scanner_contract or {}).get("ranked_active_symbols") or [])
     candidate_symbols = ranked_symbols or active_symbols
+    if TRADE_QUALITY_OVERRIDE_ENABLED:
+        quality_allow_set = set(TRADE_QUALITY_ALLOWED_SYMBOLS)
+        candidate_symbols = [s for s in candidate_symbols if s in quality_allow_set]
+        allowed_pilot_symbols = [s for s in allowed_pilot_symbols if s in quality_allow_set] or list(TRADE_QUALITY_ALLOWED_SYMBOLS)
     admitted_symbols = candidate_symbols[:scanner_rank_cap]
     allow_scanner_new_symbols = _env_bool("ALLOW_SCANNER_NEW_SYMBOLS", False)
     scanner_driven_universe = bool(SCANNER_DRIVEN_UNIVERSE)
