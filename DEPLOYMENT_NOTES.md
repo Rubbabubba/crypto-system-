@@ -1,1 +1,1 @@
-Patch 085: trade quality override; stricter tc1 admission and allowed-symbol focus.
+Deploy Patch 086 main + scanner. No env changes required.
