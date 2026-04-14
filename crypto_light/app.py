@@ -1104,6 +1104,13 @@ if TRADE_QUALITY_OVERRIDE_ENABLED:
     TC1_POST_ENTRY_PROTECT_AFTER_BPS = max(float(TC1_POST_ENTRY_PROTECT_AFTER_BPS), 60.0)
     TC1_POST_ENTRY_MAX_GIVEBACK_BPS = min(float(TC1_POST_ENTRY_MAX_GIVEBACK_BPS), 15.0)
 
+TC1_REGIME_FILTER_ENABLED = (os.getenv("TC1_REGIME_FILTER_ENABLED", "1").strip().lower() in ("1", "true", "yes", "on"))
+TC1_PATIENCE_ENGINE_ENABLED = (os.getenv("TC1_PATIENCE_ENGINE_ENABLED", "1").strip().lower() in ("1", "true", "yes", "on"))
+TC1_PATIENCE_CONSECUTIVE_LOSSES_PAUSE = int(float(os.getenv("TC1_PATIENCE_CONSECUTIVE_LOSSES_PAUSE", "2") or 2))
+TC1_PATIENCE_PAUSE_MINUTES = float(os.getenv("TC1_PATIENCE_PAUSE_MINUTES", "180") or 180.0)
+TC1_PATIENCE_SYMBOL_COOLDOWN_MINUTES = float(os.getenv("TC1_PATIENCE_SYMBOL_COOLDOWN_MINUTES", "240") or 240.0)
+TC1_PATIENCE_LOOKBACK_DAYS = float(os.getenv("TC1_PATIENCE_LOOKBACK_DAYS", "14") or 14.0)
+
 
 # ---------- Scanner config (soft allow) ----------
 SCANNER_URL = os.getenv("SCANNER_URL", "").strip()
@@ -6370,6 +6377,101 @@ def worker_exit(payload: WorkerExitPayload):
 
 
 
+
+def _tc1_patience_state(symbol: str) -> dict:
+    symbol = normalize_symbol(symbol)
+    out = {
+        "enabled": bool(TC1_PATIENCE_ENGINE_ENABLED),
+        "allow": True,
+        "reason": "ok",
+        "consecutive_losses": 0,
+        "global_pause_active": False,
+        "global_pause_remaining_min": 0.0,
+        "symbol_cooldown_active": False,
+        "symbol_cooldown_remaining_min": 0.0,
+        "last_tc1_closed_utc": None,
+        "last_tc1_symbol": None,
+    }
+    if not TC1_PATIENCE_ENGINE_ENABLED:
+        return out
+    try:
+        since = max(0.0, time.time() - float(TC1_PATIENCE_LOOKBACK_DAYS) * 86400.0)
+        rows = trade_journal.list_closed_trades(since=since, limit=200) or []
+    except Exception as e:
+        out.update({"allow": True, "reason": f"journal_unavailable:{e}"})
+        return out
+    tc1_rows = []
+    for r in rows:
+        try:
+            strat = str((r or {}).get("strategy") or "").strip().lower()
+            if strat != "tc1":
+                continue
+            tc1_rows.append(r or {})
+        except Exception:
+            continue
+    if not tc1_rows:
+        return out
+    tc1_rows = sorted(tc1_rows, key=lambda r: float(r.get("closed_ts") or r.get("exit_ts") or r.get("ts") or 0.0), reverse=True)
+    latest = tc1_rows[0]
+    latest_ts = float(latest.get("closed_ts") or latest.get("exit_ts") or latest.get("ts") or 0.0)
+    latest_pnl = _safe_float(latest.get("net_pnl_usd"))
+    out["last_tc1_closed_utc"] = datetime.fromtimestamp(latest_ts, timezone.utc).isoformat().replace('+00:00','Z') if latest_ts > 0 else None
+    out["last_tc1_symbol"] = normalize_symbol(str(latest.get("symbol") or "")) if latest.get("symbol") else None
+    consecutive_losses = 0
+    for r in tc1_rows:
+        pnl = _safe_float((r or {}).get("net_pnl_usd"))
+        if pnl < 0:
+            consecutive_losses += 1
+        else:
+            break
+    out["consecutive_losses"] = int(consecutive_losses)
+    if latest_pnl < 0 and consecutive_losses >= int(TC1_PATIENCE_CONSECUTIVE_LOSSES_PAUSE):
+        age_min = max(0.0, (time.time() - latest_ts) / 60.0) if latest_ts > 0 else 0.0
+        remaining = max(0.0, float(TC1_PATIENCE_PAUSE_MINUTES) - age_min)
+        if remaining > 0:
+            out.update({
+                "allow": False,
+                "reason": "tc1_global_patience_pause",
+                "global_pause_active": True,
+                "global_pause_remaining_min": float(round(remaining, 3)),
+            })
+            return out
+    for r in tc1_rows:
+        rsym = normalize_symbol(str((r or {}).get("symbol") or ""))
+        if rsym != symbol:
+            continue
+        pnl = _safe_float((r or {}).get("net_pnl_usd"))
+        if pnl >= 0:
+            break
+        loss_ts = float(r.get("closed_ts") or r.get("exit_ts") or r.get("ts") or 0.0)
+        age_min = max(0.0, (time.time() - loss_ts) / 60.0) if loss_ts > 0 else 0.0
+        remaining = max(0.0, float(TC1_PATIENCE_SYMBOL_COOLDOWN_MINUTES) - age_min)
+        if remaining > 0:
+            out.update({
+                "allow": False,
+                "reason": "tc1_symbol_cooldown",
+                "symbol_cooldown_active": True,
+                "symbol_cooldown_remaining_min": float(round(remaining, 3)),
+            })
+            return out
+        break
+    return out
+
+
+def _tc1_regime_state(regime_quiet: bool) -> dict:
+    allow = True
+    reason = "ok"
+    if TC1_REGIME_FILTER_ENABLED and bool(regime_quiet):
+        allow = False
+        reason = "tc1_regime_quiet_block"
+    return {
+        "enabled": bool(TC1_REGIME_FILTER_ENABLED),
+        "allow": bool(allow),
+        "reason": reason,
+        "regime_quiet": bool(regime_quiet),
+    }
+
+
 def _entry_signals_for_symbol(symbol: str, *, regime_quiet: bool) -> tuple[dict, dict]:
     """Return (signals, debug) for the given symbol.
 
@@ -6396,9 +6498,21 @@ def _entry_signals_for_symbol(symbol: str, *, regime_quiet: bool) -> tuple[dict,
         debug["rb1"] = rb1_meta
 
     if wants_tc1:
-        tc1_fired, tc1_meta = _tc1_long_signal(symbol)
-        signals["tc1"] = bool(tc1_fired)
-        debug["tc1"] = tc1_meta
+        regime_state = _tc1_regime_state(regime_quiet=bool(regime_quiet))
+        patience_state = _tc1_patience_state(symbol)
+        if not bool(regime_state.get("allow")):
+            signals["tc1"] = False
+            debug["tc1"] = {"reason": regime_state.get("reason"), "regime": regime_state, "patience": patience_state}
+        elif not bool(patience_state.get("allow")):
+            signals["tc1"] = False
+            debug["tc1"] = {"reason": patience_state.get("reason"), "regime": regime_state, "patience": patience_state}
+        else:
+            tc1_fired, tc1_meta = _tc1_long_signal(symbol)
+            tc1_meta = dict(tc1_meta or {})
+            tc1_meta["regime"] = regime_state
+            tc1_meta["patience"] = patience_state
+            signals["tc1"] = bool(tc1_fired)
+            debug["tc1"] = tc1_meta
 
     # Optional strategies for quiet / choppy regimes unless fixed mode explicitly requests them.
     if wants_cr1 and (STRATEGY_MODE == "fixed" or (STRATEGY_MODE != "legacy" and regime_quiet)):
