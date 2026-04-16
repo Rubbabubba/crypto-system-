@@ -1104,6 +1104,9 @@ if TRADE_QUALITY_OVERRIDE_ENABLED:
     TC1_POST_ENTRY_PROTECT_AFTER_BPS = max(float(TC1_POST_ENTRY_PROTECT_AFTER_BPS), 60.0)
     TC1_POST_ENTRY_MAX_GIVEBACK_BPS = min(float(TC1_POST_ENTRY_MAX_GIVEBACK_BPS), 15.0)
 
+ADAPTIVE_ENTRY_QUALITY_ENGINE_ENABLED = (os.getenv("ADAPTIVE_ENTRY_QUALITY_ENGINE_ENABLED", "1").strip().lower() in ("1", "true", "yes", "on"))
+ADAPTIVE_ENTRY_QUALITY_PREFERRED_SYMBOLS = set(TRADE_QUALITY_ALLOWED_SYMBOLS)
+
 TC1_REGIME_FILTER_ENABLED = (os.getenv("TC1_REGIME_FILTER_ENABLED", "1").strip().lower() in ("1", "true", "yes", "on"))
 TC1_PATIENCE_ENGINE_ENABLED = (os.getenv("TC1_PATIENCE_ENGINE_ENABLED", "1").strip().lower() in ("1", "true", "yes", "on"))
 TC1_PATIENCE_CONSECUTIVE_LOSSES_PAUSE = int(float(os.getenv("TC1_PATIENCE_CONSECUTIVE_LOSSES_PAUSE", "2") or 2))
@@ -1512,10 +1515,22 @@ def _rank_candidate(symbol: str, strategy: str, sig_debug: dict) -> dict:
         close = float(meta.get("close") or 0.0)
         ltf = float(meta.get("ltf_ema") or 0.0)
         edge = ((close - ltf) / ltf) if ltf > 0 else 0.0
+        trend_sep_bps = float(meta.get("trend_sep_bps") or 0.0)
+        close_fraction = float(meta.get("close_fraction") or 0.0)
+        expansion = float(meta.get("breakout_range_atr") or 0.0)
+        spread_pct = float(meta.get("spread_pct") or 0.0) if meta.get("spread_pct") is not None else None
+        preferred = normalize_symbol(symbol) in ADAPTIVE_ENTRY_QUALITY_PREFERRED_SYMBOLS
 
         score += max(0.0, edge) * 2.0
         score += max(0.0, vol_ratio - 1.0)
-        components.update({"edge": edge})
+        score += max(0.0, trend_sep_bps / 25.0)
+        score += max(0.0, close_fraction - 0.65) * 3.0
+        score += max(0.0, expansion - 1.0) * 1.5
+        if preferred:
+            score += 1.25
+        if spread_pct is not None:
+            score += max(0.0, (0.0020 - float(spread_pct)) * 400.0)
+        components.update({"edge": edge, "trend_sep_bps": trend_sep_bps, "close_fraction": close_fraction, "breakout_range_atr": expansion, "preferred": preferred, "spread_pct": spread_pct})
 
     else:
         # quiet-regime strategies may have their own filters; just lightly prefer better volume
@@ -2030,6 +2045,27 @@ def _tc0_long_signal(symbol: str) -> tuple[bool, dict]:
     return (bool(breakout and atr_ok and vwap_ok and spread_ok and profit_ok), meta)
 
 
+
+
+def _tc1_adaptive_quality_profile(symbol: str, *, trend_sep_bps: float | None, breakout_range_atr: float | None, close_fraction: float | None, spread_pct: float | None) -> dict:
+    preferred = normalize_symbol(symbol) in ADAPTIVE_ENTRY_QUALITY_PREFERRED_SYMBOLS
+    strong_trend = trend_sep_bps is not None and float(trend_sep_bps) >= 18.0
+    strong_expansion = breakout_range_atr is not None and float(breakout_range_atr) >= 1.45
+    strong_close = close_fraction is not None and float(close_fraction) >= 0.82
+    tight_spread = spread_pct is not None and float(spread_pct) <= 0.0012
+    high_conviction = bool(preferred and strong_trend and strong_expansion and strong_close and tight_spread)
+    return {
+        "enabled": bool(ADAPTIVE_ENTRY_QUALITY_ENGINE_ENABLED),
+        "preferred_symbol": bool(preferred),
+        "high_conviction": bool(high_conviction),
+        "trend_sep_min_bps": 8.0 if high_conviction else 12.0,
+        "breakout_distance_min_bps": 6.0 if high_conviction else 10.0,
+        "expected_move_atr_mult": 5.1 if high_conviction else float(TC1_EXPECTED_MOVE_ATR_MULT),
+        "min_close_fraction": 0.78 if high_conviction else float(TC1_BREAKOUT_MIN_CLOSE_FRACTION),
+        "max_spread_pct": 0.0018 if high_conviction else float(TC1_MAX_SPREAD_PCT),
+    }
+
+
 def _tc1_long_signal(symbol: str) -> tuple[bool, dict]:
     """TC1 true breakout entry logic.
 
@@ -2055,7 +2091,6 @@ def _tc1_long_signal(symbol: str) -> tuple[bool, dict]:
     uptrend = (ema_fast[-1] >= (ema_slow[-1] * (1.0 - eps))) and (ema_fast[-1] > ema_fast[-2])
     trend_sep_bps = (((ema_fast[-1] / ema_slow[-1]) - 1.0) * 10000.0) if ema_slow[-1] > 0 else None
     trend_sep_min_bps = 12.0 if TRADE_QUALITY_OVERRIDE_ENABLED else 0.0
-    trend_sep_ok = (trend_sep_bps is not None and trend_sep_bps >= trend_sep_min_bps) if TRADE_QUALITY_OVERRIDE_ENABLED else True
 
     need = max(
         ENTRY_ENGINE_LIMIT_BARS,
@@ -2088,8 +2123,6 @@ def _tc1_long_signal(symbol: str) -> tuple[bool, dict]:
     breakout_trigger_px = breakout_level + breakout_buffer_px
     breakout = cur_close >= breakout_trigger_px
     breakout_distance_bps = (((cur_close / breakout_trigger_px) - 1.0) * 10000.0) if breakout_trigger_px > 0 else None
-    breakout_distance_min_bps = 10.0 if TRADE_QUALITY_OVERRIDE_ENABLED else 0.0
-    breakout_distance_ok = (breakout_distance_bps is not None and breakout_distance_bps >= breakout_distance_min_bps) if TRADE_QUALITY_OVERRIDE_ENABLED else True
 
     atr_now, _ = _atr_from_bars(ltf, length=int(TC1_ATR_LEN))
     atr_pct = (float(atr_now) / float(cur_close)) if atr_now and cur_close > 0 else None
@@ -2102,8 +2135,6 @@ def _tc1_long_signal(symbol: str) -> tuple[bool, dict]:
     close_fraction = None
     if bar_range > 0:
         close_fraction = (cur_close - cur_low) / bar_range
-    close_strength_ok = (close_fraction is not None and close_fraction >= float(TC1_BREAKOUT_MIN_CLOSE_FRACTION))
-
     ema_confirm = cur_close >= cur_ema
     vwap = _vwap_from_bars(ltf, lookback=max(TC1_LTF_EMA, TC0_VWAP_LOOKBACK_BARS))
     vwap_ok = (not bool(TC1_REQUIRE_VWAP)) or (vwap is not None and cur_close >= float(vwap))
@@ -2116,12 +2147,39 @@ def _tc1_long_signal(symbol: str) -> tuple[bool, dict]:
         ask = float(ask or 0.0)
         mid = ((bid + ask) / 2.0) if (bid > 0 and ask > 0) else 0.0
         spread_pct = ((ask - bid) / mid) if mid > 0 else None
-        if TC1_MAX_SPREAD_PCT and spread_pct is not None:
-            spread_ok = spread_pct <= float(TC1_MAX_SPREAD_PCT)
     except Exception:
         spread_ok = True
 
-    expected_move_bps = (float(atr_pct) * 10000.0 * float(TC1_EXPECTED_MOVE_ATR_MULT)) if atr_pct is not None else None
+    adaptive_quality = _tc1_adaptive_quality_profile(
+        symbol,
+        trend_sep_bps=trend_sep_bps,
+        breakout_range_atr=breakout_range_atr,
+        close_fraction=close_fraction,
+        spread_pct=spread_pct,
+    ) if ADAPTIVE_ENTRY_QUALITY_ENGINE_ENABLED else {
+        "enabled": False,
+        "preferred_symbol": False,
+        "high_conviction": False,
+        "trend_sep_min_bps": float(trend_sep_min_bps),
+        "breakout_distance_min_bps": 10.0 if TRADE_QUALITY_OVERRIDE_ENABLED else 0.0,
+        "expected_move_atr_mult": float(TC1_EXPECTED_MOVE_ATR_MULT),
+        "expected_move_atr_mult_effective": float(expected_move_atr_mult_effective),
+        "adaptive_quality": adaptive_quality,
+        "min_close_fraction": float(TC1_BREAKOUT_MIN_CLOSE_FRACTION),
+        "max_spread_pct": float(TC1_MAX_SPREAD_PCT),
+        "max_spread_pct_effective": float(max_spread_pct_effective),
+    }
+    trend_sep_min_bps = float(adaptive_quality.get("trend_sep_min_bps") or trend_sep_min_bps)
+    trend_sep_ok = (trend_sep_bps is not None and trend_sep_bps >= trend_sep_min_bps) if TRADE_QUALITY_OVERRIDE_ENABLED else True
+    breakout_distance_min_bps = float(adaptive_quality.get("breakout_distance_min_bps") or (10.0 if TRADE_QUALITY_OVERRIDE_ENABLED else 0.0))
+    breakout_distance_ok = (breakout_distance_bps is not None and breakout_distance_bps >= breakout_distance_min_bps) if TRADE_QUALITY_OVERRIDE_ENABLED else True
+    close_fraction_min = float(adaptive_quality.get("min_close_fraction") or float(TC1_BREAKOUT_MIN_CLOSE_FRACTION))
+    close_strength_ok = (close_fraction is not None and close_fraction >= close_fraction_min)
+    max_spread_pct_effective = float(adaptive_quality.get("max_spread_pct") or float(TC1_MAX_SPREAD_PCT))
+    if max_spread_pct_effective and spread_pct is not None:
+        spread_ok = spread_pct <= max_spread_pct_effective
+    expected_move_atr_mult_effective = float(adaptive_quality.get("expected_move_atr_mult") or float(TC1_EXPECTED_MOVE_ATR_MULT))
+    expected_move_bps = (float(atr_pct) * 10000.0 * expected_move_atr_mult_effective) if atr_pct is not None else None
     profit_ok, profit_meta = _profitability_gate(expected_move_bps, spread_pct=spread_pct) if PROFIT_FILTER_ENABLED else (True, {"profit_filter_enabled": False})
 
     reason = None
@@ -2182,6 +2240,7 @@ def _tc1_long_signal(symbol: str) -> tuple[bool, dict]:
         "close_fraction": float(close_fraction) if close_fraction is not None else None,
         "close_strength_ok": bool(close_strength_ok),
         "breakout_min_close_fraction": float(TC1_BREAKOUT_MIN_CLOSE_FRACTION),
+        "close_fraction_min_effective": float(close_fraction_min),
         "ema_confirm": bool(ema_confirm),
         "atr": float(atr_now) if atr_now is not None else None,
         "atr_pct": float(atr_pct) if atr_pct is not None else None,
@@ -2192,9 +2251,12 @@ def _tc1_long_signal(symbol: str) -> tuple[bool, dict]:
         "spread_pct": float(spread_pct) if spread_pct is not None else None,
         "spread_ok": bool(spread_ok),
         "max_spread_pct": float(TC1_MAX_SPREAD_PCT),
+        "max_spread_pct_effective": float(max_spread_pct_effective),
         "profit_filter": profit_meta,
         "expected_move_bps": float(expected_move_bps) if expected_move_bps is not None else None,
         "expected_move_atr_mult": float(TC1_EXPECTED_MOVE_ATR_MULT),
+        "expected_move_atr_mult_effective": float(expected_move_atr_mult_effective),
+        "adaptive_quality": adaptive_quality,
         "gate_summary": {
             "trend": bool(uptrend),
             "breakout": bool(breakout),
@@ -7002,6 +7064,7 @@ def diagnostics_live_config():
             "breakout_buffer_pct": float(TC1_BREAKOUT_BUFFER_PCT),
             "breakout_min_range_atr": float(TC1_BREAKOUT_MIN_RANGE_ATR),
             "breakout_min_close_fraction": float(TC1_BREAKOUT_MIN_CLOSE_FRACTION),
+        "close_fraction_min_effective": float(close_fraction_min),
             "min_take_profit_bps": float(TC1_MIN_TAKE_PROFIT_BPS),
             "break_even_after_bps": float(TC1_BREAK_EVEN_AFTER_BPS),
             "time_exit_min_gross_bps": float(TC1_TIME_EXIT_MIN_GROSS_BPS),
@@ -7009,7 +7072,10 @@ def diagnostics_live_config():
             "post_entry_max_giveback_bps": float(TC1_POST_ENTRY_MAX_GIVEBACK_BPS),
             "require_vwap": bool(TC1_REQUIRE_VWAP),
             "max_spread_pct": float(TC1_MAX_SPREAD_PCT),
+        "max_spread_pct_effective": float(max_spread_pct_effective),
             "expected_move_atr_mult": float(TC1_EXPECTED_MOVE_ATR_MULT),
+        "expected_move_atr_mult_effective": float(expected_move_atr_mult_effective),
+        "adaptive_quality": adaptive_quality,
             "max_hold_sec": int(getattr(settings, "tc1_max_hold_sec", 0) or 0),
         },
     }
