@@ -1113,6 +1113,13 @@ TC1_PATIENCE_CONSECUTIVE_LOSSES_PAUSE = int(float(os.getenv("TC1_PATIENCE_CONSEC
 TC1_PATIENCE_PAUSE_MINUTES = float(os.getenv("TC1_PATIENCE_PAUSE_MINUTES", "180") or 180.0)
 TC1_PATIENCE_SYMBOL_COOLDOWN_MINUTES = float(os.getenv("TC1_PATIENCE_SYMBOL_COOLDOWN_MINUTES", "240") or 240.0)
 TC1_PATIENCE_LOOKBACK_DAYS = float(os.getenv("TC1_PATIENCE_LOOKBACK_DAYS", "14") or 14.0)
+TC1_ENTRY_MODEL_REWRITE_ENABLED = (os.getenv("TC1_ENTRY_MODEL_REWRITE_ENABLED", "1").strip().lower() in ("1", "true", "yes", "on"))
+TC1_MOMENTUM_MIN_CLOSE_FRACTION = float(os.getenv("TC1_MOMENTUM_MIN_CLOSE_FRACTION", "0.68") or 0.68)
+TC1_MOMENTUM_MIN_RANGE_ATR = float(os.getenv("TC1_MOMENTUM_MIN_RANGE_ATR", "0.85") or 0.85)
+TC1_MOMENTUM_BREAKOUT_DISTANCE_MIN_BPS = float(os.getenv("TC1_MOMENTUM_BREAKOUT_DISTANCE_MIN_BPS", "3.0") or 3.0)
+TC1_PULLBACK_RECLAIM_MIN_CLOSE_FRACTION = float(os.getenv("TC1_PULLBACK_RECLAIM_MIN_CLOSE_FRACTION", "0.58") or 0.58)
+TC1_PULLBACK_RECLAIM_RANGE_ATR_MIN = float(os.getenv("TC1_PULLBACK_RECLAIM_RANGE_ATR_MIN", "0.55") or 0.55)
+TC1_PULLBACK_RECLAIM_BARS = int(float(os.getenv("TC1_PULLBACK_RECLAIM_BARS", "3") or 3))
 
 
 # ---------- Scanner config (soft allow) ----------
@@ -2066,6 +2073,43 @@ def _tc1_adaptive_quality_profile(symbol: str, *, trend_sep_bps: float | None, b
     }
 
 
+def _tc1_pullback_reclaim_profile(ltf_opens: list[float], ltf_closes: list[float], ltf_highs: list[float], ltf_lows: list[float], *, atr_now: float | None, reclaim_px: float, cur_close: float, cur_high: float, cur_low: float, cur_ema: float, vwap: float | None) -> dict:
+    bars = max(2, int(TC1_PULLBACK_RECLAIM_BARS))
+    if len(ltf_closes) < (bars + 3):
+        return {"eligible": False, "reason": "insufficient_reclaim_bars"}
+    window_high = max(ltf_highs[-(bars + 3):-1])
+    window_low = min(ltf_lows[-(bars + 3):-1])
+    reclaim_anchor = max(reclaim_px, max(ltf_highs[-(bars + 1):-1]))
+    reclaim_distance_bps = (((cur_close / reclaim_anchor) - 1.0) * 10000.0) if reclaim_anchor > 0 else None
+    pullback_depth_atr = ((window_high - window_low) / float(atr_now)) if atr_now and atr_now > 0 else None
+    reclaim_bar_range = max(0.0, cur_high - cur_low)
+    reclaim_range_atr = (reclaim_bar_range / float(atr_now)) if atr_now and atr_now > 0 else None
+    reclaim_close_fraction = ((cur_close - cur_low) / reclaim_bar_range) if reclaim_bar_range > 0 else None
+    prior_red_count = sum(1 for o, c in zip(ltf_opens[-(bars + 1):-1], ltf_closes[-(bars + 1):-1]) if c <= o)
+    shallow_pullback = bool(pullback_depth_atr is not None and float(TC1_PULLBACK_ATR_MIN) <= pullback_depth_atr <= float(TC1_PULLBACK_ATR_MAX))
+    reclaim_close_ok = bool(reclaim_close_fraction is not None and reclaim_close_fraction >= float(TC1_PULLBACK_RECLAIM_MIN_CLOSE_FRACTION))
+    reclaim_range_ok = bool(reclaim_range_atr is not None and reclaim_range_atr >= float(TC1_PULLBACK_RECLAIM_RANGE_ATR_MIN))
+    reclaim_ok = bool(cur_close >= reclaim_anchor and cur_close >= cur_ema and (vwap is None or cur_close >= float(vwap)))
+    prior_pullback_present = bool(prior_red_count >= 1 or (pullback_depth_atr is not None and pullback_depth_atr >= float(TC1_PULLBACK_ATR_MIN)))
+    eligible = bool(shallow_pullback and prior_pullback_present and reclaim_ok and reclaim_close_ok and reclaim_range_ok)
+    return {
+        "eligible": eligible,
+        "reason": None if eligible else "pullback_reclaim_not_ready",
+        "reclaim_anchor": float(reclaim_anchor),
+        "reclaim_distance_bps": float(reclaim_distance_bps) if reclaim_distance_bps is not None else None,
+        "pullback_depth_atr": float(pullback_depth_atr) if pullback_depth_atr is not None else None,
+        "reclaim_range_atr": float(reclaim_range_atr) if reclaim_range_atr is not None else None,
+        "reclaim_close_fraction": float(reclaim_close_fraction) if reclaim_close_fraction is not None else None,
+        "prior_red_count": int(prior_red_count),
+        "prior_pullback_present": bool(prior_pullback_present),
+        "shallow_pullback": bool(shallow_pullback),
+        "reclaim_close_ok": bool(reclaim_close_ok),
+        "reclaim_range_ok": bool(reclaim_range_ok),
+        "reclaim_ok": bool(reclaim_ok),
+        "bars": int(bars),
+    }
+
+
 def _tc1_long_signal(symbol: str) -> tuple[bool, dict]:
     """TC1 true breakout entry logic.
 
@@ -2123,6 +2167,7 @@ def _tc1_long_signal(symbol: str) -> tuple[bool, dict]:
     breakout_trigger_px = breakout_level + breakout_buffer_px
     breakout = cur_close >= breakout_trigger_px
     breakout_distance_bps = (((cur_close / breakout_trigger_px) - 1.0) * 10000.0) if breakout_trigger_px > 0 else None
+    reclaim_px = breakout_level * (1.0 + float(TC1_RECLAIM_BUFFER_PCT))
 
     atr_now, _ = _atr_from_bars(ltf, length=int(TC1_ATR_LEN))
     atr_pct = (float(atr_now) / float(cur_close)) if atr_now and cur_close > 0 else None
@@ -2165,6 +2210,9 @@ def _tc1_long_signal(symbol: str) -> tuple[bool, dict]:
         "expected_move_atr_mult": float(TC1_EXPECTED_MOVE_ATR_MULT),
         "expected_move_atr_mult_effective": float(expected_move_atr_mult_effective),
         "adaptive_quality": adaptive_quality,
+        "reclaim_px": float(reclaim_px),
+        "pullback_profile": pullback_profile,
+        "pullback_ok": bool(pullback_ok),
         "min_close_fraction": float(TC1_BREAKOUT_MIN_CLOSE_FRACTION),
         "max_spread_pct": float(TC1_MAX_SPREAD_PCT),
         "max_spread_pct_effective": float(max_spread_pct_effective),
@@ -2182,21 +2230,45 @@ def _tc1_long_signal(symbol: str) -> tuple[bool, dict]:
     expected_move_bps = (float(atr_pct) * 10000.0 * expected_move_atr_mult_effective) if atr_pct is not None else None
     profit_ok, profit_meta = _profitability_gate(expected_move_bps, spread_pct=spread_pct) if PROFIT_FILTER_ENABLED else (True, {"profit_filter_enabled": False})
 
+    momentum_close_fraction_min = min(close_fraction_min, float(TC1_MOMENTUM_MIN_CLOSE_FRACTION)) if TC1_ENTRY_MODEL_REWRITE_ENABLED else close_fraction_min
+    momentum_range_atr_min = min(float(TC1_BREAKOUT_MIN_RANGE_ATR), float(TC1_MOMENTUM_MIN_RANGE_ATR)) if TC1_ENTRY_MODEL_REWRITE_ENABLED else float(TC1_BREAKOUT_MIN_RANGE_ATR)
+    momentum_distance_min_bps = min(float(breakout_distance_min_bps), float(TC1_MOMENTUM_BREAKOUT_DISTANCE_MIN_BPS)) if TC1_ENTRY_MODEL_REWRITE_ENABLED else float(breakout_distance_min_bps)
+    momentum_close_ok = (close_fraction is not None and close_fraction >= momentum_close_fraction_min)
+    momentum_expansion_ok = (breakout_range_atr is not None and breakout_range_atr >= momentum_range_atr_min)
+    momentum_distance_ok = (breakout_distance_bps is not None and breakout_distance_bps >= momentum_distance_min_bps)
+    momentum_ok = bool(uptrend and trend_sep_ok and breakout and momentum_distance_ok and momentum_expansion_ok and momentum_close_ok and ema_confirm and atr_ok and vwap_ok and spread_ok and profit_ok)
+
+    pullback_profile = _tc1_pullback_reclaim_profile(
+        ltf_opens,
+        ltf_closes,
+        ltf_highs,
+        ltf_lows,
+        atr_now=float(atr_now) if atr_now is not None else None,
+        reclaim_px=float(reclaim_px),
+        cur_close=float(cur_close),
+        cur_high=float(cur_high),
+        cur_low=float(cur_low),
+        cur_ema=float(cur_ema),
+        vwap=float(vwap) if vwap is not None else None,
+    ) if TC1_ENTRY_MODEL_REWRITE_ENABLED else {"eligible": False, "reason": "entry_model_rewrite_disabled"}
+    pullback_ok = bool(uptrend and trend_sep_ok and atr_ok and vwap_ok and spread_ok and profit_ok and pullback_profile.get("eligible"))
+
+    signal_mode = None
     reason = None
-    if not uptrend:
+    if momentum_ok:
+        signal_mode = "momentum_continuation"
+    elif pullback_ok:
+        signal_mode = "pullback_reclaim"
+    elif not uptrend:
         reason = "trend_not_up"
     elif not trend_sep_ok:
         reason = "trend_too_weak"
-    elif not breakout:
-        reason = "no_structure_breakout"
-    elif not breakout_distance_ok:
+    elif breakout and not momentum_distance_ok:
         reason = "breakout_too_shallow"
-    elif not expansion_ok:
+    elif breakout and not momentum_expansion_ok:
         reason = "breakout_no_expansion"
-    elif not close_strength_ok:
+    elif breakout and not momentum_close_ok:
         reason = "weak_breakout_close"
-    elif not ema_confirm:
-        reason = "below_ltf_ema"
     elif not atr_ok:
         reason = "atr_too_low"
     elif not vwap_ok:
@@ -2205,9 +2277,13 @@ def _tc1_long_signal(symbol: str) -> tuple[bool, dict]:
         reason = "spread_too_wide"
     elif not profit_ok:
         reason = "profit_filter_blocked"
+    elif pullback_profile.get("reason"):
+        reason = str(pullback_profile.get("reason"))
+    else:
+        reason = "no_entry_pattern"
 
     meta = {
-        "strategy_name": "tpc1_breakout_unlock",
+        "strategy_name": "tpc1_entry_model_rewrite",
         "reason": reason or "signal",
         "uptrend": bool(uptrend),
         "uptrend_raw": bool(raw_uptrend),
@@ -2239,6 +2315,15 @@ def _tc1_long_signal(symbol: str) -> tuple[bool, dict]:
         "breakout_min_range_atr": float(TC1_BREAKOUT_MIN_RANGE_ATR),
         "close_fraction": float(close_fraction) if close_fraction is not None else None,
         "close_strength_ok": bool(close_strength_ok),
+        "signal_mode": signal_mode,
+        "entry_model_rewrite_enabled": bool(TC1_ENTRY_MODEL_REWRITE_ENABLED),
+        "momentum_ok": bool(momentum_ok),
+        "momentum_close_fraction_min": float(momentum_close_fraction_min),
+        "momentum_range_atr_min": float(momentum_range_atr_min),
+        "momentum_distance_min_bps": float(momentum_distance_min_bps),
+        "momentum_close_ok": bool(momentum_close_ok),
+        "momentum_expansion_ok": bool(momentum_expansion_ok),
+        "momentum_distance_ok": bool(momentum_distance_ok),
         "breakout_min_close_fraction": float(TC1_BREAKOUT_MIN_CLOSE_FRACTION),
         "close_fraction_min_effective": float(close_fraction_min),
         "ema_confirm": bool(ema_confirm),
@@ -2257,6 +2342,9 @@ def _tc1_long_signal(symbol: str) -> tuple[bool, dict]:
         "expected_move_atr_mult": float(TC1_EXPECTED_MOVE_ATR_MULT),
         "expected_move_atr_mult_effective": float(expected_move_atr_mult_effective),
         "adaptive_quality": adaptive_quality,
+        "reclaim_px": float(reclaim_px),
+        "pullback_profile": pullback_profile,
+        "pullback_ok": bool(pullback_ok),
         "gate_summary": {
             "trend": bool(uptrend),
             "breakout": bool(breakout),
@@ -2269,20 +2357,7 @@ def _tc1_long_signal(symbol: str) -> tuple[bool, dict]:
             "profit": bool(profit_ok),
         },
     }
-    return (
-        bool(
-            uptrend
-            and breakout
-            and expansion_ok
-            and close_strength_ok
-            and ema_confirm
-            and atr_ok
-            and vwap_ok
-            and spread_ok
-            and profit_ok
-        ),
-        meta,
-    )
+    return (bool(momentum_ok or pullback_ok), meta)
 
 
 
@@ -7076,6 +7151,9 @@ def diagnostics_live_config():
             "expected_move_atr_mult": float(TC1_EXPECTED_MOVE_ATR_MULT),
         "expected_move_atr_mult_effective": float(expected_move_atr_mult_effective),
         "adaptive_quality": adaptive_quality,
+        "reclaim_px": float(reclaim_px),
+        "pullback_profile": pullback_profile,
+        "pullback_ok": bool(pullback_ok),
             "max_hold_sec": int(getattr(settings, "tc1_max_hold_sec", 0) or 0),
         },
     }
