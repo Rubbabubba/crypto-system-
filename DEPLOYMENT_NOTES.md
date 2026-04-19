@@ -1,1 +1,3 @@
-Patch 092: opportunity expansion + trigger timing calibration. No env changes required.
+# Patch 094
+
+Main: tc1 threshold calibration plus scan-path performance trim.
