@@ -1114,11 +1114,11 @@ TC1_PATIENCE_PAUSE_MINUTES = float(os.getenv("TC1_PATIENCE_PAUSE_MINUTES", "180"
 TC1_PATIENCE_SYMBOL_COOLDOWN_MINUTES = float(os.getenv("TC1_PATIENCE_SYMBOL_COOLDOWN_MINUTES", "240") or 240.0)
 TC1_PATIENCE_LOOKBACK_DAYS = float(os.getenv("TC1_PATIENCE_LOOKBACK_DAYS", "14") or 14.0)
 TC1_ENTRY_MODEL_REWRITE_ENABLED = (os.getenv("TC1_ENTRY_MODEL_REWRITE_ENABLED", "1").strip().lower() in ("1", "true", "yes", "on"))
-TC1_MOMENTUM_MIN_CLOSE_FRACTION = float(os.getenv("TC1_MOMENTUM_MIN_CLOSE_FRACTION", "0.68") or 0.68)
-TC1_MOMENTUM_MIN_RANGE_ATR = float(os.getenv("TC1_MOMENTUM_MIN_RANGE_ATR", "0.85") or 0.85)
-TC1_MOMENTUM_BREAKOUT_DISTANCE_MIN_BPS = float(os.getenv("TC1_MOMENTUM_BREAKOUT_DISTANCE_MIN_BPS", "3.0") or 3.0)
-TC1_PULLBACK_RECLAIM_MIN_CLOSE_FRACTION = float(os.getenv("TC1_PULLBACK_RECLAIM_MIN_CLOSE_FRACTION", "0.58") or 0.58)
-TC1_PULLBACK_RECLAIM_RANGE_ATR_MIN = float(os.getenv("TC1_PULLBACK_RECLAIM_RANGE_ATR_MIN", "0.55") or 0.55)
+TC1_MOMENTUM_MIN_CLOSE_FRACTION = float(os.getenv("TC1_MOMENTUM_MIN_CLOSE_FRACTION", "0.62") or 0.68)
+TC1_MOMENTUM_MIN_RANGE_ATR = float(os.getenv("TC1_MOMENTUM_MIN_RANGE_ATR", "0.72") or 0.85)
+TC1_MOMENTUM_BREAKOUT_DISTANCE_MIN_BPS = float(os.getenv("TC1_MOMENTUM_BREAKOUT_DISTANCE_MIN_BPS", "2.0") or 3.0)
+TC1_PULLBACK_RECLAIM_MIN_CLOSE_FRACTION = float(os.getenv("TC1_PULLBACK_RECLAIM_MIN_CLOSE_FRACTION", "0.54") or 0.58)
+TC1_PULLBACK_RECLAIM_RANGE_ATR_MIN = float(os.getenv("TC1_PULLBACK_RECLAIM_RANGE_ATR_MIN", "0.45") or 0.55)
 TC1_PULLBACK_RECLAIM_BARS = int(float(os.getenv("TC1_PULLBACK_RECLAIM_BARS", "3") or 3))
 
 
@@ -2056,20 +2056,20 @@ def _tc0_long_signal(symbol: str) -> tuple[bool, dict]:
 
 def _tc1_adaptive_quality_profile(symbol: str, *, trend_sep_bps: float | None, breakout_range_atr: float | None, close_fraction: float | None, spread_pct: float | None) -> dict:
     preferred = normalize_symbol(symbol) in ADAPTIVE_ENTRY_QUALITY_PREFERRED_SYMBOLS
-    strong_trend = trend_sep_bps is not None and float(trend_sep_bps) >= 16.0
-    strong_expansion = breakout_range_atr is not None and float(breakout_range_atr) >= 1.30
-    strong_close = close_fraction is not None and float(close_fraction) >= 0.80
-    tight_spread = spread_pct is not None and float(spread_pct) <= 0.0015
+    strong_trend = trend_sep_bps is not None and float(trend_sep_bps) >= 14.0
+    strong_expansion = breakout_range_atr is not None and float(breakout_range_atr) >= 1.10
+    strong_close = close_fraction is not None and float(close_fraction) >= 0.72
+    tight_spread = spread_pct is not None and float(spread_pct) <= 0.0018
     high_conviction = bool(preferred and strong_trend and strong_expansion and strong_close and tight_spread)
     return {
         "enabled": bool(ADAPTIVE_ENTRY_QUALITY_ENGINE_ENABLED),
         "preferred_symbol": bool(preferred),
         "high_conviction": bool(high_conviction),
-        "trend_sep_min_bps": 6.0 if high_conviction else 12.0,
-        "breakout_distance_min_bps": 4.0 if high_conviction else 9.0,
-        "expected_move_atr_mult": 4.8 if high_conviction else float(TC1_EXPECTED_MOVE_ATR_MULT),
-        "min_close_fraction": 0.74 if high_conviction else float(TC1_BREAKOUT_MIN_CLOSE_FRACTION),
-        "max_spread_pct": 0.0020 if high_conviction else float(TC1_MAX_SPREAD_PCT),
+        "trend_sep_min_bps": 4.0 if high_conviction else 10.0,
+        "breakout_distance_min_bps": 2.5 if high_conviction else 7.0,
+        "expected_move_atr_mult": 4.2 if high_conviction else max(3.8, float(TC1_EXPECTED_MOVE_ATR_MULT) - 0.4),
+        "min_close_fraction": 0.68 if high_conviction else max(0.56, float(TC1_BREAKOUT_MIN_CLOSE_FRACTION) - 0.02),
+        "max_spread_pct": 0.0022 if high_conviction else min(0.0028, float(TC1_MAX_SPREAD_PCT) + 0.0001),
     }
 
 
@@ -2184,6 +2184,51 @@ def _tc1_long_signal(symbol: str) -> tuple[bool, dict]:
     vwap = _vwap_from_bars(ltf, lookback=max(TC1_LTF_EMA, TC0_VWAP_LOOKBACK_BARS))
     vwap_ok = (not bool(TC1_REQUIRE_VWAP)) or (vwap is not None and cur_close >= float(vwap))
 
+    # Pre-check before spread/profit work. If neither tc1 pattern is even close, avoid
+    # extra work on the scan path for this symbol.
+    base_context_ok = bool(uptrend and ema_confirm and atr_ok and vwap_ok)
+    pre_pullback_profile = _tc1_pullback_reclaim_profile(
+        ltf_opens,
+        ltf_closes,
+        ltf_highs,
+        ltf_lows,
+        atr_now=float(atr_now) if atr_now is not None else None,
+        reclaim_px=float(reclaim_px),
+        cur_close=float(cur_close),
+        cur_high=float(cur_high),
+        cur_low=float(cur_low),
+        cur_ema=float(cur_ema),
+        vwap=float(vwap) if vwap is not None else None,
+    ) if TC1_ENTRY_MODEL_REWRITE_ENABLED else {"eligible": False, "reason": "entry_model_rewrite_disabled"}
+
+    momentum_precheck = bool(
+        base_context_ok
+        and breakout
+        and breakout_distance_bps is not None and breakout_distance_bps >= 1.5
+        and breakout_range_atr is not None and breakout_range_atr >= 0.60
+        and close_fraction is not None and close_fraction >= 0.52
+    )
+    pullback_precheck = bool(base_context_ok and pre_pullback_profile.get("eligible"))
+    if not momentum_precheck and not pullback_precheck:
+        return False, {
+            "strategy_name": "tpc1_entry_model_rewrite",
+            "reason": "no_entry_pattern_precheck",
+            "uptrend": bool(uptrend),
+            "uptrend_raw": bool(raw_uptrend),
+            "trend_soften_epsilon": float(eps),
+            "trend_sep_bps": float(trend_sep_bps) if trend_sep_bps is not None else None,
+            "breakout": bool(breakout),
+            "breakout_distance_bps": float(breakout_distance_bps) if breakout_distance_bps is not None else None,
+            "breakout_range_atr": float(breakout_range_atr) if breakout_range_atr is not None else None,
+            "close_fraction": float(close_fraction) if close_fraction is not None else None,
+            "ema_confirm": bool(ema_confirm),
+            "atr_ok": bool(atr_ok),
+            "vwap_ok": bool(vwap_ok),
+            "pre_pullback_profile": pre_pullback_profile,
+            "signal_mode": None,
+            "entry_model_rewrite_enabled": bool(TC1_ENTRY_MODEL_REWRITE_ENABLED),
+        }
+
     bid = ask = spread_pct = None
     spread_ok = True
     try:
@@ -2238,19 +2283,7 @@ def _tc1_long_signal(symbol: str) -> tuple[bool, dict]:
     momentum_distance_ok = (breakout_distance_bps is not None and breakout_distance_bps >= momentum_distance_min_bps)
     momentum_ok = bool(uptrend and trend_sep_ok and breakout and momentum_distance_ok and momentum_expansion_ok and momentum_close_ok and ema_confirm and atr_ok and vwap_ok and spread_ok and profit_ok)
 
-    pullback_profile = _tc1_pullback_reclaim_profile(
-        ltf_opens,
-        ltf_closes,
-        ltf_highs,
-        ltf_lows,
-        atr_now=float(atr_now) if atr_now is not None else None,
-        reclaim_px=float(reclaim_px),
-        cur_close=float(cur_close),
-        cur_high=float(cur_high),
-        cur_low=float(cur_low),
-        cur_ema=float(cur_ema),
-        vwap=float(vwap) if vwap is not None else None,
-    ) if TC1_ENTRY_MODEL_REWRITE_ENABLED else {"eligible": False, "reason": "entry_model_rewrite_disabled"}
+    pullback_profile = pre_pullback_profile
     pullback_ok = bool(uptrend and trend_sep_ok and atr_ok and vwap_ok and spread_ok and profit_ok and pullback_profile.get("eligible"))
 
     signal_mode = None
