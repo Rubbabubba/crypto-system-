@@ -2049,20 +2049,20 @@ def _tc0_long_signal(symbol: str) -> tuple[bool, dict]:
 
 def _tc1_adaptive_quality_profile(symbol: str, *, trend_sep_bps: float | None, breakout_range_atr: float | None, close_fraction: float | None, spread_pct: float | None) -> dict:
     preferred = normalize_symbol(symbol) in ADAPTIVE_ENTRY_QUALITY_PREFERRED_SYMBOLS
-    strong_trend = trend_sep_bps is not None and float(trend_sep_bps) >= 18.0
-    strong_expansion = breakout_range_atr is not None and float(breakout_range_atr) >= 1.45
-    strong_close = close_fraction is not None and float(close_fraction) >= 0.82
-    tight_spread = spread_pct is not None and float(spread_pct) <= 0.0012
+    strong_trend = trend_sep_bps is not None and float(trend_sep_bps) >= 16.0
+    strong_expansion = breakout_range_atr is not None and float(breakout_range_atr) >= 1.30
+    strong_close = close_fraction is not None and float(close_fraction) >= 0.80
+    tight_spread = spread_pct is not None and float(spread_pct) <= 0.0015
     high_conviction = bool(preferred and strong_trend and strong_expansion and strong_close and tight_spread)
     return {
         "enabled": bool(ADAPTIVE_ENTRY_QUALITY_ENGINE_ENABLED),
         "preferred_symbol": bool(preferred),
         "high_conviction": bool(high_conviction),
-        "trend_sep_min_bps": 8.0 if high_conviction else 12.0,
-        "breakout_distance_min_bps": 6.0 if high_conviction else 10.0,
-        "expected_move_atr_mult": 5.1 if high_conviction else float(TC1_EXPECTED_MOVE_ATR_MULT),
-        "min_close_fraction": 0.78 if high_conviction else float(TC1_BREAKOUT_MIN_CLOSE_FRACTION),
-        "max_spread_pct": 0.0018 if high_conviction else float(TC1_MAX_SPREAD_PCT),
+        "trend_sep_min_bps": 6.0 if high_conviction else 12.0,
+        "breakout_distance_min_bps": 4.0 if high_conviction else 9.0,
+        "expected_move_atr_mult": 4.8 if high_conviction else float(TC1_EXPECTED_MOVE_ATR_MULT),
+        "min_close_fraction": 0.74 if high_conviction else float(TC1_BREAKOUT_MIN_CLOSE_FRACTION),
+        "max_spread_pct": 0.0020 if high_conviction else float(TC1_MAX_SPREAD_PCT),
     }
 
 
