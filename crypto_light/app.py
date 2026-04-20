@@ -2880,6 +2880,13 @@ def _scanner_contract_snapshot() -> dict[str, Any]:
     guardrails = dict((compatibility or {}).get("fee_churn_guardrails") or {})
     raw_alignment = dict((compatibility or {}).get("alignment") or {}) if isinstance(compatibility, dict) else {}
     btc_alignment = dict((compatibility or {}).get("btc_only_live_alignment") or {}) if isinstance(compatibility, dict) else {}
+    vetted_symbols = []
+    if isinstance(compatibility, dict):
+        for s in (compatibility.get("vetted_symbols") or []):
+            try:
+                vetted_symbols.append(normalize_symbol(str(s)))
+            except Exception:
+                continue
     return {
         "reachable": reachable,
         "scanner_ok": scanner_ok,
@@ -2896,6 +2903,7 @@ def _scanner_contract_snapshot() -> dict[str, Any]:
         "guardrails": guardrails,
         "alignment": raw_alignment,
         "btc_only_live_alignment": btc_alignment,
+        "vetted_symbols": vetted_symbols[:24],
         "raw_compatibility": compatibility if isinstance(compatibility, dict) else {},
         "meta": {
             **(meta or {}),
@@ -2919,7 +2927,7 @@ def _path_b_admission_snapshot(scanner_contract: dict[str, Any]) -> dict[str, An
     _contract_safe_lock_7 = ["BTC/USD", "ETH/USD", "SOL/USD", "ADA/USD", "LINK/USD", "AVAX/USD", "DOT/USD"]
     _contract_safe_lock_7_set = set(_contract_safe_lock_7)
     _contract_unsafe_10 = {"BTC/USD", "ETH/USD", "SOL/USD", "ADA/USD", "XRP/USD", "DOGE/USD", "LINK/USD", "AVAX/USD", "LTC/USD", "DOT/USD"}
-    configured_allowed_symbols = set(_effective_allowed_symbols(list(ALLOWED_SYMBOLS)))
+    configured_allowed_symbols = set(_effective_allowed_symbols(list(ALLOWED_SYMBOLS))) | set(list(scanner_contract.get("vetted_symbols") or []))
     if set(allowed_pilot_symbols) == _contract_unsafe_10:
         allowed_pilot_symbols = list(_contract_safe_lock_7)
     effective_allowed_symbols = _contract_safe_lock_7_set if configured_allowed_symbols == _contract_unsafe_10 else configured_allowed_symbols
@@ -3136,8 +3144,9 @@ def _compatibility_snapshot() -> dict[str, Any]:
     allowed_symbols = sorted(list(ALLOWED_SYMBOLS))
     allow_scanner_new_symbols = _env_bool("ALLOW_SCANNER_NEW_SYMBOLS", False)
     active_symbols = list(scanner_contract.get("active_symbols") or [])
-    allowed_set = set(allowed_symbols)
-    admissible_active_symbols = [s for s in active_symbols if s in allowed_set] if allowed_symbols else list(active_symbols)
+    vetted_symbols = [s for s in list(scanner_contract.get("vetted_symbols") or []) if isinstance(s, str)]
+    allowed_set = set(allowed_symbols) | set(vetted_symbols)
+    admissible_active_symbols = [s for s in active_symbols if s in allowed_set] if allowed_set else list(active_symbols)
     invalid_active_symbols = []
     if active_symbols and FILTER_UNIVERSE_BY_ALLOWED_SYMBOLS and allowed_symbols and not allow_scanner_new_symbols:
         invalid_active_symbols = [s for s in active_symbols if s not in allowed_set]
@@ -3172,6 +3181,7 @@ def _compatibility_snapshot() -> dict[str, Any]:
         "scanner_mode": scanner_contract.get("mode"),
         "allowed_symbols_count": len(allowed_symbols),
         "allowed_symbols_sample": allowed_symbols[:12],
+        "scanner_vetted_symbols_sample": vetted_symbols[:12],
         "scanner_active_count": len(active_symbols),
         "scanner_active_symbols_sample": active_symbols[:12],
         "admissible_active_symbols_count": len(admissible_active_symbols),
@@ -3257,12 +3267,14 @@ def _build_universe(payload, scanner_syms: list[str]) -> list[str]:
 
     # Allowed-symbol filtering (off by default for scanner-driven universe)
     allowed = set(getattr(settings, "allowed_symbols", []) or [])
-    if allowed and FILTER_UNIVERSE_BY_ALLOWED_SYMBOLS and not (force_scan and SCANNER_SOFT_ALLOW):
-        universe = [s for s in universe if s in allowed]
+    scanner_vetted = _scanner_vetted_symbols_from_cache() if SCANNER_DRIVEN_UNIVERSE else set()
+    effective_allowed = set(allowed) | set(scanner_vetted)
+    if effective_allowed and FILTER_UNIVERSE_BY_ALLOWED_SYMBOLS and not (force_scan and SCANNER_SOFT_ALLOW):
+        universe = [s for s in universe if s in effective_allowed]
 
-    # Stable fallback: if universe empty but allowed configured, use allowed
-    if not universe and allowed:
-        universe = list(dict.fromkeys(list(allowed)))
+    # Stable fallback: if universe empty but allowed configured, use effective allowed
+    if not universe and effective_allowed:
+        universe = list(dict.fromkeys(list(effective_allowed)))
 
     return universe
 
@@ -3296,6 +3308,19 @@ def _scanner_refresh() -> None:
         _SCANNER_CACHE["ts"] = time.time()
         _SCANNER_CACHE["ok"] = False
         _SCANNER_CACHE["last_error"] = str(e)
+
+
+def _scanner_vetted_symbols_from_cache() -> set[str]:
+    raw = dict(_SCANNER_CACHE.get("raw") or {})
+    compat = raw.get("compatibility") if isinstance(raw.get("compatibility"), dict) else {}
+    vetted = raw.get("vetted_symbols") or compat.get("vetted_symbols") or []
+    out: set[str] = set()
+    for s in vetted or []:
+        try:
+            out.add(normalize_symbol(str(s)))
+        except Exception:
+            continue
+    return out
 
 
 def _phase1_safety_report() -> Dict[str, Any]:
