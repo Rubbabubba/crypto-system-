@@ -1517,8 +1517,8 @@ def _rank_candidate(symbol: str, strategy: str, sig_debug: dict) -> dict:
 
         components.update({"prox": prox, "dist_to_level_pct": dist, "near_pct": near_pct, "momentum": momentum})
 
-    elif strat in ("tc1", "tr1"):
-        meta = (sig_debug or {}).get(strat) or {}
+    elif strat == "tc1":
+        meta = (sig_debug or {}).get("tc1") or {}
         close = float(meta.get("close") or 0.0)
         ltf = float(meta.get("ltf_ema") or 0.0)
         edge = ((close - ltf) / ltf) if ltf > 0 else 0.0
@@ -1538,6 +1538,28 @@ def _rank_candidate(symbol: str, strategy: str, sig_debug: dict) -> dict:
         if spread_pct is not None:
             score += max(0.0, (0.0020 - float(spread_pct)) * 400.0)
         components.update({"edge": edge, "trend_sep_bps": trend_sep_bps, "close_fraction": close_fraction, "breakout_range_atr": expansion, "preferred": preferred, "spread_pct": spread_pct})
+
+    elif strat == "tr1":
+        meta = (sig_debug or {}).get("tr1") or {}
+        close = float(meta.get("close") or 0.0)
+        ltf = float(meta.get("ltf_ema") or 0.0)
+        edge = ((close - ltf) / ltf) if ltf > 0 else 0.0
+        trend_sep_bps = float(meta.get("trend_sep_bps") or 0.0)
+        close_fraction = float(meta.get("close_fraction") or 0.0)
+        reclaim_strength = float(meta.get("reclaim_strength_bps") or 0.0)
+        spread_pct = float(meta.get("spread_pct") or 0.0) if meta.get("spread_pct") is not None else None
+        preferred = normalize_symbol(symbol) in ADAPTIVE_ENTRY_QUALITY_PREFERRED_SYMBOLS
+
+        score += max(0.0, edge) * 1.8
+        score += max(0.0, vol_ratio - 1.0)
+        score += max(0.0, trend_sep_bps / 28.0)
+        score += max(0.0, close_fraction - 0.55) * 2.5
+        score += max(0.0, reclaim_strength / 20.0)
+        if preferred:
+            score += 1.35
+        if spread_pct is not None:
+            score += max(0.0, (0.0022 - float(spread_pct)) * 350.0)
+        components.update({"edge": edge, "trend_sep_bps": trend_sep_bps, "close_fraction": close_fraction, "reclaim_strength_bps": reclaim_strength, "preferred": preferred, "spread_pct": spread_pct})
 
     else:
         # quiet-regime strategies may have their own filters; just lightly prefer better volume
@@ -1697,7 +1719,7 @@ def _strategy_max_hold_sec(strategy: str) -> int:
     if s == "tc1":
         return int(getattr(settings, "tc1_max_hold_sec", 0) or 0)
     if s == "tr1":
-        return max(int(getattr(settings, "tc1_max_hold_sec", 0) or 0), 5400)
+        return int(TR1_MAX_HOLD_SEC)
     return 0
 
 
@@ -2112,6 +2134,83 @@ def _tc1_pullback_reclaim_profile(ltf_opens: list[float], ltf_closes: list[float
     }
 
 
+def _tr1_long_signal(symbol: str) -> tuple[bool, dict]:
+    bars = _get_bars(symbol, timeframe=ENTRY_ENGINE_TIMEFRAME, limit=max(120, TR1_LOOKBACK_BARS + TR1_PULLBACK_LOOKBACK_BARS + 80))
+    dbg = {"symbol": normalize_symbol(symbol), "strategy_name": "tr1_trend_resume", "fired": False}
+    fresh_ok, fresh_meta = _guard_fresh_bars(bars, ENTRY_ENGINE_TIMEFRAME)
+    dbg["fresh_guard"] = fresh_meta
+    if not fresh_ok or len(bars) < max(60, TR1_LOOKBACK_BARS + TR1_PULLBACK_LOOKBACK_BARS + 5):
+        dbg["reason"] = "stale_or_insufficient_bars"
+        return False, dbg
+    closes = [float(b.get("c") or 0.0) for b in bars]
+    highs = [float(b.get("h") or 0.0) for b in bars]
+    lows = [float(b.get("l") or 0.0) for b in bars]
+    opens = [float(b.get("o") or 0.0) for b in bars]
+    cur_close = closes[-1]; cur_high = highs[-1]; cur_low = lows[-1]
+    atr_now, atr_pct = _atr_from_bars(bars, length=int(getattr(settings, "tc1_atr_len", 14) or 14))
+    ltf_ema = _ema(closes, TR1_LTF_EMA)
+    htf_bars = _get_bars(symbol, timeframe=str(getattr(settings, "tc1_htf_timeframe", "60Min") or "60Min"), limit=max(TR1_HTF_SLOW + 5, 220))
+    htf_closes = [float(b.get("c") or 0.0) for b in htf_bars] if htf_bars else []
+    htf_fast = _ema(htf_closes, TR1_HTF_FAST) if htf_closes else 0.0
+    htf_slow = _ema(htf_closes, TR1_HTF_SLOW) if htf_closes else 0.0
+    trend_ok = bool(htf_fast > htf_slow > 0)
+    trend_sep_bps = (((htf_fast - htf_slow) / htf_slow) * 10000.0) if htf_slow > 0 else 0.0
+    vwap = _vwap_from_bars(bars, lookback=min(len(bars), max(20, TR1_LOOKBACK_BARS + 10)))
+    spread_pct = None
+    try:
+        bid, ask = _best_bid_ask(symbol)
+        if bid and ask and bid > 0 and ask >= bid:
+            spread_pct = max(0.0, (ask - bid) / bid)
+    except Exception:
+        spread_pct = None
+    recent_high = max(highs[-max(3, TR1_LOOKBACK_BARS):-1]) if len(highs) > max(3, TR1_LOOKBACK_BARS) else max(highs[:-1])
+    recent_low = min(lows[-max(3, TR1_PULLBACK_LOOKBACK_BARS+1):-1]) if len(lows) > max(3, TR1_PULLBACK_LOOKBACK_BARS+1) else min(lows[:-1])
+    pullback_depth_atr = ((recent_high - recent_low) / atr_now) if atr_now > 0 else 0.0
+    close_fraction = ((cur_close - cur_low) / max(cur_high - cur_low, 1e-12)) if cur_high > cur_low else 0.0
+    reclaim_anchor = max(float(ltf_ema or 0.0), float(vwap or 0.0), recent_high)
+    reclaim_strength_bps = (((cur_close - reclaim_anchor) / reclaim_anchor) * 10000.0) if reclaim_anchor > 0 else 0.0
+    range_atr = ((cur_high - cur_low) / atr_now) if atr_now > 0 else 0.0
+    expected_move_bps = max(int(TR1_MIN_TAKE_PROFIT_BPS), int((TR1_EXPECTED_MOVE_ATR_MULT * float(atr_pct or 0.0)) * 10000.0)) if atr_pct is not None else int(TR1_MIN_TAKE_PROFIT_BPS)
+    dbg.update({"close": cur_close, "ltf_ema": ltf_ema, "vwap": vwap, "trend_ok": trend_ok, "trend_sep_bps": trend_sep_bps, "atr_now": atr_now, "atr_pct": atr_pct, "spread_pct": spread_pct, "recent_high": recent_high, "recent_low": recent_low, "pullback_depth_atr": pullback_depth_atr, "close_fraction": close_fraction, "reclaim_anchor": reclaim_anchor, "reclaim_strength_bps": reclaim_strength_bps, "breakout_range_atr": range_atr, "expected_move_bps": expected_move_bps})
+    if not trend_ok:
+        dbg["reason"] = "trend_not_up"
+        return False, dbg
+    if atr_pct is None or atr_pct < TR1_MIN_ATR_PCT:
+        dbg["reason"] = "atr_too_low"
+        return False, dbg
+    if spread_pct is not None and spread_pct > TR1_MAX_SPREAD_PCT:
+        dbg["reason"] = "spread_too_wide"
+        return False, dbg
+    if TR1_REQUIRE_VWAP and vwap and cur_close < vwap:
+        dbg["reason"] = "below_vwap"
+        return False, dbg
+    if not (TR1_PULLBACK_ATR_MIN <= pullback_depth_atr <= TR1_PULLBACK_ATR_MAX):
+        dbg["reason"] = "pullback_depth_out_of_band"
+        return False, dbg
+    if cur_close <= reclaim_anchor:
+        dbg["reason"] = "reclaim_not_confirmed"
+        return False, dbg
+    if close_fraction < TR1_MIN_CLOSE_FRACTION:
+        dbg["reason"] = "close_strength_too_low"
+        return False, dbg
+    if range_atr < TR1_MIN_RANGE_ATR:
+        dbg["reason"] = "range_too_small"
+        return False, dbg
+    # profitability guard reusing existing model
+    round_trip_bps = _estimated_round_trip_bps(spread_pct=spread_pct)
+    move_to_cost = (float(expected_move_bps) / float(round_trip_bps)) if round_trip_bps > 0 else 0.0
+    dbg["estimated_round_trip_bps"] = round_trip_bps
+    dbg["move_to_cost_mult"] = move_to_cost
+    if expected_move_bps < max(int(PROFIT_FILTER_MIN_EXPECTED_MOVE_BPS), int(TR1_MIN_TAKE_PROFIT_BPS)):
+        dbg["reason"] = "expected_move_too_small"
+        return False, dbg
+    if move_to_cost < max(float(PROFIT_FILTER_MIN_MOVE_TO_COST_MULT), 1.2):
+        dbg["reason"] = "move_to_cost_too_low"
+        return False, dbg
+    dbg["fired"] = True
+    dbg["reason"] = "tr1_reclaim_resume"
+    return True, dbg
+
 def _tc1_long_signal(symbol: str) -> tuple[bool, dict]:
     """TC1 true breakout entry logic.
 
@@ -2394,135 +2493,6 @@ def _tc1_long_signal(symbol: str) -> tuple[bool, dict]:
     }
     return (bool(momentum_ok or pullback_ok), meta)
 
-
-def _tr1_long_signal(symbol: str) -> tuple[bool, dict]:
-    """TR1 trend-resume long entry model for majors.
-
-    Complements tc1 by focusing on established HTF uptrends that pull back into
-    the EMA/VWAP zone and then reclaim recent local structure.
-    """
-    htf_need = max(TC1_HTF_LIMIT_BARS, TC1_HTF_SLOW + 5)
-    htf = _get_bars(symbol, timeframe=TC1_HTF_TIMEFRAME, limit=htf_need)
-    if not htf or len(htf) < (TC1_HTF_SLOW + 3):
-        return False, {"reason": "insufficient_htf_bars", "bars": len(htf) if htf else 0}
-    htf_fresh_ok, htf_fresh_meta = _guard_fresh_bars(htf, TC1_HTF_TIMEFRAME)
-    if not htf_fresh_ok:
-        return False, {"reason": "stale_htf_bars", "bars": len(htf), "freshness": htf_fresh_meta}
-
-    htf_closes = [float(b["c"]) for b in htf]
-    ema_fast = _ema(htf_closes, TC1_HTF_FAST)
-    ema_slow = _ema(htf_closes, TC1_HTF_SLOW)
-    eps = TC1_TREND_SOFTEN_EPSILON if TC1_TREND_SOFTEN_EPSILON and TC1_TREND_SOFTEN_EPSILON > 0 else 0.0
-    uptrend = (ema_fast[-1] >= (ema_slow[-1] * (1.0 - eps))) and (ema_fast[-1] > ema_fast[-2])
-    trend_sep_bps = (((ema_fast[-1] / ema_slow[-1]) - 1.0) * 10000.0) if ema_slow[-1] > 0 else None
-
-    need = max(ENTRY_ENGINE_LIMIT_BARS, TC1_LTF_EMA + 10, TC1_ATR_LEN + 10, TC1_BREAKOUT_LOOKBACK_BARS + 5)
-    ltf = _get_bars(symbol, timeframe=ENTRY_ENGINE_TIMEFRAME, limit=need)
-    if not ltf or len(ltf) < need:
-        return False, {"reason": "insufficient_ltf_bars", "bars": len(ltf) if ltf else 0, "uptrend": uptrend}
-    ltf_fresh_ok, ltf_fresh_meta = _guard_fresh_bars(ltf, ENTRY_ENGINE_TIMEFRAME)
-    if not ltf_fresh_ok:
-        return False, {"reason": "stale_ltf_bars", "bars": len(ltf), "uptrend": uptrend, "freshness": ltf_fresh_meta}
-
-    ltf_opens = [float(b["o"]) for b in ltf]
-    ltf_closes = [float(b["c"]) for b in ltf]
-    ltf_highs = [float(b["h"]) for b in ltf]
-    ltf_lows = [float(b["l"]) for b in ltf]
-    ltf_ema = _ema(ltf_closes, TC1_LTF_EMA)
-
-    cur_close = ltf_closes[-1]
-    cur_high = ltf_highs[-1]
-    cur_low = ltf_lows[-1]
-    cur_ema = ltf_ema[-1]
-    atr_now, _ = _atr_from_bars(ltf, length=int(TC1_ATR_LEN))
-    atr_pct = (float(atr_now) / float(cur_close)) if atr_now and cur_close > 0 else None
-    atr_ok = (atr_pct is not None and atr_pct >= max(0.0005, float(TC1_MIN_ATR_PCT) * 0.85))
-
-    vwap = _vwap_from_bars(ltf, lookback=max(TC1_LTF_EMA, TC0_VWAP_LOOKBACK_BARS))
-    vwap_ok = (not bool(TC1_REQUIRE_VWAP)) or (vwap is not None and cur_close >= float(vwap))
-
-    bars = max(3, int(TC1_PULLBACK_RECLAIM_BARS))
-    reclaim_anchor = max(max(ltf_highs[-(bars + 1):-1]), cur_ema * (1.0 + max(0.0, float(TC1_RECLAIM_BUFFER_PCT) * 0.5)))
-    pullback_profile = _tc1_pullback_reclaim_profile(
-        ltf_opens, ltf_closes, ltf_highs, ltf_lows,
-        atr_now=float(atr_now) if atr_now is not None else None,
-        reclaim_px=float(reclaim_anchor),
-        cur_close=float(cur_close),
-        cur_high=float(cur_high),
-        cur_low=float(cur_low),
-        cur_ema=float(cur_ema),
-        vwap=float(vwap) if vwap is not None else None,
-    )
-
-    bar_range = max(0.0, cur_high - cur_low)
-    close_fraction = ((cur_close - cur_low) / bar_range) if bar_range > 0 else None
-    reclaim_distance_bps = float(pullback_profile.get("reclaim_distance_bps") or 0.0)
-    reclaim_close_ok = close_fraction is not None and close_fraction >= 0.56
-    reclaim_distance_ok = reclaim_distance_bps >= 0.5
-    trend_sep_ok = trend_sep_bps is not None and trend_sep_bps >= 3.0
-
-    spread_pct = None
-    spread_ok = True
-    try:
-        bid, ask = _best_bid_ask(symbol)
-        bid = float(bid or 0.0); ask = float(ask or 0.0)
-        mid = ((bid + ask) / 2.0) if (bid > 0 and ask > 0) else 0.0
-        spread_pct = ((ask - bid) / mid) if mid > 0 else None
-        if spread_pct is not None:
-            spread_ok = spread_pct <= min(0.0026, float(TC1_MAX_SPREAD_PCT) + 0.0002)
-    except Exception:
-        spread_ok = True
-
-    expected_move_bps = (float(atr_pct) * 10000.0 * max(3.0, float(TC1_EXPECTED_MOVE_ATR_MULT) - 1.0)) if atr_pct is not None else None
-    profit_ok, profit_meta = _profitability_gate(expected_move_bps, spread_pct=spread_pct) if PROFIT_FILTER_ENABLED else (True, {"profit_filter_enabled": False})
-
-    eligible = bool(uptrend and trend_sep_ok and atr_ok and vwap_ok and spread_ok and profit_ok and pullback_profile.get("eligible") and reclaim_close_ok and reclaim_distance_ok)
-    reason = None
-    if not eligible:
-        if not uptrend:
-            reason = "trend_not_up"
-        elif not trend_sep_ok:
-            reason = "trend_too_weak"
-        elif not atr_ok:
-            reason = "atr_too_low"
-        elif not vwap_ok:
-            reason = "below_vwap"
-        elif not pullback_profile.get("eligible"):
-            reason = str(pullback_profile.get("reason") or "pullback_reclaim_not_ready")
-        elif not reclaim_close_ok:
-            reason = "weak_reclaim_close"
-        elif not reclaim_distance_ok:
-            reason = "reclaim_too_shallow"
-        elif not spread_ok:
-            reason = "spread_too_wide"
-        elif not profit_ok:
-            reason = str((profit_meta or {}).get("reason") or "profit_filter_blocked")
-        else:
-            reason = "tr1_not_ready"
-
-    meta = {
-        "strategy_name": "tr1_trend_resume",
-        "reason": reason,
-        "signal_mode": "trend_resume_reclaim" if eligible else None,
-        "uptrend": bool(uptrend),
-        "trend_sep_bps": float(trend_sep_bps) if trend_sep_bps is not None else None,
-        "close": float(cur_close),
-        "ltf_ema": float(cur_ema),
-        "vwap": float(vwap) if vwap is not None else None,
-        "atr_now": float(atr_now) if atr_now is not None else None,
-        "atr_pct": float(atr_pct) if atr_pct is not None else None,
-        "spread_pct": float(spread_pct) if spread_pct is not None else None,
-        "spread_ok": bool(spread_ok),
-        "trend_sep_ok": bool(trend_sep_ok),
-        "atr_ok": bool(atr_ok),
-        "vwap_ok": bool(vwap_ok),
-        "reclaim_close_ok": bool(reclaim_close_ok),
-        "reclaim_distance_ok": bool(reclaim_distance_ok),
-        "pullback_profile": pullback_profile,
-        "profit_filter": profit_meta,
-        "expected_move_bps": float(expected_move_bps) if expected_move_bps is not None else None,
-    }
-    return bool(eligible), meta
 
 
 def _within_minutes_after_utc_hhmm(now: datetime, hhmm_utc: str, window_min: int) -> bool:
@@ -3336,6 +3306,7 @@ def _phase1_safety_report() -> Dict[str, Any]:
         "tc0": bool(ENABLE_TC0),
         "rb1": bool(ENABLE_RB1),
         "tc1": bool(ENABLE_TC1),
+        "tr1": bool(ENABLE_TR1),
         "cr1": bool(ENABLE_CR1),
         "mm1": bool(ENABLE_MM1),
     }
@@ -6776,8 +6747,8 @@ def _tc1_regime_state(regime_quiet: bool) -> dict:
 def _entry_signals_for_symbol(symbol: str, *, regime_quiet: bool) -> tuple[dict, dict]:
     """Return (signals, debug) for the given symbol.
 
-    signals: {"tc0": bool, "rb1": bool, "tc1": bool, "cr1"?: bool, "mm1"?: bool}
-    debug:   {"tc0": {...}, "rb1": {...}, "tc1": {...}, ...}
+    signals: {"tc0": bool, "rb1": bool, "tc1": bool, "tr1": bool, "cr1"?: bool, "mm1"?: bool}
+    debug:   {"tc0": {...}, "rb1": {...}, "tc1": {...}, "tr1": {...}, ...}
     """
     signals: dict = {}
     debug: dict = {}
@@ -6785,7 +6756,7 @@ def _entry_signals_for_symbol(symbol: str, *, regime_quiet: bool) -> tuple[dict,
     wants_tc0 = ENABLE_TC0 and (STRATEGY_MODE != "fixed" or "tc0" in ENTRY_ENGINE_STRATEGIES)
     wants_rb1 = ENABLE_RB1 and (STRATEGY_MODE != "fixed" or "rb1" in ENTRY_ENGINE_STRATEGIES)
     wants_tc1 = ENABLE_TC1 and (STRATEGY_MODE != "fixed" or "tc1" in ENTRY_ENGINE_STRATEGIES)
-    wants_tr1 = ENABLE_TC1 and (STRATEGY_MODE != "fixed" or ("tc1" in ENTRY_ENGINE_STRATEGIES or "tr1" in ENTRY_ENGINE_STRATEGIES))
+    wants_tr1 = ENABLE_TR1
     wants_cr1 = ENABLE_CR1 and (STRATEGY_MODE != "fixed" or "cr1" in ENTRY_ENGINE_STRATEGIES)
     wants_mm1 = ENABLE_MM1 and (STRATEGY_MODE != "fixed" or "mm1" in ENTRY_ENGINE_STRATEGIES)
 
@@ -6799,19 +6770,19 @@ def _entry_signals_for_symbol(symbol: str, *, regime_quiet: bool) -> tuple[dict,
         signals["rb1"] = bool(rb1_fired)
         debug["rb1"] = rb1_meta
 
-    regime_state = None
-    patience_state = None
-    if wants_tc1 or wants_tr1:
+    if wants_tc1:
         regime_state = _tc1_regime_state(regime_quiet=bool(regime_quiet))
         patience_state = _tc1_patience_state(symbol)
-
-    if wants_tc1:
         if not bool(regime_state.get("allow")):
             signals["tc1"] = False
             debug["tc1"] = {"reason": regime_state.get("reason"), "regime": regime_state, "patience": patience_state}
+            signals["tr1"] = False
+            debug["tr1"] = {"reason": regime_state.get("reason"), "regime": regime_state, "patience": patience_state}
         elif not bool(patience_state.get("allow")):
             signals["tc1"] = False
             debug["tc1"] = {"reason": patience_state.get("reason"), "regime": regime_state, "patience": patience_state}
+            signals["tr1"] = False
+            debug["tr1"] = {"reason": patience_state.get("reason"), "regime": regime_state, "patience": patience_state}
         else:
             tc1_fired, tc1_meta = _tc1_long_signal(symbol)
             tc1_meta = dict(tc1_meta or {})
@@ -6819,21 +6790,18 @@ def _entry_signals_for_symbol(symbol: str, *, regime_quiet: bool) -> tuple[dict,
             tc1_meta["patience"] = patience_state
             signals["tc1"] = bool(tc1_fired)
             debug["tc1"] = tc1_meta
+            if wants_tr1:
+                tr1_fired, tr1_meta = _tr1_long_signal(symbol)
+                tr1_meta = dict(tr1_meta or {})
+                tr1_meta["regime"] = regime_state
+                tr1_meta["patience"] = patience_state
+                signals["tr1"] = bool(tr1_fired)
+                debug["tr1"] = tr1_meta
 
-    if wants_tr1:
-        if not bool(regime_state.get("allow")):
-            signals["tr1"] = False
-            debug["tr1"] = {"reason": regime_state.get("reason"), "regime": regime_state, "patience": patience_state}
-        elif not bool(patience_state.get("allow")):
-            signals["tr1"] = False
-            debug["tr1"] = {"reason": patience_state.get("reason"), "regime": regime_state, "patience": patience_state}
-        else:
-            tr1_fired, tr1_meta = _tr1_long_signal(symbol)
-            tr1_meta = dict(tr1_meta or {})
-            tr1_meta["regime"] = regime_state
-            tr1_meta["patience"] = patience_state
-            signals["tr1"] = bool(tr1_fired)
-            debug["tr1"] = tr1_meta
+    if wants_tr1 and not wants_tc1:
+        tr1_fired, tr1_meta = _tr1_long_signal(symbol)
+        signals["tr1"] = bool(tr1_fired)
+        debug["tr1"] = tr1_meta
 
     # Optional strategies for quiet / choppy regimes unless fixed mode explicitly requests them.
     if wants_cr1 and (STRATEGY_MODE == "fixed" or (STRATEGY_MODE != "legacy" and regime_quiet)):
@@ -7281,8 +7249,6 @@ def diagnostics_live_config():
             runtime_order.append(s)
         elif s == "tc1" and ENABLE_TC1:
             runtime_order.append(s)
-        elif s == "tr1" and ENABLE_TC1:
-            runtime_order.append(s)
         elif s == "cr1" and ENABLE_CR1:
             runtime_order.append(s)
         elif s == "mm1" and ENABLE_MM1:
@@ -7296,7 +7262,6 @@ def diagnostics_live_config():
         "enable_tc0": bool(ENABLE_TC0),
         "enable_rb1": bool(ENABLE_RB1),
         "enable_tc1": bool(ENABLE_TC1),
-        "enable_tr1": bool(ENABLE_TC1),
         "enable_cr1": bool(ENABLE_CR1),
         "enable_mm1": bool(ENABLE_MM1),
         "tc0_params": {
