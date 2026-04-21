@@ -1166,6 +1166,9 @@ TR1_MIN_RANGE_ATR = float(os.getenv("TR1_MIN_RANGE_ATR", "0.70") or 0.70)
 TR1_MAX_HOLD_SEC = int(float(os.getenv("TR1_MAX_HOLD_SEC", "21600") or 21600))
 TR1_REGIME_FILTER_ENABLED = (os.getenv("TR1_REGIME_FILTER_ENABLED", "1").strip().lower() in ("1", "true", "yes", "on"))
 TR1_USE_TC1_PATIENCE = (os.getenv("TR1_USE_TC1_PATIENCE", "1").strip().lower() in ("1", "true", "yes", "on"))
+TR1_ROLLOUT_GATE_ENABLED = (os.getenv("TR1_ROLLOUT_GATE_ENABLED", "1").strip().lower() in ("1", "true", "yes", "on"))
+TR1_ROLLOUT_GATE_BYPASS_KILL_SWITCH = (os.getenv("TR1_ROLLOUT_GATE_BYPASS_KILL_SWITCH", "1").strip().lower() in ("1", "true", "yes", "on"))
+TR1_ROLLOUT_GATE_MAX_SYMBOLS = int(float(os.getenv("TR1_ROLLOUT_GATE_MAX_SYMBOLS", "1") or 1))
 
 
 # ---------- Scanner config (soft allow) ----------
@@ -2924,13 +2927,58 @@ def _universe_control_snapshot(days: float | None = None) -> dict[str, Any]:
     return out
 
 
+
+def _tr1_rollout_gate_snapshot(days: float | None = None) -> dict[str, Any]:
+    enabled = bool(TR1_ROLLOUT_GATE_ENABLED)
+    fixed_mode = str(STRATEGY_MODE).strip().lower() == "fixed"
+    tr1_live = bool(ENABLE_TR1) and (not fixed_mode or "tr1" in ENTRY_ENGINE_STRATEGIES)
+    bypass = bool(TR1_ROLLOUT_GATE_BYPASS_KILL_SWITCH)
+    max_symbols = max(1, int(TR1_ROLLOUT_GATE_MAX_SYMBOLS or 1))
+    out = {
+        "enabled": enabled,
+        "fixed_mode": fixed_mode,
+        "tr1_live": tr1_live,
+        "bypass_kill_switch": bypass,
+        "max_symbols": max_symbols,
+        "active": False,
+        "reason": "disabled",
+        "allowed_symbols": [],
+    }
+    if not enabled:
+        return out
+    if not tr1_live:
+        out["reason"] = "tr1_not_live"
+        return out
+    snap = _profitability_isolation_snapshot(days=days)
+    allowed = [normalize_symbol(str(s)) for s in list(snap.get("allowed_symbols") or []) if str(s).strip()]
+    if not allowed:
+        out["reason"] = "no_allowed_symbols"
+        return out
+    out["allowed_symbols"] = allowed[:max_symbols]
+    out["active"] = True
+    out["reason"] = "tr1_rollout_gate_active"
+    return out
+
+
 def _filter_symbols_by_universe_control(symbols: list[str], *, days: float | None = None) -> tuple[list[str], list[str], dict[str, Any]]:
     snap = _universe_control_snapshot(days=days)
     normalized_in = [normalize_symbol(str(s)) for s in list(symbols or []) if str(s).strip()]
     if not bool(snap.get("enabled")):
         return list(dict.fromkeys(normalized_in)), [], snap
     if bool(snap.get("kill_switch_active")):
+        gate = _tr1_rollout_gate_snapshot(days=days)
+        if bool(gate.get("active")) and bool(gate.get("bypass_kill_switch")):
+            allowed = {normalize_symbol(str(s)) for s in list(gate.get("allowed_symbols") or []) if str(s).strip()}
+            filtered = [s for s in normalized_in if s in allowed]
+            removed = [s for s in normalized_in if s not in allowed]
+            snap = dict(snap)
+            snap["rollout_gate"] = gate
+            snap["authoritative"] = True
+            snap["authoritative_reason"] = "tr1_rollout_gate"
+            snap["kill_switch_active"] = True
+            return list(dict.fromkeys(filtered)), list(dict.fromkeys(removed)), snap
         snap = dict(snap)
+        snap["rollout_gate"] = gate
         snap["authoritative"] = True
         snap["authoritative_reason"] = "kill_switch_active"
         return [], list(dict.fromkeys(normalized_in)), snap
@@ -8750,6 +8798,7 @@ def diagnostics_universe_control(days: float = 30.0):
         "build": build_payload(),
         "days": float(days),
         "universe_control": snap,
+        "rollout_gate": dict((snap or {}).get("rollout_gate") or _tr1_rollout_gate_snapshot(days=days)),
         "kill_switch_enabled": bool((snap or {}).get("kill_switch_enabled")),
         "kill_switch_active": bool((snap or {}).get("kill_switch_active")),
         "expectancy_window_days": float((snap or {}).get("expectancy_window_days") or days),
