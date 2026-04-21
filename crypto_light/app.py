@@ -4401,7 +4401,7 @@ def _extract_execution_metrics(res: dict | None, *, fallback_price: float = 0.0,
     }
 
 
-def _record_open_trade_journal(*, symbol: str, strategy: str, source: str, signal_name: str | None, signal_id: str | None, req_id: str, requested_notional_usd: float, stop_price: float, take_price: float, px_fallback: float, res: dict, opened_ts: float | None = None) -> None:
+def _record_open_trade_journal(*, symbol: str, strategy: str, source: str, signal_name: str | None, signal_id: str | None, req_id: str, requested_notional_usd: float, stop_price: float, take_price: float, px_fallback: float, res: dict, opened_ts: float | None = None, entry_context: dict | None = None) -> None:
     metrics = _extract_execution_metrics(res, fallback_price=float(px_fallback or 0.0), fallback_qty=(float(requested_notional_usd or 0.0) / float(px_fallback or 1.0)) if float(px_fallback or 0.0) > 0 else 0.0)
     trade_journal.upsert_open_trade({
         'symbol': symbol,
@@ -4420,11 +4420,11 @@ def _record_open_trade_journal(*, symbol: str, strategy: str, source: str, signa
         'requested_notional_usd': float(requested_notional_usd),
         'stop_price': float(stop_price),
         'take_price': float(take_price),
-        'meta': {'order_result': res},
+        'meta': {'order_result': res, 'entry_context': dict(entry_context or {}), 'entry_ref_price': float(px_fallback or 0.0), 'regime_state': (entry_context or {}).get('regime_state')},
     })
 
 
-def _record_exit_trade_journal(*, symbol: str, reason: str, px_fallback: float, res: dict, closed_ts: float | None = None) -> dict | None:
+def _record_exit_trade_journal(*, symbol: str, reason: str, px_fallback: float, res: dict, closed_ts: float | None = None, exit_context: dict | None = None) -> dict | None:
     metrics = _extract_execution_metrics(res, fallback_price=float(px_fallback or 0.0))
     out = trade_journal.close_trade(symbol, {
         'closed_ts': float(closed_ts or time.time()),
@@ -4435,7 +4435,7 @@ def _record_exit_trade_journal(*, symbol: str, reason: str, px_fallback: float, 
         'exit_cost': metrics.get('cost'),
         'exit_fee': metrics.get('fee'),
         'exit_reason': reason,
-        'meta': {'order_result': res},
+        'meta': {'order_result': res, 'exit_context': dict(exit_context or {}), 'exit_ref_price': float(px_fallback or 0.0)},
     })
     try:
         _journal_sync_daily_realized_pnl()
@@ -4730,7 +4730,7 @@ def _execute_long_entry(
             **merged_payload,
         }
         _log_event("warning", evt)
-        _record_blocked_trade(structured_reason, req_id=req_id, source=source, **merged_payload)
+        _record_blocked_trade(structured_reason, req_id=req_id, source=source, symbol=symbol, strategy=strategy, signal_id=signal_id, fingerprint=admission_ctx.get('fingerprint'), regime_state=admission_ctx.get('regime_state'), ranking_score=admission_ctx.get('ranking_score'), spread_pct=admission_ctx.get('spread_pct'), **merged_payload)
         _record_ops_event('entry_ignored', symbol=symbol, strategy=strategy, signal_id=signal_id, reason=structured_reason, payload=evt, fingerprint=admission_ctx.get('fingerprint'))
         _record_rejected_admission(admission_ctx, structured_reason, payload=evt)
         return {"ok": True, "ignored": True, "reason": structured_reason, **merged_payload}
@@ -5204,6 +5204,17 @@ def _execute_long_entry(
                 px_fallback=float(px),
                 res=res,
                 opened_ts=opened_ts,
+                entry_context={
+                    'symbol': symbol,
+                    'strategy': strategy,
+                    'regime_state': admission_ctx.get('regime_state'),
+                    'reference_price': float(px),
+                    'entry_ref_price': float(px),
+                    'expected_move_bps': _float_or_none((((candidate_meta or {}).get('signal_meta') or {}).get('expected_move_bps')) or ((candidate_meta or {}).get('expected_move_bps')) or (((candidate_meta or {}).get('signal_meta') or {}).get('profit_filter') or {}).get('expected_move_bps'), ),
+                    'profit_filter': dict((((candidate_meta or {}).get('signal_meta') or {}).get('profit_filter') or {})),
+                    'spread_pct': _float_or_none((candidate_meta or {}).get('spread_pct')),
+                    'ranking_score': _float_or_none((candidate_meta or {}).get('ranking_score')),
+                },
             )
         except Exception:
             pass
@@ -6498,7 +6509,14 @@ def worker_exit(payload: WorkerExitPayload):
                     state.mark_exit(symbol)
                     state.set_pending_exit(symbol, reason=reason, txid=res.get("txid"))
                     try:
-                        journal_close = _record_exit_trade_journal(symbol=symbol, reason=reason, px_fallback=float(px), res=res, closed_ts=now.timestamp())
+                        journal_close = _record_exit_trade_journal(symbol=symbol, reason=reason, px_fallback=float(px), res=res, closed_ts=now.timestamp(), exit_context={
+                            'symbol': symbol,
+                            'strategy': getattr(plan, 'strategy', None),
+                            'reference_price': float(px),
+                            'exit_ref_price': float(px),
+                            'regime_state': None,
+                            'reason': reason,
+                        })
                     except Exception:
                         journal_close = None
                     metrics_exit = _extract_execution_metrics(res, fallback_price=float(px), fallback_qty=float(qty))
@@ -7583,26 +7601,36 @@ def diagnostics_last_exit():
 
 
 @app.get("/diagnostics/blocked_trades")
-def diagnostics_blocked_trades(limit: int = 50):
+def diagnostics_blocked_trades(limit: int = 50, lookback_hours: int = 24):
     lim = max(1, min(int(limit or 50), int(BLOCKED_TRADES_LIMIT)))
-    items = list(getattr(state, 'blocked_trades', []) or [])[-lim:]
+    mem_items = list(getattr(state, 'blocked_trades', []) or [])[-lim:]
+    since_ts = time.time() - max(1, int(lookback_hours or 24)) * 3600.0
+    persisted = lifecycle_db.list_recent_admission_events(admission_result='rejected', since_ts=since_ts, limit=lim)
     reason_counts: Dict[str, int] = {}
     strategy_counts: Dict[str, int] = {}
-    for item in items:
+    for item in persisted:
+        reason = str(item.get('reject_reason') or item.get('reason') or 'unknown')
+        strategy = str(item.get('strategy_id') or 'unknown')
+        reason_counts[reason] = int(reason_counts.get(reason, 0)) + 1
+        strategy_counts[strategy] = int(strategy_counts.get(strategy, 0)) + 1
+    for item in mem_items:
         if not isinstance(item, dict):
             continue
         reason = str(item.get("reason") or item.get("block_reason") or "unknown")
         strategy = str(item.get("strategy") or item.get("chosen_strategy") or "unknown")
-        reason_counts[reason] = int(reason_counts.get(reason, 0)) + 1
-        strategy_counts[strategy] = int(strategy_counts.get(strategy, 0)) + 1
+        reason_counts.setdefault(reason, 0)
+        strategy_counts.setdefault(strategy, 0)
     return {
         "ok": True,
         "utc": utc_now_iso(),
         "limit": lim,
-        "count": len(items),
+        "lookback_hours": int(lookback_hours),
+        "in_memory_count": len(mem_items),
+        "persisted_count": len(persisted),
         "reason_counts": reason_counts,
         "strategy_counts": strategy_counts,
-        "items": items,
+        "persisted_items": persisted,
+        "in_memory_items": mem_items,
     }
 
 
@@ -8177,6 +8205,20 @@ def _serialize_recent_trade(row: dict[str, Any]) -> dict[str, Any]:
         "clean_trade": bool(row.get("clean_trade")),
         "max_realized_slippage_bps": row.get("max_realized_slippage_bps"),
         "alert_flags_json": row.get("alert_flags_json"),
+        "entry_liquidity_role": row.get("entry_liquidity_role"),
+        "exit_liquidity_role": row.get("exit_liquidity_role"),
+        "entry_execution_path": row.get("entry_execution_path"),
+        "exit_execution_path": row.get("exit_execution_path"),
+        "projected_move_bps": row.get("projected_move_bps"),
+        "projected_cost_bps": row.get("projected_cost_bps"),
+        "realized_move_bps": row.get("realized_move_bps"),
+        "realized_cost_bps": row.get("realized_cost_bps"),
+        "net_edge_bps": row.get("net_edge_bps"),
+        "projected_move_to_cost_mult": row.get("projected_move_to_cost_mult"),
+        "realized_move_to_cost_mult": row.get("realized_move_to_cost_mult"),
+        "hold_bucket": row.get("hold_bucket"),
+        "regime_state": row.get("regime_state"),
+        "expectancy_bucket": row.get("expectancy_bucket"),
         "updated_utc": row.get("updated_utc"),
     }
 

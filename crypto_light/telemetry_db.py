@@ -7,6 +7,7 @@ import time
 from typing import Any, Dict, List, Optional
 
 from . import trade_journal
+from . import lifecycle_db
 
 
 def _canonical_trade_symbol(symbol: str) -> str:
@@ -62,6 +63,13 @@ def _connect() -> sqlite3.Connection:
     return conn
 
 
+def _ensure_columns(conn: sqlite3.Connection, table: str, cols: Dict[str, str]) -> None:
+    existing = {str(r[1]) for r in conn.execute(f"PRAGMA table_info({table})").fetchall()}
+    for name, ctype in cols.items():
+        if name not in existing:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {ctype}")
+
+
 def init_db() -> None:
     with _connect() as conn:
         conn.execute(
@@ -81,6 +89,10 @@ def init_db() -> None:
               exit_txid TEXT,
               entry_execution TEXT,
               exit_execution TEXT,
+              entry_execution_path TEXT,
+              exit_execution_path TEXT,
+              entry_liquidity_role TEXT,
+              exit_liquidity_role TEXT,
               entry_ref_price REAL,
               exit_ref_price REAL,
               entry_fill_price REAL,
@@ -96,6 +108,16 @@ def init_db() -> None:
               entry_realized_slippage_bps REAL,
               exit_realized_slippage_bps REAL,
               max_realized_slippage_bps REAL,
+              projected_move_bps REAL,
+              projected_cost_bps REAL,
+              realized_move_bps REAL,
+              realized_cost_bps REAL,
+              net_edge_bps REAL,
+              projected_move_to_cost_mult REAL,
+              realized_move_to_cost_mult REAL,
+              hold_bucket TEXT,
+              regime_state TEXT,
+              expectancy_bucket TEXT,
               fees_total REAL,
               gross_pnl_usd REAL,
               net_pnl_usd REAL,
@@ -109,8 +131,26 @@ def init_db() -> None:
             )
             """
         )
+        _ensure_columns(conn, 'trade_telemetry', {
+            'entry_execution_path': 'TEXT',
+            'exit_execution_path': 'TEXT',
+            'entry_liquidity_role': 'TEXT',
+            'exit_liquidity_role': 'TEXT',
+            'projected_move_bps': 'REAL',
+            'projected_cost_bps': 'REAL',
+            'realized_move_bps': 'REAL',
+            'realized_cost_bps': 'REAL',
+            'net_edge_bps': 'REAL',
+            'projected_move_to_cost_mult': 'REAL',
+            'realized_move_to_cost_mult': 'REAL',
+            'hold_bucket': 'TEXT',
+            'regime_state': 'TEXT',
+            'expectancy_bucket': 'TEXT',
+        })
         conn.execute("CREATE INDEX IF NOT EXISTS idx_trade_telemetry_closed_ts ON trade_telemetry(closed_ts DESC)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_trade_telemetry_symbol_closed_ts ON trade_telemetry(symbol, closed_ts DESC)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_trade_telemetry_regime_closed_ts ON trade_telemetry(regime_state, closed_ts DESC)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_trade_telemetry_hold_bucket_closed_ts ON trade_telemetry(hold_bucket, closed_ts DESC)")
         conn.commit()
 
 
@@ -169,25 +209,144 @@ def _fee_bps(fee: Optional[float], cost: Optional[float]) -> Optional[float]:
     return abs(float(fee)) / abs(float(cost)) * 10000.0
 
 
+def _liquidity_role(execution: Any) -> str:
+    s = str(execution or '').strip().lower()
+    if not s:
+        return 'unknown'
+    if 'post_only' in s or 'maker' in s:
+        return 'maker'
+    if 'market' in s or 'aggressive' in s or 'stop_loss' in s or 'stop-limit' in s or 'stop_limit' in s:
+        return 'taker'
+    if 'limit' in s:
+        return 'limit'
+    return 'unknown'
+
+
+def _execution_path(execution: Any, order_result: Dict[str, Any] | None = None) -> str:
+    s = str(execution or '').strip().lower()
+    res = dict(order_result or {})
+    if not s and res:
+        s = str(res.get('execution') or '').strip().lower()
+    maker_first = bool(res.get('maker_first'))
+    market_fallback = bool(res.get('market_fallback')) or bool((res.get('fallback') or {}).get('used'))
+    if maker_first and market_fallback:
+        return 'maker_then_fallback'
+    if maker_first:
+        return 'maker_first'
+    if 'post_only' in s or 'maker' in s:
+        return 'post_only'
+    if 'market' in s:
+        return 'market'
+    if 'aggressive' in s:
+        return 'limit_aggressive'
+    if 'stop' in s:
+        return 'stop'
+    return s or 'unknown'
+
+
+def _hold_bucket(hold_sec: Optional[float]) -> str:
+    hs = _to_float(hold_sec)
+    if hs is None:
+        return 'unknown'
+    if hs < 900:
+        return '<15m'
+    if hs < 3600:
+        return '15m-1h'
+    if hs < 4 * 3600:
+        return '1h-4h'
+    if hs < 24 * 3600:
+        return '4h-24h'
+    return '24h+'
+
+
+def _bps_change(start_px: Optional[float], end_px: Optional[float]) -> Optional[float]:
+    if start_px is None or end_px is None:
+        return None
+    if float(start_px) <= 0:
+        return None
+    return (float(end_px) - float(start_px)) / float(start_px) * 10000.0
+
+
+def _ratio(num: Optional[float], den: Optional[float]) -> Optional[float]:
+    if num is None or den is None:
+        return None
+    if float(den) <= 0:
+        return None
+    return float(num) / float(den)
+
+
+def _expectancy_bucket(net_edge_bps: Optional[float]) -> str:
+    v = _to_float(net_edge_bps)
+    if v is None:
+        return 'unknown'
+    if v >= 50:
+        return 'strong_positive'
+    if v >= 0:
+        return 'positive'
+    if v >= -50:
+        return 'slightly_negative'
+    return 'negative'
+
+
+def _group_stats(rows: List[Dict[str, Any]], key: str) -> Dict[str, Dict[str, Any]]:
+    out: Dict[str, Dict[str, Any]] = {}
+    for r in rows:
+        bucket = str(r.get(key) or 'unknown')
+        cur = out.setdefault(bucket, {'trades': 0, 'wins': 0, 'losses': 0, 'net_pnl_usd': 0.0, 'gross_pnl_usd': 0.0, 'fees_total_usd': 0.0, 'avg_realized_move_bps': None, 'avg_net_edge_bps': None})
+        cur['trades'] += 1
+        pnl = float(r.get('net_pnl_usd') or 0.0)
+        gpnl = float(r.get('gross_pnl_usd') or 0.0)
+        fees = float(r.get('fees_total') or 0.0)
+        cur['net_pnl_usd'] += pnl
+        cur['gross_pnl_usd'] += gpnl
+        cur['fees_total_usd'] += fees
+        if pnl > 0:
+            cur['wins'] += 1
+        elif pnl < 0:
+            cur['losses'] += 1
+        cur.setdefault('_rm', []).append(_to_float(r.get('realized_move_bps')))
+        cur.setdefault('_ne', []).append(_to_float(r.get('net_edge_bps')))
+    for bucket, cur in out.items():
+        rm = [float(x) for x in cur.pop('_rm', []) if x is not None]
+        ne = [float(x) for x in cur.pop('_ne', []) if x is not None]
+        cur['win_rate'] = (float(cur['wins']) / float(cur['wins'] + cur['losses'])) if (cur['wins'] + cur['losses']) > 0 else None
+        cur['avg_realized_move_bps'] = (sum(rm) / len(rm)) if rm else None
+        cur['avg_net_edge_bps'] = (sum(ne) / len(ne)) if ne else None
+    return out
+
+
+def _blocked_trade_summary(days: float) -> Dict[str, Any]:
+    since_ts = time.time() - max(0.0, float(days)) * 86400.0
+    try:
+        return lifecycle_db.summarize_admission_events(since_ts=since_ts)
+    except Exception:
+        return {'total': 0, 'by_result': {}, 'by_reason': {}}
+
+
 def sync_from_trade_journal(limit: int = 500) -> Dict[str, Any]:
     init_db()
     rows = _dedupe_journal_rows(trade_journal.list_closed_trades(limit=max(1, int(limit))))
     expected_slippage_bps = _env_float("EXPECTED_SLIPPAGE_BPS", _env_float("SLIPPAGE_BPS", 8.0))
+    entry_fee_bps_env = _env_float("ENTRY_FEE_BPS", 0.0)
+    exit_fee_bps_env = _env_float("EXIT_FEE_BPS", 0.0)
     max_realized_slippage_bps_alert = _env_float("MAX_REALIZED_SLIPPAGE_BPS_ALERT", 35.0)
     max_entry_fee_bps_alert = _env_float("MAX_ENTRY_FEE_BPS_ALERT", 40.0)
     max_exit_fee_bps_alert = _env_float("MAX_EXIT_FEE_BPS_ALERT", 40.0)
     inserted = 0
     with _connect() as conn:
         conn.execute("DELETE FROM trade_telemetry")
+        now_ts = time.time()
         for r in rows:
             meta = _safe_json_loads(r.get("meta_json"))
             order_result = _safe_json_loads(meta.get("order_result"))
             entry_ctx = _safe_json_loads(meta.get("entry_context"))
-            # support direct top-level fallback too
+            exit_ctx = _safe_json_loads(meta.get("exit_context"))
             entry_ref_price = _to_float(meta.get("entry_ref_price"))
             if entry_ref_price is None:
-                entry_ref_price = _to_float(entry_ctx.get("entry_ref_price"))
+                entry_ref_price = _to_float(entry_ctx.get("entry_ref_price", entry_ctx.get('reference_price')))
             exit_ref_price = _to_float(meta.get("exit_ref_price"))
+            if exit_ref_price is None:
+                exit_ref_price = _to_float(exit_ctx.get('exit_ref_price', exit_ctx.get('reference_price')))
             partial_close = bool(meta.get("partial_close") or False)
             entry_fill_price = _to_float(r.get("entry_price"))
             exit_fill_price = _to_float(r.get("exit_price"))
@@ -197,6 +356,24 @@ def sync_from_trade_journal(limit: int = 500) -> Dict[str, Any]:
             exit_slip = _slippage_bps(exit_fill_price, exit_ref_price)
             slips = [x for x in [entry_slip, exit_slip] if x is not None]
             max_slip = max(slips) if slips else None
+            projected_move_bps = _to_float(entry_ctx.get('expected_move_bps', meta.get('expected_move_bps')))
+            projected_cost_bps = _to_float((entry_ctx.get('profit_filter') or {}).get('round_trip_cost_bps', meta.get('projected_cost_bps')))
+            if projected_cost_bps is None:
+                projected_cost_bps = float(entry_fee_bps_env) + float(exit_fee_bps_env) + (2.0 * float(expected_slippage_bps))
+            realized_move_bps = _bps_change(entry_fill_price or entry_ref_price, exit_fill_price or exit_ref_price)
+            realized_cost_bps = None
+            if entry_fee_bps is not None or exit_fee_bps is not None:
+                realized_cost_bps = float(entry_fee_bps or 0.0) + float(exit_fee_bps or 0.0) + float(entry_slip or 0.0) + float(exit_slip or 0.0)
+            net_edge_bps = None if realized_move_bps is None or realized_cost_bps is None else float(realized_move_bps) - float(realized_cost_bps)
+            projected_move_to_cost_mult = _ratio(projected_move_bps, projected_cost_bps)
+            realized_move_to_cost_mult = _ratio(realized_move_bps, realized_cost_bps)
+            regime_state = str(entry_ctx.get('regime_state') or meta.get('regime_state') or 'unknown')
+            entry_execution = r.get('entry_execution')
+            exit_execution = r.get('exit_execution')
+            entry_execution_path = _execution_path(entry_execution, order_result)
+            exit_execution_path = _execution_path(exit_execution, order_result)
+            entry_liquidity_role = _liquidity_role(entry_execution)
+            exit_liquidity_role = _liquidity_role(exit_execution)
             alerts: List[str] = []
             if entry_slip is not None and entry_slip > max_realized_slippage_bps_alert:
                 alerts.append("entry_slippage_high")
@@ -208,6 +385,8 @@ def sync_from_trade_journal(limit: int = 500) -> Dict[str, Any]:
                 alerts.append("exit_fee_high")
             if partial_close:
                 alerts.append("partial_close")
+            if net_edge_bps is not None and net_edge_bps < 0:
+                alerts.append('negative_edge')
             clean_trade = int(len(alerts) == 0 and bool(r.get("exit_txid")) and bool(r.get("entry_txid")))
             payload = {
                 "trade_key": _trade_key(r),
@@ -222,8 +401,12 @@ def sync_from_trade_journal(limit: int = 500) -> Dict[str, Any]:
                 "hold_sec": _to_float(r.get("hold_sec")),
                 "entry_txid": r.get("entry_txid"),
                 "exit_txid": r.get("exit_txid"),
-                "entry_execution": r.get("entry_execution"),
-                "exit_execution": r.get("exit_execution"),
+                "entry_execution": entry_execution,
+                "exit_execution": exit_execution,
+                "entry_execution_path": entry_execution_path,
+                "exit_execution_path": exit_execution_path,
+                "entry_liquidity_role": entry_liquidity_role,
+                "exit_liquidity_role": exit_liquidity_role,
                 "entry_ref_price": entry_ref_price,
                 "exit_ref_price": exit_ref_price,
                 "entry_fill_price": entry_fill_price,
@@ -239,6 +422,16 @@ def sync_from_trade_journal(limit: int = 500) -> Dict[str, Any]:
                 "entry_realized_slippage_bps": entry_slip,
                 "exit_realized_slippage_bps": exit_slip,
                 "max_realized_slippage_bps": max_slip,
+                "projected_move_bps": projected_move_bps,
+                "projected_cost_bps": projected_cost_bps,
+                "realized_move_bps": realized_move_bps,
+                "realized_cost_bps": realized_cost_bps,
+                "net_edge_bps": net_edge_bps,
+                "projected_move_to_cost_mult": projected_move_to_cost_mult,
+                "realized_move_to_cost_mult": realized_move_to_cost_mult,
+                "hold_bucket": _hold_bucket(_to_float(r.get('hold_sec'))),
+                "regime_state": regime_state,
+                "expectancy_bucket": _expectancy_bucket(net_edge_bps),
                 "fees_total": _to_float(r.get("fees_total")),
                 "gross_pnl_usd": _to_float(r.get("gross_pnl_usd")),
                 "net_pnl_usd": _to_float(r.get("net_pnl_usd")),
@@ -249,24 +442,33 @@ def sync_from_trade_journal(limit: int = 500) -> Dict[str, Any]:
                 "meta_json": json.dumps({
                     "expected_slippage_bps": expected_slippage_bps,
                     "order_result": order_result,
+                    "entry_context": entry_ctx,
+                    "exit_context": exit_ctx,
                     "source_meta": meta,
+                    "synced_utc": now_ts,
                 }, separators=(",", ":"), sort_keys=True),
-                "created_utc": time.time(),
-                "updated_utc": time.time(),
+                "created_utc": now_ts,
+                "updated_utc": now_ts,
             }
             conn.execute(
                 """
                 INSERT INTO trade_telemetry (
                   trade_key, symbol, strategy, source, signal_name, signal_id, req_id, opened_ts, closed_ts, hold_sec,
-                  entry_txid, exit_txid, entry_execution, exit_execution, entry_ref_price, exit_ref_price,
+                  entry_txid, exit_txid, entry_execution, exit_execution, entry_execution_path, exit_execution_path,
+                  entry_liquidity_role, exit_liquidity_role, entry_ref_price, exit_ref_price,
                   entry_fill_price, exit_fill_price, entry_qty, exit_qty, entry_cost, exit_cost, entry_fee, exit_fee,
                   entry_fee_bps, exit_fee_bps, entry_realized_slippage_bps, exit_realized_slippage_bps, max_realized_slippage_bps,
+                  projected_move_bps, projected_cost_bps, realized_move_bps, realized_cost_bps, net_edge_bps,
+                  projected_move_to_cost_mult, realized_move_to_cost_mult, hold_bucket, regime_state, expectancy_bucket,
                   fees_total, gross_pnl_usd, net_pnl_usd, exit_reason, partial_close, clean_trade, alert_flags_json, meta_json, created_utc, updated_utc
                 ) VALUES (
                   :trade_key, :symbol, :strategy, :source, :signal_name, :signal_id, :req_id, :opened_ts, :closed_ts, :hold_sec,
-                  :entry_txid, :exit_txid, :entry_execution, :exit_execution, :entry_ref_price, :exit_ref_price,
+                  :entry_txid, :exit_txid, :entry_execution, :exit_execution, :entry_execution_path, :exit_execution_path,
+                  :entry_liquidity_role, :exit_liquidity_role, :entry_ref_price, :exit_ref_price,
                   :entry_fill_price, :exit_fill_price, :entry_qty, :exit_qty, :entry_cost, :exit_cost, :entry_fee, :exit_fee,
                   :entry_fee_bps, :exit_fee_bps, :entry_realized_slippage_bps, :exit_realized_slippage_bps, :max_realized_slippage_bps,
+                  :projected_move_bps, :projected_cost_bps, :realized_move_bps, :realized_cost_bps, :net_edge_bps,
+                  :projected_move_to_cost_mult, :realized_move_to_cost_mult, :hold_bucket, :regime_state, :expectancy_bucket,
                   :fees_total, :gross_pnl_usd, :net_pnl_usd, :exit_reason, :partial_close, :clean_trade, :alert_flags_json, :meta_json, :created_utc, :updated_utc
                 )
                 ON CONFLICT(trade_key) DO UPDATE SET
@@ -278,6 +480,10 @@ def sync_from_trade_journal(limit: int = 500) -> Dict[str, Any]:
                   hold_sec=excluded.hold_sec,
                   entry_execution=excluded.entry_execution,
                   exit_execution=excluded.exit_execution,
+                  entry_execution_path=excluded.entry_execution_path,
+                  exit_execution_path=excluded.exit_execution_path,
+                  entry_liquidity_role=excluded.entry_liquidity_role,
+                  exit_liquidity_role=excluded.exit_liquidity_role,
                   entry_ref_price=excluded.entry_ref_price,
                   exit_ref_price=excluded.exit_ref_price,
                   entry_fill_price=excluded.entry_fill_price,
@@ -293,6 +499,16 @@ def sync_from_trade_journal(limit: int = 500) -> Dict[str, Any]:
                   entry_realized_slippage_bps=excluded.entry_realized_slippage_bps,
                   exit_realized_slippage_bps=excluded.exit_realized_slippage_bps,
                   max_realized_slippage_bps=excluded.max_realized_slippage_bps,
+                  projected_move_bps=excluded.projected_move_bps,
+                  projected_cost_bps=excluded.projected_cost_bps,
+                  realized_move_bps=excluded.realized_move_bps,
+                  realized_cost_bps=excluded.realized_cost_bps,
+                  net_edge_bps=excluded.net_edge_bps,
+                  projected_move_to_cost_mult=excluded.projected_move_to_cost_mult,
+                  realized_move_to_cost_mult=excluded.realized_move_to_cost_mult,
+                  hold_bucket=excluded.hold_bucket,
+                  regime_state=excluded.regime_state,
+                  expectancy_bucket=excluded.expectancy_bucket,
                   fees_total=excluded.fees_total,
                   gross_pnl_usd=excluded.gross_pnl_usd,
                   net_pnl_usd=excluded.net_pnl_usd,
@@ -336,6 +552,13 @@ def summary(days: float = 30.0) -> Dict[str, Any]:
     slippage_vals = [float(r["max_realized_slippage_bps"]) for r in rec if r.get("max_realized_slippage_bps") is not None]
     fees_vals = [float(r["fees_total"] or 0.0) for r in rec]
     net_vals = [float(r["net_pnl_usd"] or 0.0) for r in rec]
+    projected_edge_vals = [float(r['projected_move_bps']) - float(r['projected_cost_bps']) for r in rec if r.get('projected_move_bps') is not None and r.get('projected_cost_bps') is not None]
+    realized_edge_vals = [float(r['net_edge_bps']) for r in rec if r.get('net_edge_bps') is not None]
+    blocked = _blocked_trade_summary(days)
+    maker_entry = sum(1 for r in rec if str(r.get('entry_liquidity_role') or '') == 'maker')
+    taker_entry = sum(1 for r in rec if str(r.get('entry_liquidity_role') or '') == 'taker')
+    maker_exit = sum(1 for r in rec if str(r.get('exit_liquidity_role') or '') == 'maker')
+    taker_exit = sum(1 for r in rec if str(r.get('exit_liquidity_role') or '') == 'taker')
     return {
         "ok": True,
         "db_path": _db_path(),
@@ -347,6 +570,15 @@ def summary(days: float = 30.0) -> Dict[str, Any]:
         "fees_total_usd": sum(fees_vals),
         "avg_max_realized_slippage_bps": (sum(slippage_vals) / len(slippage_vals)) if slippage_vals else None,
         "max_realized_slippage_bps": max(slippage_vals) if slippage_vals else None,
+        "avg_projected_edge_bps": (sum(projected_edge_vals) / len(projected_edge_vals)) if projected_edge_vals else None,
+        "avg_realized_edge_bps": (sum(realized_edge_vals) / len(realized_edge_vals)) if realized_edge_vals else None,
+        "maker_vs_taker": {
+            'entry': {'maker': maker_entry, 'taker': taker_entry, 'other': max(0, total - maker_entry - taker_entry)},
+            'exit': {'maker': maker_exit, 'taker': taker_exit, 'other': max(0, total - maker_exit - taker_exit)},
+        },
+        "expectancy_by_hold_bucket": _group_stats(rec, 'hold_bucket'),
+        "expectancy_by_regime": _group_stats(rec, 'regime_state'),
+        "blocked_trade_summary": blocked,
         "latest_closed_ts": rec[0].get("closed_ts") if rec else None,
         "open_trades": len(trade_journal.list_open_trades(limit=5000)),
     }
