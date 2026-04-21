@@ -981,6 +981,7 @@ STRATEGY_MODE = (os.getenv("STRATEGY_MODE", "auto") or "auto").strip().lower()  
 ENABLE_RB1 = ("rb1" in ENTRY_ENGINE_STRATEGIES_LIST) or (os.getenv("ENABLE_RB1", "1").strip().lower() in ("1", "true", "yes", "on"))
 ENABLE_TC0 = (os.getenv("ENABLE_TC0", "1").strip().lower() in ("1", "true", "yes", "on"))
 ENABLE_TC1 = (os.getenv("ENABLE_TC1", "1").strip().lower() in ("1", "true", "yes", "on"))
+ENABLE_TR1 = (os.getenv("ENABLE_TR1", "0").strip().lower() in ("1", "true", "yes", "on"))
 
 PROFITABILITY_ISOLATION_ENABLED = (os.getenv("PROFITABILITY_ISOLATION_ENABLED", "1").strip().lower() in ("1", "true", "yes", "on"))
 PROFITABILITY_ISOLATION_DAYS = int(float(os.getenv("PROFITABILITY_ISOLATION_DAYS", "30") or 30))
@@ -1144,6 +1145,27 @@ TC1_MOMENTUM_BREAKOUT_DISTANCE_MIN_BPS = float(os.getenv("TC1_MOMENTUM_BREAKOUT_
 TC1_PULLBACK_RECLAIM_MIN_CLOSE_FRACTION = float(os.getenv("TC1_PULLBACK_RECLAIM_MIN_CLOSE_FRACTION", "0.54") or 0.58)
 TC1_PULLBACK_RECLAIM_RANGE_ATR_MIN = float(os.getenv("TC1_PULLBACK_RECLAIM_RANGE_ATR_MIN", "0.45") or 0.55)
 TC1_PULLBACK_RECLAIM_BARS = int(float(os.getenv("TC1_PULLBACK_RECLAIM_BARS", "3") or 3))
+
+# TR1 params (Strategy Family V2: higher-timeframe trend pullback / reclaim)
+TR1_ENABLED = ENABLE_TR1
+TR1_LTF_EMA = int(float(os.getenv("TR1_LTF_EMA", "21") or 21))
+TR1_HTF_TIMEFRAME = os.getenv("TR1_HTF_TIMEFRAME", os.getenv("TC1_HTF_TIMEFRAME", "60Min")).strip() or "60Min"
+TR1_HTF_FAST = int(float(os.getenv("TR1_HTF_FAST", "50") or 50))
+TR1_HTF_SLOW = int(float(os.getenv("TR1_HTF_SLOW", "200") or 200))
+TR1_LOOKBACK_BARS = int(float(os.getenv("TR1_LOOKBACK_BARS", "20") or 20))
+TR1_PULLBACK_LOOKBACK_BARS = int(float(os.getenv("TR1_PULLBACK_LOOKBACK_BARS", "6") or 6))
+TR1_MIN_ATR_PCT = float(os.getenv("TR1_MIN_ATR_PCT", "0.0010") or 0.0010)
+TR1_PULLBACK_ATR_MIN = float(os.getenv("TR1_PULLBACK_ATR_MIN", "0.35") or 0.35)
+TR1_PULLBACK_ATR_MAX = float(os.getenv("TR1_PULLBACK_ATR_MAX", "1.40") or 1.40)
+TR1_REQUIRE_VWAP = (os.getenv("TR1_REQUIRE_VWAP", "1").strip().lower() in ("1", "true", "yes", "on"))
+TR1_MAX_SPREAD_PCT = float(os.getenv("TR1_MAX_SPREAD_PCT", "0.0020") or 0.0020)
+TR1_EXPECTED_MOVE_ATR_MULT = float(os.getenv("TR1_EXPECTED_MOVE_ATR_MULT", "6.0") or 6.0)
+TR1_MIN_TAKE_PROFIT_BPS = float(os.getenv("TR1_MIN_TAKE_PROFIT_BPS", "150") or 150.0)
+TR1_MIN_CLOSE_FRACTION = float(os.getenv("TR1_MIN_CLOSE_FRACTION", "0.62") or 0.62)
+TR1_MIN_RANGE_ATR = float(os.getenv("TR1_MIN_RANGE_ATR", "0.70") or 0.70)
+TR1_MAX_HOLD_SEC = int(float(os.getenv("TR1_MAX_HOLD_SEC", "21600") or 21600))
+TR1_REGIME_FILTER_ENABLED = (os.getenv("TR1_REGIME_FILTER_ENABLED", "1").strip().lower() in ("1", "true", "yes", "on"))
+TR1_USE_TC1_PATIENCE = (os.getenv("TR1_USE_TC1_PATIENCE", "1").strip().lower() in ("1", "true", "yes", "on"))
 
 
 # ---------- Scanner config (soft allow) ----------
@@ -2173,7 +2195,7 @@ def _tr1_long_signal(symbol: str) -> tuple[bool, dict]:
     cur_close = closes[-1]; cur_high = highs[-1]; cur_low = lows[-1]
     atr_now, atr_pct = _atr_from_bars(bars, length=int(getattr(settings, "tc1_atr_len", 14) or 14))
     ltf_ema = _ema(closes, TR1_LTF_EMA)
-    htf_bars = _get_bars(symbol, timeframe=str(getattr(settings, "tc1_htf_timeframe", "60Min") or "60Min"), limit=max(TR1_HTF_SLOW + 5, 220))
+    htf_bars = _get_bars(symbol, timeframe=str(TR1_HTF_TIMEFRAME or "60Min"), limit=max(TR1_HTF_SLOW + 5, 220))
     htf_closes = [float(b.get("c") or 0.0) for b in htf_bars] if htf_bars else []
     htf_fast = _ema(htf_closes, TR1_HTF_FAST) if htf_closes else 0.0
     htf_slow = _ema(htf_closes, TR1_HTF_SLOW) if htf_closes else 0.0
@@ -7050,6 +7072,20 @@ def _tc1_regime_state(regime_quiet: bool) -> dict:
     }
 
 
+def _tr1_regime_state(regime_quiet: bool) -> dict:
+    allow = True
+    reason = "ok"
+    if TR1_REGIME_FILTER_ENABLED and bool(regime_quiet):
+        allow = False
+        reason = "tr1_regime_quiet_block"
+    return {
+        "enabled": bool(TR1_REGIME_FILTER_ENABLED),
+        "allow": bool(allow),
+        "reason": reason,
+        "regime_quiet": bool(regime_quiet),
+    }
+
+
 def _entry_signals_for_symbol(symbol: str, *, regime_quiet: bool) -> tuple[dict, dict]:
     """Return (signals, debug) for the given symbol.
 
@@ -7062,7 +7098,7 @@ def _entry_signals_for_symbol(symbol: str, *, regime_quiet: bool) -> tuple[dict,
     wants_tc0 = ENABLE_TC0 and (STRATEGY_MODE != "fixed" or "tc0" in ENTRY_ENGINE_STRATEGIES)
     wants_rb1 = ENABLE_RB1 and (STRATEGY_MODE != "fixed" or "rb1" in ENTRY_ENGINE_STRATEGIES)
     wants_tc1 = ENABLE_TC1 and (STRATEGY_MODE != "fixed" or "tc1" in ENTRY_ENGINE_STRATEGIES)
-    wants_tr1 = ENABLE_TR1
+    wants_tr1 = ENABLE_TR1 and (STRATEGY_MODE != "fixed" or "tr1" in ENTRY_ENGINE_STRATEGIES)
     wants_cr1 = ENABLE_CR1 and (STRATEGY_MODE != "fixed" or "cr1" in ENTRY_ENGINE_STRATEGIES)
     wants_mm1 = ENABLE_MM1 and (STRATEGY_MODE != "fixed" or "mm1" in ENTRY_ENGINE_STRATEGIES)
 
@@ -7105,9 +7141,21 @@ def _entry_signals_for_symbol(symbol: str, *, regime_quiet: bool) -> tuple[dict,
                 debug["tr1"] = tr1_meta
 
     if wants_tr1 and not wants_tc1:
-        tr1_fired, tr1_meta = _tr1_long_signal(symbol)
-        signals["tr1"] = bool(tr1_fired)
-        debug["tr1"] = tr1_meta
+        tr1_regime_state = _tr1_regime_state(regime_quiet=bool(regime_quiet))
+        tr1_patience_state = _tc1_patience_state(symbol) if TR1_USE_TC1_PATIENCE else {"allow": True, "reason": "disabled", "enabled": False}
+        if not bool(tr1_regime_state.get("allow")):
+            signals["tr1"] = False
+            debug["tr1"] = {"reason": tr1_regime_state.get("reason"), "regime": tr1_regime_state, "patience": tr1_patience_state}
+        elif not bool(tr1_patience_state.get("allow")):
+            signals["tr1"] = False
+            debug["tr1"] = {"reason": tr1_patience_state.get("reason"), "regime": tr1_regime_state, "patience": tr1_patience_state}
+        else:
+            tr1_fired, tr1_meta = _tr1_long_signal(symbol)
+            tr1_meta = dict(tr1_meta or {})
+            tr1_meta["regime"] = tr1_regime_state
+            tr1_meta["patience"] = tr1_patience_state
+            signals["tr1"] = bool(tr1_fired)
+            debug["tr1"] = tr1_meta
 
     # Optional strategies for quiet / choppy regimes unless fixed mode explicitly requests them.
     if wants_cr1 and (STRATEGY_MODE == "fixed" or (STRATEGY_MODE != "legacy" and regime_quiet)):
@@ -8283,6 +8331,44 @@ def scan_entries(payload: WorkerScanPayload):
             "candidates": [{"symbol": c.get("symbol"), "strategy": c.get("strategy"), "score": float(c.get("score") or 0.0), "rank": (c.get("rank") or {}).get("components")} for c in candidates],
             "strategy_summary": strategy_summary,
             "per_symbol": per_symbol,
+        },
+    }
+
+
+@app.get("/diagnostics/strategy_family_v2")
+def diagnostics_strategy_family_v2():
+    return {
+        "ok": True,
+        "utc": utc_now_iso(),
+        "build": build_payload(),
+        "strategy_family_v2": {
+            "strategy": "tr1",
+            "enabled": bool(ENABLE_TR1),
+            "entry_engine_enabled": bool(ENTRY_ENGINE_ENABLED),
+            "entry_engine_strategies": list(ENTRY_ENGINE_STRATEGIES_LIST or []),
+            "fixed_mode_active": bool(STRATEGY_MODE == "fixed"),
+            "profitability_isolation_allowed_strategies": list(PROFITABILITY_ISOLATION_ALLOWED_STRATEGIES or []),
+            "config": {
+                "entry_timeframe": ENTRY_ENGINE_TIMEFRAME,
+                "htf_timeframe": TR1_HTF_TIMEFRAME,
+                "ltf_ema": TR1_LTF_EMA,
+                "htf_fast": TR1_HTF_FAST,
+                "htf_slow": TR1_HTF_SLOW,
+                "lookback_bars": TR1_LOOKBACK_BARS,
+                "pullback_lookback_bars": TR1_PULLBACK_LOOKBACK_BARS,
+                "min_atr_pct": TR1_MIN_ATR_PCT,
+                "pullback_atr_min": TR1_PULLBACK_ATR_MIN,
+                "pullback_atr_max": TR1_PULLBACK_ATR_MAX,
+                "require_vwap": bool(TR1_REQUIRE_VWAP),
+                "max_spread_pct": TR1_MAX_SPREAD_PCT,
+                "expected_move_atr_mult": TR1_EXPECTED_MOVE_ATR_MULT,
+                "min_take_profit_bps": TR1_MIN_TAKE_PROFIT_BPS,
+                "min_close_fraction": TR1_MIN_CLOSE_FRACTION,
+                "min_range_atr": TR1_MIN_RANGE_ATR,
+                "max_hold_sec": TR1_MAX_HOLD_SEC,
+                "regime_filter_enabled": bool(TR1_REGIME_FILTER_ENABLED),
+                "use_tc1_patience": bool(TR1_USE_TC1_PATIENCE),
+            },
         },
     }
 
