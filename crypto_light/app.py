@@ -967,6 +967,16 @@ STRATEGY_MODE = (os.getenv("STRATEGY_MODE", "auto") or "auto").strip().lower()  
 ENABLE_RB1 = ("rb1" in ENTRY_ENGINE_STRATEGIES_LIST) or (os.getenv("ENABLE_RB1", "1").strip().lower() in ("1", "true", "yes", "on"))
 ENABLE_TC0 = (os.getenv("ENABLE_TC0", "1").strip().lower() in ("1", "true", "yes", "on"))
 ENABLE_TC1 = (os.getenv("ENABLE_TC1", "1").strip().lower() in ("1", "true", "yes", "on"))
+
+PROFITABILITY_ISOLATION_ENABLED = (os.getenv("PROFITABILITY_ISOLATION_ENABLED", "1").strip().lower() in ("1", "true", "yes", "on"))
+PROFITABILITY_ISOLATION_DAYS = int(float(os.getenv("PROFITABILITY_ISOLATION_DAYS", "30") or 30))
+PROFITABILITY_ISOLATION_MIN_TRADES = int(float(os.getenv("PROFITABILITY_ISOLATION_MIN_TRADES", "1") or 1))
+PROFITABILITY_ISOLATION_MAX_SYMBOLS = int(float(os.getenv("PROFITABILITY_ISOLATION_MAX_SYMBOLS", "4") or 4))
+PROFITABILITY_ISOLATION_MAX_AVG_NET_EDGE_BPS = float(os.getenv("PROFITABILITY_ISOLATION_MAX_AVG_NET_EDGE_BPS", "-75") or -75)
+PROFITABILITY_ISOLATION_MIN_WIN_RATE = float(os.getenv("PROFITABILITY_ISOLATION_MIN_WIN_RATE", "0.5") or 0.5)
+PROFITABILITY_ISOLATION_ALLOWED_STRATEGIES = [s.strip().lower() for s in os.getenv("PROFITABILITY_ISOLATION_ALLOWED_STRATEGIES", "tc1").split(",") if s.strip()]
+PROFITABILITY_ISOLATION_STRATEGY_SET = set(PROFITABILITY_ISOLATION_ALLOWED_STRATEGIES or ["tc1"])
+PROFITABILITY_ISOLATION_SYMBOLS_RAW = os.getenv("PROFITABILITY_ISOLATION_SYMBOLS", "")
 ENABLE_CR1 = (os.getenv("ENABLE_CR1", "0").strip().lower() in ("1", "true", "yes", "on"))
 ENABLE_MM1 = (os.getenv("ENABLE_MM1", "0").strip().lower() in ("1", "true", "yes", "on"))
 _ALLOWED_STRATEGY_NAMES = ("tc0", "rb1", "tc1", "tr1", "cr1", "mm1")
@@ -2707,6 +2717,84 @@ def _env_symbol_list(name: str) -> list[str]:
         out.append(sym)
     return out
 
+def _profitability_isolation_snapshot(days: float | None = None) -> dict[str, Any]:
+    enabled = bool(PROFITABILITY_ISOLATION_ENABLED)
+    days = float(days if days is not None else PROFITABILITY_ISOLATION_DAYS)
+    base_snapshot: dict[str, Any] = {
+        "enabled": enabled,
+        "days": days,
+        "min_trades": int(PROFITABILITY_ISOLATION_MIN_TRADES),
+        "max_symbols": int(PROFITABILITY_ISOLATION_MAX_SYMBOLS),
+        "strategy_allow_env": list(PROFITABILITY_ISOLATION_ALLOWED_STRATEGIES or []),
+        "symbol_allow_env": _env_symbol_list("PROFITABILITY_ISOLATION_SYMBOLS"),
+        "allowed_strategies": list(PROFITABILITY_ISOLATION_ALLOWED_STRATEGIES or ["tc1"]),
+        "allowed_symbols": _env_symbol_list("PROFITABILITY_ISOLATION_SYMBOLS"),
+        "derived_strategies": [],
+        "derived_symbols": [],
+        "reason": "disabled" if not enabled else "ok",
+        "telemetry_ok": False,
+    }
+    if not enabled:
+        return base_snapshot
+    try:
+        tel = telemetry_db.summary(days=days)
+    except Exception as e:
+        out = dict(base_snapshot)
+        out["reason"] = f"telemetry_error:{type(e).__name__}"
+        return out
+    out = dict(base_snapshot)
+    out["telemetry_ok"] = bool(tel.get("ok"))
+    out["telemetry_closed_trades"] = int(tel.get("closed_trades") or 0)
+    st = dict(((tel.get("strategy_truth") or {}).get("by_strategy") or {}))
+    sy = dict(((tel.get("strategy_truth") or {}).get("by_symbol") or {}))
+    profitable_strategies: list[tuple[float, str]] = []
+    for name, meta in st.items():
+        trades = int((meta or {}).get("trades") or 0)
+        net = float((meta or {}).get("net_pnl_usd") or 0.0)
+        if trades >= int(PROFITABILITY_ISOLATION_MIN_TRADES) and net > 0.0:
+            profitable_strategies.append((net, str(name).strip().lower()))
+    profitable_strategies = sorted(profitable_strategies, key=lambda x: (-x[0], x[1]))
+    derived_strategies = [name for _, name in profitable_strategies]
+    out["derived_strategies"] = derived_strategies
+    out["allowed_strategies"] = list(PROFITABILITY_ISOLATION_ALLOWED_STRATEGIES or derived_strategies or ["tc1"])
+    derived_symbols_payload: list[tuple[float, str]] = []
+    for symbol, meta in sy.items():
+        meta = dict(meta or {})
+        trades = int(meta.get("trades") or 0)
+        if trades < int(PROFITABILITY_ISOLATION_MIN_TRADES):
+            continue
+        net = float(meta.get("net_pnl_usd") or 0.0)
+        avg_edge = _safe_float(meta.get("avg_net_edge_bps"))
+        win_rate = _safe_float(meta.get("win_rate"))
+        qualifies = net > 0.0
+        if not qualifies and avg_edge is not None and win_rate is not None:
+            qualifies = avg_edge >= float(PROFITABILITY_ISOLATION_MAX_AVG_NET_EDGE_BPS) and win_rate >= float(PROFITABILITY_ISOLATION_MIN_WIN_RATE)
+        if qualifies:
+            derived_symbols_payload.append((net, normalize_symbol(str(symbol))))
+    derived_symbols_payload = sorted(derived_symbols_payload, key=lambda x: (-x[0], x[1]))
+    derived_symbols = [sym for _, sym in derived_symbols_payload[: max(1, int(PROFITABILITY_ISOLATION_MAX_SYMBOLS))]]
+    out["derived_symbols"] = derived_symbols
+    out["allowed_symbols"] = _env_symbol_list("PROFITABILITY_ISOLATION_SYMBOLS") or derived_symbols
+    if not out["allowed_symbols"]:
+        out["reason"] = "no_profitable_symbols_derived"
+    return out
+
+
+def _profitability_isolation_allows(symbol: str, strategy: str) -> tuple[bool, str, dict[str, Any]]:
+    snap = _profitability_isolation_snapshot()
+    if not bool(snap.get("enabled")):
+        return True, "disabled", snap
+    sym = normalize_symbol(str(symbol or ""))
+    strat = str(strategy or "").strip().lower()
+    allowed_strategies = {str(s).strip().lower() for s in list(snap.get("allowed_strategies") or []) if str(s).strip()}
+    allowed_symbols = {normalize_symbol(str(s)) for s in list(snap.get("allowed_symbols") or []) if str(s).strip()}
+    if allowed_strategies and strat and strat not in allowed_strategies:
+        return False, "profitability_isolation_strategy_block", snap
+    if allowed_symbols and sym and sym not in allowed_symbols:
+        return False, "profitability_isolation_symbol_block", snap
+    return True, "ok", snap
+
+
 def _safe_count(value: Any) -> int:
     if value is None:
         return 0
@@ -3275,6 +3363,11 @@ def _build_universe(payload, scanner_syms: list[str]) -> list[str]:
     # Stable fallback: if universe empty but allowed configured, use effective allowed
     if not universe and effective_allowed:
         universe = list(dict.fromkeys(list(effective_allowed)))
+
+    isolation = _profitability_isolation_snapshot()
+    isolation_symbols = {normalize_symbol(str(s)) for s in list((isolation or {}).get("allowed_symbols") or []) if str(s).strip()}
+    if bool((isolation or {}).get("enabled")) and isolation_symbols:
+        universe = [s for s in universe if normalize_symbol(str(s)) in isolation_symbols]
 
     return universe
 
@@ -6905,6 +6998,9 @@ def place_entry(symbol: str, *, strategy: str, req_id: str | None = None, client
       - meta: dict (full structured execution result)
     """
     rid = req_id or str(uuid4())
+    iso_allow, iso_reason, iso_snapshot = _profitability_isolation_allows(symbol, strategy)
+    if not iso_allow:
+        return False, iso_reason, {"ok": True, "executed": False, "reason": iso_reason, "profitability_isolation": iso_snapshot}
     res = _execute_long_entry(
         symbol=symbol,
         strategy=strategy,
@@ -7826,6 +7922,15 @@ def scan_entries(payload: WorkerScanPayload):
                 strategy = fired_strats[0]
         d["eligible"] = True
         d["chosen_strategy"] = strategy
+        iso_allow, iso_reason, iso_snapshot = _profitability_isolation_allows(sym, strategy)
+        d["profitability_isolation"] = iso_snapshot
+        if not iso_allow:
+            d["eligible"] = False
+            d["skip"].append(iso_reason)
+            scan_ctx = _build_admission_context(symbol=sym, strategy=strategy, signal_name=strategy, signal_id=_scanner_signal_id(sym, strategy), source='scan_entries', extra={'regime_quiet': bool(regime_quiet), 'profitability_isolation': iso_snapshot}, px_hint=None)
+            _record_rejected_admission(scan_ctx, f'rejected_{iso_reason}', payload=d)
+            per_symbol[sym] = d
+            continue
         rank = _rank_candidate(sym, strategy, sig_debug)
         d["rank"] = rank
         candidates.append({"symbol": sym, "strategy": strategy, "score": float(rank.get("score") or 0.0), "rank": rank, "signal_meta": dict((sig_debug or {}).get(strategy) or {}), "regime_quiet": bool(regime_quiet)})
@@ -8399,6 +8504,18 @@ def diagnostics_execution_truth(days: float = 30.0):
         'maker_vs_taker': telemetry.get('maker_vs_taker') or {},
         'execution_truth': telemetry.get('execution_truth') or {},
         'recent_trades': (snap.get('recent_trades') or {}).get('count') or 0,
+    }
+
+
+@app.get("/diagnostics/profitability_isolation")
+def diagnostics_profitability_isolation(days: float = 30.0):
+    snap = _profitability_isolation_snapshot(days=days)
+    return {
+        'ok': True,
+        'utc': utc_now_iso(),
+        'build': PATCH_BUILD,
+        'days': float(days),
+        'profitability_isolation': snap,
     }
 
 
