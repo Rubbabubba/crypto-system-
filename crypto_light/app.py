@@ -8660,7 +8660,7 @@ def diagnostics_universe_control(days: float = 30.0):
     effective_symbols, removed_symbols, authority = _filter_symbols_by_universe_control(candidate_symbols, days=days)
     return {
         "ok": True,
-        "utc": _utc_now_iso(),
+        "utc": utc_now_iso(),
         "build": build_info.build_payload(),
         "days": float(days),
         "universe_control": snap,
