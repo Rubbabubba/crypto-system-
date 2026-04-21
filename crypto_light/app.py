@@ -8547,7 +8547,20 @@ def diagnostics_execution_truth(days: float = 30.0):
 @app.get("/diagnostics/profitability_isolation")
 def diagnostics_profitability_isolation(days: float = 30.0):
     snap = _profitability_isolation_snapshot(days=days)
-    scanner_contract = _scanner_contract_snapshot(force=False)
+    scanner_contract = {}
+    scanner_error = None
+    try:
+        scanner_contract = _scanner_contract_snapshot()
+    except TypeError:
+        # Backward-compatible hotfix: some baselines expose _scanner_contract_snapshot without newer kwargs.
+        try:
+            scanner_contract = _scanner_contract_snapshot()
+        except Exception as e:
+            scanner_error = f'{type(e).__name__}: {e}'
+            scanner_contract = {}
+    except Exception as e:
+        scanner_error = f'{type(e).__name__}: {e}'
+        scanner_contract = {}
     ranked_symbols = list((scanner_contract or {}).get('ranked_active_symbols') or [])
     active_symbols = list((scanner_contract or {}).get('active_symbols') or [])
     candidate_symbols = ranked_symbols or active_symbols
@@ -8563,6 +8576,7 @@ def diagnostics_profitability_isolation(days: float = 30.0):
         'scanner_candidate_symbols': candidate_symbols,
         'effective_candidate_symbols': effective_symbols,
         'removed_candidate_symbols': removed_symbols,
+        'scanner_contract_error': scanner_error,
     }
 
 
