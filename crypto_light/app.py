@@ -8661,7 +8661,7 @@ def diagnostics_universe_control(days: float = 30.0):
     return {
         "ok": True,
         "utc": utc_now_iso(),
-        "build": build_info.build_payload(),
+        "build": build_payload(),
         "days": float(days),
         "universe_control": snap,
         "kill_switch_enabled": bool((snap or {}).get("kill_switch_enabled")),
