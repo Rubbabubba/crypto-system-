@@ -2774,7 +2774,11 @@ def _profitability_isolation_snapshot(days: float | None = None) -> dict[str, An
     derived_symbols_payload = sorted(derived_symbols_payload, key=lambda x: (-x[0], x[1]))
     derived_symbols = [sym for _, sym in derived_symbols_payload[: max(1, int(PROFITABILITY_ISOLATION_MAX_SYMBOLS))]]
     out["derived_symbols"] = derived_symbols
-    out["allowed_symbols"] = _env_symbol_list("PROFITABILITY_ISOLATION_SYMBOLS") or derived_symbols
+    env_symbols = _env_symbol_list("PROFITABILITY_ISOLATION_SYMBOLS")
+    out["allowed_symbols"] = env_symbols or derived_symbols
+    out["symbol_source"] = "env" if env_symbols else ("derived" if derived_symbols else "none")
+    out["authoritative"] = bool(out["allowed_symbols"])
+    out["authoritative_reason"] = "allowed_symbols_available" if out["allowed_symbols"] else "no_profitable_symbols_derived"
     if not out["allowed_symbols"]:
         out["reason"] = "no_profitable_symbols_derived"
     return out
@@ -2793,6 +2797,31 @@ def _profitability_isolation_allows(symbol: str, strategy: str) -> tuple[bool, s
     if allowed_symbols and sym and sym not in allowed_symbols:
         return False, "profitability_isolation_symbol_block", snap
     return True, "ok", snap
+
+
+def _filter_symbols_by_profitability_isolation(symbols: list[str], *, days: float | None = None) -> tuple[list[str], list[str], dict[str, Any]]:
+    snap = _profitability_isolation_snapshot(days=days)
+    normalized_in = [normalize_symbol(str(s)) for s in list(symbols or []) if str(s).strip()]
+    if not bool(snap.get("enabled")):
+        snap = dict(snap)
+        snap["authoritative"] = False
+        snap["authoritative_reason"] = "disabled"
+        return list(dict.fromkeys(normalized_in)), [], snap
+    allowed_symbols = {normalize_symbol(str(s)) for s in list(snap.get("allowed_symbols") or []) if str(s).strip()}
+    if not allowed_symbols:
+        snap = dict(snap)
+        snap["authoritative"] = False
+        snap["authoritative_reason"] = "no_allowed_symbols"
+        return list(dict.fromkeys(normalized_in)), [], snap
+    filtered = [s for s in normalized_in if s in allowed_symbols]
+    removed = [s for s in normalized_in if s not in allowed_symbols]
+    snap = dict(snap)
+    snap["authoritative"] = True
+    snap["authoritative_reason"] = "allowed_symbols_intersection"
+    snap["input_symbol_count"] = len(normalized_in)
+    snap["filtered_symbol_count"] = len(filtered)
+    snap["removed_symbol_count"] = len(removed)
+    return list(dict.fromkeys(filtered)), list(dict.fromkeys(removed)), snap
 
 
 def _safe_count(value: Any) -> int:
@@ -3040,6 +3069,9 @@ def _path_b_admission_snapshot(scanner_contract: dict[str, Any]) -> dict[str, An
     active_symbols = list((scanner_contract or {}).get("active_symbols") or [])
     ranked_symbols = list((scanner_contract or {}).get("ranked_active_symbols") or [])
     candidate_symbols = ranked_symbols or active_symbols
+    profitability_removed_symbols: list[str] = []
+    profitability_authority: dict[str, Any] = _profitability_isolation_snapshot()
+    candidate_symbols, profitability_removed_symbols, profitability_authority = _filter_symbols_by_profitability_isolation(candidate_symbols)
     if TRADE_QUALITY_OVERRIDE_ENABLED:
         quality_allow_set = set(TRADE_QUALITY_ALLOWED_SYMBOLS)
         candidate_symbols = [s for s in candidate_symbols if s in quality_allow_set]
@@ -3084,6 +3116,11 @@ def _path_b_admission_snapshot(scanner_contract: dict[str, Any]) -> dict[str, An
         "candidate_symbols_sample": candidate_symbols[:12],
         "admitted_symbols_count": len(admitted_symbols),
         "admitted_symbols_sample": admitted_symbols[:12],
+        "profitability_isolation_authoritative": bool((profitability_authority or {}).get("authoritative")),
+        "profitability_isolation_reason": (profitability_authority or {}).get("authoritative_reason"),
+        "profitability_isolation_allowed_symbols": list((profitability_authority or {}).get("allowed_symbols") or []),
+        "profitability_removed_symbols_count": len(profitability_removed_symbols),
+        "profitability_removed_symbols_sample": profitability_removed_symbols[:12],
         "requirements": {
             "require_contract_compatible": True,
             "require_fee_guard": True,
@@ -8510,12 +8547,22 @@ def diagnostics_execution_truth(days: float = 30.0):
 @app.get("/diagnostics/profitability_isolation")
 def diagnostics_profitability_isolation(days: float = 30.0):
     snap = _profitability_isolation_snapshot(days=days)
+    scanner_contract = _scanner_contract_snapshot(force=False)
+    ranked_symbols = list((scanner_contract or {}).get('ranked_active_symbols') or [])
+    active_symbols = list((scanner_contract or {}).get('active_symbols') or [])
+    candidate_symbols = ranked_symbols or active_symbols
+    effective_symbols, removed_symbols, authority = _filter_symbols_by_profitability_isolation(candidate_symbols, days=days)
     return {
         'ok': True,
         'utc': utc_now_iso(),
         'build': PATCH_BUILD,
         'days': float(days),
         'profitability_isolation': snap,
+        'authoritative': bool((authority or {}).get('authoritative')),
+        'authoritative_reason': (authority or {}).get('authoritative_reason'),
+        'scanner_candidate_symbols': candidate_symbols,
+        'effective_candidate_symbols': effective_symbols,
+        'removed_candidate_symbols': removed_symbols,
     }
 
 
