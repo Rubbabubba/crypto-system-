@@ -209,40 +209,12 @@ def _fee_bps(fee: Optional[float], cost: Optional[float]) -> Optional[float]:
     return abs(float(fee)) / abs(float(cost)) * 10000.0
 
 
-def _liquidity_role(execution: Any) -> str:
-    s = str(execution or '').strip().lower()
-    if not s:
-        return 'unknown'
-    if 'post_only' in s or 'maker' in s:
-        return 'maker'
-    if 'market' in s or 'aggressive' in s or 'stop_loss' in s or 'stop-limit' in s or 'stop_limit' in s:
-        return 'taker'
-    if 'limit' in s:
-        return 'limit'
-    return 'unknown'
+def _liquidity_role(execution: Any, order_result: Dict[str, Any] | None = None) -> str:
+    return _execution_detail(execution, order_result).get('liquidity_role') or 'unknown'
 
 
 def _execution_path(execution: Any, order_result: Dict[str, Any] | None = None) -> str:
-    s = str(execution or '').strip().lower()
-    res = dict(order_result or {})
-    if not s and res:
-        s = str(res.get('execution') or '').strip().lower()
-    maker_first = bool(res.get('maker_first'))
-    market_fallback = bool(res.get('market_fallback')) or bool((res.get('fallback') or {}).get('used'))
-    if maker_first and market_fallback:
-        return 'maker_then_fallback'
-    if maker_first:
-        return 'maker_first'
-    if 'post_only' in s or 'maker' in s:
-        return 'post_only'
-    if 'market' in s:
-        return 'market'
-    if 'aggressive' in s:
-        return 'limit_aggressive'
-    if 'stop' in s:
-        return 'stop'
-    return s or 'unknown'
-
+    return _execution_detail(execution, order_result).get('path') or 'unknown'
 
 def _hold_bucket(hold_sec: Optional[float]) -> str:
     hs = _to_float(hold_sec)
@@ -257,6 +229,126 @@ def _hold_bucket(hold_sec: Optional[float]) -> str:
     if hs < 24 * 3600:
         return '4h-24h'
     return '24h+'
+
+
+def _normalize_regime_label(value: Any) -> str:
+    s = str(value or '').strip().lower()
+    if not s:
+        return 'unknown'
+    mapping = {
+        'quiet': 'quiet',
+        'expansion': 'expansion',
+        'trend': 'expansion',
+        'trending': 'expansion',
+        'chop': 'quiet',
+        'choppy': 'quiet',
+        'range': 'quiet',
+        'ranging': 'quiet',
+        'unknown': 'unknown',
+    }
+    return mapping.get(s, s)
+
+
+def _resolve_regime_state(entry_ctx: Dict[str, Any], exit_ctx: Dict[str, Any], meta: Dict[str, Any]) -> str:
+    for candidate in (
+        entry_ctx.get('regime_state'),
+        meta.get('regime_state'),
+        ((entry_ctx.get('signal_meta') or {}).get('regime') or {}).get('state'),
+        ((entry_ctx.get('signal_meta') or {}).get('regime') or {}).get('reason'),
+        ((entry_ctx.get('extra') or {}).get('signal_meta') or {}).get('regime_state'),
+        exit_ctx.get('regime_state'),
+    ):
+        label = _normalize_regime_label(candidate)
+        if label != 'unknown':
+            return label
+    for flag in (
+        entry_ctx.get('regime_quiet'),
+        ((entry_ctx.get('signal_meta') or {}).get('regime') or {}).get('regime_quiet'),
+        ((entry_ctx.get('extra') or {}).get('regime_quiet') if isinstance(entry_ctx.get('extra'), dict) else None),
+        meta.get('regime_quiet'),
+        exit_ctx.get('regime_quiet'),
+    ):
+        if flag is True:
+            return 'quiet'
+        if flag is False:
+            return 'expansion'
+    return 'unknown'
+
+
+def _execution_detail(execution: Any, order_result: Dict[str, Any] | None = None) -> Dict[str, str]:
+    s = str(execution or '').strip().lower()
+    res = dict(order_result or {})
+    if not s and res:
+        s = str(res.get('execution') or '').strip().lower()
+    if res.get('maker_first'):
+        if s == 'market':
+            return {'path': 'maker_first_fallback_market', 'liquidity_role': 'taker'}
+        if 'post_only' in s:
+            return {'path': 'maker_first_post_only', 'liquidity_role': 'maker'}
+        return {'path': 'maker_first', 'liquidity_role': 'mixed'}
+    if res.get('aggressive_limit_first'):
+        if s == 'market':
+            return {'path': 'limit_aggressive_fallback_market', 'liquidity_role': 'taker'}
+        return {'path': 'limit_aggressive', 'liquidity_role': 'taker'}
+    if s in ('post_only_limit', 'maker', 'post_only'):
+        return {'path': 'post_only', 'liquidity_role': 'maker'}
+    if s in ('market', 'stop_loss', 'stop-limit', 'stop_limit'):
+        return {'path': 'market' if s == 'market' else 'stop', 'liquidity_role': 'taker'}
+    if s == 'limit_aggressive':
+        return {'path': 'limit_aggressive', 'liquidity_role': 'taker'}
+    if 'reconciled' in s or 'backfill' in s or 'reconstructed' in s or s in ('adopted', 'dry_run'):
+        return {'path': s or 'unknown', 'liquidity_role': 'unknown'}
+    if 'limit' in s:
+        return {'path': 'limit', 'liquidity_role': 'unknown'}
+    return {'path': s or 'unknown', 'liquidity_role': 'unknown'}
+
+
+def _symbol_truth_summary(rows: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
+    out: Dict[str, Dict[str, Any]] = {}
+    for r in rows:
+        symbol = str(r.get('symbol') or 'unknown')
+        cur = out.setdefault(symbol, {'trades': 0, 'wins': 0, 'losses': 0, 'net_pnl_usd': 0.0, 'avg_net_edge_bps': None})
+        cur['trades'] += 1
+        pnl = float(r.get('net_pnl_usd') or 0.0)
+        cur['net_pnl_usd'] += pnl
+        if pnl > 0:
+            cur['wins'] += 1
+        elif pnl < 0:
+            cur['losses'] += 1
+        cur.setdefault('_ne', []).append(_to_float(r.get('net_edge_bps')))
+    for cur in out.values():
+        ne = [float(x) for x in cur.pop('_ne', []) if x is not None]
+        cur['win_rate'] = (float(cur['wins']) / float(cur['wins'] + cur['losses'])) if (cur['wins'] + cur['losses']) > 0 else None
+        cur['avg_net_edge_bps'] = (sum(ne) / len(ne)) if ne else None
+    return dict(sorted(out.items(), key=lambda kv: (-int(kv[1].get('trades') or 0), kv[0])))
+
+
+def _execution_truth_summary(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
+    out = {'entry_paths': {}, 'exit_paths': {}, 'entry_roles': {}, 'exit_roles': {}, 'path_pairs': {}}
+    for r in rows:
+        ep = str(r.get('entry_execution_path') or 'unknown')
+        xp = str(r.get('exit_execution_path') or 'unknown')
+        er = str(r.get('entry_liquidity_role') or 'unknown')
+        xr = str(r.get('exit_liquidity_role') or 'unknown')
+        pair = f'{ep} -> {xp}'
+        for bucket, key in ((out['entry_paths'], ep), (out['exit_paths'], xp), (out['entry_roles'], er), (out['exit_roles'], xr), (out['path_pairs'], pair)):
+            bucket[key] = int(bucket.get(key, 0)) + 1
+    return out
+
+
+def _strategy_truth_summary(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
+    strategies = _group_stats(rows, 'strategy')
+    symbols = _symbol_truth_summary(rows)
+    regime_known = sum(1 for r in rows if str(r.get('regime_state') or 'unknown') != 'unknown')
+    return {
+        'by_strategy': strategies,
+        'by_symbol': symbols,
+        'regime_coverage': {
+            'known': regime_known,
+            'unknown': max(0, len(rows) - regime_known),
+            'coverage_pct': (float(regime_known) / float(len(rows)) * 100.0) if rows else None,
+        },
+    }
 
 
 def _bps_change(start_px: Optional[float], end_px: Optional[float]) -> Optional[float]:
@@ -367,13 +459,13 @@ def sync_from_trade_journal(limit: int = 500) -> Dict[str, Any]:
             net_edge_bps = None if realized_move_bps is None or realized_cost_bps is None else float(realized_move_bps) - float(realized_cost_bps)
             projected_move_to_cost_mult = _ratio(projected_move_bps, projected_cost_bps)
             realized_move_to_cost_mult = _ratio(realized_move_bps, realized_cost_bps)
-            regime_state = str(entry_ctx.get('regime_state') or meta.get('regime_state') or 'unknown')
+            regime_state = _resolve_regime_state(entry_ctx, exit_ctx, meta)
             entry_execution = r.get('entry_execution')
             exit_execution = r.get('exit_execution')
             entry_execution_path = _execution_path(entry_execution, order_result)
             exit_execution_path = _execution_path(exit_execution, order_result)
-            entry_liquidity_role = _liquidity_role(entry_execution)
-            exit_liquidity_role = _liquidity_role(exit_execution)
+            entry_liquidity_role = _liquidity_role(entry_execution, order_result)
+            exit_liquidity_role = _liquidity_role(exit_execution, order_result)
             alerts: List[str] = []
             if entry_slip is not None and entry_slip > max_realized_slippage_bps_alert:
                 alerts.append("entry_slippage_high")
@@ -576,6 +668,8 @@ def summary(days: float = 30.0) -> Dict[str, Any]:
             'entry': {'maker': maker_entry, 'taker': taker_entry, 'other': max(0, total - maker_entry - taker_entry)},
             'exit': {'maker': maker_exit, 'taker': taker_exit, 'other': max(0, total - maker_exit - taker_exit)},
         },
+        "execution_truth": _execution_truth_summary(rec),
+        "strategy_truth": _strategy_truth_summary(rec),
         "expectancy_by_hold_bucket": _group_stats(rec, 'hold_bucket'),
         "expectancy_by_regime": _group_stats(rec, 'regime_state'),
         "blocked_trade_summary": blocked,

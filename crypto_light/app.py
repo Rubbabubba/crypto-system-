@@ -4535,12 +4535,37 @@ def _build_admission_context(*, symbol: str, strategy: str, signal_name: str | N
         'breakout_distance_pct': breakout_distance_pct,
         'ranking_score': _float_or_none(extra.get('ranking_score', rank.get('score'))),
         'spread_pct': _float_or_none(extra.get('spread_pct', signal_meta.get('spread_pct'))),
-        'regime_state': 'quiet' if bool(extra.get('regime_quiet')) else 'expansion',
+        'regime_state': _resolve_admission_regime_state(extra, signal_meta),
         'signal_meta': signal_meta,
         'rank': rank,
         'extra': extra,
     }
 
+
+
+
+def _resolve_admission_regime_state(extra: dict, signal_meta: dict) -> str:
+    regime = dict(signal_meta.get('regime') or {})
+    for candidate in (
+        extra.get('regime_state'),
+        signal_meta.get('regime_state'),
+        regime.get('state'),
+        regime.get('label'),
+        regime.get('reason'),
+    ):
+        s = str(candidate or '').strip().lower()
+        if s in ('quiet', 'expansion'):
+            return s
+        if s in ('trend', 'trending'):
+            return 'expansion'
+        if s in ('range', 'ranging', 'chop', 'choppy'):
+            return 'quiet'
+    rq = extra.get('regime_quiet')
+    if rq is True:
+        return 'quiet'
+    if rq is False:
+        return 'expansion'
+    return 'unknown'
 
 def _record_admission_event(ctx: dict, *, admission_result: str, reject_reason: str | None = None, payload: dict | None = None) -> None:
     try:
@@ -8209,6 +8234,8 @@ def _serialize_recent_trade(row: dict[str, Any]) -> dict[str, Any]:
         "exit_liquidity_role": row.get("exit_liquidity_role"),
         "entry_execution_path": row.get("entry_execution_path"),
         "exit_execution_path": row.get("exit_execution_path"),
+        "entry_execution": row.get("entry_execution"),
+        "exit_execution": row.get("exit_execution"),
         "projected_move_bps": row.get("projected_move_bps"),
         "projected_cost_bps": row.get("projected_cost_bps"),
         "realized_move_bps": row.get("realized_move_bps"),
@@ -8342,6 +8369,37 @@ def dashboard(recent_limit: int = 15):
 @app.get("/performance")
 def performance(days: float = 30.0, recent_limit: int = 25):
     return _performance_snapshot(days=days, recent_limit=recent_limit)
+
+
+
+@app.get("/diagnostics/strategy_truth")
+def diagnostics_strategy_truth(days: float = 30.0):
+    snap = _performance_snapshot(days=days, recent_limit=25)
+    telemetry = ((((snap.get('pnl') or {}).get('telemetry_window')) or {}))
+    return {
+        'ok': True,
+        'utc': utc_now_iso(),
+        'build': PATCH_BUILD,
+        'days': float(days),
+        'strategy_truth': telemetry.get('strategy_truth') or {},
+        'expectancy_by_regime': telemetry.get('expectancy_by_regime') or {},
+        'expectancy_by_hold_bucket': telemetry.get('expectancy_by_hold_bucket') or {},
+    }
+
+
+@app.get("/diagnostics/execution_truth")
+def diagnostics_execution_truth(days: float = 30.0):
+    snap = _performance_snapshot(days=days, recent_limit=25)
+    telemetry = ((((snap.get('pnl') or {}).get('telemetry_window')) or {}))
+    return {
+        'ok': True,
+        'utc': utc_now_iso(),
+        'build': PATCH_BUILD,
+        'days': float(days),
+        'maker_vs_taker': telemetry.get('maker_vs_taker') or {},
+        'execution_truth': telemetry.get('execution_truth') or {},
+        'recent_trades': (snap.get('recent_trades') or {}).get('count') or 0,
+    }
 
 
 @app.get("/diagnostics/recent_trades")
