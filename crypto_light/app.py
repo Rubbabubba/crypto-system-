@@ -2824,6 +2824,91 @@ def _filter_symbols_by_profitability_isolation(symbols: list[str], *, days: floa
     return list(dict.fromkeys(filtered)), list(dict.fromkeys(removed)), snap
 
 
+
+def _universe_control_snapshot(days: float | None = None) -> dict[str, Any]:
+    days = float(days if days is not None else KILL_SWITCH_WINDOW_DAYS)
+    out: dict[str, Any] = {
+        "enabled": bool(UNIVERSE_CONTROL_ENABLED),
+        "kill_switch_enabled": bool(KILL_SWITCH_ENABLED),
+        "expectancy_window_days": days,
+        "kill_switch_active": False,
+        "kill_switch_reason": "disabled",
+        "rolling_net_pnl": None,
+        "rolling_avg_edge_bps": None,
+        "approved_symbols": [],
+        "rejected_symbols": [],
+        "symbol_scores": {},
+        "authoritative": False,
+        "authoritative_reason": "disabled",
+        "telemetry_ok": False,
+    }
+    if not bool(UNIVERSE_CONTROL_ENABLED):
+        return out
+    try:
+        tel = telemetry_db.summary(days=days)
+    except Exception as e:
+        out["authoritative_reason"] = f"telemetry_error:{type(e).__name__}"
+        out["kill_switch_reason"] = out["authoritative_reason"]
+        return out
+    out["telemetry_ok"] = bool(tel.get("ok"))
+    out["rolling_net_pnl"] = _safe_float(tel.get("net_pnl_usd"))
+    out["rolling_avg_edge_bps"] = _safe_float(tel.get("avg_realized_edge_bps"))
+    trades = int(tel.get("closed_trades") or 0)
+    if bool(KILL_SWITCH_ENABLED) and trades >= int(KILL_SWITCH_MIN_TRADES):
+        net = _safe_float(out["rolling_net_pnl"])
+        edge = _safe_float(out["rolling_avg_edge_bps"])
+        if (net is not None and net <= float(KILL_SWITCH_MAX_NEG_NET_PNL)) or (edge is not None and edge <= float(KILL_SWITCH_MAX_NEG_EDGE_BPS)):
+            out["kill_switch_active"] = True
+            out["kill_switch_reason"] = "rolling_expectancy_breach"
+        else:
+            out["kill_switch_reason"] = "ok"
+    else:
+        out["kill_switch_reason"] = "insufficient_trades" if trades < int(KILL_SWITCH_MIN_TRADES) else "disabled"
+    by_symbol = dict(((tel.get("strategy_truth") or {}).get("by_symbol") or {}))
+    scored=[]
+    for sym, meta in by_symbol.items():
+        meta=dict(meta or {})
+        t=int(meta.get("trades") or 0)
+        if t < int(SYMBOL_QUALITY_MIN_TRADES):
+            continue
+        net=float(meta.get("net_pnl_usd") or 0.0)
+        edge=_safe_float(meta.get("avg_net_edge_bps"))
+        win=_safe_float(meta.get("win_rate")) or 0.0
+        score=net + (edge or -9999)/100.0 + (win*10.0)
+        qualifies = (net > 0.0) or ((edge is not None and edge >= float(SYMBOL_QUALITY_MAX_NEG_EDGE_BPS)) and win >= float(SYMBOL_QUALITY_MIN_WIN_RATE))
+        out["symbol_scores"][normalize_symbol(str(sym))] = {"trades": t, "net_pnl_usd": net, "avg_net_edge_bps": edge, "win_rate": win, "score": score, "qualifies": bool(qualifies)}
+        scored.append((qualifies, score, normalize_symbol(str(sym))))
+    scored.sort(key=lambda x:(not x[0], -x[1], x[2]))
+    approved=[sym for q,_,sym in scored if q][:max(1,int(SYMBOL_QUALITY_MAX_SYMBOLS))]
+    rejected=[sym for q,_,sym in scored if not q]
+    out["approved_symbols"]=approved
+    out["rejected_symbols"]=rejected
+    out["authoritative"]=bool(approved) or bool(out["kill_switch_active"])
+    out["authoritative_reason"] = "kill_switch_active" if out["kill_switch_active"] else ("approved_symbols_available" if approved else "no_approved_symbols")
+    return out
+
+
+def _filter_symbols_by_universe_control(symbols: list[str], *, days: float | None = None) -> tuple[list[str], list[str], dict[str, Any]]:
+    snap = _universe_control_snapshot(days=days)
+    normalized_in = [normalize_symbol(str(s)) for s in list(symbols or []) if str(s).strip()]
+    if not bool(snap.get("enabled")):
+        return list(dict.fromkeys(normalized_in)), [], snap
+    if bool(snap.get("kill_switch_active")):
+        snap = dict(snap)
+        snap["authoritative"] = True
+        snap["authoritative_reason"] = "kill_switch_active"
+        return [], list(dict.fromkeys(normalized_in)), snap
+    approved = {normalize_symbol(str(s)) for s in list(snap.get("approved_symbols") or []) if str(s).strip()}
+    if not approved:
+        return list(dict.fromkeys(normalized_in)), [], snap
+    filtered = [s for s in normalized_in if s in approved]
+    removed = [s for s in normalized_in if s not in approved]
+    snap = dict(snap)
+    snap["authoritative"] = True
+    snap["authoritative_reason"] = "approved_symbols_intersection"
+    return list(dict.fromkeys(filtered)), list(dict.fromkeys(removed)), snap
+
+
 def _safe_count(value: Any) -> int:
     if value is None:
         return 0
@@ -3072,6 +3157,9 @@ def _path_b_admission_snapshot(scanner_contract: dict[str, Any]) -> dict[str, An
     profitability_removed_symbols: list[str] = []
     profitability_authority: dict[str, Any] = _profitability_isolation_snapshot()
     candidate_symbols, profitability_removed_symbols, profitability_authority = _filter_symbols_by_profitability_isolation(candidate_symbols)
+    universe_removed_symbols: list[str] = []
+    universe_control: dict[str, Any] = _universe_control_snapshot()
+    candidate_symbols, universe_removed_symbols, universe_control = _filter_symbols_by_universe_control(candidate_symbols)
     if TRADE_QUALITY_OVERRIDE_ENABLED:
         quality_allow_set = set(TRADE_QUALITY_ALLOWED_SYMBOLS)
         candidate_symbols = [s for s in candidate_symbols if s in quality_allow_set]
@@ -3121,6 +3209,12 @@ def _path_b_admission_snapshot(scanner_contract: dict[str, Any]) -> dict[str, An
         "profitability_isolation_allowed_symbols": list((profitability_authority or {}).get("allowed_symbols") or []),
         "profitability_removed_symbols_count": len(profitability_removed_symbols),
         "profitability_removed_symbols_sample": profitability_removed_symbols[:12],
+        "universe_control_authoritative": bool((universe_control or {}).get("authoritative")),
+        "universe_control_reason": (universe_control or {}).get("authoritative_reason"),
+        "universe_control_kill_switch_active": bool((universe_control or {}).get("kill_switch_active")),
+        "universe_control_approved_symbols": list((universe_control or {}).get("approved_symbols") or []),
+        "universe_removed_symbols_count": len(universe_removed_symbols),
+        "universe_removed_symbols_sample": universe_removed_symbols[:12],
         "requirements": {
             "require_contract_compatible": True,
             "require_fee_guard": True,
@@ -8541,6 +8635,34 @@ def diagnostics_execution_truth(days: float = 30.0):
         'maker_vs_taker': telemetry.get('maker_vs_taker') or {},
         'execution_truth': telemetry.get('execution_truth') or {},
         'recent_trades': (snap.get('recent_trades') or {}).get('count') or 0,
+    }
+
+
+@app.get("/diagnostics/universe_control")
+def diagnostics_universe_control(days: float = 30.0):
+    snap = _universe_control_snapshot(days=days)
+    scanner_contract = _scanner_contract_snapshot()
+    candidate_symbols = list((scanner_contract or {}).get("ranked_active_symbols") or (scanner_contract or {}).get("active_symbols") or [])
+    effective_symbols, removed_symbols, authority = _filter_symbols_by_universe_control(candidate_symbols, days=days)
+    return {
+        "ok": True,
+        "utc": _utc_now_iso(),
+        "build": build_info.build_payload(),
+        "days": float(days),
+        "universe_control": snap,
+        "kill_switch_enabled": bool((snap or {}).get("kill_switch_enabled")),
+        "kill_switch_active": bool((snap or {}).get("kill_switch_active")),
+        "expectancy_window_days": float((snap or {}).get("expectancy_window_days") or days),
+        "rolling_net_pnl": (snap or {}).get("rolling_net_pnl"),
+        "rolling_avg_edge_bps": (snap or {}).get("rolling_avg_edge_bps"),
+        "approved_symbols": list((snap or {}).get("approved_symbols") or []),
+        "rejected_symbols": list((snap or {}).get("rejected_symbols") or []),
+        "symbol_scores": dict((snap or {}).get("symbol_scores") or {}),
+        "authoritative": bool((authority or {}).get("authoritative")),
+        "authoritative_reason": (authority or {}).get("authoritative_reason"),
+        "scanner_candidate_symbols": candidate_symbols,
+        "effective_candidate_symbols": effective_symbols,
+        "removed_candidate_symbols": removed_symbols,
     }
 
 
