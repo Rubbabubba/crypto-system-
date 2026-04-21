@@ -106,6 +106,20 @@ DUST_NOTIONAL_CLOSE_THRESHOLD_USD = float(getattr(settings, 'dust_notional_close
 DUST_MIN_VOLUME_BUFFER_PCT = float(getattr(settings, 'dust_min_volume_buffer_pct', 0.05) or 0.05)
 
 
+# Patch 100A hotfix: define universe-control config globals locally so diagnostics
+# and readiness paths cannot crash on missing names.
+UNIVERSE_CONTROL_ENABLED = int(os.getenv('UNIVERSE_CONTROL_ENABLED', str(int(bool(getattr(settings, 'universe_control_enabled', 0) or 0)))))
+KILL_SWITCH_ENABLED = int(os.getenv('KILL_SWITCH_ENABLED', str(int(bool(getattr(settings, 'kill_switch_enabled', 0) or 0)))))
+KILL_SWITCH_WINDOW_DAYS = float(os.getenv('KILL_SWITCH_WINDOW_DAYS', str(float(getattr(settings, 'kill_switch_window_days', 30) or 30))))
+KILL_SWITCH_MIN_TRADES = int(os.getenv('KILL_SWITCH_MIN_TRADES', str(int(getattr(settings, 'kill_switch_min_trades', 5) or 5))))
+KILL_SWITCH_MAX_NEG_NET_PNL = float(os.getenv('KILL_SWITCH_MAX_NEG_NET_PNL', str(float(getattr(settings, 'kill_switch_max_neg_net_pnl', -25) or -25))))
+KILL_SWITCH_MAX_NEG_EDGE_BPS = float(os.getenv('KILL_SWITCH_MAX_NEG_EDGE_BPS', str(float(getattr(settings, 'kill_switch_max_neg_edge_bps', -80) or -80))))
+SYMBOL_QUALITY_MIN_TRADES = int(os.getenv('SYMBOL_QUALITY_MIN_TRADES', str(int(getattr(settings, 'symbol_quality_min_trades', 1) or 1))))
+SYMBOL_QUALITY_MAX_SYMBOLS = int(os.getenv('SYMBOL_QUALITY_MAX_SYMBOLS', str(int(getattr(settings, 'symbol_quality_max_symbols', 4) or 4))))
+SYMBOL_QUALITY_MIN_WIN_RATE = float(os.getenv('SYMBOL_QUALITY_MIN_WIN_RATE', str(float(getattr(settings, 'symbol_quality_min_win_rate', 0.35) or 0.35))))
+SYMBOL_QUALITY_MAX_NEG_EDGE_BPS = float(os.getenv('SYMBOL_QUALITY_MAX_NEG_EDGE_BPS', str(float(getattr(settings, 'symbol_quality_max_neg_edge_bps', -60) or -60))))
+
+
 def _portfolio_exposure_usd_from_balances(balances: dict[str, float]) -> float:
     """Best-effort mark-to-market exposure for non-USD *non-stable* assets.
 
