@@ -2928,7 +2928,7 @@ def _universe_control_snapshot(days: float | None = None) -> dict[str, Any]:
 
 
 
-def _tr1_rollout_gate_snapshot(days: float | None = None) -> dict[str, Any]:
+def _tr1_rollout_gate_snapshot(days: float | None = None, candidate_symbols: list[str] | None = None) -> dict[str, Any]:
     enabled = bool(TR1_ROLLOUT_GATE_ENABLED)
     fixed_mode = str(STRATEGY_MODE).strip().lower() == "fixed"
     tr1_live = bool(ENABLE_TR1) and (not fixed_mode or "tr1" in ENTRY_ENGINE_STRATEGIES)
@@ -2943,6 +2943,9 @@ def _tr1_rollout_gate_snapshot(days: float | None = None) -> dict[str, Any]:
         "active": False,
         "reason": "disabled",
         "allowed_symbols": [],
+        "candidate_symbols": [],
+        "candidate_intersection": [],
+        "selection_mode": "none",
     }
     if not enabled:
         return out
@@ -2954,7 +2957,20 @@ def _tr1_rollout_gate_snapshot(days: float | None = None) -> dict[str, Any]:
     if not allowed:
         out["reason"] = "no_allowed_symbols"
         return out
+    candidate_list = [normalize_symbol(str(s)) for s in list(candidate_symbols or []) if str(s).strip()]
+    candidate_list = list(dict.fromkeys(candidate_list))
+    out["candidate_symbols"] = candidate_list
+    allowed_set = set(allowed)
+    live_overlap = [s for s in candidate_list if s in allowed_set]
+    out["candidate_intersection"] = live_overlap
+    if live_overlap:
+        out["allowed_symbols"] = live_overlap[:max_symbols]
+        out["selection_mode"] = "live_candidate_intersection"
+        out["active"] = True
+        out["reason"] = "tr1_rollout_gate_active"
+        return out
     out["allowed_symbols"] = allowed[:max_symbols]
+    out["selection_mode"] = "historical_allowed_fallback"
     out["active"] = True
     out["reason"] = "tr1_rollout_gate_active"
     return out
@@ -2966,7 +2982,7 @@ def _filter_symbols_by_universe_control(symbols: list[str], *, days: float | Non
     if not bool(snap.get("enabled")):
         return list(dict.fromkeys(normalized_in)), [], snap
     if bool(snap.get("kill_switch_active")):
-        gate = _tr1_rollout_gate_snapshot(days=days)
+        gate = _tr1_rollout_gate_snapshot(days=days, candidate_symbols=normalized_in)
         if bool(gate.get("active")) and bool(gate.get("bypass_kill_switch")):
             allowed = {normalize_symbol(str(s)) for s in list(gate.get("allowed_symbols") or []) if str(s).strip()}
             filtered = [s for s in normalized_in if s in allowed]
