@@ -134,6 +134,9 @@ ENTRY_ATTEMPT_TRUTH: Dict[str, Any] = {
     "last_order_attempt_payload_summary": None,
     "last_broker_submission_result": None,
     "last_rejected_entry_reason": None,
+    "last_signal_breakdown": None,
+    "last_tr1_signal_breakdown": None,
+    "last_signal_debug_by_symbol": {},
 }
 
 
@@ -2217,14 +2220,98 @@ def _tc1_pullback_reclaim_profile(ltf_opens: list[float], ltf_closes: list[float
     }
 
 
+
+def _tr1_rule_row(name: str, passed: bool, *, actual: Any = None, threshold: Any = None, detail: str | None = None) -> dict:
+    return {"rule": str(name), "passed": bool(passed), "actual": actual, "threshold": threshold, "detail": detail}
+
+
+def _tr1_finalize_debug(dbg: dict, reason: str, *, fired: bool = False) -> dict:
+    """Attach rule-level TR1 diagnostics. Observability only."""
+    try:
+        checks = list(dbg.get("checks") or [])
+        failed = [str(c.get("rule")) for c in checks if not bool(c.get("passed"))]
+        dbg["fired"] = bool(fired)
+        dbg["reason"] = str(reason)
+        dbg["failed_checks"] = failed
+        dbg["failed_check_count"] = int(len(failed))
+        dbg["primary_failed_check"] = (failed[0] if failed else None)
+        dbg["signal_breakdown"] = {
+            "strategy": "tr1",
+            "symbol": dbg.get("symbol"),
+            "fired": bool(fired),
+            "reason": str(reason),
+            "primary_failed_check": (failed[0] if failed else None),
+            "failed_checks": failed,
+            "checks": checks,
+            "metrics": {
+                "close": dbg.get("close"),
+                "ltf_ema": dbg.get("ltf_ema"),
+                "vwap": dbg.get("vwap"),
+                "htf_fast": dbg.get("htf_fast"),
+                "htf_slow": dbg.get("htf_slow"),
+                "trend_sep_bps": dbg.get("trend_sep_bps"),
+                "atr_pct": dbg.get("atr_pct"),
+                "spread_pct": dbg.get("spread_pct"),
+                "pullback_depth_atr": dbg.get("pullback_depth_atr"),
+                "close_fraction": dbg.get("close_fraction"),
+                "reclaim_strength_bps": dbg.get("reclaim_strength_bps"),
+                "breakout_range_atr": dbg.get("breakout_range_atr"),
+                "expected_move_bps": dbg.get("expected_move_bps"),
+                "estimated_round_trip_bps": dbg.get("estimated_round_trip_bps"),
+                "move_to_cost_mult": dbg.get("move_to_cost_mult"),
+            },
+        }
+    except Exception:
+        dbg["reason"] = str(reason)
+        dbg["fired"] = bool(fired)
+    return dbg
+
+
+def _extract_tr1_signal_breakdown_from_debug(signal_debug: Any) -> dict | None:
+    try:
+        if not isinstance(signal_debug, dict):
+            return None
+        tr1 = signal_debug.get("tr1") or {}
+        if not isinstance(tr1, dict):
+            return None
+        return tr1.get("signal_breakdown") or {
+            "strategy": "tr1",
+            "symbol": tr1.get("symbol"),
+            "fired": bool(tr1.get("fired", False)),
+            "reason": tr1.get("reason"),
+            "primary_failed_check": tr1.get("primary_failed_check"),
+            "failed_checks": list(tr1.get("failed_checks") or []),
+            "checks": list(tr1.get("checks") or []),
+        }
+    except Exception:
+        return None
+
+
+def _compact_signal_debug_by_symbol(per_symbol: dict | None) -> dict:
+    out: dict[str, Any] = {}
+    try:
+        for sym, d in (per_symbol or {}).items():
+            sd = (d or {}).get("signal_debug") or {}
+            out[normalize_symbol(str(sym))] = {
+                "signals": dict((d or {}).get("signals") or {}),
+                "skip": list((d or {}).get("skip") or []),
+                "tr1": _extract_tr1_signal_breakdown_from_debug(sd),
+            }
+    except Exception:
+        pass
+    return out
+
+
 def _tr1_long_signal(symbol: str) -> tuple[bool, dict]:
     bars = _get_bars(symbol, timeframe=ENTRY_ENGINE_TIMEFRAME, limit=max(120, TR1_LOOKBACK_BARS + TR1_PULLBACK_LOOKBACK_BARS + 80))
-    dbg = {"symbol": normalize_symbol(symbol), "strategy_name": "tr1_trend_resume", "fired": False}
+    dbg = {"symbol": normalize_symbol(symbol), "strategy_name": "tr1_trend_resume", "fired": False, "checks": []}
     fresh_ok, fresh_meta = _guard_fresh_bars(bars, ENTRY_ENGINE_TIMEFRAME)
+    min_bars = max(60, TR1_LOOKBACK_BARS + TR1_PULLBACK_LOOKBACK_BARS + 5)
     dbg["fresh_guard"] = fresh_meta
-    if not fresh_ok or len(bars) < max(60, TR1_LOOKBACK_BARS + TR1_PULLBACK_LOOKBACK_BARS + 5):
-        dbg["reason"] = "stale_or_insufficient_bars"
-        return False, dbg
+    dbg["checks"].append(_tr1_rule_row("fresh_bars", bool(fresh_ok and len(bars) >= min_bars), actual={"fresh_ok": bool(fresh_ok), "bars": len(bars)}, threshold={"min_bars": min_bars}, detail="entry timeframe bars must be fresh and sufficient"))
+    if not fresh_ok or len(bars) < min_bars:
+        return False, _tr1_finalize_debug(dbg, "stale_or_insufficient_bars")
+
     closes = [float(b.get("c") or 0.0) for b in bars]
     highs = [float(b.get("h") or 0.0) for b in bars]
     lows = [float(b.get("l") or 0.0) for b in bars]
@@ -2254,45 +2341,45 @@ def _tr1_long_signal(symbol: str) -> tuple[bool, dict]:
     reclaim_strength_bps = (((cur_close - reclaim_anchor) / reclaim_anchor) * 10000.0) if reclaim_anchor > 0 else 0.0
     range_atr = ((cur_high - cur_low) / atr_now) if atr_now > 0 else 0.0
     expected_move_bps = max(int(TR1_MIN_TAKE_PROFIT_BPS), int((TR1_EXPECTED_MOVE_ATR_MULT * float(atr_pct or 0.0)) * 10000.0)) if atr_pct is not None else int(TR1_MIN_TAKE_PROFIT_BPS)
-    dbg.update({"close": cur_close, "ltf_ema": ltf_ema, "vwap": vwap, "trend_ok": trend_ok, "trend_sep_bps": trend_sep_bps, "atr_now": atr_now, "atr_pct": atr_pct, "spread_pct": spread_pct, "recent_high": recent_high, "recent_low": recent_low, "pullback_depth_atr": pullback_depth_atr, "close_fraction": close_fraction, "reclaim_anchor": reclaim_anchor, "reclaim_strength_bps": reclaim_strength_bps, "breakout_range_atr": range_atr, "expected_move_bps": expected_move_bps})
-    if not trend_ok:
-        dbg["reason"] = "trend_not_up"
-        return False, dbg
-    if atr_pct is None or atr_pct < TR1_MIN_ATR_PCT:
-        dbg["reason"] = "atr_too_low"
-        return False, dbg
-    if spread_pct is not None and spread_pct > TR1_MAX_SPREAD_PCT:
-        dbg["reason"] = "spread_too_wide"
-        return False, dbg
-    if TR1_REQUIRE_VWAP and vwap and cur_close < vwap:
-        dbg["reason"] = "below_vwap"
-        return False, dbg
-    if not (TR1_PULLBACK_ATR_MIN <= pullback_depth_atr <= TR1_PULLBACK_ATR_MAX):
-        dbg["reason"] = "pullback_depth_out_of_band"
-        return False, dbg
-    if cur_close <= reclaim_anchor:
-        dbg["reason"] = "reclaim_not_confirmed"
-        return False, dbg
-    if close_fraction < TR1_MIN_CLOSE_FRACTION:
-        dbg["reason"] = "close_strength_too_low"
-        return False, dbg
-    if range_atr < TR1_MIN_RANGE_ATR:
-        dbg["reason"] = "range_too_small"
-        return False, dbg
-    # profitability guard reusing existing model
     round_trip_bps = _estimated_round_trip_bps(spread_pct=spread_pct)
     move_to_cost = (float(expected_move_bps) / float(round_trip_bps)) if round_trip_bps > 0 else 0.0
-    dbg["estimated_round_trip_bps"] = round_trip_bps
-    dbg["move_to_cost_mult"] = move_to_cost
-    if expected_move_bps < max(int(PROFIT_FILTER_MIN_EXPECTED_MOVE_BPS), int(TR1_MIN_TAKE_PROFIT_BPS)):
-        dbg["reason"] = "expected_move_too_small"
-        return False, dbg
-    if move_to_cost < max(float(PROFIT_FILTER_MIN_MOVE_TO_COST_MULT), 1.2):
-        dbg["reason"] = "move_to_cost_too_low"
-        return False, dbg
-    dbg["fired"] = True
-    dbg["reason"] = "tr1_reclaim_resume"
-    return True, dbg
+
+    dbg.update({"close": cur_close, "ltf_ema": ltf_ema, "vwap": vwap, "htf_fast": htf_fast, "htf_slow": htf_slow, "trend_ok": trend_ok, "trend_sep_bps": trend_sep_bps, "atr_now": atr_now, "atr_pct": atr_pct, "spread_pct": spread_pct, "recent_high": recent_high, "recent_low": recent_low, "pullback_depth_atr": pullback_depth_atr, "close_fraction": close_fraction, "reclaim_anchor": reclaim_anchor, "reclaim_strength_bps": reclaim_strength_bps, "breakout_range_atr": range_atr, "expected_move_bps": expected_move_bps, "estimated_round_trip_bps": round_trip_bps, "move_to_cost_mult": move_to_cost})
+    checks = dbg["checks"]
+    checks.append(_tr1_rule_row("htf_trend_up", trend_ok, actual={"htf_fast": htf_fast, "htf_slow": htf_slow, "trend_sep_bps": trend_sep_bps}, threshold="htf_fast > htf_slow > 0", detail="higher timeframe trend must be up"))
+    checks.append(_tr1_rule_row("atr_min", bool(atr_pct is not None and atr_pct >= TR1_MIN_ATR_PCT), actual=atr_pct, threshold=TR1_MIN_ATR_PCT, detail="ATR percent must clear the minimum volatility floor"))
+    checks.append(_tr1_rule_row("spread_max", bool(spread_pct is None or spread_pct <= TR1_MAX_SPREAD_PCT), actual=spread_pct, threshold=TR1_MAX_SPREAD_PCT, detail="spread must be acceptable before entry"))
+    checks.append(_tr1_rule_row("above_vwap", bool((not TR1_REQUIRE_VWAP) or (vwap and cur_close >= vwap)), actual={"close": cur_close, "vwap": vwap, "require_vwap": bool(TR1_REQUIRE_VWAP)}, threshold="close >= vwap when required", detail="price must be above VWAP when VWAP confirmation is enabled"))
+    checks.append(_tr1_rule_row("pullback_depth_band", bool(TR1_PULLBACK_ATR_MIN <= pullback_depth_atr <= TR1_PULLBACK_ATR_MAX), actual=pullback_depth_atr, threshold={"min": TR1_PULLBACK_ATR_MIN, "max": TR1_PULLBACK_ATR_MAX}, detail="pullback depth must be neither too shallow nor too extended"))
+    checks.append(_tr1_rule_row("reclaim_confirmed", bool(cur_close > reclaim_anchor), actual={"close": cur_close, "reclaim_anchor": reclaim_anchor, "reclaim_strength_bps": reclaim_strength_bps}, threshold="close > max(ltf_ema, vwap, recent_high)", detail="price must reclaim the selected anchor"))
+    checks.append(_tr1_rule_row("close_strength", bool(close_fraction >= TR1_MIN_CLOSE_FRACTION), actual=close_fraction, threshold=TR1_MIN_CLOSE_FRACTION, detail="bar close must be strong enough within the candle range"))
+    checks.append(_tr1_rule_row("range_expansion", bool(range_atr >= TR1_MIN_RANGE_ATR), actual=range_atr, threshold=TR1_MIN_RANGE_ATR, detail="current bar range must show enough expansion"))
+    expected_move_floor = max(int(PROFIT_FILTER_MIN_EXPECTED_MOVE_BPS), int(TR1_MIN_TAKE_PROFIT_BPS))
+    checks.append(_tr1_rule_row("expected_move_floor", bool(expected_move_bps >= expected_move_floor), actual=expected_move_bps, threshold=expected_move_floor, detail="projected move must clear the minimum expected gross move"))
+    move_to_cost_floor = max(float(PROFIT_FILTER_MIN_MOVE_TO_COST_MULT), 1.2)
+    checks.append(_tr1_rule_row("move_to_cost", bool(move_to_cost >= move_to_cost_floor), actual=move_to_cost, threshold=move_to_cost_floor, detail="projected move must be large enough versus estimated round-trip cost"))
+
+    if not trend_ok:
+        return False, _tr1_finalize_debug(dbg, "trend_not_up")
+    if atr_pct is None or atr_pct < TR1_MIN_ATR_PCT:
+        return False, _tr1_finalize_debug(dbg, "atr_too_low")
+    if spread_pct is not None and spread_pct > TR1_MAX_SPREAD_PCT:
+        return False, _tr1_finalize_debug(dbg, "spread_too_wide")
+    if TR1_REQUIRE_VWAP and vwap and cur_close < vwap:
+        return False, _tr1_finalize_debug(dbg, "below_vwap")
+    if not (TR1_PULLBACK_ATR_MIN <= pullback_depth_atr <= TR1_PULLBACK_ATR_MAX):
+        return False, _tr1_finalize_debug(dbg, "pullback_depth_out_of_band")
+    if cur_close <= reclaim_anchor:
+        return False, _tr1_finalize_debug(dbg, "reclaim_not_confirmed")
+    if close_fraction < TR1_MIN_CLOSE_FRACTION:
+        return False, _tr1_finalize_debug(dbg, "close_strength_too_low")
+    if range_atr < TR1_MIN_RANGE_ATR:
+        return False, _tr1_finalize_debug(dbg, "range_too_small")
+    if expected_move_bps < expected_move_floor:
+        return False, _tr1_finalize_debug(dbg, "expected_move_too_small")
+    if move_to_cost < move_to_cost_floor:
+        return False, _tr1_finalize_debug(dbg, "move_to_cost_too_low")
+    return True, _tr1_finalize_debug(dbg, "tr1_reclaim_resume", fired=True)
 
 def _tc1_long_signal(symbol: str) -> tuple[bool, dict]:
     """TC1 true breakout entry logic.
@@ -8354,6 +8441,9 @@ def scan_entries(payload: WorkerScanPayload):
             results=results,
             last_no_trade_reason=(None if any(bool(r.get("ok")) for r in results) else ((first_result or {}).get("reason") if isinstance(first_result, dict) else None)),
             last_rejected_entry_reason=((first_result or {}).get("reason") if isinstance(first_result, dict) and not bool(first_result.get("ok")) else None),
+            last_signal_debug_by_symbol=_compact_signal_debug_by_symbol(per_symbol),
+            last_tr1_signal_breakdown=_extract_tr1_signal_breakdown_from_debug((per_symbol.get(first_admitted.get("symbol")) or {}).get("signal_debug") or {}),
+            last_signal_breakdown=_extract_tr1_signal_breakdown_from_debug((per_symbol.get(first_admitted.get("symbol")) or {}).get("signal_debug") or {}),
         )
     else:
         no_trade_reason = None
@@ -8372,6 +8462,9 @@ def scan_entries(payload: WorkerScanPayload):
             results=results,
             last_no_trade_reason=no_trade_reason or "no_admitted_candidates",
             last_rejected_entry_reason=no_trade_reason or "no_admitted_candidates",
+            last_signal_debug_by_symbol=_compact_signal_debug_by_symbol(per_symbol),
+            last_tr1_signal_breakdown=next((v.get("tr1") for v in _compact_signal_debug_by_symbol(per_symbol).values() if v.get("tr1")), None),
+            last_signal_breakdown=next((v.get("tr1") for v in _compact_signal_debug_by_symbol(per_symbol).values() if v.get("tr1")), None),
         )
 
     # --- Equity debug (helps diagnose no_equity quickly) ---
@@ -8522,6 +8615,20 @@ def diagnostics_strategy_family_v2():
             },
         },
     }
+
+@app.get("/diagnostics/tr1_signal_breakdown")
+def diagnostics_tr1_signal_breakdown():
+    snap = _entry_attempt_truth_snapshot()
+    return {
+        "ok": True,
+        "utc": utc_now_iso(),
+        "build": build_payload(),
+        "tr1_signal_breakdown": snap.get("last_tr1_signal_breakdown") or snap.get("last_signal_breakdown"),
+        "last_no_trade_reason": snap.get("last_no_trade_reason"),
+        "last_rejected_entry_reason": snap.get("last_rejected_entry_reason"),
+        "last_signal_debug_by_symbol": snap.get("last_signal_debug_by_symbol") or {},
+    }
+
 
 @app.get("/diagnostics/entry_attempt_truth")
 def diagnostics_entry_attempt_truth():
