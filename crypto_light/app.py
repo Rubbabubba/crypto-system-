@@ -120,6 +120,40 @@ SYMBOL_QUALITY_MIN_WIN_RATE = float(os.getenv('SYMBOL_QUALITY_MIN_WIN_RATE', str
 SYMBOL_QUALITY_MAX_NEG_EDGE_BPS = float(os.getenv('SYMBOL_QUALITY_MAX_NEG_EDGE_BPS', str(float(getattr(settings, 'symbol_quality_max_neg_edge_bps', -60) or -60))))
 
 
+# Patch 101C: post-admission entry attempt truth for diagnosing why admitted symbols
+# do or do not turn into live orders. Diagnostics only; no strategy/execution behavior changes.
+ENTRY_ATTEMPT_TRUTH_LOCK = Lock()
+ENTRY_ATTEMPT_TRUTH: Dict[str, Any] = {
+    "snapshot_utc": None,
+    "last_scan_utc": None,
+    "last_admitted_symbol": None,
+    "last_admitted_strategy": None,
+    "admitted_candidates": [],
+    "results": [],
+    "last_no_trade_reason": None,
+    "last_order_attempt_payload_summary": None,
+    "last_broker_submission_result": None,
+    "last_rejected_entry_reason": None,
+}
+
+
+def _set_entry_attempt_truth(**updates: Any) -> None:
+    try:
+        with ENTRY_ATTEMPT_TRUTH_LOCK:
+            ENTRY_ATTEMPT_TRUTH.update({k: v for k, v in updates.items()})
+            ENTRY_ATTEMPT_TRUTH["snapshot_utc"] = utc_now_iso()
+    except Exception:
+        pass
+
+
+def _entry_attempt_truth_snapshot() -> Dict[str, Any]:
+    try:
+        with ENTRY_ATTEMPT_TRUTH_LOCK:
+            return dict(ENTRY_ATTEMPT_TRUTH)
+    except Exception:
+        return dict(ENTRY_ATTEMPT_TRUTH)
+
+
 def _portfolio_exposure_usd_from_balances(balances: dict[str, float]) -> float:
     """Best-effort mark-to-market exposure for non-USD *non-stable* assets.
 
@@ -7255,9 +7289,24 @@ def place_entry(symbol: str, *, strategy: str, req_id: str | None = None, client
       - meta: dict (full structured execution result)
     """
     rid = req_id or str(uuid4())
+    attempt_summary = {
+        "symbol": normalize_symbol(symbol),
+        "strategy": str(strategy or "").strip().lower(),
+        "req_id": rid,
+        "source": "scan_entries",
+        "notional": notional,
+        "candidate_meta": dict(candidate_meta or {}),
+    }
     iso_allow, iso_reason, iso_snapshot = _profitability_isolation_allows(symbol, strategy)
     if not iso_allow:
-        return False, iso_reason, {"ok": True, "executed": False, "reason": iso_reason, "profitability_isolation": iso_snapshot}
+        res = {"ok": True, "executed": False, "reason": iso_reason, "profitability_isolation": iso_snapshot}
+        _set_entry_attempt_truth(
+            last_order_attempt_payload_summary=attempt_summary,
+            last_broker_submission_result=res,
+            last_rejected_entry_reason=iso_reason,
+            last_no_trade_reason=iso_reason,
+        )
+        return False, iso_reason, res
     res = _execute_long_entry(
         symbol=symbol,
         strategy=strategy,
@@ -7274,6 +7323,12 @@ def place_entry(symbol: str, *, strategy: str, req_id: str | None = None, client
     #   {"ok": True, "executed": True|False, "reason": "..."} or {"ok": False, "error": "..."}
     ok = bool(res.get("ok", False))
     reason = res.get("reason") or res.get("error")
+    _set_entry_attempt_truth(
+        last_order_attempt_payload_summary=attempt_summary,
+        last_broker_submission_result=res,
+        last_rejected_entry_reason=(None if (ok and res.get("executed", False)) else (reason or "not_executed")),
+        last_no_trade_reason=(None if (ok and res.get("executed", False)) else (reason or "not_executed")),
+    )
     # If ok but not executed, treat as not-ok for scan_entries "placed" reporting.
     if ok and not res.get("executed", False):
         return False, reason or "not_executed", res
@@ -8287,6 +8342,38 @@ def scan_entries(payload: WorkerScanPayload):
             }
         )
 
+    admitted_candidates = [{"symbol": c.get("symbol"), "strategy": c.get("strategy"), "score": float(c.get("score") or 0.0)} for c in (candidates or [])]
+    first_result = (results[0] if results else None)
+    if admitted_candidates:
+        first_admitted = admitted_candidates[0]
+        _set_entry_attempt_truth(
+            last_scan_utc=utc_now_iso(),
+            last_admitted_symbol=first_admitted.get("symbol"),
+            last_admitted_strategy=first_admitted.get("strategy"),
+            admitted_candidates=admitted_candidates,
+            results=results,
+            last_no_trade_reason=(None if any(bool(r.get("ok")) for r in results) else ((first_result or {}).get("reason") if isinstance(first_result, dict) else None)),
+            last_rejected_entry_reason=((first_result or {}).get("reason") if isinstance(first_result, dict) and not bool(first_result.get("ok")) else None),
+        )
+    else:
+        no_trade_reason = None
+        rejected_candidates = []
+        for sym, d in (per_symbol or {}).items():
+            skips = list(d.get("skip") or [])
+            if skips:
+                rejected_candidates.append({"symbol": sym, "reasons": skips})
+        if rejected_candidates:
+            no_trade_reason = "; ".join([f"{x['symbol']}:{','.join(x['reasons'])}" for x in rejected_candidates[:5]])
+        _set_entry_attempt_truth(
+            last_scan_utc=utc_now_iso(),
+            last_admitted_symbol=None,
+            last_admitted_strategy=None,
+            admitted_candidates=[],
+            results=results,
+            last_no_trade_reason=no_trade_reason or "no_admitted_candidates",
+            last_rejected_entry_reason=no_trade_reason or "no_admitted_candidates",
+        )
+
     # --- Equity debug (helps diagnose no_equity quickly) ---
     bal_dbg = _balances_by_asset()
     stable_cash_dbg = _stable_cash_usd(bal_dbg)
@@ -8435,6 +8522,16 @@ def diagnostics_strategy_family_v2():
             },
         },
     }
+
+@app.get("/diagnostics/entry_attempt_truth")
+def diagnostics_entry_attempt_truth():
+    return {
+        "ok": True,
+        "utc": utc_now_iso(),
+        "build": build_payload(),
+        "entry_attempt_truth": _entry_attempt_truth_snapshot(),
+    }
+
 
 @app.get("/build")
 def build_info_endpoint():
