@@ -1,1 +1,0 @@
-patch-078-scan-broker-decoupling-and-coordination-hardening
