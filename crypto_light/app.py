@@ -1019,6 +1019,10 @@ ENABLE_RB1 = ("rb1" in ENTRY_ENGINE_STRATEGIES_LIST) or (os.getenv("ENABLE_RB1",
 ENABLE_TC0 = (os.getenv("ENABLE_TC0", "1").strip().lower() in ("1", "true", "yes", "on"))
 ENABLE_TC1 = (os.getenv("ENABLE_TC1", "1").strip().lower() in ("1", "true", "yes", "on"))
 ENABLE_TR1 = (os.getenv("ENABLE_TR1", "0").strip().lower() in ("1", "true", "yes", "on"))
+# Patch 001 rebuild strategies:
+#   me1 = Momentum Expansion, mr1 = Mean Reversion Reclaim
+ENABLE_ME1 = ("me1" in ENTRY_ENGINE_STRATEGIES_LIST) or (os.getenv("ENABLE_ME1", "0").strip().lower() in ("1", "true", "yes", "on"))
+ENABLE_MR1 = ("mr1" in ENTRY_ENGINE_STRATEGIES_LIST) or (os.getenv("ENABLE_MR1", "0").strip().lower() in ("1", "true", "yes", "on"))
 
 PROFITABILITY_ISOLATION_ENABLED = (os.getenv("PROFITABILITY_ISOLATION_ENABLED", "1").strip().lower() in ("1", "true", "yes", "on"))
 PROFITABILITY_ISOLATION_DAYS = int(float(os.getenv("PROFITABILITY_ISOLATION_DAYS", "30") or 30))
@@ -1031,7 +1035,7 @@ PROFITABILITY_ISOLATION_STRATEGY_SET = set(PROFITABILITY_ISOLATION_ALLOWED_STRAT
 PROFITABILITY_ISOLATION_SYMBOLS_RAW = os.getenv("PROFITABILITY_ISOLATION_SYMBOLS", "")
 ENABLE_CR1 = (os.getenv("ENABLE_CR1", "0").strip().lower() in ("1", "true", "yes", "on"))
 ENABLE_MM1 = (os.getenv("ENABLE_MM1", "0").strip().lower() in ("1", "true", "yes", "on"))
-_ALLOWED_STRATEGY_NAMES = ("tc0", "rb1", "tc1", "tr1", "cr1", "mm1")
+_ALLOWED_STRATEGY_NAMES = ("me1", "mr1", "tc0", "rb1", "tc1", "tr1", "cr1", "mm1")
 if not ENTRY_ENGINE_STRATEGIES_LIST:
     ENTRY_ENGINE_STRATEGIES_LIST = ["tc0", "tc1"]
 ENTRY_ENGINE_STRATEGIES_LIST = [s for s in ENTRY_ENGINE_STRATEGIES_LIST if s in _ALLOWED_STRATEGY_NAMES]
@@ -1537,6 +1541,163 @@ def _vwap_from_bars(bars: list[dict], lookback: int | None = None) -> float | No
         num += tp * v
         den += v
     return (num / den) if den > 0 else None
+
+
+# ---------- Patch 001: profit-first rebuild strategies ----------
+def _env_float(name: str, default: float) -> float:
+    try:
+        return float(os.getenv(name, str(default)) or default)
+    except Exception:
+        return float(default)
+
+def _env_int(name: str, default: int) -> int:
+    try:
+        return int(float(os.getenv(name, str(default)) or default))
+    except Exception:
+        return int(default)
+
+ME1_LOOKBACK_BARS = _env_int("ME1_LOOKBACK_BARS", 12)
+ME1_MIN_RANGE_ATR = _env_float("ME1_MIN_RANGE_ATR", 0.85)
+ME1_BREAKOUT_BUFFER_PCT = _env_float("ME1_BREAKOUT_BUFFER_PCT", 0.0004)
+ME1_MIN_VOLUME_MULT = _env_float("ME1_MIN_VOLUME_MULT", 1.25)
+ME1_REQUIRE_BTC_ALIGNMENT = (os.getenv("ME1_REQUIRE_BTC_ALIGNMENT", "1").strip().lower() in ("1", "true", "yes", "on"))
+ME1_MAX_SPREAD_PCT = _env_float("ME1_MAX_SPREAD_PCT", 0.0025)
+
+MR1_DROP_LOOKBACK_BARS = _env_int("MR1_DROP_LOOKBACK_BARS", 8)
+MR1_MIN_DROP_ATR = _env_float("MR1_MIN_DROP_ATR", 1.15)
+MR1_MIN_LOWER_WICK_PCT = _env_float("MR1_MIN_LOWER_WICK_PCT", 0.35)
+MR1_RECLAIM_EMA_PERIOD = _env_int("MR1_RECLAIM_EMA_PERIOD", 21)
+MR1_REQUIRE_VWAP_RECLAIM = (os.getenv("MR1_REQUIRE_VWAP_RECLAIM", "1").strip().lower() in ("1", "true", "yes", "on"))
+MR1_MIN_VOLUME_MULT = _env_float("MR1_MIN_VOLUME_MULT", 1.10)
+MR1_MAX_SPREAD_PCT = _env_float("MR1_MAX_SPREAD_PCT", 0.0025)
+
+def _bar_float(bar: dict, key: str, default: float = 0.0) -> float:
+    try:
+        return float((bar or {}).get(key) or default)
+    except Exception:
+        return float(default)
+
+def _avg(values: list[float]) -> float | None:
+    vals = [float(v) for v in values if v is not None]
+    return (sum(vals) / float(len(vals))) if vals else None
+
+def _spread_snapshot(symbol: str) -> dict:
+    bid, ask = _best_bid_ask(symbol)
+    spread_pct = None
+    if bid and ask and bid > 0 and ask > 0:
+        mid = (float(bid) + float(ask)) / 2.0
+        spread_pct = (float(ask) - float(bid)) / mid if mid > 0 else None
+    return {"bid": bid, "ask": ask, "spread_pct": spread_pct}
+
+def _btc_alignment_ok() -> tuple[bool, dict]:
+    bars = _get_bars("BTC/USD", timeframe="60Min", limit=80)
+    ok, freshness = _guard_fresh_bars(bars or [], "60Min")
+    if not ok:
+        return False, {"reason": "btc_alignment_stale_or_missing", "freshness": freshness}
+    closes = [_bar_float(b, "c") for b in (bars or []) if _bar_float(b, "c") > 0]
+    if len(closes) < 55:
+        return False, {"reason": "btc_alignment_insufficient_bars", "bars": len(closes), "freshness": freshness}
+    ema_fast = _ema(closes, 21)[-1]
+    ema_slow = _ema(closes, 50)[-1]
+    last = closes[-1]
+    aligned = bool(last >= ema_fast >= ema_slow)
+    return aligned, {"reason": "ok" if aligned else "btc_not_aligned", "last": last, "ema21": ema_fast, "ema50": ema_slow, "freshness": freshness}
+
+def _me1_long_signal(symbol: str) -> tuple[bool, dict]:
+    """Momentum Expansion: long only after compression/range expansion and volume confirmation."""
+    bars = _get_bars(symbol, timeframe=ENTRY_ENGINE_TIMEFRAME, limit=max(80, ME1_LOOKBACK_BARS + 35))
+    fresh_ok, freshness = _guard_fresh_bars(bars or [], ENTRY_ENGINE_TIMEFRAME)
+    if not fresh_ok:
+        return False, {"strategy": "me1", "reason": "stale_or_missing_bars", "freshness": freshness}
+    if not bars or len(bars) < ME1_LOOKBACK_BARS + 20:
+        return False, {"strategy": "me1", "reason": "insufficient_bars", "bars": len(bars or [])}
+
+    last = bars[-1]
+    prev_window = bars[-(ME1_LOOKBACK_BARS + 1):-1]
+    vols = [_bar_float(b, "v") for b in bars if _bar_float(b, "v") >= 0]
+    atr_now, _ = _atr_from_bars(bars, length=14)
+    px = _bar_float(last, "c")
+    high = _bar_float(last, "h")
+    low = _bar_float(last, "l")
+    open_px = _bar_float(last, "o")
+    range_high = max(_bar_float(b, "h") for b in prev_window)
+    range_low = min(_bar_float(b, "l") for b in prev_window)
+    bar_range = max(0.0, high - low)
+    range_atr = (bar_range / float(atr_now)) if atr_now and atr_now > 0 else 0.0
+    breakout_level = range_high * (1.0 + float(ME1_BREAKOUT_BUFFER_PCT))
+    avg_vol = _avg(vols[-21:-1]) or 0.0
+    vol_mult = (_bar_float(last, "v") / avg_vol) if avg_vol > 0 else 0.0
+    spread = _spread_snapshot(symbol)
+    spread_pct = spread.get("spread_pct")
+    btc_ok, btc_meta = (True, {"reason": "disabled_or_btc_symbol"})
+    if ME1_REQUIRE_BTC_ALIGNMENT and normalize_symbol(symbol) != "BTC/USD":
+        btc_ok, btc_meta = _btc_alignment_ok()
+
+    checks = {
+        "breakout": px > breakout_level,
+        "green_bar": px > open_px,
+        "range_expansion": range_atr >= float(ME1_MIN_RANGE_ATR),
+        "volume_expansion": vol_mult >= float(ME1_MIN_VOLUME_MULT),
+        "spread_ok": (spread_pct is None or spread_pct <= float(ME1_MAX_SPREAD_PCT)),
+        "btc_alignment_ok": bool(btc_ok),
+    }
+    fired = all(bool(v) for v in checks.values())
+    reason = "ok" if fired else ",".join([k for k, v in checks.items() if not v])
+    return fired, {
+        "strategy": "me1", "reason": reason, "checks": checks, "price": px,
+        "range_high": range_high, "range_low": range_low, "breakout_level": breakout_level,
+        "atr": atr_now, "range_atr": range_atr, "volume_mult": vol_mult,
+        "spread": spread, "btc_alignment": btc_meta, "freshness": freshness,
+    }
+
+def _mr1_long_signal(symbol: str) -> tuple[bool, dict]:
+    """Mean Reversion Reclaim: long only after sharp flush, rejection wick, and reclaim confirmation."""
+    bars = _get_bars(symbol, timeframe=ENTRY_ENGINE_TIMEFRAME, limit=max(90, MR1_DROP_LOOKBACK_BARS + 45))
+    fresh_ok, freshness = _guard_fresh_bars(bars or [], ENTRY_ENGINE_TIMEFRAME)
+    if not fresh_ok:
+        return False, {"strategy": "mr1", "reason": "stale_or_missing_bars", "freshness": freshness}
+    if not bars or len(bars) < MR1_DROP_LOOKBACK_BARS + MR1_RECLAIM_EMA_PERIOD + 5:
+        return False, {"strategy": "mr1", "reason": "insufficient_bars", "bars": len(bars or [])}
+
+    last = bars[-1]
+    window = bars[-(MR1_DROP_LOOKBACK_BARS + 1):-1]
+    closes = [_bar_float(b, "c") for b in bars if _bar_float(b, "c") > 0]
+    vols = [_bar_float(b, "v") for b in bars if _bar_float(b, "v") >= 0]
+    atr_now, _ = _atr_from_bars(bars, length=14)
+    px = _bar_float(last, "c")
+    open_px = _bar_float(last, "o")
+    high = _bar_float(last, "h")
+    low = _bar_float(last, "l")
+    prior_high = max(_bar_float(b, "h") for b in window)
+    drop_atr = ((prior_high - low) / float(atr_now)) if atr_now and atr_now > 0 else 0.0
+    candle_range = max(0.0, high - low)
+    lower_wick = max(0.0, min(open_px, px) - low)
+    lower_wick_pct = (lower_wick / candle_range) if candle_range > 0 else 0.0
+    ema_now = _ema(closes, int(MR1_RECLAIM_EMA_PERIOD))[-1]
+    vwap = _vwap_from_bars(bars, lookback=48)
+    avg_vol = _avg(vols[-21:-1]) or 0.0
+    vol_mult = (_bar_float(last, "v") / avg_vol) if avg_vol > 0 else 0.0
+    spread = _spread_snapshot(symbol)
+    spread_pct = spread.get("spread_pct")
+
+    checks = {
+        "sharp_flush": drop_atr >= float(MR1_MIN_DROP_ATR),
+        "rejection_wick": lower_wick_pct >= float(MR1_MIN_LOWER_WICK_PCT),
+        "green_or_reclaim_bar": px >= open_px,
+        "ema_reclaim": px >= ema_now,
+        "vwap_reclaim": (not MR1_REQUIRE_VWAP_RECLAIM) or (vwap is not None and px >= float(vwap)),
+        "volume_confirm": vol_mult >= float(MR1_MIN_VOLUME_MULT),
+        "spread_ok": (spread_pct is None or spread_pct <= float(MR1_MAX_SPREAD_PCT)),
+    }
+    fired = all(bool(v) for v in checks.values())
+    reason = "ok" if fired else ",".join([k for k, v in checks.items() if not v])
+    return fired, {
+        "strategy": "mr1", "reason": reason, "checks": checks, "price": px,
+        "prior_high": prior_high, "drop_atr": drop_atr, "atr": atr_now,
+        "lower_wick_pct": lower_wick_pct, "ema": ema_now, "vwap": vwap,
+        "volume_mult": vol_mult, "spread": spread, "freshness": freshness,
+    }
+
 def _median(xs: list[float]) -> float | None:
     if not xs:
         return None
@@ -7280,12 +7441,24 @@ def _entry_signals_for_symbol(symbol: str, *, regime_quiet: bool) -> tuple[dict,
     signals: dict = {}
     debug: dict = {}
 
+    wants_me1 = ENABLE_ME1 and (STRATEGY_MODE != "fixed" or "me1" in ENTRY_ENGINE_STRATEGIES)
+    wants_mr1 = ENABLE_MR1 and (STRATEGY_MODE != "fixed" or "mr1" in ENTRY_ENGINE_STRATEGIES)
     wants_tc0 = ENABLE_TC0 and (STRATEGY_MODE != "fixed" or "tc0" in ENTRY_ENGINE_STRATEGIES)
     wants_rb1 = ENABLE_RB1 and (STRATEGY_MODE != "fixed" or "rb1" in ENTRY_ENGINE_STRATEGIES)
     wants_tc1 = ENABLE_TC1 and (STRATEGY_MODE != "fixed" or "tc1" in ENTRY_ENGINE_STRATEGIES)
     wants_tr1 = ENABLE_TR1 and (STRATEGY_MODE != "fixed" or "tr1" in ENTRY_ENGINE_STRATEGIES)
     wants_cr1 = ENABLE_CR1 and (STRATEGY_MODE != "fixed" or "cr1" in ENTRY_ENGINE_STRATEGIES)
     wants_mm1 = ENABLE_MM1 and (STRATEGY_MODE != "fixed" or "mm1" in ENTRY_ENGINE_STRATEGIES)
+
+    if wants_me1:
+        me1_fired, me1_meta = _me1_long_signal(symbol)
+        signals["me1"] = bool(me1_fired)
+        debug["me1"] = me1_meta
+
+    if wants_mr1:
+        mr1_fired, mr1_meta = _mr1_long_signal(symbol)
+        signals["mr1"] = bool(mr1_fired)
+        debug["mr1"] = mr1_meta
 
     if wants_tc0:
         tc0_fired, tc0_meta = _tc0_long_signal(symbol)
@@ -8298,6 +8471,10 @@ def scan_entries(payload: WorkerScanPayload):
                 strategy = "mm1"
             elif fired.get("cr1"):
                 strategy = "cr1"
+            elif fired.get("me1"):
+                strategy = "me1"
+            elif fired.get("mr1"):
+                strategy = "mr1"
             elif fired.get("tc0"):
                 strategy = "tc0"
             elif fired.get("tc1"):
@@ -8309,7 +8486,11 @@ def scan_entries(payload: WorkerScanPayload):
             else:
                 strategy = fired_strats[0]
         else:
-            if fired.get("tc0"):
+            if fired.get("me1"):
+                strategy = "me1"
+            elif fired.get("mr1"):
+                strategy = "mr1"
+            elif fired.get("tc0"):
                 strategy = "tc0"
             elif fired.get("tc1"):
                 strategy = "tc1"
@@ -8343,9 +8524,9 @@ def scan_entries(payload: WorkerScanPayload):
             s = (s or "").lower()
             if bool(regime_quiet) and STRATEGY_MODE != "legacy":
                 # Quiet regime: prioritize inventory-friendly / maker-capture first.
-                return {"mm1": 0, "cr1": 1, "tc0": 2, "tc1": 3, "tr1": 4, "rb1": 5}.get(s, 9)
+                return {"mr1": 0, "me1": 1, "mm1": 2, "cr1": 3, "tc0": 4, "tc1": 5, "tr1": 6, "rb1": 7}.get(s, 9)
             # Non-quiet: prioritize directional edge.
-            return {"tc0": 0, "tc1": 1, "tr1": 2, "rb1": 3, "cr1": 4, "mm1": 5}.get(s, 9)
+            return {"me1": 0, "mr1": 1, "tc0": 2, "tc1": 3, "tr1": 4, "rb1": 5, "cr1": 6, "mm1": 7}.get(s, 9)
 
         def _uix(sym: str) -> int:
             try:
@@ -8920,6 +9101,42 @@ def _performance_snapshot(days: float = 30.0, recent_limit: int = 25) -> dict[st
             "trades": recent,
         },
         "live_validation": validation,
+    }
+
+
+@app.get("/diagnostics/patch001_rebuild")
+def diagnostics_patch001_rebuild():
+    return {
+        "ok": True,
+        "patch": "001-crypto-rebuild-core",
+        "purpose": "profit-first reset with me1 momentum expansion and mr1 mean reversion reclaim",
+        "entry_engine_strategies": ENTRY_ENGINE_STRATEGIES_LIST,
+        "enabled": {"me1": bool(ENABLE_ME1), "mr1": bool(ENABLE_MR1)},
+        "universe_recommendation": ["BTC/USD", "ETH/USD", "SOL/USD"],
+        "me1": {
+            "lookback_bars": ME1_LOOKBACK_BARS,
+            "min_range_atr": ME1_MIN_RANGE_ATR,
+            "breakout_buffer_pct": ME1_BREAKOUT_BUFFER_PCT,
+            "min_volume_mult": ME1_MIN_VOLUME_MULT,
+            "require_btc_alignment": ME1_REQUIRE_BTC_ALIGNMENT,
+            "max_spread_pct": ME1_MAX_SPREAD_PCT,
+        },
+        "mr1": {
+            "drop_lookback_bars": MR1_DROP_LOOKBACK_BARS,
+            "min_drop_atr": MR1_MIN_DROP_ATR,
+            "min_lower_wick_pct": MR1_MIN_LOWER_WICK_PCT,
+            "reclaim_ema_period": MR1_RECLAIM_EMA_PERIOD,
+            "require_vwap_reclaim": MR1_REQUIRE_VWAP_RECLAIM,
+            "min_volume_mult": MR1_MIN_VOLUME_MULT,
+            "max_spread_pct": MR1_MAX_SPREAD_PCT,
+        },
+        "runtime": {
+            "strategy_mode": STRATEGY_MODE,
+            "max_open_positions": MAX_OPEN_POSITIONS,
+            "max_entries_per_day": MAX_ENTRIES_PER_DAY,
+            "max_entries_per_scan": MAX_ENTRIES_PER_SCAN,
+            "max_spread_pct": MAX_SPREAD_PCT,
+        },
     }
 
 
