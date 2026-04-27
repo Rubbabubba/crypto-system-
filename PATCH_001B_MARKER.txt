@@ -1,0 +1,3 @@
+Patch 001B - Throughput Calibration
+Scope: controlled threshold calibration, fixed allowlist universe scanning, ME1/MR1 decision diagnostics preservation.
+No execution, sizing, lifecycle, journal, broker, or risk-limit behavior changed in code.
