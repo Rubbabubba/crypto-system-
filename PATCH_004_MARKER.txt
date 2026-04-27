@@ -1,0 +1,2 @@
+Patch 004 - Real Throughput Activation
+Behavior-changing but bounded to strategy entry qualification. No sizing, execution, exits, journal, worker cadence, or universe changes.
