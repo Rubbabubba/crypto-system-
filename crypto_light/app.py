@@ -8452,6 +8452,131 @@ def test_place_trade(payload: Dict[str, Any] = Body(default={})):
     return _market_notional(symbol=symbol, side='sell', notional=use_notional, strategy=strategy, price=px)
 
 
+
+
+# Patch 002: scan-evidence observability. Diagnostics-only persistence used to turn every
+# scan/no-signal into an evidence record for calibration. This must not affect entry,
+# execution, risk, lifecycle, or exit behavior.
+PATCH002_SCAN_OBS_PATH = os.getenv("PATCH002_SCAN_OBS_PATH", "/var/data/patch002_scan_observations.jsonl")
+PATCH002_SCAN_OBS_MAX_ROWS = int(os.getenv("PATCH002_SCAN_OBS_MAX_ROWS", "1000") or "1000")
+
+def _patch002_compact_strategy_debug(strategy: str, dbg: Dict[str, Any]) -> Dict[str, Any]:
+    dbg = dict(dbg or {})
+    spread = dbg.get("spread") if isinstance(dbg.get("spread"), dict) else {}
+    out: Dict[str, Any] = {
+        "reason": dbg.get("reason"),
+        "checks": dbg.get("checks") or {},
+        "price": dbg.get("price"),
+        "spread_pct": spread.get("spread_pct"),
+        "volume_mult": dbg.get("volume_mult"),
+    }
+    if strategy == "me1":
+        out.update({"range_atr": dbg.get("range_atr"), "breakout_level": dbg.get("breakout_level"), "range_high": dbg.get("range_high"), "range_low": dbg.get("range_low")})
+    elif strategy == "mr1":
+        out.update({"drop_atr": dbg.get("drop_atr"), "lower_wick_pct": dbg.get("lower_wick_pct"), "ema": dbg.get("ema"), "vwap": dbg.get("vwap")})
+    return out
+
+def _patch002_compact_scan_observation(scan_response: Dict[str, Any]) -> Dict[str, Any]:
+    diagnostics = (scan_response or {}).get("diagnostics") or {}
+    per_symbol = diagnostics.get("per_symbol") or {}
+    symbols = []
+    reason_counts: Dict[str, int] = {}
+    for sym, d in (per_symbol or {}).items():
+        d = dict(d or {})
+        sig_debug = d.get("signal_debug") or {}
+        skips = list(d.get("skip") or [])
+        for r in skips:
+            reason_counts[str(r)] = reason_counts.get(str(r), 0) + 1
+        symbols.append({
+            "symbol": sym,
+            "eligible": bool(d.get("eligible")),
+            "skip": skips,
+            "signals": d.get("signals") or {},
+            "chosen_strategy": d.get("chosen_strategy"),
+            "me1": _patch002_compact_strategy_debug("me1", (sig_debug or {}).get("me1") or {}),
+            "mr1": _patch002_compact_strategy_debug("mr1", (sig_debug or {}).get("mr1") or {}),
+        })
+    return {
+        "utc": (scan_response or {}).get("utc") or utc_now_iso(),
+        "patch": "002-scan-evidence-observability",
+        "universe_count": (scan_response or {}).get("universe_count"),
+        "final_universe": (((scan_response or {}).get("universe_lock") or {}).get("final_universe") or []),
+        "scanner_reason": (((scan_response or {}).get("scanner") or {}).get("reason")),
+        "results": (scan_response or {}).get("results") or [],
+        "candidates": diagnostics.get("candidates") or [],
+        "strategy_summary": diagnostics.get("strategy_summary") or {},
+        "reason_counts": reason_counts,
+        "symbols": symbols,
+    }
+
+def _patch002_record_scan_observation(scan_response: Dict[str, Any]) -> None:
+    try:
+        row = _patch002_compact_scan_observation(scan_response)
+        path = PATCH002_SCAN_OBS_PATH
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(row, separators=(",", ":"), default=str) + "\n")
+        max_rows = max(50, int(PATCH002_SCAN_OBS_MAX_ROWS or 1000))
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                lines = f.readlines()
+            if len(lines) > max_rows:
+                with open(path, "w", encoding="utf-8") as f:
+                    f.writelines(lines[-max_rows:])
+        except Exception:
+            pass
+    except Exception:
+        pass
+
+def _patch002_read_scan_observations(limit: int = 50) -> List[Dict[str, Any]]:
+    limit = max(1, min(int(limit or 50), 500))
+    path = PATCH002_SCAN_OBS_PATH
+    if not os.path.exists(path):
+        return []
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            lines = f.readlines()[-limit:]
+        rows = []
+        for line in lines:
+            try:
+                rows.append(json.loads(line))
+            except Exception:
+                continue
+        return rows
+    except Exception:
+        return []
+
+def _patch002_quality_summary(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
+    by_symbol: Dict[str, Any] = {}
+    totals = {"scans": len(rows), "signals": 0, "candidates": 0, "executions": 0}
+    reason_counts: Dict[str, int] = {}
+    for row in rows:
+        totals["candidates"] += len(row.get("candidates") or [])
+        totals["executions"] += sum(1 for r in (row.get("results") or []) if isinstance(r, dict) and r.get("status") == "executed")
+        for reason, count in (row.get("reason_counts") or {}).items():
+            reason_counts[reason] = reason_counts.get(reason, 0) + int(count or 0)
+        for symrow in (row.get("symbols") or []):
+            sym = symrow.get("symbol") or "unknown"
+            b = by_symbol.setdefault(sym, {"scans": 0, "eligible": 0, "me1_signals": 0, "mr1_signals": 0, "avg_me1_volume_mult": 0.0, "avg_me1_range_atr": 0.0, "avg_mr1_volume_mult": 0.0, "avg_mr1_drop_atr": 0.0})
+            b["scans"] += 1
+            if symrow.get("eligible"):
+                b["eligible"] += 1
+            sigs = symrow.get("signals") or {}
+            if sigs.get("me1"):
+                b["me1_signals"] += 1
+                totals["signals"] += 1
+            if sigs.get("mr1"):
+                b["mr1_signals"] += 1
+                totals["signals"] += 1
+            n = max(1, b["scans"])
+            me1 = symrow.get("me1") or {}
+            mr1 = symrow.get("mr1") or {}
+            for key, val in (("avg_me1_volume_mult", me1.get("volume_mult")), ("avg_me1_range_atr", me1.get("range_atr")), ("avg_mr1_volume_mult", mr1.get("volume_mult")), ("avg_mr1_drop_atr", mr1.get("drop_atr"))):
+                if isinstance(val, (int, float)):
+                    b[key] = ((b[key] * (n - 1)) + float(val)) / n
+    return {"totals": totals, "reason_counts": reason_counts, "by_symbol": by_symbol}
+
+
 @app.post("/worker/scan_entries")
 def scan_entries(payload: WorkerScanPayload):
     """
@@ -8851,6 +8976,7 @@ def scan_entries(payload: WorkerScanPayload):
         },
     }
 
+    _patch002_record_scan_observation(scan_response)
 
     return scan_response
 
@@ -8980,6 +9106,34 @@ def diagnostics_universe_lock():
         "filter_universe_by_allowed_symbols": bool(FILTER_UNIVERSE_BY_ALLOWED_SYMBOLS),
     }
 
+
+
+@app.get("/diagnostics/patch002_observability")
+def diagnostics_patch002_observability():
+    rows = _patch002_read_scan_observations(limit=5)
+    return {
+        "ok": True,
+        "utc": utc_now_iso(),
+        "patch": "002-scan-evidence-observability",
+        "behavior_changed": False,
+        "trading_path_changed": False,
+        "purpose": "persist compact scan/no-signal evidence for calibration and business feedback loop",
+        "storage_path": PATCH002_SCAN_OBS_PATH,
+        "max_rows": PATCH002_SCAN_OBS_MAX_ROWS,
+        "stored_rows_sample_count": len(rows),
+        "latest_observation_utc": (rows[-1].get("utc") if rows else None),
+        "verification_endpoints": ["GET /build", "GET /diagnostics/patch002_observability", "POST /worker/scan_entries", "GET /diagnostics/scan_observations?limit=10", "GET /diagnostics/scan_quality_summary?limit=100", "GET /diagnostics/entry_decisions", "POST /worker/exit"],
+    }
+
+@app.get("/diagnostics/scan_observations")
+def diagnostics_scan_observations(limit: int = 50):
+    rows = _patch002_read_scan_observations(limit=limit)
+    return {"ok": True, "utc": utc_now_iso(), "patch": "002-scan-evidence-observability", "count": len(rows), "observations": rows}
+
+@app.get("/diagnostics/scan_quality_summary")
+def diagnostics_scan_quality_summary(limit: int = 200):
+    rows = _patch002_read_scan_observations(limit=limit)
+    return {"ok": True, "utc": utc_now_iso(), "patch": "002-scan-evidence-observability", "input_rows": len(rows), "summary": _patch002_quality_summary(rows)}
 
 
 @app.get("/diagnostics/patch001_cleanup")
