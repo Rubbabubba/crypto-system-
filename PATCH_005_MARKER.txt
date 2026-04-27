@@ -1,0 +1,4 @@
+Patch 005 - Pre-Breakout Participation
+Behavior-changing but bounded entry timing patch.
+Adds ME1 near-breakout participation and MR1 current-or-prior volume confirmation.
+No sizing, execution, exit, journal, universe, or worker cadence changes.
