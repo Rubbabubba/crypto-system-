@@ -1,0 +1,3 @@
+Patch 001C - Authoritative Universe Lock
+Forces rebuild scans to evaluate BTC/USD, ETH/USD, SOL/USD every scan.
+No strategy, risk, sizing, execution, lifecycle, journal, or exit changes.
