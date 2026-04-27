@@ -1,0 +1,5 @@
+Patch 003 — Adaptive Throughput Mode
+
+Behavior-changing but bounded strategy-entry calibration.
+No sizing, execution, exit, journal, or universe changes.
+Adds adaptive ME1 range/volume gates and adaptive MR1 no-EMA reclaim mode.
