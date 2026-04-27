@@ -1582,6 +1582,18 @@ MR1_ADAPTIVE_MIN_VOLUME_MULT = _env_float("MR1_ADAPTIVE_MIN_VOLUME_MULT", 0.55)
 MR1_ADAPTIVE_MIN_DROP_ATR = _env_float("MR1_ADAPTIVE_MIN_DROP_ATR", 1.15)
 MR1_ADAPTIVE_MIN_LOWER_WICK_PCT = _env_float("MR1_ADAPTIVE_MIN_LOWER_WICK_PCT", 0.35)
 
+# Patch 004: real throughput activation. Behavior-changing but still bounded to
+# entry qualification only. No sizing, execution, exits, journal, worker cadence,
+# or universe changes.
+REAL_THROUGHPUT_ENABLED = (os.getenv("REAL_THROUGHPUT_ENABLED", "1").strip().lower() in ("1", "true", "yes", "on"))
+ME1_REAL_MIN_RANGE_ATR = _env_float("ME1_REAL_MIN_RANGE_ATR", 0.35)
+ME1_REAL_MIN_VOLUME_MULT = _env_float("ME1_REAL_MIN_VOLUME_MULT", 0.35)
+ME1_REAL_BREAKOUT_BUFFER_PCT = _env_float("ME1_REAL_BREAKOUT_BUFFER_PCT", 0.00015)
+MR1_REAL_ALLOW_SOFT_RECLAIM = (os.getenv("MR1_REAL_ALLOW_SOFT_RECLAIM", "1").strip().lower() in ("1", "true", "yes", "on"))
+MR1_REAL_MIN_VOLUME_MULT = _env_float("MR1_REAL_MIN_VOLUME_MULT", 0.35)
+MR1_REAL_MIN_DROP_ATR = _env_float("MR1_REAL_MIN_DROP_ATR", 1.15)
+MR1_REAL_MIN_LOWER_WICK_PCT = _env_float("MR1_REAL_MIN_LOWER_WICK_PCT", 0.25)
+
 def _bar_float(bar: dict, key: str, default: float = 0.0) -> float:
     try:
         return float((bar or {}).get(key) or default)
@@ -1645,6 +1657,7 @@ def _me1_long_signal(symbol: str) -> tuple[bool, dict]:
         btc_ok, btc_meta = _btc_alignment_ok()
 
     adaptive_enabled = bool(ADAPTIVE_THROUGHPUT_ENABLED)
+    real_enabled = bool(REAL_THROUGHPUT_ENABLED)
     base_checks = {
         "breakout": px > breakout_level,
         "green_bar": px > open_px,
@@ -1658,12 +1671,26 @@ def _me1_long_signal(symbol: str) -> tuple[bool, dict]:
         adaptive_checks["range_expansion"] = range_atr >= float(ME1_ADAPTIVE_MIN_RANGE_ATR)
         adaptive_checks["volume_expansion"] = vol_mult >= float(ME1_ADAPTIVE_MIN_VOLUME_MULT)
 
+    real_breakout_level = range_high * (1.0 + float(ME1_REAL_BREAKOUT_BUFFER_PCT))
+    real_checks = {
+        "breakout": px > real_breakout_level,
+        "green_bar": px > open_px,
+        "range_expansion": range_atr >= float(ME1_REAL_MIN_RANGE_ATR),
+        "volume_expansion": vol_mult >= float(ME1_REAL_MIN_VOLUME_MULT),
+        "spread_ok": (spread_pct is None or spread_pct <= float(ME1_MAX_SPREAD_PCT)),
+        "btc_alignment_ok": bool(btc_ok),
+    }
+
     base_fired = all(bool(v) for v in base_checks.values())
     adaptive_fired = bool(adaptive_enabled and all(bool(v) for v in adaptive_checks.values()))
-    fired = bool(base_fired or adaptive_fired)
-    checks = adaptive_checks if adaptive_fired and not base_fired else base_checks
+    real_fired = bool(real_enabled and all(bool(v) for v in real_checks.values()))
+    fired = bool(base_fired or adaptive_fired or real_fired)
+    if real_fired and not (base_fired or adaptive_fired):
+        checks = real_checks
+    else:
+        checks = adaptive_checks if adaptive_fired and not base_fired else base_checks
     reason = "ok" if fired else ",".join([k for k, v in checks.items() if not v])
-    mode = "base" if base_fired else ("adaptive" if adaptive_fired else "none")
+    mode = "base" if base_fired else ("adaptive" if adaptive_fired else ("real" if real_fired else "none"))
     return fired, {
         "strategy": "me1", "reason": reason, "checks": checks, "price": px,
         "range_high": range_high, "range_low": range_low, "breakout_level": breakout_level,
@@ -1676,6 +1703,15 @@ def _me1_long_signal(symbol: str) -> tuple[bool, dict]:
             "adaptive_checks": adaptive_checks,
             "min_range_atr": float(ME1_ADAPTIVE_MIN_RANGE_ATR),
             "min_volume_mult": float(ME1_ADAPTIVE_MIN_VOLUME_MULT),
+        },
+        "real_throughput": {
+            "enabled": real_enabled,
+            "mode": "real" if real_fired and not (base_fired or adaptive_fired) else mode,
+            "checks": real_checks,
+            "breakout_level": real_breakout_level,
+            "min_range_atr": float(ME1_REAL_MIN_RANGE_ATR),
+            "min_volume_mult": float(ME1_REAL_MIN_VOLUME_MULT),
+            "breakout_buffer_pct": float(ME1_REAL_BREAKOUT_BUFFER_PCT),
         },
     }
 
@@ -1710,6 +1746,7 @@ def _mr1_long_signal(symbol: str) -> tuple[bool, dict]:
     spread_pct = spread.get("spread_pct")
 
     adaptive_enabled = bool(ADAPTIVE_THROUGHPUT_ENABLED and MR1_ADAPTIVE_ALLOW_NO_EMA_RECLAIM)
+    real_enabled = bool(REAL_THROUGHPUT_ENABLED and MR1_REAL_ALLOW_SOFT_RECLAIM)
     base_checks = {
         "sharp_flush": drop_atr >= float(MR1_MIN_DROP_ATR),
         "rejection_wick": lower_wick_pct >= float(MR1_MIN_LOWER_WICK_PCT),
@@ -1727,12 +1764,24 @@ def _mr1_long_signal(symbol: str) -> tuple[bool, dict]:
         "volume_confirm": vol_mult >= float(MR1_ADAPTIVE_MIN_VOLUME_MULT),
         "spread_ok": (spread_pct is None or spread_pct <= float(MR1_MAX_SPREAD_PCT)),
     }
+    real_reclaim_ok = bool((px >= open_px) or (px >= ema_now) or (vwap is not None and px >= float(vwap)))
+    real_checks = {
+        "sharp_flush": drop_atr >= float(MR1_REAL_MIN_DROP_ATR),
+        "rejection_wick": lower_wick_pct >= float(MR1_REAL_MIN_LOWER_WICK_PCT),
+        "soft_reclaim": real_reclaim_ok,
+        "volume_confirm": vol_mult >= float(MR1_REAL_MIN_VOLUME_MULT),
+        "spread_ok": (spread_pct is None or spread_pct <= float(MR1_MAX_SPREAD_PCT)),
+    }
     base_fired = all(bool(v) for v in base_checks.values())
     adaptive_fired = bool(adaptive_enabled and all(bool(v) for v in adaptive_checks.values()))
-    fired = bool(base_fired or adaptive_fired)
-    checks = adaptive_checks if adaptive_fired and not base_fired else base_checks
+    real_fired = bool(real_enabled and all(bool(v) for v in real_checks.values()))
+    fired = bool(base_fired or adaptive_fired or real_fired)
+    if real_fired and not (base_fired or adaptive_fired):
+        checks = real_checks
+    else:
+        checks = adaptive_checks if adaptive_fired and not base_fired else base_checks
     reason = "ok" if fired else ",".join([k for k, v in checks.items() if not v])
-    mode = "base" if base_fired else ("adaptive" if adaptive_fired else "none")
+    mode = "base" if base_fired else ("adaptive" if adaptive_fired else ("real" if real_fired else "none"))
     return fired, {
         "strategy": "mr1", "reason": reason, "checks": checks, "price": px,
         "prior_high": prior_high, "drop_atr": drop_atr, "atr": atr_now,
@@ -1747,6 +1796,15 @@ def _mr1_long_signal(symbol: str) -> tuple[bool, dict]:
             "min_volume_mult": float(MR1_ADAPTIVE_MIN_VOLUME_MULT),
             "min_drop_atr": float(MR1_ADAPTIVE_MIN_DROP_ATR),
             "min_lower_wick_pct": float(MR1_ADAPTIVE_MIN_LOWER_WICK_PCT),
+        },
+        "real_throughput": {
+            "enabled": real_enabled,
+            "mode": "real" if real_fired and not (base_fired or adaptive_fired) else mode,
+            "checks": real_checks,
+            "allow_soft_reclaim": bool(MR1_REAL_ALLOW_SOFT_RECLAIM),
+            "min_volume_mult": float(MR1_REAL_MIN_VOLUME_MULT),
+            "min_drop_atr": float(MR1_REAL_MIN_DROP_ATR),
+            "min_lower_wick_pct": float(MR1_REAL_MIN_LOWER_WICK_PCT),
         },
     }
 
@@ -9816,4 +9874,36 @@ def diagnostics_tc1_trade_observability(limit: int = 25, include_open: int = 1):
         },
         "recent_tc1_trades": tc1_trades,
         "open_tc1_plans": open_plans,
+    }
+
+
+@app.get("/diagnostics/patch004_real_throughput")
+def diagnostics_patch004_real_throughput():
+    return {
+        "ok": True,
+        "utc": datetime.now(timezone.utc).isoformat(),
+        "patch": "004-real-throughput-activation",
+        "behavior_changed": True,
+        "scope": "bounded strategy-entry activation only; no sizing/execution/exit/journal/universe/worker changes",
+        "enabled": bool(REAL_THROUGHPUT_ENABLED),
+        "me1": {
+            "real_min_range_atr": ME1_REAL_MIN_RANGE_ATR,
+            "real_min_volume_mult": ME1_REAL_MIN_VOLUME_MULT,
+            "real_breakout_buffer_pct": ME1_REAL_BREAKOUT_BUFFER_PCT,
+        },
+        "mr1": {
+            "real_allow_soft_reclaim": bool(MR1_REAL_ALLOW_SOFT_RECLAIM),
+            "real_min_volume_mult": MR1_REAL_MIN_VOLUME_MULT,
+            "real_min_drop_atr": MR1_REAL_MIN_DROP_ATR,
+            "real_min_lower_wick_pct": MR1_REAL_MIN_LOWER_WICK_PCT,
+        },
+        "verification_endpoints": [
+            "GET /build",
+            "GET /diagnostics/patch004_real_throughput",
+            "POST /worker/scan_entries",
+            "GET /diagnostics/entry_decisions",
+            "GET /diagnostics/scan_observations?limit=10",
+            "GET /diagnostics/scan_quality_summary?limit=100",
+            "POST /worker/exit",
+        ],
     }
