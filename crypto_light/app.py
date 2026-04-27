@@ -8760,6 +8760,8 @@ def scan_entries(payload: WorkerScanPayload):
     }
 
 
+    return scan_response
+
 @app.get("/diagnostics/strategy_family_v2")
 def diagnostics_strategy_family_v2():
     return {
@@ -8820,6 +8822,53 @@ def diagnostics_entry_attempt_truth():
         "entry_attempt_truth": _entry_attempt_truth_snapshot(),
     }
 
+
+
+@app.get("/diagnostics/entry_decisions")
+def diagnostics_entry_decisions():
+    """
+    Patch 001A: compact latest scan-decision view for ME1/MR1 rebuild.
+    Diagnostics only: no strategy, risk, sizing, admission, or execution behavior changes.
+    """
+    snap = _entry_attempt_truth_snapshot()
+    debug_by_symbol = snap.get("last_signal_debug_by_symbol") or {}
+    decisions = []
+    for symbol, debug in (debug_by_symbol or {}).items():
+        me1 = (debug or {}).get("me1") or {}
+        mr1 = (debug or {}).get("mr1") or {}
+        decisions.append({
+            "symbol": symbol,
+            "me1": {
+                "reason": me1.get("reason"),
+                "checks": me1.get("checks"),
+                "price": me1.get("price"),
+                "range_atr": me1.get("range_atr"),
+                "volume_mult": me1.get("volume_mult"),
+                "spread": me1.get("spread"),
+                "btc_alignment": me1.get("btc_alignment"),
+            },
+            "mr1": {
+                "reason": mr1.get("reason"),
+                "checks": mr1.get("checks"),
+                "price": mr1.get("price"),
+                "drop_atr": mr1.get("drop_atr"),
+                "lower_wick_pct": mr1.get("lower_wick_pct"),
+                "volume_mult": mr1.get("volume_mult"),
+                "spread": mr1.get("spread"),
+            },
+        })
+    return {
+        "ok": True,
+        "utc": utc_now_iso(),
+        "patch": "001A-entry-decision-observability",
+        "behavior_changed": False,
+        "last_scan_utc": snap.get("last_scan_utc"),
+        "last_no_trade_reason": snap.get("last_no_trade_reason"),
+        "last_rejected_entry_reason": snap.get("last_rejected_entry_reason"),
+        "admitted_candidates": snap.get("admitted_candidates") or [],
+        "results": snap.get("results") or [],
+        "decisions": decisions,
+    }
 
 @app.get("/build")
 def build_info_endpoint():
