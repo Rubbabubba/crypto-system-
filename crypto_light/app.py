@@ -1594,6 +1594,18 @@ MR1_REAL_MIN_VOLUME_MULT = _env_float("MR1_REAL_MIN_VOLUME_MULT", 0.35)
 MR1_REAL_MIN_DROP_ATR = _env_float("MR1_REAL_MIN_DROP_ATR", 1.15)
 MR1_REAL_MIN_LOWER_WICK_PCT = _env_float("MR1_REAL_MIN_LOWER_WICK_PCT", 0.25)
 
+# Patch 005: pre-breakout participation. Behavior-changing but still bounded to
+# entry qualification/timing only. No sizing, execution, exits, journal, worker
+# cadence, or universe changes.
+PREBREAKOUT_PARTICIPATION_ENABLED = (os.getenv("PREBREAKOUT_PARTICIPATION_ENABLED", "1").strip().lower() in ("1", "true", "yes", "on"))
+ME1_PREBREAKOUT_MAX_DISTANCE_PCT = _env_float("ME1_PREBREAKOUT_MAX_DISTANCE_PCT", 0.0025)
+ME1_PREBREAKOUT_MIN_RANGE_ATR = _env_float("ME1_PREBREAKOUT_MIN_RANGE_ATR", 0.35)
+ME1_PREBREAKOUT_MIN_VOLUME_MULT = _env_float("ME1_PREBREAKOUT_MIN_VOLUME_MULT", 0.25)
+MR1_PRIOR_VOLUME_ENABLED = (os.getenv("MR1_PRIOR_VOLUME_ENABLED", "1").strip().lower() in ("1", "true", "yes", "on"))
+MR1_PRIOR_VOLUME_MIN_MULT = _env_float("MR1_PRIOR_VOLUME_MIN_MULT", 0.35)
+MR1_PREBREAKOUT_MIN_DROP_ATR = _env_float("MR1_PREBREAKOUT_MIN_DROP_ATR", 1.15)
+MR1_PREBREAKOUT_MIN_LOWER_WICK_PCT = _env_float("MR1_PREBREAKOUT_MIN_LOWER_WICK_PCT", 0.20)
+
 def _bar_float(bar: dict, key: str, default: float = 0.0) -> float:
     try:
         return float((bar or {}).get(key) or default)
@@ -1681,16 +1693,32 @@ def _me1_long_signal(symbol: str) -> tuple[bool, dict]:
         "btc_alignment_ok": bool(btc_ok),
     }
 
+    prebreakout_enabled = bool(PREBREAKOUT_PARTICIPATION_ENABLED)
+    prebreakout_level = range_high * (1.0 + float(ME1_REAL_BREAKOUT_BUFFER_PCT))
+    prebreakout_floor = prebreakout_level * (1.0 - max(0.0, float(ME1_PREBREAKOUT_MAX_DISTANCE_PCT)))
+    distance_to_breakout_pct = ((prebreakout_level - px) / prebreakout_level) if prebreakout_level and prebreakout_level > 0 else None
+    prebreakout_checks = {
+        "near_breakout": px >= prebreakout_floor,
+        "green_bar": px > open_px,
+        "range_expansion": range_atr >= float(ME1_PREBREAKOUT_MIN_RANGE_ATR),
+        "volume_expansion": vol_mult >= float(ME1_PREBREAKOUT_MIN_VOLUME_MULT),
+        "spread_ok": (spread_pct is None or spread_pct <= float(ME1_MAX_SPREAD_PCT)),
+        "btc_alignment_ok": bool(btc_ok),
+    }
+
     base_fired = all(bool(v) for v in base_checks.values())
     adaptive_fired = bool(adaptive_enabled and all(bool(v) for v in adaptive_checks.values()))
     real_fired = bool(real_enabled and all(bool(v) for v in real_checks.values()))
-    fired = bool(base_fired or adaptive_fired or real_fired)
-    if real_fired and not (base_fired or adaptive_fired):
+    prebreakout_fired = bool(prebreakout_enabled and all(bool(v) for v in prebreakout_checks.values()))
+    fired = bool(base_fired or adaptive_fired or real_fired or prebreakout_fired)
+    if prebreakout_fired and not (base_fired or adaptive_fired or real_fired):
+        checks = prebreakout_checks
+    elif real_fired and not (base_fired or adaptive_fired):
         checks = real_checks
     else:
         checks = adaptive_checks if adaptive_fired and not base_fired else base_checks
     reason = "ok" if fired else ",".join([k for k, v in checks.items() if not v])
-    mode = "base" if base_fired else ("adaptive" if adaptive_fired else ("real" if real_fired else "none"))
+    mode = "base" if base_fired else ("adaptive" if adaptive_fired else ("real" if real_fired else ("prebreakout" if prebreakout_fired else "none")))
     return fired, {
         "strategy": "me1", "reason": reason, "checks": checks, "price": px,
         "range_high": range_high, "range_low": range_low, "breakout_level": breakout_level,
@@ -1712,6 +1740,17 @@ def _me1_long_signal(symbol: str) -> tuple[bool, dict]:
             "min_range_atr": float(ME1_REAL_MIN_RANGE_ATR),
             "min_volume_mult": float(ME1_REAL_MIN_VOLUME_MULT),
             "breakout_buffer_pct": float(ME1_REAL_BREAKOUT_BUFFER_PCT),
+        },
+        "prebreakout": {
+            "enabled": prebreakout_enabled,
+            "mode": "prebreakout" if prebreakout_fired and not (base_fired or adaptive_fired or real_fired) else mode,
+            "checks": prebreakout_checks,
+            "breakout_level": prebreakout_level,
+            "prebreakout_floor": prebreakout_floor,
+            "distance_to_breakout_pct": distance_to_breakout_pct,
+            "max_distance_pct": float(ME1_PREBREAKOUT_MAX_DISTANCE_PCT),
+            "min_range_atr": float(ME1_PREBREAKOUT_MIN_RANGE_ATR),
+            "min_volume_mult": float(ME1_PREBREAKOUT_MIN_VOLUME_MULT),
         },
     }
 
@@ -1742,6 +1781,8 @@ def _mr1_long_signal(symbol: str) -> tuple[bool, dict]:
     vwap = _vwap_from_bars(bars, lookback=48)
     avg_vol = _avg(vols[-21:-1]) or 0.0
     vol_mult = (_bar_float(last, "v") / avg_vol) if avg_vol > 0 else 0.0
+    prior_vol = _bar_float(bars[-2], "v") if len(bars or []) >= 2 else 0.0
+    prior_vol_mult = (prior_vol / avg_vol) if avg_vol > 0 else 0.0
     spread = _spread_snapshot(symbol)
     spread_pct = spread.get("spread_pct")
 
@@ -1772,21 +1813,33 @@ def _mr1_long_signal(symbol: str) -> tuple[bool, dict]:
         "volume_confirm": vol_mult >= float(MR1_REAL_MIN_VOLUME_MULT),
         "spread_ok": (spread_pct is None or spread_pct <= float(MR1_MAX_SPREAD_PCT)),
     }
+    prior_volume_enabled = bool(PREBREAKOUT_PARTICIPATION_ENABLED and MR1_PRIOR_VOLUME_ENABLED)
+    prior_volume_confirm = bool((vol_mult >= float(MR1_PRIOR_VOLUME_MIN_MULT)) or (prior_vol_mult >= float(MR1_PRIOR_VOLUME_MIN_MULT)))
+    prior_volume_checks = {
+        "sharp_flush": drop_atr >= float(MR1_PREBREAKOUT_MIN_DROP_ATR),
+        "rejection_wick": lower_wick_pct >= float(MR1_PREBREAKOUT_MIN_LOWER_WICK_PCT),
+        "soft_reclaim": real_reclaim_ok,
+        "current_or_prior_volume": prior_volume_confirm,
+        "spread_ok": (spread_pct is None or spread_pct <= float(MR1_MAX_SPREAD_PCT)),
+    }
     base_fired = all(bool(v) for v in base_checks.values())
     adaptive_fired = bool(adaptive_enabled and all(bool(v) for v in adaptive_checks.values()))
     real_fired = bool(real_enabled and all(bool(v) for v in real_checks.values()))
-    fired = bool(base_fired or adaptive_fired or real_fired)
-    if real_fired and not (base_fired or adaptive_fired):
+    prior_volume_fired = bool(prior_volume_enabled and all(bool(v) for v in prior_volume_checks.values()))
+    fired = bool(base_fired or adaptive_fired or real_fired or prior_volume_fired)
+    if prior_volume_fired and not (base_fired or adaptive_fired or real_fired):
+        checks = prior_volume_checks
+    elif real_fired and not (base_fired or adaptive_fired):
         checks = real_checks
     else:
         checks = adaptive_checks if adaptive_fired and not base_fired else base_checks
     reason = "ok" if fired else ",".join([k for k, v in checks.items() if not v])
-    mode = "base" if base_fired else ("adaptive" if adaptive_fired else ("real" if real_fired else "none"))
+    mode = "base" if base_fired else ("adaptive" if adaptive_fired else ("real" if real_fired else ("prior_volume" if prior_volume_fired else "none")))
     return fired, {
         "strategy": "mr1", "reason": reason, "checks": checks, "price": px,
         "prior_high": prior_high, "drop_atr": drop_atr, "atr": atr_now,
         "lower_wick_pct": lower_wick_pct, "ema": ema_now, "vwap": vwap,
-        "volume_mult": vol_mult, "spread": spread, "freshness": freshness,
+        "volume_mult": vol_mult, "prior_volume_mult": prior_vol_mult, "spread": spread, "freshness": freshness,
         "adaptive": {
             "enabled": adaptive_enabled,
             "mode": mode,
@@ -1805,6 +1858,16 @@ def _mr1_long_signal(symbol: str) -> tuple[bool, dict]:
             "min_volume_mult": float(MR1_REAL_MIN_VOLUME_MULT),
             "min_drop_atr": float(MR1_REAL_MIN_DROP_ATR),
             "min_lower_wick_pct": float(MR1_REAL_MIN_LOWER_WICK_PCT),
+        },
+        "prior_volume": {
+            "enabled": prior_volume_enabled,
+            "mode": "prior_volume" if prior_volume_fired and not (base_fired or adaptive_fired or real_fired) else mode,
+            "checks": prior_volume_checks,
+            "current_volume_mult": vol_mult,
+            "prior_volume_mult": prior_vol_mult,
+            "min_volume_mult": float(MR1_PRIOR_VOLUME_MIN_MULT),
+            "min_drop_atr": float(MR1_PREBREAKOUT_MIN_DROP_ATR),
+            "min_lower_wick_pct": float(MR1_PREBREAKOUT_MIN_LOWER_WICK_PCT),
         },
     }
 
@@ -9900,6 +9963,38 @@ def diagnostics_patch004_real_throughput():
         "verification_endpoints": [
             "GET /build",
             "GET /diagnostics/patch004_real_throughput",
+            "POST /worker/scan_entries",
+            "GET /diagnostics/entry_decisions",
+            "GET /diagnostics/scan_observations?limit=10",
+            "GET /diagnostics/scan_quality_summary?limit=100",
+            "POST /worker/exit",
+        ],
+    }
+
+
+@app.get("/diagnostics/patch005_prebreakout")
+def diagnostics_patch005_prebreakout():
+    return {
+        "ok": True,
+        "utc": datetime.now(timezone.utc).isoformat(),
+        "patch": "005-prebreakout-participation",
+        "behavior_changed": True,
+        "scope": "bounded entry-timing activation only; no sizing/execution/exit/journal/universe/worker changes",
+        "enabled": bool(PREBREAKOUT_PARTICIPATION_ENABLED),
+        "me1": {
+            "prebreakout_max_distance_pct": ME1_PREBREAKOUT_MAX_DISTANCE_PCT,
+            "prebreakout_min_range_atr": ME1_PREBREAKOUT_MIN_RANGE_ATR,
+            "prebreakout_min_volume_mult": ME1_PREBREAKOUT_MIN_VOLUME_MULT,
+        },
+        "mr1": {
+            "prior_volume_enabled": bool(MR1_PRIOR_VOLUME_ENABLED),
+            "prior_volume_min_mult": MR1_PRIOR_VOLUME_MIN_MULT,
+            "prebreakout_min_drop_atr": MR1_PREBREAKOUT_MIN_DROP_ATR,
+            "prebreakout_min_lower_wick_pct": MR1_PREBREAKOUT_MIN_LOWER_WICK_PCT,
+        },
+        "verification_endpoints": [
+            "GET /build",
+            "GET /diagnostics/patch005_prebreakout",
             "POST /worker/scan_entries",
             "GET /diagnostics/entry_decisions",
             "GET /diagnostics/scan_observations?limit=10",
