@@ -1571,6 +1571,17 @@ MR1_REQUIRE_VWAP_RECLAIM = (os.getenv("MR1_REQUIRE_VWAP_RECLAIM", "1").strip().l
 MR1_MIN_VOLUME_MULT = _env_float("MR1_MIN_VOLUME_MULT", 1.10)
 MR1_MAX_SPREAD_PCT = _env_float("MR1_MAX_SPREAD_PCT", 0.0025)
 
+# Patch 003: adaptive throughput mode. Behavior-changing but bounded: no sizing,
+# execution, exit, journal, or universe changes. These gates increase signal
+# generation only when the underlying setup is otherwise structurally present.
+ADAPTIVE_THROUGHPUT_ENABLED = (os.getenv("ADAPTIVE_THROUGHPUT_ENABLED", "1").strip().lower() in ("1", "true", "yes", "on"))
+ME1_ADAPTIVE_MIN_RANGE_ATR = _env_float("ME1_ADAPTIVE_MIN_RANGE_ATR", 0.35)
+ME1_ADAPTIVE_MIN_VOLUME_MULT = _env_float("ME1_ADAPTIVE_MIN_VOLUME_MULT", 0.55)
+MR1_ADAPTIVE_ALLOW_NO_EMA_RECLAIM = (os.getenv("MR1_ADAPTIVE_ALLOW_NO_EMA_RECLAIM", "1").strip().lower() in ("1", "true", "yes", "on"))
+MR1_ADAPTIVE_MIN_VOLUME_MULT = _env_float("MR1_ADAPTIVE_MIN_VOLUME_MULT", 0.55)
+MR1_ADAPTIVE_MIN_DROP_ATR = _env_float("MR1_ADAPTIVE_MIN_DROP_ATR", 1.15)
+MR1_ADAPTIVE_MIN_LOWER_WICK_PCT = _env_float("MR1_ADAPTIVE_MIN_LOWER_WICK_PCT", 0.35)
+
 def _bar_float(bar: dict, key: str, default: float = 0.0) -> float:
     try:
         return float((bar or {}).get(key) or default)
@@ -1633,7 +1644,8 @@ def _me1_long_signal(symbol: str) -> tuple[bool, dict]:
     if ME1_REQUIRE_BTC_ALIGNMENT and normalize_symbol(symbol) != "BTC/USD":
         btc_ok, btc_meta = _btc_alignment_ok()
 
-    checks = {
+    adaptive_enabled = bool(ADAPTIVE_THROUGHPUT_ENABLED)
+    base_checks = {
         "breakout": px > breakout_level,
         "green_bar": px > open_px,
         "range_expansion": range_atr >= float(ME1_MIN_RANGE_ATR),
@@ -1641,13 +1653,30 @@ def _me1_long_signal(symbol: str) -> tuple[bool, dict]:
         "spread_ok": (spread_pct is None or spread_pct <= float(ME1_MAX_SPREAD_PCT)),
         "btc_alignment_ok": bool(btc_ok),
     }
-    fired = all(bool(v) for v in checks.values())
+    adaptive_checks = dict(base_checks)
+    if adaptive_enabled:
+        adaptive_checks["range_expansion"] = range_atr >= float(ME1_ADAPTIVE_MIN_RANGE_ATR)
+        adaptive_checks["volume_expansion"] = vol_mult >= float(ME1_ADAPTIVE_MIN_VOLUME_MULT)
+
+    base_fired = all(bool(v) for v in base_checks.values())
+    adaptive_fired = bool(adaptive_enabled and all(bool(v) for v in adaptive_checks.values()))
+    fired = bool(base_fired or adaptive_fired)
+    checks = adaptive_checks if adaptive_fired and not base_fired else base_checks
     reason = "ok" if fired else ",".join([k for k, v in checks.items() if not v])
+    mode = "base" if base_fired else ("adaptive" if adaptive_fired else "none")
     return fired, {
         "strategy": "me1", "reason": reason, "checks": checks, "price": px,
         "range_high": range_high, "range_low": range_low, "breakout_level": breakout_level,
         "atr": atr_now, "range_atr": range_atr, "volume_mult": vol_mult,
         "spread": spread, "btc_alignment": btc_meta, "freshness": freshness,
+        "adaptive": {
+            "enabled": adaptive_enabled,
+            "mode": mode,
+            "base_checks": base_checks,
+            "adaptive_checks": adaptive_checks,
+            "min_range_atr": float(ME1_ADAPTIVE_MIN_RANGE_ATR),
+            "min_volume_mult": float(ME1_ADAPTIVE_MIN_VOLUME_MULT),
+        },
     }
 
 def _mr1_long_signal(symbol: str) -> tuple[bool, dict]:
@@ -1680,7 +1709,8 @@ def _mr1_long_signal(symbol: str) -> tuple[bool, dict]:
     spread = _spread_snapshot(symbol)
     spread_pct = spread.get("spread_pct")
 
-    checks = {
+    adaptive_enabled = bool(ADAPTIVE_THROUGHPUT_ENABLED and MR1_ADAPTIVE_ALLOW_NO_EMA_RECLAIM)
+    base_checks = {
         "sharp_flush": drop_atr >= float(MR1_MIN_DROP_ATR),
         "rejection_wick": lower_wick_pct >= float(MR1_MIN_LOWER_WICK_PCT),
         "green_or_reclaim_bar": px >= open_px,
@@ -1689,13 +1719,35 @@ def _mr1_long_signal(symbol: str) -> tuple[bool, dict]:
         "volume_confirm": vol_mult >= float(MR1_MIN_VOLUME_MULT),
         "spread_ok": (spread_pct is None or spread_pct <= float(MR1_MAX_SPREAD_PCT)),
     }
-    fired = all(bool(v) for v in checks.values())
+    adaptive_checks = {
+        "sharp_flush": drop_atr >= float(MR1_ADAPTIVE_MIN_DROP_ATR),
+        "rejection_wick": lower_wick_pct >= float(MR1_ADAPTIVE_MIN_LOWER_WICK_PCT),
+        "green_or_reclaim_bar": px >= open_px,
+        "vwap_reclaim": (vwap is not None and px >= float(vwap)),
+        "volume_confirm": vol_mult >= float(MR1_ADAPTIVE_MIN_VOLUME_MULT),
+        "spread_ok": (spread_pct is None or spread_pct <= float(MR1_MAX_SPREAD_PCT)),
+    }
+    base_fired = all(bool(v) for v in base_checks.values())
+    adaptive_fired = bool(adaptive_enabled and all(bool(v) for v in adaptive_checks.values()))
+    fired = bool(base_fired or adaptive_fired)
+    checks = adaptive_checks if adaptive_fired and not base_fired else base_checks
     reason = "ok" if fired else ",".join([k for k, v in checks.items() if not v])
+    mode = "base" if base_fired else ("adaptive" if adaptive_fired else "none")
     return fired, {
         "strategy": "mr1", "reason": reason, "checks": checks, "price": px,
         "prior_high": prior_high, "drop_atr": drop_atr, "atr": atr_now,
         "lower_wick_pct": lower_wick_pct, "ema": ema_now, "vwap": vwap,
         "volume_mult": vol_mult, "spread": spread, "freshness": freshness,
+        "adaptive": {
+            "enabled": adaptive_enabled,
+            "mode": mode,
+            "base_checks": base_checks,
+            "adaptive_checks": adaptive_checks,
+            "allow_no_ema_reclaim": bool(MR1_ADAPTIVE_ALLOW_NO_EMA_RECLAIM),
+            "min_volume_mult": float(MR1_ADAPTIVE_MIN_VOLUME_MULT),
+            "min_drop_atr": float(MR1_ADAPTIVE_MIN_DROP_ATR),
+            "min_lower_wick_pct": float(MR1_ADAPTIVE_MIN_LOWER_WICK_PCT),
+        },
     }
 
 def _median(xs: list[float]) -> float | None:
@@ -8469,6 +8521,7 @@ def _patch002_compact_strategy_debug(strategy: str, dbg: Dict[str, Any]) -> Dict
         "price": dbg.get("price"),
         "spread_pct": spread.get("spread_pct"),
         "volume_mult": dbg.get("volume_mult"),
+        "adaptive": dbg.get("adaptive"),
     }
     if strategy == "me1":
         out.update({"range_atr": dbg.get("range_atr"), "breakout_level": dbg.get("breakout_level"), "range_high": dbg.get("range_high"), "range_low": dbg.get("range_low")})
@@ -9475,6 +9528,42 @@ def diagnostics_patch001_rebuild():
             "max_entries_per_scan": MAX_ENTRIES_PER_SCAN,
             "max_spread_pct": MAX_SPREAD_PCT,
         },
+    }
+
+
+@app.get("/diagnostics/patch003_adaptive_throughput")
+def diagnostics_patch003_adaptive_throughput():
+    return {
+        "ok": True,
+        "utc": utc_now_iso(),
+        "patch": "003-adaptive-throughput-mode",
+        "behavior_changed": True,
+        "scope": "bounded strategy-entry calibration only; no sizing/execution/exit/journal/universe changes",
+        "enabled": bool(ADAPTIVE_THROUGHPUT_ENABLED),
+        "me1": {
+            "base_min_range_atr": ME1_MIN_RANGE_ATR,
+            "base_min_volume_mult": ME1_MIN_VOLUME_MULT,
+            "adaptive_min_range_atr": ME1_ADAPTIVE_MIN_RANGE_ATR,
+            "adaptive_min_volume_mult": ME1_ADAPTIVE_MIN_VOLUME_MULT,
+        },
+        "mr1": {
+            "base_min_drop_atr": MR1_MIN_DROP_ATR,
+            "base_min_lower_wick_pct": MR1_MIN_LOWER_WICK_PCT,
+            "base_min_volume_mult": MR1_MIN_VOLUME_MULT,
+            "adaptive_allow_no_ema_reclaim": bool(MR1_ADAPTIVE_ALLOW_NO_EMA_RECLAIM),
+            "adaptive_min_drop_atr": MR1_ADAPTIVE_MIN_DROP_ATR,
+            "adaptive_min_lower_wick_pct": MR1_ADAPTIVE_MIN_LOWER_WICK_PCT,
+            "adaptive_min_volume_mult": MR1_ADAPTIVE_MIN_VOLUME_MULT,
+        },
+        "verification_endpoints": [
+            "GET /build",
+            "GET /diagnostics/patch003_adaptive_throughput",
+            "POST /worker/scan_entries",
+            "GET /diagnostics/entry_decisions",
+            "GET /diagnostics/scan_observations?limit=10",
+            "GET /diagnostics/scan_quality_summary?limit=100",
+            "POST /worker/exit",
+        ],
     }
 
 
