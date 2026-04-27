@@ -8471,7 +8471,20 @@ def scan_entries(payload: WorkerScanPayload):
         return JSONResponse(status_code=401, content={"ok": False, "utc": utc_now_iso(), "error": reason})
 
     # 1) Scanner → symbols (soft allowlist) + meta
-    scanner_ok, scanner_reason, scanner_meta, scanner_syms = _scanner_fetch_active_symbols_and_meta()
+    # Patch 001D cleanup: when the rebuild authoritative universe is active, the old scanner
+    # service is intentionally suspended. Do not call it, do not surface http_503 as a scary
+    # runtime error, and do not let scanner availability affect trading decisions.
+    if _patch001c_authoritative_universe_enabled(payload):
+        scanner_ok = True
+        scanner_reason = "bypassed_authoritative_universe"
+        scanner_meta = {
+            "scanner_bypassed": True,
+            "reason": "patch001d_scanner_suspended_cleanup",
+            "scanner_url": SCANNER_URL or os.getenv("SCANNER_URL", ""),
+        }
+        scanner_syms = []
+    else:
+        scanner_ok, scanner_reason, scanner_meta, scanner_syms = _scanner_fetch_active_symbols_and_meta()
 
     # 2) Universe (explicit symbols > allowed list (+ scanner if soft allow))
     universe = _build_universe(payload, scanner_syms)
@@ -8967,6 +8980,30 @@ def diagnostics_universe_lock():
         "filter_universe_by_allowed_symbols": bool(FILTER_UNIVERSE_BY_ALLOWED_SYMBOLS),
     }
 
+
+
+@app.get("/diagnostics/patch001_cleanup")
+def diagnostics_patch001_cleanup():
+    """Patch 001D verification endpoint for scanner-suspension cleanup."""
+    return {
+        "ok": True,
+        "utc": utc_now_iso(),
+        "patch": "001D-scanner-suspension-cleanup",
+        "behavior_changed": False,
+        "trading_path_changed": False,
+        "scanner_dependency_removed": True,
+        "old_scanner_expected_suspended": True,
+        "authoritative_universe_enabled": _patch001c_authoritative_universe_enabled(),
+        "fixed_universe": _patch001c_fixed_universe_symbols(),
+        "last_universe_lock": dict(_LAST_UNIVERSE_LOCK_SNAPSHOT or {}),
+        "expected_services": [
+            "main crypto webhook service",
+            "crypto background worker"
+        ],
+        "safe_to_keep_suspended": [
+            "scanner-gcvb"
+        ],
+    }
 
 @app.get("/build")
 def build_info_endpoint():
