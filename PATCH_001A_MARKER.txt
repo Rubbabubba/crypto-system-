@@ -1,0 +1,1 @@
+Patch 001A — Entry Decision Observability. No drift. No regression. Diagnostics-only.
