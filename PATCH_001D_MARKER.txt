@@ -1,0 +1,8 @@
+Patch 001D - Scanner Suspension Cleanup
+
+Scope:
+- Cleanup only.
+- Old scanner service can remain suspended.
+- Main scan path bypasses scanner fetch when Patch 001C authoritative universe is active.
+- Trading universe remains BTC/USD, ETH/USD, SOL/USD.
+- No strategy, risk, sizing, execution, lifecycle, journal, or exit behavior changes.
