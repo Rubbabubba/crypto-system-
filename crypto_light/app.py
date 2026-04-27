@@ -3804,21 +3804,48 @@ def _compatibility_snapshot() -> dict[str, Any]:
         "multi_symbol_admission_enabled": bool(path_b.get("multi_symbol_admission_enabled")),
     }
 
+_LAST_UNIVERSE_LOCK_SNAPSHOT: dict[str, Any] = {}
+
+def _patch001c_fixed_universe_symbols() -> list[str]:
+    """Patch 001C fixed rebuild universe. Defaults to BTC/ETH/SOL unless explicitly overridden."""
+    raw = os.getenv("REBUILD_FIXED_UNIVERSE", "BTC/USD,ETH/USD,SOL/USD")
+    out: list[str] = []
+    seen: set[str] = set()
+    for token in str(raw or "").split(","):
+        token = token.strip()
+        if not token:
+            continue
+        try:
+            sym = normalize_symbol(token)
+        except Exception:
+            continue
+        if sym in seen:
+            continue
+        seen.add(sym)
+        out.append(sym)
+    return out or ["BTC/USD", "ETH/USD", "SOL/USD"]
+
+def _patch001c_authoritative_universe_enabled(payload=None) -> bool:
+    flag = os.getenv("REBUILD_AUTHORITATIVE_UNIVERSE_ENABLED", "1").strip().lower() in ("1", "true", "yes", "on")
+    if not flag:
+        return False
+    try:
+        requested = getattr(payload, "symbols", None) or []
+        if requested:
+            return False
+    except Exception:
+        pass
+    strategies = {str(x).strip().lower() for x in list(ENTRY_ENGINE_STRATEGIES_LIST or []) if str(x).strip()}
+    return bool({"me1", "mr1"} & strategies) and not bool(SCANNER_DRIVEN_UNIVERSE)
+
 def _build_universe(payload, scanner_syms: list[str]) -> list[str]:
     """Build the scan universe safely.
 
-    Priority:
-      1) Explicit payload.symbols (if provided and non-empty)
-      2) Scanner symbols (scanner_syms)  <-- primary mode
-      3) Fallback to settings.allowed_symbols
-
-    Optional behaviors (env-driven):
-      - SCANNER_TARGET_N: cap universe size from scanner (default 5)
-      - UNIVERSE_USD_ONLY: keep only */USD
-      - UNIVERSE_PREFER_USD_FOR_STABLES: when USD-only, convert BASE/USDT or BASE/USDC -> BASE/USD
-        *only if BASE/USD exists in scanner list*, else drop it.
-      - FILTER_UNIVERSE_BY_ALLOWED_SYMBOLS: intersect universe with ALLOWED_SYMBOLS (default off)
+    Patch 001C: in the ME1/MR1 rebuild path, scanner-driven universe is disabled and
+    the scan universe is authoritative: BTC/USD, ETH/USD, SOL/USD. This prevents old
+    scanner/profitability isolation state from narrowing scan coverage to one symbol.
     """
+    global _LAST_UNIVERSE_LOCK_SNAPSHOT
     try:
         requested = getattr(payload, "symbols", None) or []
         force_scan = bool(getattr(payload, "force_scan", False))
@@ -3841,58 +3868,100 @@ def _build_universe(payload, scanner_syms: list[str]) -> list[str]:
 
     requested_norm = _norm_list(requested)
     scanner_norm = _norm_list(scanner_syms)
+    allowed_norm = _norm_list(getattr(settings, "allowed_symbols", []) or [])
+    fixed_universe = _patch001c_fixed_universe_symbols()
 
-    # Build raw universe
+    details: dict[str, Any] = {
+        "patch": "001C-authoritative-universe-lock",
+        "utc": utc_now_iso(),
+        "requested_symbols": requested_norm,
+        "scanner_symbols": scanner_norm,
+        "settings_allowed_symbols": allowed_norm,
+        "fixed_universe": fixed_universe,
+        "scanner_driven_universe": bool(SCANNER_DRIVEN_UNIVERSE),
+        "filter_universe_by_allowed_symbols": bool(FILTER_UNIVERSE_BY_ALLOWED_SYMBOLS),
+        "profitability_isolation_universe_filter_bypassed": False,
+        "source": None,
+        "removed": [],
+    }
+
+    authoritative = _patch001c_authoritative_universe_enabled(payload)
     if requested_norm:
         universe = requested_norm
+        details["source"] = "payload.symbols"
+    elif authoritative:
+        universe = list(fixed_universe)
+        details["source"] = "patch001c_authoritative_fixed_universe"
+        details["profitability_isolation_universe_filter_bypassed"] = True
     elif SCANNER_DRIVEN_UNIVERSE and scanner_norm:
         universe = scanner_norm[: max(1, int(SCANNER_TARGET_N or 5))]
+        details["source"] = "scanner_driven"
     else:
-        # Patch 001B: when scanner-driven universe is disabled, scan the configured allowlist first.
-        # This preserves Patch 001's BTC/ETH/SOL rebuild intent and prevents old scanner output
-        # from accidentally narrowing evaluation to a single intersecting symbol.
-        universe = _norm_list(getattr(settings, "allowed_symbols", []) or [])
+        universe = allowed_norm
+        details["source"] = "settings.allowed_symbols"
         if not universe and scanner_norm:
             universe = scanner_norm
+            details["source"] = "scanner_fallback"
 
-    # USD-only filtering / conversion
+    details["pre_usd_filter_universe"] = list(universe)
+
     if UNIVERSE_USD_ONLY:
         scanner_set = set(scanner_norm)
         out: list[str] = []
-        for s in universe:
+        for s0 in universe:
             try:
-                base, quote = s.split("/", 1)
+                base, quote = s0.split("/", 1)
             except Exception:
+                details.setdefault("removed", []).append({"symbol": s0, "reason": "malformed_symbol"})
                 continue
             if quote == "USD":
-                out.append(s)
+                out.append(s0)
                 continue
             if UNIVERSE_PREFER_USD_FOR_STABLES and quote in ("USDT", "USDC"):
                 cand = f"{base}/USD"
                 if cand in scanner_set:
                     out.append(cand)
-                # else: drop (don't silently trade a different quote)
-        # de-dupe preserve order
+                else:
+                    details.setdefault("removed", []).append({"symbol": s0, "reason": "usd_preferred_pair_not_in_scanner"})
+            else:
+                details.setdefault("removed", []).append({"symbol": s0, "reason": "non_usd_quote"})
         universe = list(dict.fromkeys(out))
 
-    # Allowed-symbol filtering (off by default for scanner-driven universe)
-    allowed = set(getattr(settings, "allowed_symbols", []) or [])
+    allowed = set(allowed_norm)
     scanner_vetted = _scanner_vetted_symbols_from_cache() if SCANNER_DRIVEN_UNIVERSE else set()
     effective_allowed = set(allowed) | set(scanner_vetted)
-    if effective_allowed and FILTER_UNIVERSE_BY_ALLOWED_SYMBOLS and not (force_scan and SCANNER_SOFT_ALLOW):
-        universe = [s for s in universe if s in effective_allowed]
+    if (not authoritative) and effective_allowed and FILTER_UNIVERSE_BY_ALLOWED_SYMBOLS and not (force_scan and SCANNER_SOFT_ALLOW):
+        before = list(universe)
+        universe = [x for x in universe if x in effective_allowed]
+        for x in before:
+            if x not in universe:
+                details.setdefault("removed", []).append({"symbol": x, "reason": "not_in_effective_allowed_symbols"})
 
-    # Stable fallback: if universe empty but allowed configured, use effective allowed
     if not universe and effective_allowed:
         universe = list(dict.fromkeys(list(effective_allowed)))
+        details["source"] = f"{details.get('source')}_effective_allowed_fallback"
 
     isolation = _profitability_isolation_snapshot()
-    isolation_symbols = {normalize_symbol(str(s)) for s in list((isolation or {}).get("allowed_symbols") or []) if str(s).strip()}
-    if bool((isolation or {}).get("enabled")) and isolation_symbols:
-        universe = [s for s in universe if normalize_symbol(str(s)) in isolation_symbols]
+    isolation_symbols = {normalize_symbol(str(x)) for x in list((isolation or {}).get("allowed_symbols") or []) if str(x).strip()}
+    details["profitability_isolation"] = {
+        "enabled": bool((isolation or {}).get("enabled")),
+        "allowed_symbols": sorted(list(isolation_symbols)),
+        "authoritative": bool((isolation or {}).get("authoritative")),
+        "reason": (isolation or {}).get("reason"),
+        "symbol_source": (isolation or {}).get("symbol_source"),
+    }
+    if (not authoritative) and bool((isolation or {}).get("enabled")) and isolation_symbols:
+        before = list(universe)
+        universe = [x for x in universe if normalize_symbol(str(x)) in isolation_symbols]
+        for x in before:
+            if x not in universe:
+                details.setdefault("removed", []).append({"symbol": x, "reason": "profitability_isolation_universe_filter"})
 
+    universe = list(dict.fromkeys(universe))
+    details["final_universe"] = list(universe)
+    details["final_count"] = len(universe)
+    _LAST_UNIVERSE_LOCK_SNAPSHOT = details
     return universe
-
 
 def _scanner_refresh() -> None:
     if not SCANNER_URL:
@@ -8695,6 +8764,7 @@ def scan_entries(payload: WorkerScanPayload):
         "ok": True,
         "utc": utc_now_iso(),
         "universe_count": len(universe),
+        "universe_lock": dict(_LAST_UNIVERSE_LOCK_SNAPSHOT or {}),
         "scanner": {
             "ok": scanner_ok,
             "reason": scanner_reason,
@@ -8869,9 +8939,10 @@ def diagnostics_entry_decisions():
     return {
         "ok": True,
         "utc": utc_now_iso(),
-        "patch": "001B-throughput-calibration",
+        "patch": "001C-authoritative-universe-lock",
         "behavior_changed": False,
-        "calibration_scope": "env thresholds + fixed allowlist universe + decision diagnostics",
+        "calibration_scope": "authoritative BTC/ETH/SOL scan universe + decision diagnostics",
+        "universe_lock": dict(_LAST_UNIVERSE_LOCK_SNAPSHOT or {}),
         "last_scan_utc": snap.get("last_scan_utc"),
         "last_no_trade_reason": snap.get("last_no_trade_reason"),
         "last_rejected_entry_reason": snap.get("last_rejected_entry_reason"),
@@ -8879,6 +8950,23 @@ def diagnostics_entry_decisions():
         "results": snap.get("results") or [],
         "decisions": decisions,
     }
+
+@app.get("/diagnostics/universe_lock")
+def diagnostics_universe_lock():
+    """Patch 001C verification endpoint for authoritative scan-universe construction."""
+    return {
+        "ok": True,
+        "utc": utc_now_iso(),
+        "patch": "001C-authoritative-universe-lock",
+        "authoritative_enabled": _patch001c_authoritative_universe_enabled(),
+        "fixed_universe": _patch001c_fixed_universe_symbols(),
+        "last_universe_lock": dict(_LAST_UNIVERSE_LOCK_SNAPSHOT or {}),
+        "entry_engine_strategies": ENTRY_ENGINE_STRATEGIES_LIST,
+        "scanner_driven_universe": bool(SCANNER_DRIVEN_UNIVERSE),
+        "scanner_soft_allow": bool(SCANNER_SOFT_ALLOW),
+        "filter_universe_by_allowed_symbols": bool(FILTER_UNIVERSE_BY_ALLOWED_SYMBOLS),
+    }
+
 
 @app.get("/build")
 def build_info_endpoint():
