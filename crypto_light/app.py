@@ -2453,9 +2453,13 @@ def _compact_signal_debug_by_symbol(per_symbol: dict | None) -> dict:
     try:
         for sym, d in (per_symbol or {}).items():
             sd = (d or {}).get("signal_debug") or {}
+            # Patch 001B: preserve ME1/MR1 debug payloads in entry-attempt truth.
+            # This is diagnostics-only; it does not change signal, risk, admission, sizing, or execution behavior.
             out[normalize_symbol(str(sym))] = {
                 "signals": dict((d or {}).get("signals") or {}),
                 "skip": list((d or {}).get("skip") or []),
+                "me1": dict(sd.get("me1") or {}),
+                "mr1": dict(sd.get("mr1") or {}),
                 "tr1": _extract_tr1_signal_breakdown_from_debug(sd),
             }
     except Exception:
@@ -3841,10 +3845,15 @@ def _build_universe(payload, scanner_syms: list[str]) -> list[str]:
     # Build raw universe
     if requested_norm:
         universe = requested_norm
-    elif scanner_norm:
-        universe = scanner_norm[: max(1, int(SCANNER_TARGET_N or 5))] if SCANNER_DRIVEN_UNIVERSE else scanner_norm
+    elif SCANNER_DRIVEN_UNIVERSE and scanner_norm:
+        universe = scanner_norm[: max(1, int(SCANNER_TARGET_N or 5))]
     else:
+        # Patch 001B: when scanner-driven universe is disabled, scan the configured allowlist first.
+        # This preserves Patch 001's BTC/ETH/SOL rebuild intent and prevents old scanner output
+        # from accidentally narrowing evaluation to a single intersecting symbol.
         universe = _norm_list(getattr(settings, "allowed_symbols", []) or [])
+        if not universe and scanner_norm:
+            universe = scanner_norm
 
     # USD-only filtering / conversion
     if UNIVERSE_USD_ONLY:
@@ -8860,8 +8869,9 @@ def diagnostics_entry_decisions():
     return {
         "ok": True,
         "utc": utc_now_iso(),
-        "patch": "001A-entry-decision-observability",
+        "patch": "001B-throughput-calibration",
         "behavior_changed": False,
+        "calibration_scope": "env thresholds + fixed allowlist universe + decision diagnostics",
         "last_scan_utc": snap.get("last_scan_utc"),
         "last_no_trade_reason": snap.get("last_no_trade_reason"),
         "last_rejected_entry_reason": snap.get("last_rejected_entry_reason"),
