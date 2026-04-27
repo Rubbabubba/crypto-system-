@@ -1150,6 +1150,11 @@ TC1_POST_ENTRY_PROTECT_AFTER_BPS = float(os.getenv("TC1_POST_ENTRY_PROTECT_AFTER
 TC1_POST_ENTRY_MAX_GIVEBACK_BPS = float(os.getenv("TC1_POST_ENTRY_MAX_GIVEBACK_BPS", "18") or 18.0)
 TC1_ORPHAN_PLAN_CLOSE_MIN_AGE_SEC = float(os.getenv("TC1_ORPHAN_PLAN_CLOSE_MIN_AGE_SEC", "86400") or 86400.0)
 
+# Patch 006 - Profitability Isolation Recalibration flags
+PROFITABILITY_RECALIBRATION_ENABLED = (os.getenv("PROFITABILITY_RECALIBRATION_ENABLED", "0").strip().lower() in ("1", "true", "yes", "on"))
+PROFITABILITY_RECALIBRATION_ALLOWED_STRATEGIES = [s.strip().lower() for s in os.getenv("PROFITABILITY_RECALIBRATION_ALLOWED_STRATEGIES", "me1,mr1").split(",") if s.strip()]
+PROFITABILITY_RECALIBRATION_ALLOWED_SYMBOLS = [s.strip().upper() for s in os.getenv("PROFITABILITY_RECALIBRATION_ALLOWED_SYMBOLS", "BTC/USD,ETH/USD,SOL/USD").split(",") if s.strip()]
+
 # Trade quality override (Patch 085)
 TRADE_QUALITY_OVERRIDE_ENABLED = (os.getenv("TRADE_QUALITY_OVERRIDE_ENABLED", "1").strip().lower() in ("1", "true", "yes", "on"))
 TRADE_QUALITY_ALLOWED_SYMBOLS = ["BTC/USD", "ETH/USD", "SOL/USD", "ADA/USD", "LINK/USD", "AVAX/USD", "DOT/USD"]
@@ -1168,6 +1173,18 @@ if TRADE_QUALITY_OVERRIDE_ENABLED:
     TC1_BREAK_EVEN_AFTER_BPS = max(float(TC1_BREAK_EVEN_AFTER_BPS), 80.0)
     TC1_TIME_EXIT_MIN_GROSS_BPS = max(float(TC1_TIME_EXIT_MIN_GROSS_BPS), 90.0)
     TC1_POST_ENTRY_PROTECT_AFTER_BPS = max(float(TC1_POST_ENTRY_PROTECT_AFTER_BPS), 60.0)
+
+# Patch 006 deliberately runs after the legacy trade-quality override so the rebuild can gather paper-trade truth.
+if PROFITABILITY_RECALIBRATION_ENABLED:
+    PROFIT_FILTER_MIN_MOVE_TO_COST_MULT = float(os.getenv("PROFIT_FILTER_MIN_MOVE_TO_COST_MULT", "1.20") or 1.20)
+    PROFIT_FILTER_MIN_EXPECTED_MOVE_BPS = float(os.getenv("PROFIT_FILTER_MIN_EXPECTED_MOVE_BPS", "45") or 45.0)
+    PROFIT_FILTER_SOFT_PASS_ENABLED = (os.getenv("PROFIT_FILTER_SOFT_PASS_ENABLED", "1").strip().lower() in ("1", "true", "yes", "on"))
+    PROFIT_FILTER_SOFT_PASS_MIN_MOVE_TO_COST_MULT = float(os.getenv("PROFIT_FILTER_SOFT_PASS_MIN_MOVE_TO_COST_MULT", "0.90") or 0.90)
+    PROFIT_FILTER_SOFT_PASS_MIN_EXPECTED_MOVE_BPS = float(os.getenv("PROFIT_FILTER_SOFT_PASS_MIN_EXPECTED_MOVE_BPS", "25") or 25.0)
+    PROFITABILITY_ISOLATION_ALLOWED_STRATEGIES = list(PROFITABILITY_RECALIBRATION_ALLOWED_STRATEGIES or ["me1", "mr1"])
+    PROFITABILITY_ISOLATION_STRATEGY_SET = set(PROFITABILITY_ISOLATION_ALLOWED_STRATEGIES)
+    if PROFITABILITY_RECALIBRATION_ALLOWED_SYMBOLS:
+        os.environ["PROFITABILITY_ISOLATION_SYMBOLS"] = ",".join(PROFITABILITY_RECALIBRATION_ALLOWED_SYMBOLS)
     TC1_POST_ENTRY_MAX_GIVEBACK_BPS = min(float(TC1_POST_ENTRY_MAX_GIVEBACK_BPS), 15.0)
 
 ADAPTIVE_ENTRY_QUALITY_ENGINE_ENABLED = (os.getenv("ADAPTIVE_ENTRY_QUALITY_ENGINE_ENABLED", "1").strip().lower() in ("1", "true", "yes", "on"))
@@ -9995,6 +10012,42 @@ def diagnostics_patch005_prebreakout():
         "verification_endpoints": [
             "GET /build",
             "GET /diagnostics/patch005_prebreakout",
+            "POST /worker/scan_entries",
+            "GET /diagnostics/entry_decisions",
+            "GET /diagnostics/scan_observations?limit=10",
+            "GET /diagnostics/scan_quality_summary?limit=100",
+            "POST /worker/exit",
+        ],
+    }
+
+
+@app.get("/diagnostics/patch006_profitability_recalibration")
+def diagnostics_patch006_profitability_recalibration():
+    return {
+        "ok": True,
+        "utc": datetime.now(timezone.utc).isoformat(),
+        "patch": "006-profitability-isolation-recalibration",
+        "behavior_changed": True,
+        "scope": "bounded profitability-gate recalibration only; no strategy/sizing/execution/exit/journal/universe/worker changes",
+        "enabled": bool(PROFITABILITY_RECALIBRATION_ENABLED),
+        "profit_filter": {
+            "enabled": bool(PROFIT_FILTER_ENABLED),
+            "min_move_to_cost_mult": float(PROFIT_FILTER_MIN_MOVE_TO_COST_MULT),
+            "min_expected_move_bps": float(PROFIT_FILTER_MIN_EXPECTED_MOVE_BPS),
+            "soft_pass_enabled": bool(PROFIT_FILTER_SOFT_PASS_ENABLED),
+            "soft_pass_min_move_to_cost_mult": float(PROFIT_FILTER_SOFT_PASS_MIN_MOVE_TO_COST_MULT),
+            "soft_pass_min_expected_move_bps": float(PROFIT_FILTER_SOFT_PASS_MIN_EXPECTED_MOVE_BPS),
+            "estimated_cost_bps": float(_estimated_round_trip_cost_bps(None)),
+        },
+        "profitability_isolation": {
+            "enabled": bool(PROFITABILITY_ISOLATION_ENABLED),
+            "allowed_strategies": list(PROFITABILITY_ISOLATION_ALLOWED_STRATEGIES or []),
+            "allowed_symbols": _env_symbol_list("PROFITABILITY_ISOLATION_SYMBOLS"),
+            "snapshot": _profitability_isolation_snapshot(),
+        },
+        "verification_endpoints": [
+            "GET /build",
+            "GET /diagnostics/patch006_profitability_recalibration",
             "POST /worker/scan_entries",
             "GET /diagnostics/entry_decisions",
             "GET /diagnostics/scan_observations?limit=10",
