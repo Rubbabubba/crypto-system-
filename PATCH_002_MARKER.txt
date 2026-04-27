@@ -1,0 +1,2 @@
+Patch 002 - Scan Evidence Observability
+Diagnostics-only patch. Adds scan observation persistence and summary endpoints. No strategy, risk, execution, lifecycle, journal, universe, or exit behavior changes.
