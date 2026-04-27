@@ -1,0 +1,3 @@
+Patch 006 - Profitability Isolation Recalibration
+Scope: recalibrate profitability gate and strategy/symbol allowlist for ME1/MR1 rebuild.
+No strategy, sizing, execution, exit, journal, universe, or worker changes.
