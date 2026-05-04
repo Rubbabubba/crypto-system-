@@ -9808,32 +9808,48 @@ def dashboard_ui(recent_limit: int = 25):
         )
     table_rows = "".join(rows) or "<tr><td colspan='6'>No recent trades.</td></tr>"
 
+    label_color = "#a9d6ff"
     html = f"""
     <html><head><title>Crypto Intraday Dashboard</title>
     <style>
-      body {{ font-family: Inter, Arial, sans-serif; background:#0b1020; color:#e9eefb; margin:0; }}
+      body {{ font-family: Inter, Arial, sans-serif; background:#050a18; color:#e9f2ff; margin:0; }}
       .wrap {{ max-width:1400px; margin:0 auto; padding:20px; }}
-      .grid {{ display:grid; grid-template-columns: repeat(4, 1fr); gap:12px; }}
-      .card {{ background:#141b34; border:1px solid #27325c; border-radius:10px; padding:14px; }}
-      .k {{ color:#98a4ce; font-size:12px; text-transform:uppercase; }} .v {{ font-size:26px; font-weight:700; }}
-      table {{ width:100%; border-collapse:collapse; font-size:12px; }} td,th {{ border-bottom:1px solid #253057; padding:8px; text-align:left; }}
+      .top {{ display:flex; justify-content:space-between; align-items:center; margin-bottom:14px; }}
+      .chips span {{ border:1px solid #22406a; border-radius:999px; padding:6px 10px; margin-left:8px; font-size:12px; background:#0d1730; color:{label_color}; }}
+      .grid {{ display:grid; grid-template-columns: repeat(12, 1fr); gap:12px; }}
+      .card {{ background:linear-gradient(180deg, #101933 0%, #0b1329 100%); border:1px solid #203764; border-radius:14px; padding:14px; }}
+      .span-3 {{ grid-column: span 3; }} .span-4 {{ grid-column: span 4; }} .span-6 {{ grid-column: span 6; }} .span-8 {{ grid-column: span 8; }} .span-12 {{ grid-column: span 12; }}
+      .k {{ color:{label_color}; font-size:12px; text-transform:uppercase; letter-spacing:.04em; font-weight:700; }} .v {{ font-size:30px; font-weight:800; margin-top:6px; }}
+      h2,h3 {{ margin:0 0 10px 0; }}
+      .muted {{ color:#8ea6c8; }}
+      table {{ width:100%; border-collapse:collapse; font-size:12px; }} td,th {{ border-bottom:1px solid #1c2b4d; padding:8px; text-align:left; }} th {{ color:{label_color}; }}
+      .status-ok {{ color:#76f7b0; font-weight:700; }} .status-bad {{ color:#ff8f9e; font-weight:700; }}
+      pre {{ white-space:pre-wrap; font-size:11px; color:#d0e5ff; background:#071126; border:1px solid #1b2f54; border-radius:8px; padding:10px; }}
     </style></head><body><div class="wrap">
-      <h2>Crypto Intraday Monitoring Dashboard</h2>
-      <div>Build: {snap.get("build","")} | Snapshot: {snap.get("snapshot_utc","")} | Status: <b>{readiness}</b></div><br/>
+      <div class="top">
+        <div><div class="k">Operator Console</div><h2>Crypto Intraday Dashboard</h2>
+        <div class="muted">Build: {snap.get("build","")} | Snapshot: {snap.get("snapshot_utc","")}</div></div>
+        <div class="chips"><span>{readiness}</span><span>Read-only</span><span>Fast path</span></div>
+      </div>
       <div class="grid">
-        <div class="card"><div class="k">Net PnL (window)</div><div class="v">{net_pnl}</div></div>
-        <div class="card"><div class="k">Trades</div><div class="v">{trades}</div></div>
-        <div class="card"><div class="k">Win Rate</div><div class="v">{wr}</div></div>
-        <div class="card"><div class="k">Avg Net Edge (bps)</div><div class="v">{avg_net_edge}</div></div>
-        <div class="card"><div class="k">Maker Share</div><div class="v">{maker_share}</div></div>
-        <div class="card"><div class="k">Entry Reject Rate</div><div class="v">{_pct(ops.get("entry_reject_rate") or 0.0,1)}</div></div>
-        <div class="card"><div class="k">Execution Slippage (bps)</div><div class="v">{_fmt(exec_truth.get("avg_slippage_bps"),1)}</div></div>
-        <div class="card"><div class="k">Open Plans</div><div class="v">{len(snap.get("open_plans") or [])}</div></div>
-      </div><br/>
-      <div class="grid">
-        <div class="card"><div class="k">Strategy Truth</div><pre>{json.dumps(strategy_truth, indent=2)}</pre></div>
-        <div class="card"><div class="k">Regime Expectancy</div><pre>{json.dumps(regime_truth, indent=2)}</pre></div>
-        <div class="card" style="grid-column: span 2;"><div class="k">Recent Trades</div>
+        <div class="card span-8"><h3>Performance Analytics</h3>
+          <table><tbody>
+            <tr><th>net_pnl</th><td>{net_pnl}</td><th>trades</th><td>{trades}</td></tr>
+            <tr><th>win_rate</th><td>{wr}</td><th>avg_net_edge_bps</th><td>{avg_net_edge}</td></tr>
+            <tr><th>maker_share</th><td>{maker_share}</td><th>avg_slippage_bps</th><td>{_fmt(exec_truth.get("avg_slippage_bps"),1)}</td></tr>
+            <tr><th>entry_reject_rate</th><td>{_pct(ops.get("entry_reject_rate") or 0.0,1)}</td><th>open_plans</th><td>{len(snap.get("open_plans") or [])}</td></tr>
+          </tbody></table>
+        </div>
+        <div class="card span-4"><h3>Guarded Live Path</h3>
+          <table><tbody>
+            <tr><th>ready</th><td class="{'status-ok' if snap.get('ready') else 'status-bad'}">{str(bool(snap.get('ready'))).upper()}</td></tr>
+            <tr><th>promotion_ready</th><td>{str(bool(snap.get('promotion_ready'))).upper()}</td></tr>
+            <tr><th>trade_gate_ok</th><td>{str(bool((snap.get('pretrade_health_gate') or {}).get('ok'))).upper()}</td></tr>
+          </tbody></table>
+        </div>
+        <div class="card span-6"><h3>Strategy Attribution</h3><pre>{json.dumps(strategy_truth, indent=2)}</pre></div>
+        <div class="card span-6"><h3>Regime Expectancy</h3><pre>{json.dumps(regime_truth, indent=2)}</pre></div>
+        <div class="card span-12"><h3>Recent Trades</h3>
           <table><thead><tr><th>UTC</th><th>Symbol</th><th>Side</th><th>Net PnL</th><th>Fees</th><th>Net Edge bps</th></tr></thead><tbody>{table_rows}</tbody></table>
         </div>
       </div>
