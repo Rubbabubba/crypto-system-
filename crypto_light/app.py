@@ -36,7 +36,7 @@ from .broker import best_bid_ask as _best_bid_ask
 from .sizing import compute_risk_pct_equity_notional, compute_equity_fraction_notional, compute_risk_based_notional_actual
 from .config import load_settings
 from .models import WebhookPayload, WorkerExitPayload, WorkerScanPayload, WorkerExitDiagnosticsPayload, WorkerAdoptPositionsPayload, WorkerRouteTruthPayload
-from .risk import compute_brackets, compute_atr_brackets, compute_effective_stop_pct, compute_rr_ratio, compute_stop_distance_pct
+from .risk import compute_brackets, compute_atr_brackets, compute_effective_stop_pct, compute_rr_ratio, compute_stop_distance_pct, compute_take_distance_pct
 from .state import InMemoryState, TradePlan
 from .symbol_map import normalize_symbol, from_kraken
 
@@ -963,6 +963,13 @@ def _risk_admission_check(*, symbol: str, strategy: str, px: float, stop_price: 
     )
     raw_stop_pct = compute_stop_distance_pct(float(px), float(stop_price))
     rr_ratio = compute_rr_ratio(float(px), float(stop_price), float(take_price))
+    take_distance_pct = compute_take_distance_pct(float(px), float(take_price))
+    friction_bps = float(getattr(settings, "entry_fee_bps", 0.0) or 0.0) + float(getattr(settings, "exit_fee_bps", 0.0) or 0.0) + float(getattr(settings, "slippage_bps", 0.0) or 0.0)
+    expected_gross_edge_bps = float(take_distance_pct * 10000.0)
+    expected_net_edge_bps = float(expected_gross_edge_bps - friction_bps)
+    safety_buffer_bps = float(getattr(settings, "expected_edge_safety_buffer_bps", 0.0) or 0.0)
+    min_expected_net_edge_bps = float(getattr(settings, "min_expected_net_edge_bps", 0.0) or 0.0)
+    expected_net_edge_after_buffer_bps = float(expected_net_edge_bps - safety_buffer_bps)
     min_stop = float(getattr(settings, "min_effective_stop_pct", 0.0) or 0.0)
     max_stop = float(getattr(settings, "max_effective_stop_pct", 0.0) or 0.0)
     min_rr = float(getattr(settings, "min_risk_reward_ratio", 0.0) or 0.0)
@@ -970,6 +977,7 @@ def _risk_admission_check(*, symbol: str, strategy: str, px: float, stop_price: 
         "effective_stop_pct_min": (effective_stop_pct >= min_stop) if min_stop > 0 else True,
         "effective_stop_pct_max": (effective_stop_pct <= max_stop) if max_stop > 0 else True,
         "min_risk_reward_ratio": (rr_ratio >= min_rr) if min_rr > 0 else True,
+        "min_expected_net_edge_bps": (expected_net_edge_after_buffer_bps >= min_expected_net_edge_bps) if min_expected_net_edge_bps > 0 else True,
     }
     violations = []
     if not checks["effective_stop_pct_min"]:
@@ -978,6 +986,8 @@ def _risk_admission_check(*, symbol: str, strategy: str, px: float, stop_price: 
         violations.append("effective_stop_pct_too_wide")
     if not checks["min_risk_reward_ratio"]:
         violations.append("risk_reward_too_low")
+    if not checks["min_expected_net_edge_bps"]:
+        violations.append("expected_net_edge_too_low")
     return {
         "ok": not violations,
         "symbol": symbol,
@@ -988,6 +998,12 @@ def _risk_admission_check(*, symbol: str, strategy: str, px: float, stop_price: 
         "raw_stop_pct": float(raw_stop_pct),
         "effective_stop_pct": float(effective_stop_pct),
         "risk_reward_ratio": float(rr_ratio),
+        "expected_gross_edge_bps": float(expected_gross_edge_bps),
+        "expected_net_edge_bps": float(expected_net_edge_bps),
+        "expected_net_edge_after_buffer_bps": float(expected_net_edge_after_buffer_bps),
+        "friction_bps": float(friction_bps),
+        "expected_edge_safety_buffer_bps": float(safety_buffer_bps),
+        "min_expected_net_edge_bps": float(min_expected_net_edge_bps),
         "min_effective_stop_pct": float(min_stop),
         "max_effective_stop_pct": float(max_stop),
         "min_risk_reward_ratio": float(min_rr),

@@ -112,6 +112,8 @@ class Settings:
     min_effective_stop_pct: float
     max_effective_stop_pct: float
     min_risk_reward_ratio: float
+    min_expected_net_edge_bps: float
+    expected_edge_safety_buffer_bps: float
     max_consecutive_rejections: int
     max_consecutive_stopouts: int
     ops_lockout_sec: int
@@ -285,6 +287,8 @@ def load_settings() -> Settings:
         min_effective_stop_pct=float(_getenv("MIN_EFFECTIVE_STOP_PCT", "0.003") or 0.003),
         max_effective_stop_pct=float(_getenv("MAX_EFFECTIVE_STOP_PCT", "0.05") or 0.05),
         min_risk_reward_ratio=float(_getenv("MIN_RISK_REWARD_RATIO", "1.2") or 1.2),
+        min_expected_net_edge_bps=float(_getenv("MIN_EXPECTED_NET_EDGE_BPS", "5") or 5),
+        expected_edge_safety_buffer_bps=float(_getenv("EXPECTED_EDGE_SAFETY_BUFFER_BPS", "10") or 10),
         max_consecutive_rejections=int(float(_getenv("MAX_CONSECUTIVE_REJECTIONS", "3") or 3)),
         max_consecutive_stopouts=int(float(_getenv("MAX_CONSECUTIVE_STOPOUTS", "2") or 2)),
         ops_lockout_sec=int(float(_getenv("OPS_LOCKOUT_SEC", "900") or 900)),
