@@ -22,7 +22,7 @@ from threading import Lock
 import requests
 from fastapi import FastAPI, HTTPException, Request, Body
 from fastapi.responses import JSONResponse
-from fastapi.responses import RedirectResponse
+from fastapi.responses import RedirectResponse, HTMLResponse
 
 log = logging.getLogger("crypto_light")
 
@@ -9768,6 +9768,80 @@ def dashboard(recent_limit: int = 15):
     }
 
 
+@app.get("/dashboard/ui", response_class=HTMLResponse)
+def dashboard_ui(recent_limit: int = 25):
+    snap = dashboard(recent_limit=recent_limit)
+    perf = snap.get("performance") or {}
+    pnl = perf.get("pnl") or {}
+    telemetry = pnl.get("telemetry_window") or {}
+    ops = telemetry.get("operations_health") or {}
+    exec_truth = telemetry.get("execution_truth") or {}
+    maker_taker = telemetry.get("maker_vs_taker") or {}
+    strategy_truth = telemetry.get("strategy_truth") or {}
+    regime_truth = telemetry.get("expectancy_by_regime") or {}
+    recent = (pnl.get("recent_trades") or [])[:12]
+
+    def _fmt(v: Any, digits: int = 2) -> str:
+        try:
+            return f"{float(v):,.{digits}f}"
+        except Exception:
+            return "0.00"
+
+    def _pct(v: Any, digits: int = 2) -> str:
+        try:
+            return f"{float(v) * 100:.{digits}f}%"
+        except Exception:
+            return "0.00%"
+
+    net_pnl = _fmt(pnl.get("net_pnl"))
+    trades = int(pnl.get("trades") or 0)
+    wr = _pct((pnl.get("win_rate") or 0.0), 1)
+    avg_net_edge = _fmt((telemetry.get("execution_truth") or {}).get("avg_net_edge_bps"), 1)
+    maker_share = _pct((maker_taker.get("maker_share") or 0.0), 1)
+    readiness = "READY" if snap.get("ready") else "NOT READY"
+
+    rows = []
+    for t in recent:
+        rows.append(
+            f"<tr><td>{t.get('ts','')}</td><td>{t.get('symbol','')}</td><td>{t.get('side','')}</td>"
+            f"<td>{_fmt(t.get('net_pnl'),2)}</td><td>{_fmt(t.get('fee_usd'),2)}</td><td>{_fmt(t.get('net_edge_bps'),1)}</td></tr>"
+        )
+    table_rows = "".join(rows) or "<tr><td colspan='6'>No recent trades.</td></tr>"
+
+    html = f"""
+    <html><head><title>Crypto Intraday Dashboard</title>
+    <style>
+      body {{ font-family: Inter, Arial, sans-serif; background:#0b1020; color:#e9eefb; margin:0; }}
+      .wrap {{ max-width:1400px; margin:0 auto; padding:20px; }}
+      .grid {{ display:grid; grid-template-columns: repeat(4, 1fr); gap:12px; }}
+      .card {{ background:#141b34; border:1px solid #27325c; border-radius:10px; padding:14px; }}
+      .k {{ color:#98a4ce; font-size:12px; text-transform:uppercase; }} .v {{ font-size:26px; font-weight:700; }}
+      table {{ width:100%; border-collapse:collapse; font-size:12px; }} td,th {{ border-bottom:1px solid #253057; padding:8px; text-align:left; }}
+    </style></head><body><div class="wrap">
+      <h2>Crypto Intraday Monitoring Dashboard</h2>
+      <div>Build: {snap.get("build","")} | Snapshot: {snap.get("snapshot_utc","")} | Status: <b>{readiness}</b></div><br/>
+      <div class="grid">
+        <div class="card"><div class="k">Net PnL (window)</div><div class="v">{net_pnl}</div></div>
+        <div class="card"><div class="k">Trades</div><div class="v">{trades}</div></div>
+        <div class="card"><div class="k">Win Rate</div><div class="v">{wr}</div></div>
+        <div class="card"><div class="k">Avg Net Edge (bps)</div><div class="v">{avg_net_edge}</div></div>
+        <div class="card"><div class="k">Maker Share</div><div class="v">{maker_share}</div></div>
+        <div class="card"><div class="k">Entry Reject Rate</div><div class="v">{_pct(ops.get("entry_reject_rate") or 0.0,1)}</div></div>
+        <div class="card"><div class="k">Execution Slippage (bps)</div><div class="v">{_fmt(exec_truth.get("avg_slippage_bps"),1)}</div></div>
+        <div class="card"><div class="k">Open Plans</div><div class="v">{len(snap.get("open_plans") or [])}</div></div>
+      </div><br/>
+      <div class="grid">
+        <div class="card"><div class="k">Strategy Truth</div><pre>{json.dumps(strategy_truth, indent=2)}</pre></div>
+        <div class="card"><div class="k">Regime Expectancy</div><pre>{json.dumps(regime_truth, indent=2)}</pre></div>
+        <div class="card" style="grid-column: span 2;"><div class="k">Recent Trades</div>
+          <table><thead><tr><th>UTC</th><th>Symbol</th><th>Side</th><th>Net PnL</th><th>Fees</th><th>Net Edge bps</th></tr></thead><tbody>{table_rows}</tbody></table>
+        </div>
+      </div>
+    </div></body></html>
+    """
+    return HTMLResponse(content=html)
+    
+    
 @app.get("/performance")
 def performance(days: float = 30.0, recent_limit: int = 25):
     return _performance_snapshot(days=days, recent_limit=recent_limit)
