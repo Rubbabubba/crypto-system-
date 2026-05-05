@@ -482,13 +482,18 @@ def _live_promotion_guardrails_snapshot(compatibility: dict[str, Any] | None = N
 
     release_stage = str(PATCH_BUILD.get("release_stage_configured") or "paper")
     live_stage_requested = release_stage == "live"
+    allow_degraded_scanner_in_paper = _env_bool("ALLOW_DEGRADED_SCANNER_IN_PAPER", True)
     scanner_alignment_enabled = bool(scanner_contract.get("btc_only_live_alignment", {}).get("alignment_enabled") or btc_alignment.get("scanner_alignment_enabled"))
+    degraded_scanner_mode_active = bool((not live_stage_requested) and allow_degraded_scanner_in_paper and not bool((compatibility or {}).get("scanner_ok")))
+    effective_scanner_ready = bool((compatibility or {}).get("scanner_ok")) or degraded_scanner_mode_active
+    effective_btc_alignment_ready = bool(btc_alignment.get("alignment_ready")) or degraded_scanner_mode_active
+    effective_scanner_alignment_enabled = bool(scanner_alignment_enabled) or degraded_scanner_mode_active
 
     checks = {
         "release_stage_live": live_stage_requested,
         "readiness_green": bool((compatibility or {}).get("contract_compatible")) and bool(gate.get("gate_open")),
-        "btc_only_alignment_ready": bool(btc_alignment.get("alignment_ready")),
-        "scanner_ready": bool((compatibility or {}).get("scanner_ok")),
+        "btc_only_alignment_ready": effective_btc_alignment_ready,
+        "scanner_ready": effective_scanner_ready,
         "workers_healthy": not bool((gate.get("worker_health") or {}).get("overall_stale")),
         "open_orders_clear": int(open_orders.get("count") or 0) == 0,
         "positions_clear": len(positions or []) == 0,
@@ -499,10 +504,13 @@ def _live_promotion_guardrails_snapshot(compatibility: dict[str, Any] | None = N
         "kraken_key_present": bool(os.getenv("KRAKEN_API_KEY")),
         "kraken_secret_present": bool(os.getenv("KRAKEN_API_SECRET")),
         "scanner_url_present": bool(os.getenv("SCANNER_URL")),
-        "scanner_alignment_enabled": scanner_alignment_enabled,
+        "scanner_alignment_enabled": effective_scanner_alignment_enabled,
         "live_validation_mode_enabled": _env_bool("LIVE_VALIDATION_MODE", True),
         "execution_canary_enabled": _env_bool("EXECUTION_CANARY_ENABLED", False),
+        "degraded_scanner_mode_active": degraded_scanner_mode_active,
     }
+    if degraded_scanner_mode_active:
+        checks["readiness_green"] = bool(gate.get("gate_open"))
 
     blockers = []
     if not checks["readiness_green"]:
@@ -533,6 +541,8 @@ def _live_promotion_guardrails_snapshot(compatibility: dict[str, Any] | None = N
         blockers.append("scanner_url_missing")
     if not checks["scanner_alignment_enabled"]:
         blockers.append("scanner_alignment_disabled")
+    if degraded_scanner_mode_active:
+        blockers = [b for b in blockers if b not in ("scanner_not_ready", "btc_alignment_not_ready", "scanner_alignment_disabled")]    
 
     env_guidance = {
         "release_stage": release_stage,
@@ -553,6 +563,10 @@ def _live_promotion_guardrails_snapshot(compatibility: dict[str, Any] | None = N
                 "Do not enable multi-symbol admission yet.",
                 "Do not disable fee/churn guardrails for Path B.",
             ],
+            "paper_degraded_mode": [
+                "ALLOW_DEGRADED_SCANNER_IN_PAPER=1 allows paper-mode operation when scanner is unavailable.",
+                "Degraded paper mode is never applied when RELEASE_STAGE=live.",
+            ],
         },
     }
 
@@ -569,6 +583,8 @@ def _live_promotion_guardrails_snapshot(compatibility: dict[str, Any] | None = N
         "checks": checks,
         "promotion_blockers": blockers,
         "promotion_ready": len(blockers) == 0,
+        "degraded_scanner_mode_active": degraded_scanner_mode_active,
+        "degraded_scanner_mode_reason": "paper_mode_scanner_unavailable" if degraded_scanner_mode_active else "",
         "compatibility_reason": (compatibility or {}).get("compatibility_reason"),
         "scanner_contract": scanner_contract,
         "btc_only_live_alignment": btc_alignment,
