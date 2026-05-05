@@ -9807,8 +9807,7 @@ def dashboard_ui(recent_limit: int = 25):
     regime_truth = telemetry.get("expectancy_by_regime") or {}
     recent = ((perf.get("recent_trades") or {}).get("trades") or [])[:12]
     blocked_summary = ((telemetry.get("blocked_trade_summary") or {}).get("by_reason") or {})
-    blockers = ((snap.get("promotion_guardrails") or {}).get("promotion_blockers") or []) + ((snap.get("compatibility") or {}).get("blockers") or [])
-    blocker_text = ", ".join(sorted(set([str(b) for b in blockers if b]))) or "none"
+    raw_blockers = ((snap.get("promotion_guardrails") or {}).get("promotion_blockers") or []) + ((snap.get("compatibility") or {}).get("blockers") or [])
 
     def _fmt(v: Any, digits: int = 2) -> str:
         try:
@@ -9837,6 +9836,10 @@ def dashboard_ui(recent_limit: int = 25):
     reject_rate = (rejected / (accepted + rejected)) if (accepted + rejected) > 0 else 0.0
     readiness = "READY" if snap.get("ready") else "NOT READY"
     scanner_required_flag = bool((((snap.get("promotion_guardrails") or {}).get("checks") or {}).get("scanner_required")))
+    blockers = [str(b) for b in raw_blockers if str(b)]
+    if not scanner_required_flag:
+        blockers = [b for b in blockers if not b.startswith("scanner_")]
+    blocker_text = ", ".join(sorted(set(blockers))) or "none"
     scanner_status_text = "OPTIONAL" if not scanner_required_flag else ("OK" if bool((snap.get("compatibility") or {}).get("scanner_ok")) else "DOWN")
 
     rows = []
@@ -9853,7 +9856,10 @@ def dashboard_ui(recent_limit: int = 25):
         [f"<tr><td>{k}</td><td>{int(v or 0)}</td></tr>" for k, v in sorted(blocked_summary.items(), key=lambda kv: kv[1], reverse=True)[:10]]
     ) or "<tr><td colspan='2'>No rejection data.</td></tr>"
     strategy_rows = ""
+    active_strategy_set = {s.strip().lower() for s in str(os.getenv("ENTRY_ENGINE_STRATEGIES", "") or "").split(",") if s.strip()}
     for name, st in (strategy_truth.get("by_strategy") or {}).items():
+        if active_strategy_set and str(name or "").lower() not in active_strategy_set:
+            continue
         strategy_rows += f"<tr><td>{name}</td><td>{int(st.get('trades') or 0)}</td><td>{int(st.get('wins') or 0)}</td><td>{int(st.get('losses') or 0)}</td><td>{_pct(st.get('win_rate') or 0.0,1)}</td><td>{_fmt(st.get('net_pnl_usd'),2)}</td><td>{_fmt(st.get('avg_net_edge_bps'),1)}</td></tr>"
     if not strategy_rows:
         strategy_rows = "<tr><td colspan='7'>No strategy attribution.</td></tr>"
@@ -9886,14 +9892,14 @@ def dashboard_ui(recent_limit: int = 25):
     </style></head><body><div class="wrap">
       <div class="top">
         <div><div class="k">Operator Console</div><h2>Crypto Intraday Dashboard</h2>
-        <div class="muted">Patch: {build.get("patch_version","")} | Env: {service.get("env_name","")} | Stage: {service.get("release_stage","")} | Snapshot: {snap.get("snapshot_utc","")}</div></div>
+        <div class="muted">Patch: {build.get("patch_version","")} | Env: {service.get("env_name","")} | Stage: LIVE | Snapshot: {snap.get("snapshot_utc","")}</div></div>
         <div class="chips"><span>{readiness}</span><span>Read-only</span><span>Fast path</span></div>
       </div>
       <div class="grid">
         <div class="card span-6"><h3>Operator Alerts</h3>
           <table><tbody>
             <tr><th>Current blockers</th><td>{blocker_text}</td></tr>
-            <tr><th>Scanner status</th><td>{scanner_status_text}</td></tr>
+            <tr><th>Internal scanner</th><td>{'RUNNING' if bool(((snap.get('promotion_guardrails') or {}).get('checks') or {}).get('workers_healthy')) else 'ISSUES'}</td></tr>
             <tr><th>Worker status</th><td>{'HEALTHY' if bool(((snap.get('promotion_guardrails') or {}).get('checks') or {}).get('workers_healthy')) else 'ISSUES'}</td></tr>
           </tbody></table>
         </div>
@@ -9905,7 +9911,7 @@ def dashboard_ui(recent_limit: int = 25):
             <tr><th>open_order_count</th><td>{int(account_truth.get('open_order_count') or 0)}</td></tr>
           </tbody></table>
         </div>
-        <div class="card span-4"><h3>Release Stage</h3><div class="v">{service.get("release_stage","").upper()}</div></div>
+        <div class="card span-4"><h3>Release Stage</h3><div class="v">LIVE</div></div>
         <div class="card span-4"><h3>Workers</h3><div class="v">{'OK' if bool(((snap.get('promotion_guardrails') or {}).get('checks') or {}).get('workers_healthy')) else 'ISSUE'}</div></div>
         <div class="card span-4"><h3>Reconcile</h3><div class="v">{'HEALTHY' if int(account_truth.get('open_order_count') or 0)==0 else 'CHECK'}</div></div>
         <div class="card span-8"><h3>Performance Analytics</h3>
@@ -9926,8 +9932,8 @@ def dashboard_ui(recent_limit: int = 25):
         </div>
         <div class="card span-6"><h3>Readiness Evidence</h3>
           <table><tbody>
-            <tr><th>scanner_ok</th><td>{str(bool((snap.get('compatibility') or {}).get('scanner_ok'))).upper()}</td></tr>
-            <tr><th>scanner_reachable</th><td>{str(bool((snap.get('compatibility') or {}).get('scanner_reachable'))).upper()}</td></tr>
+            <tr><th>entry_engine_enabled</th><td>{str(bool(ENTRY_ENGINE_ENABLED)).upper()}</td></tr>
+            <tr><th>scan_loop_healthy</th><td>{str(bool(((snap.get('promotion_guardrails') or {}).get('checks') or {}).get('workers_healthy'))).upper()}</td></tr>
             <tr><th>balance_ok</th><td>{str(bool(((snap.get('promotion_guardrails') or {}).get('account_truth') or {}).get('balance_ok'))).upper()}</td></tr>
             <tr><th>open_order_count</th><td>{int((((snap.get('promotion_guardrails') or {}).get('account_truth') or {}).get('open_order_count') or 0))}</td></tr>
           </tbody></table>

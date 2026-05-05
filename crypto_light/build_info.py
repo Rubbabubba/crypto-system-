@@ -41,7 +41,7 @@ def get_env_name() -> str:
 
 
 def get_release_stage() -> str:
-    return str(os.getenv("RELEASE_STAGE", os.getenv("RELEASE_STAGE_CONFIGURED", "paper")) or "paper")
+    return str(os.getenv("RELEASE_STAGE", os.getenv("RELEASE_STAGE_CONFIGURED", "live")) or "live")
 
 
 def build_payload(expected_files: list[str] | None = None) -> dict:
