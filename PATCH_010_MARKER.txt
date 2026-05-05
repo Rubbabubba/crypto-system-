@@ -1,0 +1,3 @@
+Patch 010: active admission truth.
+
+Makes dashboard rejection totals and recent trades reflect the active deployment window instead of falling back to old trade/admission history.
