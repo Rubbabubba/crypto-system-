@@ -1,3 +1,0 @@
-Patch 008: active edge decay monitor.
-
-Adds projected-vs-realized edge decay telemetry and dashboard/diagnostic visibility for current active intraday strategies.
