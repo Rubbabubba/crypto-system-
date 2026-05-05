@@ -9662,7 +9662,11 @@ def _performance_snapshot(days: float = 30.0, recent_limit: int = 25) -> dict[st
         )
     except Exception as e:
         active_window = {"ok": False, "error": f"{type(e).__name__}: {e}", "since_ts": active_since_ts}
-    active_edge_decay = dict((active_window or {}).get("edge_decay") or {})    
+    active_edge_decay = dict((active_window or {}).get("edge_decay") or {})
+    try:
+        active_admission_summary = lifecycle_db.summarize_admission_events(since_ts=active_since_ts)
+    except Exception as e:
+        active_admission_summary = {"ok": False, "error": f"{type(e).__name__}: {e}", "since_ts": active_since_ts}    
 
     return {
         "ok": True,
@@ -9699,6 +9703,7 @@ def _performance_snapshot(days: float = 30.0, recent_limit: int = 25) -> dict[st
         "live_validation": validation,
         "active_window": active_window,
         "active_edge_decay": active_edge_decay,
+        "active_admission_summary": active_admission_summary,
     }
 
 
@@ -9828,15 +9833,16 @@ def dashboard_ui(recent_limit: int = 25):
     pnl = perf.get("pnl") or {}
     telemetry = pnl.get("telemetry_window") or {}
     active_window = perf.get("active_window") or {}
+    active_admission_summary = perf.get("active_admission_summary") or {}
     edge_decay = perf.get("active_edge_decay") or ((active_window.get("edge_decay") or {}) or (telemetry.get("edge_decay") or {}))
     ops = telemetry.get("operations_health") or {}
     exec_truth = telemetry.get("execution_truth") or {}
     maker_taker = telemetry.get("maker_vs_taker") or {}
     strategy_truth = (active_window.get("strategy_truth") or telemetry.get("strategy_truth") or {})
     regime_truth = (active_window.get("expectancy_by_regime") or telemetry.get("expectancy_by_regime") or {})
-    active_recent = [ _serialize_recent_trade(dict(r)) for r in (active_window.get("recent_trades") or []) ]
-    recent = (active_recent or ((perf.get("recent_trades") or {}).get("trades") or []))[:12]
-    blocked_summary = ((telemetry.get("blocked_trade_summary") or {}).get("by_reason") or {})
+    active_recent = [_serialize_recent_trade(dict(r)) for r in (active_window.get("recent_trades") or [])]
+    recent = (active_recent if active_window.get("ok") else ((perf.get("recent_trades") or {}).get("trades") or []))[:12]
+    blocked_summary = ((active_admission_summary.get("by_reason") or {}) or ((telemetry.get("blocked_trade_summary") or {}).get("by_reason") or {}))
     raw_blockers = ((snap.get("promotion_guardrails") or {}).get("promotion_blockers") or []) + ((snap.get("compatibility") or {}).get("blockers") or [])
 
     def _fmt(v: Any, digits: int = 2) -> str:
@@ -9861,8 +9867,9 @@ def dashboard_ui(recent_limit: int = 25):
     other_cnt = float(entry_roles.get("unknown") or entry_roles.get("other") or 0.0)
     denom = maker_cnt + taker_cnt + other_cnt
     maker_share = _pct((maker_cnt / denom) if denom > 0 else 0.0, 1)
-    accepted = float(((telemetry.get("blocked_trade_summary") or {}).get("by_result") or {}).get("accepted") or 0.0)
-    rejected = float(((telemetry.get("blocked_trade_summary") or {}).get("by_result") or {}).get("rejected") or 0.0)
+    admission_result = ((active_admission_summary.get("by_result") or {}) or ((telemetry.get("blocked_trade_summary") or {}).get("by_result") or {}))
+    accepted = float(admission_result.get("accepted") or 0.0)
+    rejected = float(admission_result.get("rejected") or 0.0)
     reject_rate = (rejected / (accepted + rejected)) if (accepted + rejected) > 0 else 0.0
     readiness = "READY" if snap.get("ready") else "NOT READY"
     scanner_required_flag = bool((((snap.get("promotion_guardrails") or {}).get("checks") or {}).get("scanner_required")))
@@ -10023,6 +10030,20 @@ def diagnostics_execution_truth(days: float = 30.0):
     }
 
 
+@app.get("/diagnostics/active_admission")
+def diagnostics_active_admission(limit: int = 100):
+    since_ts = _active_telemetry_since_ts()
+    return {
+        "ok": True,
+        "utc": utc_now_iso(),
+        "build": PATCH_BUILD,
+        "active_since_ts": since_ts,
+        "active_strategies": list(ENTRY_ENGINE_STRATEGIES_LIST),
+        "summary": lifecycle_db.summarize_admission_events(since_ts=since_ts),
+        "events": lifecycle_db.list_recent_admission_events(since_ts=since_ts, limit=limit),
+    }
+
+
 @app.get("/diagnostics/edge_decay")
 def diagnostics_edge_decay(days: float = 30.0):
     return {
@@ -10034,7 +10055,7 @@ def diagnostics_edge_decay(days: float = 30.0):
         "active_since_ts": _active_telemetry_since_ts(),
         "edge_decay": telemetry_db.edge_decay_summary(days=days, strategies=list(ENTRY_ENGINE_STRATEGIES_LIST), since_ts=_active_telemetry_since_ts()),
     }
-    
+
 
 @app.get("/diagnostics/universe_control")
 def diagnostics_universe_control(days: float = 30.0):
