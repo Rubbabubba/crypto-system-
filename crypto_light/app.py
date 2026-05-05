@@ -9779,7 +9779,10 @@ def dashboard_ui(recent_limit: int = 25):
     maker_taker = telemetry.get("maker_vs_taker") or {}
     strategy_truth = telemetry.get("strategy_truth") or {}
     regime_truth = telemetry.get("expectancy_by_regime") or {}
-    recent = (pnl.get("recent_trades") or [])[:12]
+    recent = ((perf.get("recent_trades") or {}).get("trades") or [])[:12]
+    blocked_summary = ((telemetry.get("blocked_trade_summary") or {}).get("by_reason") or {})
+    blockers = ((snap.get("promotion_guardrails") or {}).get("promotion_blockers") or []) + ((snap.get("compatibility") or {}).get("blockers") or [])
+    blocker_text = ", ".join(sorted(set([str(b) for b in blockers if b]))) or "none"
 
     def _fmt(v: Any, digits: int = 2) -> str:
         try:
@@ -9807,6 +9810,9 @@ def dashboard_ui(recent_limit: int = 25):
             f"<td>{_fmt(t.get('net_pnl'),2)}</td><td>{_fmt(t.get('fee_usd'),2)}</td><td>{_fmt(t.get('net_edge_bps'),1)}</td></tr>"
         )
     table_rows = "".join(rows) or "<tr><td colspan='6'>No recent trades.</td></tr>"
+    reject_rows = "".join(
+        [f"<tr><td>{k}</td><td>{int(v or 0)}</td></tr>" for k, v in sorted(blocked_summary.items(), key=lambda kv: kv[1], reverse=True)[:10]]
+    ) or "<tr><td colspan='2'>No rejection data.</td></tr>"
 
     label_color = "#a9d6ff"
     html = f"""
@@ -9845,7 +9851,19 @@ def dashboard_ui(recent_limit: int = 25):
             <tr><th>ready</th><td class="{'status-ok' if snap.get('ready') else 'status-bad'}">{str(bool(snap.get('ready'))).upper()}</td></tr>
             <tr><th>promotion_ready</th><td>{str(bool(snap.get('promotion_ready'))).upper()}</td></tr>
             <tr><th>trade_gate_ok</th><td>{str(bool((snap.get('pretrade_health_gate') or {}).get('ok'))).upper()}</td></tr>
+            <tr><th>current_blockers</th><td>{blocker_text}</td></tr>
           </tbody></table>
+        </div>
+        <div class="card span-6"><h3>Readiness Evidence</h3>
+          <table><tbody>
+            <tr><th>scanner_ok</th><td>{str(bool((snap.get('compatibility') or {}).get('scanner_ok'))).upper()}</td></tr>
+            <tr><th>scanner_reachable</th><td>{str(bool((snap.get('compatibility') or {}).get('scanner_reachable'))).upper()}</td></tr>
+            <tr><th>balance_ok</th><td>{str(bool(((snap.get('promotion_guardrails') or {}).get('account_truth') or {}).get('balance_ok'))).upper()}</td></tr>
+            <tr><th>open_order_count</th><td>{int((((snap.get('promotion_guardrails') or {}).get('account_truth') or {}).get('open_order_count') or 0))}</td></tr>
+          </tbody></table>
+        </div>
+        <div class="card span-6"><h3>Rejection Totals</h3>
+          <table><thead><tr><th>Reason</th><th>Count</th></tr></thead><tbody>{reject_rows}</tbody></table>
         </div>
         <div class="card span-6"><h3>Strategy Attribution</h3><pre>{json.dumps(strategy_truth, indent=2)}</pre></div>
         <div class="card span-6"><h3>Regime Expectancy</h3><pre>{json.dumps(regime_truth, indent=2)}</pre></div>
