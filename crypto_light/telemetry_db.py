@@ -673,6 +673,7 @@ def summary(days: float = 30.0) -> Dict[str, Any]:
         "expectancy_by_hold_bucket": _group_stats(rec, 'hold_bucket'),
         "expectancy_by_regime": _group_stats(rec, 'regime_state'),
         "blocked_trade_summary": blocked,
+        "edge_decay": edge_decay_summary(days=float(days)),
         "latest_closed_ts": rec[0].get("closed_ts") if rec else None,
         "open_trades": len(trade_journal.list_open_trades(limit=5000)),
     }
@@ -682,7 +683,7 @@ def _mean(vals: List[float]) -> Optional[float]:
     return (sum(vals) / len(vals)) if vals else None
 
 
-def edge_decay_summary(days: float = 30.0, strategies: Optional[List[str]] = None) -> Dict[str, Any]:
+def edge_decay_summary(days: float = 30.0, strategies: Optional[List[str]] = None, since_ts: Optional[float] = None) -> Dict[str, Any]:
     """Compare projected edge at entry with realized net edge after close.
 
     Decay is realized edge minus projected edge, in bps. Negative values mean
@@ -692,6 +693,11 @@ def edge_decay_summary(days: float = 30.0, strategies: Optional[List[str]] = Non
     init_db()
     sync_from_trade_journal(limit=5000)
     since = time.time() - max(0.0, float(days)) * 86400.0
+    if since_ts is not None:
+        try:
+            since = max(float(since), float(since_ts))
+        except Exception:
+            pass
     strategy_set = {str(s or '').strip().lower() for s in (strategies or []) if str(s or '').strip()}
     with _connect() as conn:
         rows = conn.execute(
@@ -749,6 +755,7 @@ def edge_decay_summary(days: float = 30.0, strategies: Optional[List[str]] = Non
         'ok': True,
         'days': float(days),
         'strategies': sorted(strategy_set),
+        'since_ts': float(since),
         'closed_trades_considered': len(rec),
         'projected_samples': len(decay_vals),
         'projected_coverage_pct': (len(decay_vals) / len(rec)) if rec else 0.0,
@@ -759,6 +766,56 @@ def edge_decay_summary(days: float = 30.0, strategies: Optional[List[str]] = Non
         'avg_realized_edge_bps': _mean(realized_vals),
         'avg_edge_decay_bps': avg_decay,
         'by_strategy': strategy_out,
+    }
+
+
+def active_window_summary(
+    days: float = 30.0,
+    strategies: Optional[List[str]] = None,
+    since_ts: Optional[float] = None,
+    recent_limit: int = 25,
+) -> Dict[str, Any]:
+    """Summarize only current active-strategy telemetry for the active build window."""
+    init_db()
+    sync_from_trade_journal(limit=5000)
+    since = time.time() - max(0.0, float(days)) * 86400.0
+    if since_ts is not None:
+        try:
+            since = max(float(since), float(since_ts))
+        except Exception:
+            pass
+    strategy_set = {str(s or '').strip().lower() for s in (strategies or []) if str(s or '').strip()}
+    with _connect() as conn:
+        rows = conn.execute(
+            "SELECT * FROM trade_telemetry WHERE closed_ts >= ? ORDER BY closed_ts DESC",
+            (since,),
+        ).fetchall()
+    rec = [dict(r) for r in rows]
+    if strategy_set:
+        rec = [r for r in rec if str(r.get('strategy') or '').strip().lower() in strategy_set]
+
+    net_vals = [float(r.get('net_pnl_usd') or 0.0) for r in rec]
+    fees_vals = [float(r.get('fees_total') or 0.0) for r in rec]
+    realized_edge_vals = [float(r['net_edge_bps']) for r in rec if r.get('net_edge_bps') is not None]
+    wins = sum(1 for r in rec if float(r.get('net_pnl_usd') or 0.0) > 0.0)
+    losses = sum(1 for r in rec if float(r.get('net_pnl_usd') or 0.0) < 0.0)
+
+    return {
+        'ok': True,
+        'days': float(days),
+        'since_ts': float(since),
+        'strategies': sorted(strategy_set),
+        'closed_trades': len(rec),
+        'wins': wins,
+        'losses': losses,
+        'win_rate': (float(wins) / float(wins + losses)) if (wins + losses) > 0 else None,
+        'net_pnl_usd': sum(net_vals),
+        'fees_total_usd': sum(fees_vals),
+        'avg_realized_edge_bps': _mean(realized_edge_vals),
+        'strategy_truth': _strategy_truth_summary(rec),
+        'expectancy_by_regime': _group_stats(rec, 'regime_state'),
+        'edge_decay': edge_decay_summary(days=days, strategies=strategies, since_ts=since),
+        'recent_trades': rec[:max(1, int(recent_limit))],
     }
     
     

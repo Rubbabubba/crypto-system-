@@ -9602,6 +9602,24 @@ def _serialize_recent_trade(row: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _active_telemetry_since_ts() -> float | None:
+    raw_ts = str(os.getenv("ACTIVE_TELEMETRY_START_TS", "") or "").strip()
+    if raw_ts:
+        try:
+            return float(raw_ts)
+        except Exception:
+            pass
+    raw_utc = str(os.getenv("ACTIVE_TELEMETRY_START_UTC", "") or "").strip()
+    if not raw_utc:
+        raw_utc = str((PATCH_BUILD or {}).get("build_timestamp_utc") or "").strip()
+    if not raw_utc:
+        return None
+    try:
+        return datetime.fromisoformat(raw_utc.replace("Z", "+00:00")).timestamp()
+    except Exception:
+        return None
+
+
 def _performance_snapshot(days: float = 30.0, recent_limit: int = 25) -> dict[str, Any]:
     positions = get_positions()
     open_notional = sum(_safe_float(p.get("notional_usd")) for p in positions)
@@ -9634,10 +9652,17 @@ def _performance_snapshot(days: float = 30.0, recent_limit: int = 25) -> dict[st
         validation = telemetry_db.live_validation_summary()
     except Exception:
         validation = {"ok": False}
+    active_since_ts = _active_telemetry_since_ts()
     try:
-        active_edge_decay = telemetry_db.edge_decay_summary(days=float(days), strategies=list(ENTRY_ENGINE_STRATEGIES_LIST))
+        active_window = telemetry_db.active_window_summary(
+            days=float(days),
+            strategies=list(ENTRY_ENGINE_STRATEGIES_LIST),
+            since_ts=active_since_ts,
+            recent_limit=max(1, int(recent_limit)),
+        )
     except Exception as e:
-        active_edge_decay = {"ok": False, "error": f"{type(e).__name__}: {e}"}    
+        active_window = {"ok": False, "error": f"{type(e).__name__}: {e}", "since_ts": active_since_ts}
+    active_edge_decay = dict((active_window or {}).get("edge_decay") or {})    
 
     return {
         "ok": True,
@@ -9672,6 +9697,7 @@ def _performance_snapshot(days: float = 30.0, recent_limit: int = 25) -> dict[st
             "trades": recent,
         },
         "live_validation": validation,
+        "active_window": active_window,
         "active_edge_decay": active_edge_decay,
     }
 
@@ -9801,13 +9827,15 @@ def dashboard_ui(recent_limit: int = 25):
     perf = snap.get("performance") or {}
     pnl = perf.get("pnl") or {}
     telemetry = pnl.get("telemetry_window") or {}
-    edge_decay = perf.get("active_edge_decay") or (telemetry.get("edge_decay") or {})
+    active_window = perf.get("active_window") or {}
+    edge_decay = perf.get("active_edge_decay") or ((active_window.get("edge_decay") or {}) or (telemetry.get("edge_decay") or {}))
     ops = telemetry.get("operations_health") or {}
     exec_truth = telemetry.get("execution_truth") or {}
     maker_taker = telemetry.get("maker_vs_taker") or {}
-    strategy_truth = telemetry.get("strategy_truth") or {}
-    regime_truth = telemetry.get("expectancy_by_regime") or {}
-    recent = ((perf.get("recent_trades") or {}).get("trades") or [])[:12]
+    strategy_truth = (active_window.get("strategy_truth") or telemetry.get("strategy_truth") or {})
+    regime_truth = (active_window.get("expectancy_by_regime") or telemetry.get("expectancy_by_regime") or {})
+    active_recent = [ _serialize_recent_trade(dict(r)) for r in (active_window.get("recent_trades") or []) ]
+    recent = (active_recent or ((perf.get("recent_trades") or {}).get("trades") or []))[:12]
     blocked_summary = ((telemetry.get("blocked_trade_summary") or {}).get("by_reason") or {})
     raw_blockers = ((snap.get("promotion_guardrails") or {}).get("promotion_blockers") or []) + ((snap.get("compatibility") or {}).get("blockers") or [])
 
@@ -9823,10 +9851,10 @@ def dashboard_ui(recent_limit: int = 25):
         except Exception:
             return "0.00%"
 
-    net_pnl = _fmt((pnl.get("journal_window") or {}).get("net_pnl_usd"))
-    trades = int((pnl.get("journal_window") or {}).get("closed_trades") or 0)
-    wr = _pct((pnl.get("win_rate") or 0.0), 1)
-    avg_net_edge = _fmt(telemetry.get("avg_realized_edge_bps"), 1)
+    net_pnl = _fmt(active_window.get("net_pnl_usd") if active_window.get("ok") else (pnl.get("journal_window") or {}).get("net_pnl_usd"))
+    trades = int((active_window.get("closed_trades") if active_window.get("ok") else (pnl.get("journal_window") or {}).get("closed_trades")) or 0)
+    wr = _pct((active_window.get("win_rate") if active_window.get("ok") else (pnl.get("win_rate") or 0.0)) or 0.0, 1)
+    avg_net_edge = _fmt(active_window.get("avg_realized_edge_bps") if active_window.get("ok") else telemetry.get("avg_realized_edge_bps"), 1)
     entry_roles = (telemetry.get("execution_truth") or {}).get("entry_roles") or {}
     maker_cnt = float(entry_roles.get("maker") or 0.0)
     taker_cnt = float(entry_roles.get("taker") or 0.0)
@@ -10003,7 +10031,8 @@ def diagnostics_edge_decay(days: float = 30.0):
         "build": PATCH_BUILD,
         "days": float(days),
         "active_strategies": list(ENTRY_ENGINE_STRATEGIES_LIST),
-        "edge_decay": telemetry_db.edge_decay_summary(days=days, strategies=list(ENTRY_ENGINE_STRATEGIES_LIST)),
+        "active_since_ts": _active_telemetry_since_ts(),
+        "edge_decay": telemetry_db.edge_decay_summary(days=days, strategies=list(ENTRY_ENGINE_STRATEGIES_LIST), since_ts=_active_telemetry_since_ts()),
     }
     
 
