@@ -480,23 +480,25 @@ def _live_promotion_guardrails_snapshot(compatibility: dict[str, Any] | None = N
     positions = get_positions()
     live_validation = telemetry_db.live_validation_summary()
 
-    release_stage = str(PATCH_BUILD.get("release_stage_configured") or "paper")
+    release_stage = str(PATCH_BUILD.get("release_stage_configured") or "live")
     live_stage_requested = release_stage == "live"
-    allow_degraded_scanner_in_paper = _env_bool("ALLOW_DEGRADED_SCANNER_IN_PAPER", True)
+    allow_optional_external_scanner = _env_bool("ALLOW_OPTIONAL_EXTERNAL_SCANNER", True)
     scanner_required = any([
         _env_bool("SCANNER_DRIVEN_UNIVERSE", False),
         _env_bool("SCANNER_SOFT_ALLOW", False),
         _env_bool("ALLOW_SCANNER_NEW_SYMBOLS", False),
     ])
     scanner_alignment_enabled = bool(scanner_contract.get("btc_only_live_alignment", {}).get("alignment_enabled") or btc_alignment.get("scanner_alignment_enabled"))
-    degraded_scanner_mode_active = bool((not live_stage_requested) and allow_degraded_scanner_in_paper and not bool((compatibility or {}).get("scanner_ok")))
+    degraded_scanner_mode_active = bool((not live_stage_requested) and allow_optional_external_scanner and not bool((compatibility or {}).get("scanner_ok")))
     effective_scanner_ready = (not scanner_required) or bool((compatibility or {}).get("scanner_ok")) or degraded_scanner_mode_active
     effective_btc_alignment_ready = (not scanner_required) or bool(btc_alignment.get("alignment_ready")) or degraded_scanner_mode_active
     effective_scanner_alignment_enabled = (not scanner_required) or bool(scanner_alignment_enabled) or degraded_scanner_mode_active
 
+    readiness_green = bool(gate.get("gate_open")) if (degraded_scanner_mode_active or (not scanner_required)) else (bool((compatibility or {}).get("contract_compatible")) and bool(gate.get("gate_open")))
+
     checks = {
         "release_stage_live": live_stage_requested,
-        "readiness_green": bool((compatibility or {}).get("contract_compatible")) and bool(gate.get("gate_open")),
+        "readiness_green": readiness_green,
         "btc_only_alignment_ready": effective_btc_alignment_ready,
         "scanner_ready": effective_scanner_ready,
         "workers_healthy": not bool((gate.get("worker_health") or {}).get("overall_stale")),
@@ -515,9 +517,6 @@ def _live_promotion_guardrails_snapshot(compatibility: dict[str, Any] | None = N
         "degraded_scanner_mode_active": degraded_scanner_mode_active,
         "scanner_required": scanner_required,
     }
-    if degraded_scanner_mode_active:
-        checks["readiness_green"] = bool(gate.get("gate_open"))
-
     blockers = []
     if not checks["readiness_green"]:
         blockers.append("system_not_ready")
@@ -548,15 +547,13 @@ def _live_promotion_guardrails_snapshot(compatibility: dict[str, Any] | None = N
     if not checks["scanner_alignment_enabled"]:
         blockers.append("scanner_alignment_disabled")
     if degraded_scanner_mode_active or (not scanner_required):
-        blockers = [b for b in blockers if b not in ("scanner_not_ready", "btc_alignment_not_ready", "scanner_alignment_disabled", "scanner_url_missing")]    
+        blockers = [b for b in blockers if b not in ("scanner_not_ready", "btc_alignment_not_ready", "scanner_alignment_disabled", "scanner_url_missing")]
 
     env_guidance = {
         "release_stage": release_stage,
         "recommended_env_changes_for_live": {
             "main": [
-                "Set RELEASE_STAGE=live when you are ready to cut over from paper-label mode.",
                 "Keep TRADING_ENABLED=1.",
-                "Keep SCANNER_URL set to your scanner service.",
                 "Keep WORKER_SECRET and WEBHOOK_SECRET populated.",
                 "Use live Kraken API credentials in KRAKEN_API_KEY and KRAKEN_API_SECRET.",
             ],
@@ -569,9 +566,8 @@ def _live_promotion_guardrails_snapshot(compatibility: dict[str, Any] | None = N
                 "Do not enable multi-symbol admission yet.",
                 "Do not disable fee/churn guardrails for Path B.",
             ],
-            "paper_degraded_mode": [
-                "ALLOW_DEGRADED_SCANNER_IN_PAPER=1 allows paper-mode operation when scanner is unavailable.",
-                "Degraded paper mode is never applied when RELEASE_STAGE=live.",
+            "integrated_scanning_mode": [
+                "ALLOW_OPTIONAL_EXTERNAL_SCANNER=1 keeps legacy external scanner checks advisory while the main service runs scanning internally.",
             ],
             "scanner_optional_mode": [
                 "When SCANNER_DRIVEN_UNIVERSE=0 and SCANNER_SOFT_ALLOW=0, scanner is treated as optional for readiness.",
@@ -594,7 +590,7 @@ def _live_promotion_guardrails_snapshot(compatibility: dict[str, Any] | None = N
         "promotion_blockers": blockers,
         "promotion_ready": len(blockers) == 0,
         "degraded_scanner_mode_active": degraded_scanner_mode_active,
-        "degraded_scanner_mode_reason": "paper_mode_scanner_unavailable" if degraded_scanner_mode_active else "",
+        "degraded_scanner_mode_reason": "external_scanner_optional_or_unavailable" if degraded_scanner_mode_active else "",
         "compatibility_reason": (compatibility or {}).get("compatibility_reason"),
         "scanner_contract": scanner_contract,
         "btc_only_live_alignment": btc_alignment,
@@ -1216,7 +1212,7 @@ if TRADE_QUALITY_OVERRIDE_ENABLED:
     TC1_TIME_EXIT_MIN_GROSS_BPS = max(float(TC1_TIME_EXIT_MIN_GROSS_BPS), 90.0)
     TC1_POST_ENTRY_PROTECT_AFTER_BPS = max(float(TC1_POST_ENTRY_PROTECT_AFTER_BPS), 60.0)
 
-# Patch 006 deliberately runs after the legacy trade-quality override so the rebuild can gather paper-trade truth.
+# Patch 006 deliberately runs after the legacy trade-quality override so the rebuild can gather live-mode trade truth.
 if PROFITABILITY_RECALIBRATION_ENABLED:
     PROFIT_FILTER_MIN_MOVE_TO_COST_MULT = float(os.getenv("PROFIT_FILTER_MIN_MOVE_TO_COST_MULT", "1.20") or 1.20)
     PROFIT_FILTER_MIN_EXPECTED_MOVE_BPS = float(os.getenv("PROFIT_FILTER_MIN_EXPECTED_MOVE_BPS", "45") or 45.0)
@@ -9638,6 +9634,10 @@ def _performance_snapshot(days: float = 30.0, recent_limit: int = 25) -> dict[st
         validation = telemetry_db.live_validation_summary()
     except Exception:
         validation = {"ok": False}
+    try:
+        active_edge_decay = telemetry_db.edge_decay_summary(days=float(days), strategies=list(ENTRY_ENGINE_STRATEGIES_LIST))
+    except Exception as e:
+        active_edge_decay = {"ok": False, "error": f"{type(e).__name__}: {e}"}    
 
     return {
         "ok": True,
@@ -9672,6 +9672,7 @@ def _performance_snapshot(days: float = 30.0, recent_limit: int = 25) -> dict[st
             "trades": recent,
         },
         "live_validation": validation,
+        "active_edge_decay": active_edge_decay,
     }
 
 
@@ -9800,6 +9801,7 @@ def dashboard_ui(recent_limit: int = 25):
     perf = snap.get("performance") or {}
     pnl = perf.get("pnl") or {}
     telemetry = pnl.get("telemetry_window") or {}
+    edge_decay = perf.get("active_edge_decay") or (telemetry.get("edge_decay") or {})
     ops = telemetry.get("operations_health") or {}
     exec_truth = telemetry.get("execution_truth") or {}
     maker_taker = telemetry.get("maker_vs_taker") or {}
@@ -9920,6 +9922,7 @@ def dashboard_ui(recent_limit: int = 25):
             <tr><th>win_rate</th><td>{wr}</td><th>avg_net_edge_bps</th><td>{avg_net_edge}</td></tr>
             <tr><th>maker_share</th><td>{maker_share}</td><th>avg_slippage_bps</th><td>{_fmt(exec_truth.get("avg_slippage_bps"),1)}</td></tr>
             <tr><th>entry_reject_rate</th><td>{_pct(reject_rate,1)}</td><th>open_plans</th><td>{len(snap.get("open_plans") or [])}</td></tr>
+            <tr><th>edge_decay_bps</th><td>{_fmt(edge_decay.get("avg_edge_decay_bps"),1)}</td><th>edge_decay_samples</th><td>{int(edge_decay.get("projected_samples") or 0)}</td></tr>
           </tbody></table>
         </div>
         <div class="card span-4"><h3>Guarded Live Path</h3>
@@ -9991,6 +9994,18 @@ def diagnostics_execution_truth(days: float = 30.0):
         'recent_trades': (snap.get('recent_trades') or {}).get('count') or 0,
     }
 
+
+@app.get("/diagnostics/edge_decay")
+def diagnostics_edge_decay(days: float = 30.0):
+    return {
+        "ok": True,
+        "utc": utc_now_iso(),
+        "build": PATCH_BUILD,
+        "days": float(days),
+        "active_strategies": list(ENTRY_ENGINE_STRATEGIES_LIST),
+        "edge_decay": telemetry_db.edge_decay_summary(days=days, strategies=list(ENTRY_ENGINE_STRATEGIES_LIST)),
+    }
+    
 
 @app.get("/diagnostics/universe_control")
 def diagnostics_universe_control(days: float = 30.0):

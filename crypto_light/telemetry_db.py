@@ -678,6 +678,90 @@ def summary(days: float = 30.0) -> Dict[str, Any]:
     }
 
 
+def _mean(vals: List[float]) -> Optional[float]:
+    return (sum(vals) / len(vals)) if vals else None
+
+
+def edge_decay_summary(days: float = 30.0, strategies: Optional[List[str]] = None) -> Dict[str, Any]:
+    """Compare projected edge at entry with realized net edge after close.
+
+    Decay is realized edge minus projected edge, in bps. Negative values mean
+    the realized trade quality came in worse than planned. Rows without a
+    projected move/cost are excluded from decay math but counted for coverage.
+    """
+    init_db()
+    sync_from_trade_journal(limit=5000)
+    since = time.time() - max(0.0, float(days)) * 86400.0
+    strategy_set = {str(s or '').strip().lower() for s in (strategies or []) if str(s or '').strip()}
+    with _connect() as conn:
+        rows = conn.execute(
+            "SELECT * FROM trade_telemetry WHERE closed_ts >= ? ORDER BY closed_ts DESC",
+            (since,),
+        ).fetchall()
+    rec = [dict(r) for r in rows]
+    if strategy_set:
+        rec = [r for r in rec if str(r.get('strategy') or '').strip().lower() in strategy_set]
+
+    projected_vals: List[float] = []
+    realized_vals: List[float] = []
+    decay_vals: List[float] = []
+    by_strategy: Dict[str, Dict[str, Any]] = {}
+
+    for r in rec:
+        projected_move = r.get('projected_move_bps')
+        projected_cost = r.get('projected_cost_bps')
+        realized_edge = r.get('net_edge_bps')
+        if projected_move is None or projected_cost is None or realized_edge is None:
+            continue
+        try:
+            projected_edge = float(projected_move) - float(projected_cost)
+            realized = float(realized_edge)
+        except Exception:
+            continue
+        decay = realized - projected_edge
+        projected_vals.append(projected_edge)
+        realized_vals.append(realized)
+        decay_vals.append(decay)
+        key = str(r.get('strategy') or 'unknown')
+        bucket = by_strategy.setdefault(key, {'samples': 0, 'projected': [], 'realized': [], 'decay': []})
+        bucket['samples'] += 1
+        bucket['projected'].append(projected_edge)
+        bucket['realized'].append(realized)
+        bucket['decay'].append(decay)
+
+    min_samples = int(float(os.getenv('EDGE_DECAY_MIN_SAMPLES', '5') or 5))
+    warn_bps = float(os.getenv('EDGE_DECAY_WARN_BPS', '-30') or -30)
+    avg_decay = _mean(decay_vals)
+    status = 'insufficient_projection_data'
+    if len(decay_vals) >= min_samples:
+        status = 'ok' if (avg_decay is not None and avg_decay >= warn_bps) else 'edge_decay_warning'
+
+    strategy_out: Dict[str, Dict[str, Any]] = {}
+    for k, b in by_strategy.items():
+        strategy_out[k] = {
+            'samples': int(b['samples']),
+            'avg_projected_edge_bps': _mean(b['projected']),
+            'avg_realized_edge_bps': _mean(b['realized']),
+            'avg_edge_decay_bps': _mean(b['decay']),
+        }
+
+    return {
+        'ok': True,
+        'days': float(days),
+        'strategies': sorted(strategy_set),
+        'closed_trades_considered': len(rec),
+        'projected_samples': len(decay_vals),
+        'projected_coverage_pct': (len(decay_vals) / len(rec)) if rec else 0.0,
+        'min_samples': min_samples,
+        'warn_bps': warn_bps,
+        'status': status,
+        'avg_projected_edge_bps': _mean(projected_vals),
+        'avg_realized_edge_bps': _mean(realized_vals),
+        'avg_edge_decay_bps': avg_decay,
+        'by_strategy': strategy_out,
+    }
+    
+    
 def live_validation_summary() -> Dict[str, Any]:
     s = summary(days=30.0)
     eth_after = _env_int("PROMOTION_ENABLE_ETH_AFTER_CLEAN_TRADES", 10)
