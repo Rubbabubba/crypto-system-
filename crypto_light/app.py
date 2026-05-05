@@ -483,11 +483,16 @@ def _live_promotion_guardrails_snapshot(compatibility: dict[str, Any] | None = N
     release_stage = str(PATCH_BUILD.get("release_stage_configured") or "paper")
     live_stage_requested = release_stage == "live"
     allow_degraded_scanner_in_paper = _env_bool("ALLOW_DEGRADED_SCANNER_IN_PAPER", True)
+    scanner_required = any([
+        _env_bool("SCANNER_DRIVEN_UNIVERSE", False),
+        _env_bool("SCANNER_SOFT_ALLOW", False),
+        _env_bool("ALLOW_SCANNER_NEW_SYMBOLS", False),
+    ])
     scanner_alignment_enabled = bool(scanner_contract.get("btc_only_live_alignment", {}).get("alignment_enabled") or btc_alignment.get("scanner_alignment_enabled"))
     degraded_scanner_mode_active = bool((not live_stage_requested) and allow_degraded_scanner_in_paper and not bool((compatibility or {}).get("scanner_ok")))
-    effective_scanner_ready = bool((compatibility or {}).get("scanner_ok")) or degraded_scanner_mode_active
-    effective_btc_alignment_ready = bool(btc_alignment.get("alignment_ready")) or degraded_scanner_mode_active
-    effective_scanner_alignment_enabled = bool(scanner_alignment_enabled) or degraded_scanner_mode_active
+    effective_scanner_ready = (not scanner_required) or bool((compatibility or {}).get("scanner_ok")) or degraded_scanner_mode_active
+    effective_btc_alignment_ready = (not scanner_required) or bool(btc_alignment.get("alignment_ready")) or degraded_scanner_mode_active
+    effective_scanner_alignment_enabled = (not scanner_required) or bool(scanner_alignment_enabled) or degraded_scanner_mode_active
 
     checks = {
         "release_stage_live": live_stage_requested,
@@ -508,6 +513,7 @@ def _live_promotion_guardrails_snapshot(compatibility: dict[str, Any] | None = N
         "live_validation_mode_enabled": _env_bool("LIVE_VALIDATION_MODE", True),
         "execution_canary_enabled": _env_bool("EXECUTION_CANARY_ENABLED", False),
         "degraded_scanner_mode_active": degraded_scanner_mode_active,
+        "scanner_required": scanner_required,
     }
     if degraded_scanner_mode_active:
         checks["readiness_green"] = bool(gate.get("gate_open"))
@@ -537,12 +543,12 @@ def _live_promotion_guardrails_snapshot(compatibility: dict[str, Any] | None = N
         blockers.append("kraken_api_key_missing")
     if not checks["kraken_secret_present"]:
         blockers.append("kraken_api_secret_missing")
-    if not checks["scanner_url_present"]:
+    if (not checks["scanner_url_present"]) and scanner_required:
         blockers.append("scanner_url_missing")
     if not checks["scanner_alignment_enabled"]:
         blockers.append("scanner_alignment_disabled")
-    if degraded_scanner_mode_active:
-        blockers = [b for b in blockers if b not in ("scanner_not_ready", "btc_alignment_not_ready", "scanner_alignment_disabled")]    
+    if degraded_scanner_mode_active or (not scanner_required):
+        blockers = [b for b in blockers if b not in ("scanner_not_ready", "btc_alignment_not_ready", "scanner_alignment_disabled", "scanner_url_missing")]    
 
     env_guidance = {
         "release_stage": release_stage,
@@ -566,6 +572,10 @@ def _live_promotion_guardrails_snapshot(compatibility: dict[str, Any] | None = N
             "paper_degraded_mode": [
                 "ALLOW_DEGRADED_SCANNER_IN_PAPER=1 allows paper-mode operation when scanner is unavailable.",
                 "Degraded paper mode is never applied when RELEASE_STAGE=live.",
+            ],
+            "scanner_optional_mode": [
+                "When SCANNER_DRIVEN_UNIVERSE=0 and SCANNER_SOFT_ALLOW=0, scanner is treated as optional for readiness.",
+                "Enable scanner-driven controls to make scanner readiness a hard requirement again.",
             ],
         },
     }
@@ -9826,6 +9836,8 @@ def dashboard_ui(recent_limit: int = 25):
     rejected = float(((telemetry.get("blocked_trade_summary") or {}).get("by_result") or {}).get("rejected") or 0.0)
     reject_rate = (rejected / (accepted + rejected)) if (accepted + rejected) > 0 else 0.0
     readiness = "READY" if snap.get("ready") else "NOT READY"
+    scanner_required_flag = bool((((snap.get("promotion_guardrails") or {}).get("checks") or {}).get("scanner_required")))
+    scanner_status_text = "OPTIONAL" if not scanner_required_flag else ("OK" if bool((snap.get("compatibility") or {}).get("scanner_ok")) else "DOWN")
 
     rows = []
     for t in recent:
@@ -9881,7 +9893,7 @@ def dashboard_ui(recent_limit: int = 25):
         <div class="card span-6"><h3>Operator Alerts</h3>
           <table><tbody>
             <tr><th>Current blockers</th><td>{blocker_text}</td></tr>
-            <tr><th>Scanner status</th><td>{'OK' if bool((snap.get('compatibility') or {}).get('scanner_ok')) else 'DOWN'}</td></tr>
+            <tr><th>Scanner status</th><td>{scanner_status_text}</td></tr>
             <tr><th>Worker status</th><td>{'HEALTHY' if bool(((snap.get('promotion_guardrails') or {}).get('checks') or {}).get('workers_healthy')) else 'ISSUES'}</td></tr>
           </tbody></table>
         </div>
