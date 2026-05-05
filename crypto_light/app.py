@@ -9796,8 +9796,8 @@ def dashboard_ui(recent_limit: int = 25):
         except Exception:
             return "0.00%"
 
-    net_pnl = _fmt(pnl.get("net_pnl"))
-    trades = int(pnl.get("trades") or 0)
+    net_pnl = _fmt((pnl.get("journal_window") or {}).get("net_pnl_usd"))
+    trades = int((pnl.get("journal_window") or {}).get("closed_trades") or 0)
     wr = _pct((pnl.get("win_rate") or 0.0), 1)
     avg_net_edge = _fmt((telemetry.get("execution_truth") or {}).get("avg_net_edge_bps"), 1)
     maker_share = _pct((maker_taker.get("maker_share") or 0.0), 1)
@@ -9815,6 +9815,9 @@ def dashboard_ui(recent_limit: int = 25):
     ) or "<tr><td colspan='2'>No rejection data.</td></tr>"
 
     label_color = "#a9d6ff"
+    build = snap.get("build") or {}
+    service = snap.get("service") or {}
+    account_truth = ((snap.get("promotion_guardrails") or {}).get("account_truth") or {})
     html = f"""
     <html><head><title>Crypto Intraday Dashboard</title>
     <style>
@@ -9834,10 +9837,28 @@ def dashboard_ui(recent_limit: int = 25):
     </style></head><body><div class="wrap">
       <div class="top">
         <div><div class="k">Operator Console</div><h2>Crypto Intraday Dashboard</h2>
-        <div class="muted">Build: {snap.get("build","")} | Snapshot: {snap.get("snapshot_utc","")}</div></div>
+        <div class="muted">Patch: {build.get("patch_version","")} | Env: {service.get("env_name","")} | Stage: {service.get("release_stage","")} | Snapshot: {snap.get("snapshot_utc","")}</div></div>
         <div class="chips"><span>{readiness}</span><span>Read-only</span><span>Fast path</span></div>
       </div>
       <div class="grid">
+        <div class="card span-6"><h3>Operator Alerts</h3>
+          <table><tbody>
+            <tr><th>Current blockers</th><td>{blocker_text}</td></tr>
+            <tr><th>Scanner status</th><td>{'OK' if bool((snap.get('compatibility') or {}).get('scanner_ok')) else 'DOWN'}</td></tr>
+            <tr><th>Worker status</th><td>{'HEALTHY' if bool(((snap.get('promotion_guardrails') or {}).get('checks') or {}).get('workers_healthy')) else 'ISSUES'}</td></tr>
+          </tbody></table>
+        </div>
+        <div class="card span-6"><h3>Exception Center</h3>
+          <table><tbody>
+            <tr><th>promotion_ready</th><td>{str(bool(snap.get('promotion_ready'))).upper()}</td></tr>
+            <tr><th>trade_gate_ok</th><td>{str(bool((snap.get('pretrade_health_gate') or {}).get('ok'))).upper()}</td></tr>
+            <tr><th>balance_ok</th><td>{str(bool(account_truth.get('balance_ok'))).upper()}</td></tr>
+            <tr><th>open_order_count</th><td>{int(account_truth.get('open_order_count') or 0)}</td></tr>
+          </tbody></table>
+        </div>
+        <div class="card span-4"><h3>Release Stage</h3><div class="v">{service.get("release_stage","").upper()}</div></div>
+        <div class="card span-4"><h3>Workers</h3><div class="v">{'OK' if bool(((snap.get('promotion_guardrails') or {}).get('checks') or {}).get('workers_healthy')) else 'ISSUE'}</div></div>
+        <div class="card span-4"><h3>Reconcile</h3><div class="v">{'HEALTHY' if int(account_truth.get('open_order_count') or 0)==0 else 'CHECK'}</div></div>
         <div class="card span-8"><h3>Performance Analytics</h3>
           <table><tbody>
             <tr><th>net_pnl</th><td>{net_pnl}</td><th>trades</th><td>{trades}</td></tr>
