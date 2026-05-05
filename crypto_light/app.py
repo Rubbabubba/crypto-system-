@@ -9821,14 +9821,27 @@ def dashboard_ui(recent_limit: int = 25):
 
     rows = []
     for t in recent:
+        side = str(t.get("side") or t.get("entry_side") or "")
+        if not side:
+            side = "LONG"
         rows.append(
-            f"<tr><td>{t.get('ts','')}</td><td>{t.get('symbol','')}</td><td>{t.get('side','')}</td>"
-            f"<td>{_fmt(t.get('net_pnl'),2)}</td><td>{_fmt(t.get('fee_usd'),2)}</td><td>{_fmt(t.get('net_edge_bps'),1)}</td></tr>"
+            f"<tr><td>{t.get('closed_ts','')}</td><td>{t.get('symbol','')}</td><td>{side}</td>"
+            f"<td>{_fmt(t.get('net_pnl_usd'),2)}</td><td>{_fmt(t.get('fees_total'),2)}</td><td>{_fmt(t.get('net_edge_bps'),1)}</td></tr>"
         )
     table_rows = "".join(rows) or "<tr><td colspan='6'>No recent trades.</td></tr>"
     reject_rows = "".join(
         [f"<tr><td>{k}</td><td>{int(v or 0)}</td></tr>" for k, v in sorted(blocked_summary.items(), key=lambda kv: kv[1], reverse=True)[:10]]
     ) or "<tr><td colspan='2'>No rejection data.</td></tr>"
+    strategy_rows = ""
+    for name, st in (strategy_truth.get("by_strategy") or {}).items():
+        strategy_rows += f"<tr><td>{name}</td><td>{int(st.get('trades') or 0)}</td><td>{int(st.get('wins') or 0)}</td><td>{int(st.get('losses') or 0)}</td><td>{_pct(st.get('win_rate') or 0.0,1)}</td><td>{_fmt(st.get('net_pnl_usd'),2)}</td><td>{_fmt(st.get('avg_net_edge_bps'),1)}</td></tr>"
+    if not strategy_rows:
+        strategy_rows = "<tr><td colspan='7'>No strategy attribution.</td></tr>"
+    regime_rows = ""
+    for name, rg in (regime_truth or {}).items():
+        regime_rows += f"<tr><td>{name}</td><td>{int(rg.get('trades') or 0)}</td><td>{int(rg.get('wins') or 0)}</td><td>{int(rg.get('losses') or 0)}</td><td>{_pct(rg.get('win_rate') or 0.0,1)}</td><td>{_fmt(rg.get('net_pnl_usd'),2)}</td><td>{_fmt(rg.get('avg_net_edge_bps'),1)}</td></tr>"
+    if not regime_rows:
+        regime_rows = "<tr><td colspan='7'>No regime expectancy.</td></tr>"
 
     label_color = "#a9d6ff"
     build = snap.get("build") or {}
@@ -9902,8 +9915,12 @@ def dashboard_ui(recent_limit: int = 25):
         <div class="card span-6"><h3>Rejection Totals</h3>
           <table><thead><tr><th>Reason</th><th>Count</th></tr></thead><tbody>{reject_rows}</tbody></table>
         </div>
-        <div class="card span-6"><h3>Strategy Attribution</h3><pre>{json.dumps(strategy_truth, indent=2)}</pre></div>
-        <div class="card span-6"><h3>Regime Expectancy</h3><pre>{json.dumps(regime_truth, indent=2)}</pre></div>
+        <div class="card span-6"><h3>Strategy Attribution</h3>
+          <table><thead><tr><th>Strategy</th><th>Closed</th><th>Wins</th><th>Losses</th><th>Win Rate</th><th>Net P&L</th><th>Avg Net Edge</th></tr></thead><tbody>{strategy_rows}</tbody></table>
+        </div>
+        <div class="card span-6"><h3>Regime Expectancy</h3>
+          <table><thead><tr><th>Regime</th><th>Trades</th><th>Wins</th><th>Losses</th><th>Win Rate</th><th>Net P&L</th><th>Avg Net Edge</th></tr></thead><tbody>{regime_rows}</tbody></table>
+        </div>
         <div class="card span-12"><h3>Recent Trades</h3>
           <table><thead><tr><th>UTC</th><th>Symbol</th><th>Side</th><th>Net PnL</th><th>Fees</th><th>Net Edge bps</th></tr></thead><tbody>{table_rows}</tbody></table>
         </div>
