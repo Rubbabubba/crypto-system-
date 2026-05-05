@@ -9815,8 +9815,16 @@ def dashboard_ui(recent_limit: int = 25):
     net_pnl = _fmt((pnl.get("journal_window") or {}).get("net_pnl_usd"))
     trades = int((pnl.get("journal_window") or {}).get("closed_trades") or 0)
     wr = _pct((pnl.get("win_rate") or 0.0), 1)
-    avg_net_edge = _fmt((telemetry.get("execution_truth") or {}).get("avg_net_edge_bps"), 1)
-    maker_share = _pct((maker_taker.get("maker_share") or 0.0), 1)
+    avg_net_edge = _fmt(telemetry.get("avg_realized_edge_bps"), 1)
+    entry_roles = (telemetry.get("execution_truth") or {}).get("entry_roles") or {}
+    maker_cnt = float(entry_roles.get("maker") or 0.0)
+    taker_cnt = float(entry_roles.get("taker") or 0.0)
+    other_cnt = float(entry_roles.get("unknown") or entry_roles.get("other") or 0.0)
+    denom = maker_cnt + taker_cnt + other_cnt
+    maker_share = _pct((maker_cnt / denom) if denom > 0 else 0.0, 1)
+    accepted = float(((telemetry.get("blocked_trade_summary") or {}).get("by_result") or {}).get("accepted") or 0.0)
+    rejected = float(((telemetry.get("blocked_trade_summary") or {}).get("by_result") or {}).get("rejected") or 0.0)
+    reject_rate = (rejected / (accepted + rejected)) if (accepted + rejected) > 0 else 0.0
     readiness = "READY" if snap.get("ready") else "NOT READY"
 
     rows = []
@@ -9893,7 +9901,7 @@ def dashboard_ui(recent_limit: int = 25):
             <tr><th>net_pnl</th><td>{net_pnl}</td><th>trades</th><td>{trades}</td></tr>
             <tr><th>win_rate</th><td>{wr}</td><th>avg_net_edge_bps</th><td>{avg_net_edge}</td></tr>
             <tr><th>maker_share</th><td>{maker_share}</td><th>avg_slippage_bps</th><td>{_fmt(exec_truth.get("avg_slippage_bps"),1)}</td></tr>
-            <tr><th>entry_reject_rate</th><td>{_pct(ops.get("entry_reject_rate") or 0.0,1)}</td><th>open_plans</th><td>{len(snap.get("open_plans") or [])}</td></tr>
+            <tr><th>entry_reject_rate</th><td>{_pct(reject_rate,1)}</td><th>open_plans</th><td>{len(snap.get("open_plans") or [])}</td></tr>
           </tbody></table>
         </div>
         <div class="card span-4"><h3>Guarded Live Path</h3>
