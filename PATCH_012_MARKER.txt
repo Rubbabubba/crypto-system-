@@ -1,0 +1,3 @@
+Patch 012: active dashboard truth.
+
+Keeps dashboard rejection totals, regime expectancy, and no-signal diagnostics scoped to the active live window instead of falling back to stale history.
