@@ -1,0 +1,3 @@
+Patch 014: entry status dashboard.
+
+Adds an operator-facing entry status summary so readiness, trades, and no-signal blockers are visible at a glance.
