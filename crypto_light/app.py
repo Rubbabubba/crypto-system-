@@ -9729,6 +9729,62 @@ def _active_no_signal_rule_breakdown(limit: int = 250) -> dict[str, Any]:
     }
 
 
+def _active_entry_status(
+    positions: list[dict[str, Any]],
+    active_window: dict[str, Any],
+    active_signal_funnel: dict[str, Any],
+    active_no_signal_rules: dict[str, Any],
+) -> dict[str, Any]:
+    open_positions = len(positions or [])
+    closed_trades = int(active_window.get("closed_trades") or 0) if active_window.get("ok") else 0
+    accepted = int(active_signal_funnel.get("passed") or 0)
+    rejected = int(active_signal_funnel.get("rejected") or 0)
+    no_signal_count = int((active_signal_funnel.get("by_reason") or {}).get("rejected_no_signal") or 0)
+    no_signal_count += int((active_signal_funnel.get("by_reason") or {}).get("no_signal") or 0)
+    top_symbol = ((active_signal_funnel.get("no_signal_by_symbol") or [{}])[0] or {}).get("key") or None
+    top_rule = ((active_no_signal_rules.get("top_strategy_failed_checks") or [{}])[0] or {}).get("key") or None
+
+    if open_positions > 0:
+        state = "IN_POSITION"
+        blocker = "none"
+        action = "Monitor open position management and execution reconciliation."
+    elif closed_trades > 0:
+        state = "TRADING"
+        blocker = "none"
+        action = "Trading has completed active-window round trips; monitor expectancy and edge decay."
+    elif accepted > 0:
+        state = "SIGNALS_PASSED_NO_CLOSED_TRADES"
+        blocker = "fills_or_position_lifecycle"
+        action = "Inspect open plans/orders and execution telemetry for accepted signals that have not closed."
+    elif rejected > 0 and no_signal_count >= rejected:
+        state = "READY_BUT_NO_ENTRY_SIGNALS"
+        blocker = "no_signal"
+        action = "Wait for either ME1 momentum breakout/volume expansion or MR1 reclaim/rejection-wick confirmation; current market bars do not satisfy entry rules."
+    elif rejected > 0:
+        state = "READY_BUT_REJECTING_ENTRIES"
+        blocker = ", ".join((active_signal_funnel.get("by_reason") or {}).keys()) or "entry_rejections"
+        action = "Review rejection totals and the active rule-failure table for the highest-count gate."
+    else:
+        state = "READY_WAITING_FOR_SCANS"
+        blocker = "none_observed"
+        action = "No active admission events are present yet; confirm the scan loop is producing candidates."
+
+    return {
+        "ok": True,
+        "state": state,
+        "has_trades": bool(open_positions > 0 or closed_trades > 0),
+        "open_positions": open_positions,
+        "closed_trades": closed_trades,
+        "active_passed": accepted,
+        "active_rejected": rejected,
+        "no_signal_rejections": no_signal_count,
+        "primary_blocker": blocker,
+        "top_no_signal_symbol": top_symbol,
+        "top_failed_rule": top_rule,
+        "operator_action": action,
+    }
+
+
 def _performance_snapshot(days: float = 30.0, recent_limit: int = 25) -> dict[str, Any]:
     positions = get_positions()
     open_notional = sum(_safe_float(p.get("notional_usd")) for p in positions)
@@ -9777,7 +9833,8 @@ def _performance_snapshot(days: float = 30.0, recent_limit: int = 25) -> dict[st
     except Exception as e:
         active_admission_summary = {"ok": False, "error": f"{type(e).__name__}: {e}", "since_ts": active_since_ts}
     active_signal_funnel = _active_signal_funnel(limit=500)
-    active_no_signal_rules = _active_no_signal_rule_breakdown(limit=500)    
+    active_no_signal_rules = _active_no_signal_rule_breakdown(limit=500)
+    active_entry_status = _active_entry_status(positions, active_window, active_signal_funnel, active_no_signal_rules)    
 
     return {
         "ok": True,
@@ -9817,6 +9874,7 @@ def _performance_snapshot(days: float = 30.0, recent_limit: int = 25) -> dict[st
         "active_admission_summary": active_admission_summary,
         "active_signal_funnel": active_signal_funnel,
         "active_no_signal_rules": active_no_signal_rules,
+        "active_entry_status": active_entry_status,
     }
 
 
@@ -9930,6 +9988,7 @@ def dashboard(recent_limit: int = 15):
         "pretrade_health_gate": gate,
         "promotion_guardrails": promotion,
         "performance": perf,
+        "active_entry_status": (perf.get("active_entry_status") or {}),
         "open_plans": [_annotate_open_plan_legacy_state(p) if ((p or {}).get("strategy") == "tc1") else p for p in open_plans],
         "snapshot_consistency": {
             "ok": True,
@@ -9949,6 +10008,7 @@ def dashboard_ui(recent_limit: int = 25):
     active_admission_summary = perf.get("active_admission_summary") or {}
     active_signal_funnel = perf.get("active_signal_funnel") or {}
     active_no_signal_rules = perf.get("active_no_signal_rules") or {}
+    active_entry_status = perf.get("active_entry_status") or {}
     edge_decay = perf.get("active_edge_decay") or ((active_window.get("edge_decay") or {}) or (telemetry.get("edge_decay") or {}))
     ops = telemetry.get("operations_health") or {}
     exec_truth = telemetry.get("execution_truth") or {}
@@ -10003,6 +10063,7 @@ def dashboard_ui(recent_limit: int = 25):
     if not scanner_required_flag:
         blockers = [b for b in blockers if not b.startswith("scanner_")]
     blocker_text = ", ".join(sorted(set(blockers))) or "none"
+    entry_blocker_text = str(active_entry_status.get("primary_blocker") or "unknown")
     scanner_status_text = "OPTIONAL" if not scanner_required_flag else ("OK" if bool((snap.get("compatibility") or {}).get("scanner_ok")) else "DOWN")
 
     rows = []
@@ -10051,6 +10112,7 @@ def dashboard_ui(recent_limit: int = 25):
       .chips span {{ border:1px solid #22406a; border-radius:999px; padding:6px 10px; margin-left:8px; font-size:12px; background:#0d1730; color:{label_color}; }}
       .grid {{ display:grid; grid-template-columns: repeat(12, 1fr); gap:12px; }}
       .card {{ background:linear-gradient(180deg, #101933 0%, #0b1329 100%); border:1px solid #203764; border-radius:14px; padding:14px; }}
+      .callout {{ border-color:#345f9f; background:linear-gradient(180deg, #142346 0%, #0d1833 100%); }}
       .span-3 {{ grid-column: span 3; }} .span-4 {{ grid-column: span 4; }} .span-6 {{ grid-column: span 6; }} .span-8 {{ grid-column: span 8; }} .span-12 {{ grid-column: span 12; }}
       .k {{ color:{label_color}; font-size:12px; text-transform:uppercase; letter-spacing:.04em; font-weight:700; }} .v {{ font-size:30px; font-weight:800; margin-top:6px; }}
       h2,h3 {{ margin:0 0 10px 0; }}
@@ -10065,9 +10127,17 @@ def dashboard_ui(recent_limit: int = 25):
         <div class="chips"><span>{readiness}</span><span>Read-only</span><span>Fast path</span></div>
       </div>
       <div class="grid">
+        <div class="card callout span-12"><h3>Entry Status — Where Are We?</h3>
+          <table><tbody>
+            <tr><th>state</th><td>{active_entry_status.get("state") or "unknown"}</td><th>has_trades</th><td>{str(bool(active_entry_status.get("has_trades"))).upper()}</td></tr>
+            <tr><th>primary_blocker</th><td>{entry_blocker_text}</td><th>top_failed_rule</th><td>{active_entry_status.get("top_failed_rule") or "none"}</td></tr>
+            <tr><th>top_no_signal_symbol</th><td>{active_entry_status.get("top_no_signal_symbol") or "none"}</td><th>operator_action</th><td>{active_entry_status.get("operator_action") or "review diagnostics"}</td></tr>
+          </tbody></table>
+        </div>
         <div class="card span-6"><h3>Operator Alerts</h3>
           <table><tbody>
             <tr><th>Current blockers</th><td>{blocker_text}</td></tr>
+            <tr><th>Entry blocker</th><td>{entry_blocker_text}</td></tr>
             <tr><th>Internal scanner</th><td>{'RUNNING' if bool(((snap.get('promotion_guardrails') or {}).get('checks') or {}).get('workers_healthy')) else 'ISSUES'}</td></tr>
             <tr><th>Worker status</th><td>{'HEALTHY' if bool(((snap.get('promotion_guardrails') or {}).get('checks') or {}).get('workers_healthy')) else 'ISSUES'}</td></tr>
           </tbody></table>
@@ -10108,6 +10178,7 @@ def dashboard_ui(recent_limit: int = 25):
             <tr><th>open_order_count</th><td>{int((((snap.get('promotion_guardrails') or {}).get('account_truth') or {}).get('open_order_count') or 0))}</td></tr>
             <tr><th>active_passed</th><td>{int(active_signal_funnel.get("passed") or 0)}</td></tr>
             <tr><th>active_rejected</th><td>{int(active_signal_funnel.get("rejected") or 0)}</td></tr>
+            <tr><th>no_signal_rejections</th><td>{int(active_entry_status.get("no_signal_rejections") or 0)}</td></tr>
           </tbody></table>
         </div>
         <div class="card span-6"><h3>Rejection Totals</h3>
@@ -10178,6 +10249,19 @@ def diagnostics_active_no_signal_rules(limit: int = 500):
         "build": PATCH_BUILD,
         "active_strategies": list(ENTRY_ENGINE_STRATEGIES_LIST),
         "rules": _active_no_signal_rule_breakdown(limit=limit),
+    }
+
+
+@app.get("/diagnostics/active_entry_status")
+def diagnostics_active_entry_status(recent_limit: int = 25):
+    perf = _performance_snapshot(recent_limit=recent_limit)
+    return {
+        "ok": True,
+        "utc": utc_now_iso(),
+        "build": PATCH_BUILD,
+        "active_entry_status": perf.get("active_entry_status") or {},
+        "active_signal_funnel": perf.get("active_signal_funnel") or {},
+        "active_no_signal_rules": perf.get("active_no_signal_rules") or {},
     }
 
 
