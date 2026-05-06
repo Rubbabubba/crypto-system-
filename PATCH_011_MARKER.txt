@@ -1,0 +1,3 @@
+Patch 011: active signal funnel.
+
+Adds active-window admission funnel diagnostics so operators can see whether the live system is blocked by no-signal, admission gates, or post-admission execution.
