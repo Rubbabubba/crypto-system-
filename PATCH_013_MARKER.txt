@@ -1,0 +1,3 @@
+Patch 013: active no-signal rules.
+
+Adds active-window ME1/MR1 no-signal rule failure diagnostics so the operator can see which signal checks are blocking live entries.
