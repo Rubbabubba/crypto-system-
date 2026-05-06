@@ -9620,6 +9620,55 @@ def _active_telemetry_since_ts() -> float | None:
         return None
 
 
+def _active_signal_funnel(limit: int = 500) -> dict[str, Any]:
+    since_ts = _active_telemetry_since_ts()
+    try:
+        events = lifecycle_db.list_recent_admission_events(since_ts=since_ts, limit=max(1, int(limit)))
+    except Exception as e:
+        return {"ok": False, "error": f"{type(e).__name__}: {e}", "active_since_ts": since_ts}
+
+    by_result: dict[str, int] = {}
+    by_reason: dict[str, int] = {}
+    by_symbol_reason: dict[str, int] = {}
+    by_strategy_reason: dict[str, int] = {}
+    no_signal_by_symbol: dict[str, int] = {}
+    passed = 0
+    rejected = 0
+    for ev in events:
+        result = str(ev.get("admission_result") or "unknown")
+        reason = str(ev.get("reject_reason") or "")
+        symbol = _canonicalize_trade_symbol(str(ev.get("symbol") or "unknown")) or "unknown"
+        strategy = str(ev.get("strategy_id") or "unknown")
+        by_result[result] = int(by_result.get(result, 0)) + 1
+        if result == "passed":
+            passed += 1
+        if result == "rejected":
+            rejected += 1
+        if reason:
+            by_reason[reason] = int(by_reason.get(reason, 0)) + 1
+            by_symbol_reason[f"{symbol}|{reason}"] = int(by_symbol_reason.get(f"{symbol}|{reason}", 0)) + 1
+            by_strategy_reason[f"{strategy}|{reason}"] = int(by_strategy_reason.get(f"{strategy}|{reason}", 0)) + 1
+            if reason in ("rejected_no_signal", "no_signal"):
+                no_signal_by_symbol[symbol] = int(no_signal_by_symbol.get(symbol, 0)) + 1
+
+    def _top(d: dict[str, int], n: int = 8) -> list[dict[str, Any]]:
+        return [{"key": k, "count": v} for k, v in sorted(d.items(), key=lambda kv: (-kv[1], kv[0]))[:n]]
+
+    return {
+        "ok": True,
+        "active_since_ts": since_ts,
+        "events_sampled": len(events),
+        "passed": passed,
+        "rejected": rejected,
+        "pass_rate": (float(passed) / float(passed + rejected)) if (passed + rejected) > 0 else None,
+        "by_result": by_result,
+        "by_reason": by_reason,
+        "top_symbol_reasons": _top(by_symbol_reason),
+        "top_strategy_reasons": _top(by_strategy_reason),
+        "no_signal_by_symbol": _top(no_signal_by_symbol),
+    }
+
+
 def _performance_snapshot(days: float = 30.0, recent_limit: int = 25) -> dict[str, Any]:
     positions = get_positions()
     open_notional = sum(_safe_float(p.get("notional_usd")) for p in positions)
@@ -9666,7 +9715,8 @@ def _performance_snapshot(days: float = 30.0, recent_limit: int = 25) -> dict[st
     try:
         active_admission_summary = lifecycle_db.summarize_admission_events(since_ts=active_since_ts)
     except Exception as e:
-        active_admission_summary = {"ok": False, "error": f"{type(e).__name__}: {e}", "since_ts": active_since_ts}    
+        active_admission_summary = {"ok": False, "error": f"{type(e).__name__}: {e}", "since_ts": active_since_ts}
+    active_signal_funnel = _active_signal_funnel(limit=500)    
 
     return {
         "ok": True,
@@ -9704,6 +9754,7 @@ def _performance_snapshot(days: float = 30.0, recent_limit: int = 25) -> dict[st
         "active_window": active_window,
         "active_edge_decay": active_edge_decay,
         "active_admission_summary": active_admission_summary,
+        "active_signal_funnel": active_signal_funnel,
     }
 
 
@@ -9834,6 +9885,7 @@ def dashboard_ui(recent_limit: int = 25):
     telemetry = pnl.get("telemetry_window") or {}
     active_window = perf.get("active_window") or {}
     active_admission_summary = perf.get("active_admission_summary") or {}
+    active_signal_funnel = perf.get("active_signal_funnel") or {}
     edge_decay = perf.get("active_edge_decay") or ((active_window.get("edge_decay") or {}) or (telemetry.get("edge_decay") or {}))
     ops = telemetry.get("operations_health") or {}
     exec_truth = telemetry.get("execution_truth") or {}
@@ -9974,6 +10026,8 @@ def dashboard_ui(recent_limit: int = 25):
             <tr><th>scan_loop_healthy</th><td>{str(bool(((snap.get('promotion_guardrails') or {}).get('checks') or {}).get('workers_healthy'))).upper()}</td></tr>
             <tr><th>balance_ok</th><td>{str(bool(((snap.get('promotion_guardrails') or {}).get('account_truth') or {}).get('balance_ok'))).upper()}</td></tr>
             <tr><th>open_order_count</th><td>{int((((snap.get('promotion_guardrails') or {}).get('account_truth') or {}).get('open_order_count') or 0))}</td></tr>
+            <tr><th>active_passed</th><td>{int(active_signal_funnel.get("passed") or 0)}</td></tr>
+            <tr><th>active_rejected</th><td>{int(active_signal_funnel.get("rejected") or 0)}</td></tr>
           </tbody></table>
         </div>
         <div class="card span-6"><h3>Rejection Totals</h3>
@@ -10027,6 +10081,17 @@ def diagnostics_execution_truth(days: float = 30.0):
         'maker_vs_taker': telemetry.get('maker_vs_taker') or {},
         'execution_truth': telemetry.get('execution_truth') or {},
         'recent_trades': (snap.get('recent_trades') or {}).get('count') or 0,
+    }
+
+
+@app.get("/diagnostics/active_signal_funnel")
+def diagnostics_active_signal_funnel(limit: int = 500):
+    return {
+        "ok": True,
+        "utc": utc_now_iso(),
+        "build": PATCH_BUILD,
+        "active_strategies": list(ENTRY_ENGINE_STRATEGIES_LIST),
+        "funnel": _active_signal_funnel(limit=limit),
     }
 
 
