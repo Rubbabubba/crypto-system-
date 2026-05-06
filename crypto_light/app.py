@@ -9890,11 +9890,18 @@ def dashboard_ui(recent_limit: int = 25):
     ops = telemetry.get("operations_health") or {}
     exec_truth = telemetry.get("execution_truth") or {}
     maker_taker = telemetry.get("maker_vs_taker") or {}
-    strategy_truth = (active_window.get("strategy_truth") or telemetry.get("strategy_truth") or {})
-    regime_truth = (active_window.get("expectancy_by_regime") or telemetry.get("expectancy_by_regime") or {})
+    active_window_ok = bool(active_window.get("ok"))
+    active_funnel_ok = bool(active_signal_funnel.get("ok"))
+    strategy_truth = (active_window.get("strategy_truth") if active_window_ok else (telemetry.get("strategy_truth") or {})) or {}
+    regime_truth = (active_window.get("expectancy_by_regime") if active_window_ok else (telemetry.get("expectancy_by_regime") or {})) or {}
     active_recent = [_serialize_recent_trade(dict(r)) for r in (active_window.get("recent_trades") or [])]
-    recent = (active_recent if active_window.get("ok") else ((perf.get("recent_trades") or {}).get("trades") or []))[:12]
-    blocked_summary = ((active_admission_summary.get("by_reason") or {}) or ((telemetry.get("blocked_trade_summary") or {}).get("by_reason") or {}))
+    recent = (active_recent if active_window_ok else ((perf.get("recent_trades") or {}).get("trades") or []))[:12]
+    if active_funnel_ok:
+        blocked_summary = active_signal_funnel.get("by_reason") or {}
+    elif active_admission_summary.get("total") is not None:
+        blocked_summary = active_admission_summary.get("by_reason") or {}
+    else:
+        blocked_summary = ((telemetry.get("blocked_trade_summary") or {}).get("by_reason") or {})
     raw_blockers = ((snap.get("promotion_guardrails") or {}).get("promotion_blockers") or []) + ((snap.get("compatibility") or {}).get("blockers") or [])
 
     def _fmt(v: Any, digits: int = 2) -> str:
@@ -9919,9 +9926,13 @@ def dashboard_ui(recent_limit: int = 25):
     other_cnt = float(entry_roles.get("unknown") or entry_roles.get("other") or 0.0)
     denom = maker_cnt + taker_cnt + other_cnt
     maker_share = _pct((maker_cnt / denom) if denom > 0 else 0.0, 1)
-    admission_result = ((active_admission_summary.get("by_result") or {}) or ((telemetry.get("blocked_trade_summary") or {}).get("by_result") or {}))
-    accepted = float(admission_result.get("accepted") or 0.0)
-    rejected = float(admission_result.get("rejected") or 0.0)
+    if active_funnel_ok:
+        accepted = float(active_signal_funnel.get("passed") or 0.0)
+        rejected = float(active_signal_funnel.get("rejected") or 0.0)
+    else:
+        admission_result = ((active_admission_summary.get("by_result") or {}) or ((telemetry.get("blocked_trade_summary") or {}).get("by_result") or {}))
+        accepted = float(admission_result.get("accepted") or 0.0)
+        rejected = float(admission_result.get("rejected") or 0.0)
     reject_rate = (rejected / (accepted + rejected)) if (accepted + rejected) > 0 else 0.0
     readiness = "READY" if snap.get("ready") else "NOT READY"
     scanner_required_flag = bool((((snap.get("promotion_guardrails") or {}).get("checks") or {}).get("scanner_required")))
@@ -9943,7 +9954,10 @@ def dashboard_ui(recent_limit: int = 25):
     table_rows = "".join(rows) or "<tr><td colspan='6'>No recent trades.</td></tr>"
     reject_rows = "".join(
         [f"<tr><td>{k}</td><td>{int(v or 0)}</td></tr>" for k, v in sorted(blocked_summary.items(), key=lambda kv: kv[1], reverse=True)[:10]]
-    ) or "<tr><td colspan='2'>No rejection data.</td></tr>"
+    ) or "<tr><td colspan='2'>No active rejection data.</td></tr>"
+    funnel_rows = "".join(
+        [f"<tr><td>{row.get('key')}</td><td>{int(row.get('count') or 0)}</td></tr>" for row in (active_signal_funnel.get("no_signal_by_symbol") or [])[:8]]
+    ) or "<tr><td colspan='2'>No active no-signal symbols.</td></tr>"
     strategy_rows = ""
     active_strategy_set = {s.strip().lower() for s in str(os.getenv("ENTRY_ENGINE_STRATEGIES", "") or "").split(",") if s.strip()}
     for name, st in (strategy_truth.get("by_strategy") or {}).items():
@@ -10032,6 +10046,9 @@ def dashboard_ui(recent_limit: int = 25):
         </div>
         <div class="card span-6"><h3>Rejection Totals</h3>
           <table><thead><tr><th>Reason</th><th>Count</th></tr></thead><tbody>{reject_rows}</tbody></table>
+        </div>
+        <div class="card span-6"><h3>Active No-Signal Symbols</h3>
+          <table><thead><tr><th>Symbol</th><th>Count</th></tr></thead><tbody>{funnel_rows}</tbody></table>
         </div>
         <div class="card span-6"><h3>Strategy Attribution</h3>
           <table><thead><tr><th>Strategy</th><th>Closed</th><th>Wins</th><th>Losses</th><th>Win Rate</th><th>Net P&L</th><th>Avg Net Edge</th></tr></thead><tbody>{strategy_rows}</tbody></table>
