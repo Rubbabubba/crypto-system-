@@ -9739,6 +9739,86 @@ def _active_no_signal_escalation_count() -> int:
     return max(1, min(raw, 1000))
 
 
+def _active_signal_rule_gap_summary(limit: int = 500) -> dict[str, Any]:
+    since_ts = _active_telemetry_since_ts()
+    try:
+        events = lifecycle_db.list_recent_admission_events(
+            admission_result='rejected',
+            since_ts=since_ts,
+            limit=max(1, int(limit)),
+        )
+    except Exception as e:
+        return {"ok": False, "error": f"{type(e).__name__}: {e}", "active_since_ts": since_ts}
+
+    samples: dict[str, list[float]] = {}
+
+    def _add(key: str, value: Any) -> None:
+        try:
+            v = float(value)
+        except Exception:
+            return
+        if v < 0:
+            v = 0.0
+        samples.setdefault(key, []).append(v)
+
+    for ev in events:
+        reason = str(ev.get('reject_reason') or '')
+        if reason not in ('rejected_no_signal', 'no_signal'):
+            continue
+        payload_raw = ev.get('payload_json') or '{}'
+        try:
+            payload = json.loads(payload_raw) if isinstance(payload_raw, str) else dict(payload_raw or {})
+        except Exception:
+            payload = {}
+        sig_debug = dict((payload or {}).get('signal_debug') or {})
+        for strat, meta_raw in sig_debug.items():
+            strat_l = str(strat or '').lower()
+            if not isinstance(meta_raw, dict):
+                continue
+            meta = dict(meta_raw)
+            checks = dict(meta.get('checks') or {})
+            price = _safe_float(meta.get('price'))
+            if strat_l == 'me1':
+                if checks.get('breakout') is False:
+                    level = _safe_float(meta.get('breakout_level'))
+                    if price > 0 and level > 0:
+                        _add('me1|breakout_gap_bps', ((level - price) / price) * 10000.0)
+                if checks.get('volume_expansion') is False:
+                    _add('me1|volume_mult_gap', float(ME1_MIN_VOLUME_MULT) - _safe_float(meta.get('volume_mult')))
+                if checks.get('range_expansion') is False:
+                    _add('me1|range_atr_gap', float(ME1_MIN_RANGE_ATR) - _safe_float(meta.get('range_atr')))
+            if strat_l == 'mr1':
+                if checks.get('volume_confirm') is False:
+                    _add('mr1|volume_mult_gap', float(MR1_MIN_VOLUME_MULT) - _safe_float(meta.get('volume_mult')))
+                if checks.get('ema_reclaim') is False:
+                    ema = _safe_float(meta.get('ema'))
+                    if price > 0 and ema > 0:
+                        _add('mr1|ema_reclaim_gap_bps', ((ema - price) / price) * 10000.0)
+                if checks.get('rejection_wick') is False:
+                    _add('mr1|lower_wick_gap', float(MR1_MIN_LOWER_WICK_PCT) - _safe_float(meta.get('lower_wick_pct')))
+                if checks.get('sharp_flush') is False:
+                    _add('mr1|drop_atr_gap', float(MR1_MIN_DROP_ATR) - _safe_float(meta.get('drop_atr')))
+
+    rows = []
+    for key, vals in samples.items():
+        vals_sorted = sorted(vals)
+        if not vals_sorted:
+            continue
+        rows.append({
+            'key': key,
+            'samples': len(vals_sorted),
+            'closest_gap': vals_sorted[0],
+            'avg_gap': sum(vals_sorted) / float(len(vals_sorted)),
+            'worst_gap': vals_sorted[-1],
+        })
+    rows = sorted(rows, key=lambda r: (-int(r.get('samples') or 0), float(r.get('closest_gap') or 0.0), str(r.get('key') or '')))
+    return {
+        'ok': True,
+        'active_since_ts': since_ts,
+        'top_rule_gaps': rows[:8],
+    }
+
+
 def _active_entry_status(
     positions: list[dict[str, Any]],
     active_window: dict[str, Any],
@@ -10057,6 +10137,7 @@ def _performance_snapshot(days: float = 30.0, recent_limit: int = 25) -> dict[st
         active_admission_summary = {"ok": False, "error": f"{type(e).__name__}: {e}", "since_ts": active_since_ts}
     active_signal_funnel = _active_signal_funnel(limit=500)
     active_no_signal_rules = _active_no_signal_rule_breakdown(limit=500)
+    active_signal_rule_gaps = _active_signal_rule_gap_summary(limit=500)
     active_entry_status = _active_entry_status(positions, active_window, active_signal_funnel, active_no_signal_rules)
     active_signal_calibration = _active_signal_calibration_plan(active_signal_funnel, active_no_signal_rules, active_entry_status)   
 
@@ -10098,6 +10179,7 @@ def _performance_snapshot(days: float = 30.0, recent_limit: int = 25) -> dict[st
         "active_admission_summary": active_admission_summary,
         "active_signal_funnel": active_signal_funnel,
         "active_no_signal_rules": active_no_signal_rules,
+        "active_signal_rule_gaps": active_signal_rule_gaps,
         "active_entry_status": active_entry_status,
         "active_signal_calibration": active_signal_calibration,
     }
@@ -10256,6 +10338,7 @@ def dashboard_ui(recent_limit: int = 25, refresh_sec: int | None = None):
     active_admission_summary = perf.get("active_admission_summary") or {}
     active_signal_funnel = perf.get("active_signal_funnel") or {}
     active_no_signal_rules = perf.get("active_no_signal_rules") or {}
+    active_signal_rule_gaps = perf.get("active_signal_rule_gaps") or {}
     active_signal_calibration = snap.get("active_signal_calibration") or perf.get("active_signal_calibration") or {}
     active_entry_status = snap.get("active_entry_status") or perf.get("active_entry_status") or {}
     edge_decay = perf.get("active_edge_decay") or ((active_window.get("edge_decay") or {}) or (telemetry.get("edge_decay") or {}))
@@ -10322,6 +10405,8 @@ def dashboard_ui(recent_limit: int = 25, refresh_sec: int | None = None):
     shadow_experiments = list(active_signal_calibration.get("shadow_experiments") or [])
     shadow_experiment_text = ", ".join([f"{e.get('env_var')}={e.get('shadow_test_value')}" for e in shadow_experiments[:3]]) or "none"
     scan_cap_guidance_text = str(active_signal_calibration.get("scan_cap_guidance") or "none")
+    rule_gap_rows = list(active_signal_rule_gaps.get("top_rule_gaps") or [])
+    rule_gap_text = ", ".join([f"{r.get('key')} closest={_fmt(r.get('closest_gap'), 2)}" for r in rule_gap_rows[:3]]) or "none"
     scanner_status_text = "OPTIONAL" if not scanner_required_flag else ("OK" if bool((snap.get("compatibility") or {}).get("scanner_ok")) else "DOWN")
 
     rows = []
@@ -10402,6 +10487,7 @@ def dashboard_ui(recent_limit: int = 25, refresh_sec: int | None = None):
             <tr><th>review</th><td colspan="3">{calibration_review_text}</td></tr>
             <tr><th>shadow_test</th><td colspan="3">{shadow_experiment_text}</td></tr>
             <tr><th>scan_cap_guidance</th><td colspan="3">{scan_cap_guidance_text}</td></tr>
+            <tr><th>closest_rule_gaps</th><td colspan="3">{rule_gap_text}</td></tr>
             <tr><th>guardrail</th><td colspan="3">{active_signal_calibration.get("guardrail") or "Keep live risk unchanged while calibrating."}</td></tr>
           </tbody></table>
         </div>
@@ -10548,8 +10634,19 @@ def diagnostics_active_entry_status(recent_limit: int = 25):
         ),
         "active_signal_funnel": perf.get("active_signal_funnel") or {},
         "active_no_signal_rules": perf.get("active_no_signal_rules") or {},
+        "active_signal_rule_gaps": perf.get("active_signal_rule_gaps") or {},
         "pretrade_health_gate": gate,
         "promotion_guardrails": promotion,
+    }
+
+
+@app.get("/diagnostics/active_signal_rule_gaps")
+def diagnostics_active_signal_rule_gaps(limit: int = 500):
+    return {
+        "ok": True,
+        "utc": utc_now_iso(),
+        "build": PATCH_BUILD,
+        "rule_gaps": _active_signal_rule_gap_summary(limit=limit),
     }
 
 
@@ -10578,6 +10675,7 @@ def diagnostics_active_signal_calibration(recent_limit: int = 25):
         "active_signal_calibration": active_signal_calibration,
         "active_signal_funnel": perf.get("active_signal_funnel") or {},
         "active_no_signal_rules": perf.get("active_no_signal_rules") or {},
+        "active_signal_rule_gaps": perf.get("active_signal_rule_gaps") or {},
         "pretrade_health_gate": gate,
         "promotion_guardrails": promotion,
     }
