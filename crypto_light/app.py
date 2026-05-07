@@ -518,8 +518,10 @@ def _live_promotion_guardrails_snapshot(compatibility: dict[str, Any] | None = N
         "scanner_required": scanner_required,
     }
     blockers = []
+    gate_violations = [str(v) for v in ((gate or {}).get("violations") or []) if str(v)]
     if not checks["readiness_green"]:
         blockers.append("system_not_ready")
+        blockers.extend([f"pretrade_{v}" for v in gate_violations])
     if not checks["btc_only_alignment_ready"]:
         blockers.append("btc_alignment_not_ready")
     if not checks["scanner_ready"]:
@@ -9757,15 +9759,15 @@ def _active_entry_status(
         blocker = "fills_or_position_lifecycle"
         action = "Inspect open plans/orders and execution telemetry for accepted signals that have not closed."
     elif rejected > 0 and no_signal_count >= rejected:
-        state = "READY_BUT_NO_ENTRY_SIGNALS"
+        state = "NO_ENTRY_SIGNALS"
         blocker = "no_signal"
         action = "Wait for either ME1 momentum breakout/volume expansion or MR1 reclaim/rejection-wick confirmation; current market bars do not satisfy entry rules."
     elif rejected > 0:
-        state = "READY_BUT_REJECTING_ENTRIES"
+        state = "REJECTING_ENTRIES"
         blocker = ", ".join((active_signal_funnel.get("by_reason") or {}).keys()) or "entry_rejections"
         action = "Review rejection totals and the active rule-failure table for the highest-count gate."
     else:
-        state = "READY_WAITING_FOR_SCANS"
+        state = "WAITING_FOR_SCANS"
         blocker = "none_observed"
         action = "No active admission events are present yet; confirm the scan loop is producing candidates."
 
@@ -9783,6 +9785,42 @@ def _active_entry_status(
         "top_failed_rule": top_rule,
         "operator_action": action,
     }
+
+
+def _pretrade_gate_blockers(gate: dict[str, Any]) -> list[str]:
+    blockers = [str(v) for v in ((gate or {}).get("violations") or []) if str(v)]
+    if blockers:
+        return blockers
+    if not bool((gate or {}).get("gate_open")):
+        if not bool((gate or {}).get("ok", True)):
+            return ["pretrade_health_gate_error"]
+        return ["pretrade_health_gate_closed"]
+    return []
+
+
+def _dashboard_entry_status(
+    active_entry_status: dict[str, Any],
+    promotion: dict[str, Any],
+    gate: dict[str, Any],
+) -> dict[str, Any]:
+    status = dict(active_entry_status or {})
+    system_ready = bool(((promotion or {}).get("checks") or {}).get("readiness_green"))
+    promotion_ready = bool((promotion or {}).get("promotion_ready"))
+    trade_gate_open = bool((gate or {}).get("gate_open"))
+    system_blockers = [str(b) for b in ((promotion or {}).get("promotion_blockers") or []) if str(b)]
+    pretrade_blockers = _pretrade_gate_blockers(gate)
+    primary_system_blocker = (pretrade_blockers or system_blockers or ["none"])[0]
+    status.update({
+        "system_ready": system_ready,
+        "promotion_ready": promotion_ready,
+        "trade_gate_open": trade_gate_open,
+        "system_blockers": system_blockers,
+        "pretrade_blockers": pretrade_blockers,
+        "primary_system_blocker": primary_system_blocker,
+        "effective_state": (status.get("state") if system_ready else "SYSTEM_NOT_READY"),
+        "effective_primary_blocker": (status.get("primary_blocker") if system_ready else primary_system_blocker),
+    })
+    return status
 
 
 def _performance_snapshot(days: float = 30.0, recent_limit: int = 25) -> dict[str, Any]:
@@ -9975,6 +10013,8 @@ def dashboard(recent_limit: int = 15):
             open_plans.append(asdict(p) if is_dataclass(p) else p)
     except Exception:
         open_plans = []
+        
+     dashboard_entry_status = _dashboard_entry_status(perf.get("active_entry_status") or {}, promotion, gate)    
 
     return {
         "ok": True,
@@ -10008,7 +10048,7 @@ def dashboard_ui(recent_limit: int = 25):
     active_admission_summary = perf.get("active_admission_summary") or {}
     active_signal_funnel = perf.get("active_signal_funnel") or {}
     active_no_signal_rules = perf.get("active_no_signal_rules") or {}
-    active_entry_status = perf.get("active_entry_status") or {}
+    active_entry_status = snap.get("active_entry_status") or perf.get("active_entry_status") or {}
     edge_decay = perf.get("active_edge_decay") or ((active_window.get("edge_decay") or {}) or (telemetry.get("edge_decay") or {}))
     ops = telemetry.get("operations_health") or {}
     exec_truth = telemetry.get("execution_truth") or {}
@@ -10063,7 +10103,9 @@ def dashboard_ui(recent_limit: int = 25):
     if not scanner_required_flag:
         blockers = [b for b in blockers if not b.startswith("scanner_")]
     blocker_text = ", ".join(sorted(set(blockers))) or "none"
+    pretrade_blocker_text = ", ".join(active_entry_status.get("pretrade_blockers") or []) or "none"
     entry_blocker_text = str(active_entry_status.get("primary_blocker") or "unknown")
+    effective_entry_blocker_text = str(active_entry_status.get("effective_primary_blocker") or entry_blocker_text)
     scanner_status_text = "OPTIONAL" if not scanner_required_flag else ("OK" if bool((snap.get("compatibility") or {}).get("scanner_ok")) else "DOWN")
 
     rows = []
@@ -10129,14 +10171,17 @@ def dashboard_ui(recent_limit: int = 25):
       <div class="grid">
         <div class="card callout span-12"><h3>Entry Status — Where Are We?</h3>
           <table><tbody>
-            <tr><th>state</th><td>{active_entry_status.get("state") or "unknown"}</td><th>has_trades</th><td>{str(bool(active_entry_status.get("has_trades"))).upper()}</td></tr>
-            <tr><th>primary_blocker</th><td>{entry_blocker_text}</td><th>top_failed_rule</th><td>{active_entry_status.get("top_failed_rule") or "none"}</td></tr>
-            <tr><th>top_no_signal_symbol</th><td>{active_entry_status.get("top_no_signal_symbol") or "none"}</td><th>operator_action</th><td>{active_entry_status.get("operator_action") or "review diagnostics"}</td></tr>
+            <tr><th>system_state</th><td>{active_entry_status.get("effective_state") or "unknown"}</td><th>has_trades</th><td>{str(bool(active_entry_status.get("has_trades"))).upper()}</td></tr>
+            <tr><th>entry_state</th><td>{active_entry_status.get("state") or "unknown"}</td><th>entry_blocker</th><td>{entry_blocker_text}</td></tr>
+            <tr><th>system_blocker</th><td>{effective_entry_blocker_text}</td><th>pretrade_blockers</th><td>{pretrade_blocker_text}</td></tr>
+            <tr><th>top_no_signal_symbol</th><td>{active_entry_status.get("top_no_signal_symbol") or "none"}</td><th>top_failed_rule</th><td>{active_entry_status.get("top_failed_rule") or "none"}</td></tr>
+            <tr><th>operator_action</th><td colspan="3">{active_entry_status.get("operator_action") or "review diagnostics"}</td></tr>
           </tbody></table>
         </div>
         <div class="card span-6"><h3>Operator Alerts</h3>
           <table><tbody>
             <tr><th>Current blockers</th><td>{blocker_text}</td></tr>
+            <tr><th>Pretrade blockers</th><td>{pretrade_blocker_text}</td></tr>
             <tr><th>Entry blocker</th><td>{entry_blocker_text}</td></tr>
             <tr><th>Internal scanner</th><td>{'RUNNING' if bool(((snap.get('promotion_guardrails') or {}).get('checks') or {}).get('workers_healthy')) else 'ISSUES'}</td></tr>
             <tr><th>Worker status</th><td>{'HEALTHY' if bool(((snap.get('promotion_guardrails') or {}).get('checks') or {}).get('workers_healthy')) else 'ISSUES'}</td></tr>
@@ -10145,7 +10190,7 @@ def dashboard_ui(recent_limit: int = 25):
         <div class="card span-6"><h3>Exception Center</h3>
           <table><tbody>
             <tr><th>promotion_ready</th><td>{str(bool(snap.get('promotion_ready'))).upper()}</td></tr>
-            <tr><th>trade_gate_ok</th><td>{str(bool((snap.get('pretrade_health_gate') or {}).get('ok'))).upper()}</td></tr>
+            <tr><th>trade_gate_ok</th><td>{str(bool((snap.get('pretrade_health_gate') or {}).get('gate_open'))).upper()}</td></tr>
             <tr><th>balance_ok</th><td>{str(bool(account_truth.get('balance_ok'))).upper()}</td></tr>
             <tr><th>open_order_count</th><td>{int(account_truth.get('open_order_count') or 0)}</td></tr>
           </tbody></table>
@@ -10166,7 +10211,7 @@ def dashboard_ui(recent_limit: int = 25):
           <table><tbody>
             <tr><th>ready</th><td class="{'status-ok' if snap.get('ready') else 'status-bad'}">{str(bool(snap.get('ready'))).upper()}</td></tr>
             <tr><th>promotion_ready</th><td>{str(bool(snap.get('promotion_ready'))).upper()}</td></tr>
-            <tr><th>trade_gate_ok</th><td>{str(bool((snap.get('pretrade_health_gate') or {}).get('ok'))).upper()}</td></tr>
+            <tr><th>trade_gate_ok</th><td>{str(bool((snap.get('pretrade_health_gate') or {}).get('gate_open'))).upper()}</td></tr>
             <tr><th>current_blockers</th><td>{blocker_text}</td></tr>
           </tbody></table>
         </div>
@@ -10254,14 +10299,25 @@ def diagnostics_active_no_signal_rules(limit: int = 500):
 
 @app.get("/diagnostics/active_entry_status")
 def diagnostics_active_entry_status(recent_limit: int = 25):
+    try:
+        gate = _pretrade_health_gate_summary(rerun_startup_check=False)
+    except Exception:
+        gate = {"ok": False}
+    try:
+        promotion = _live_promotion_guardrails_snapshot(gate=gate)
+    except Exception:
+        promotion = {"ok": False}
     perf = _performance_snapshot(recent_limit=recent_limit)
+    active_entry_status = _dashboard_entry_status(perf.get("active_entry_status") or {}, promotion, gate)
     return {
         "ok": True,
         "utc": utc_now_iso(),
         "build": PATCH_BUILD,
-        "active_entry_status": perf.get("active_entry_status") or {},
+        "active_entry_status": active_entry_status,
         "active_signal_funnel": perf.get("active_signal_funnel") or {},
         "active_no_signal_rules": perf.get("active_no_signal_rules") or {},
+        "pretrade_health_gate": gate,
+        "promotion_guardrails": promotion,
     }
 
 
