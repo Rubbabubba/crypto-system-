@@ -10014,7 +10014,7 @@ def dashboard(recent_limit: int = 15):
     except Exception:
         open_plans = []
         
-     dashboard_entry_status = _dashboard_entry_status(perf.get("active_entry_status") or {}, promotion, gate)    
+    dashboard_entry_status = _dashboard_entry_status(perf.get("active_entry_status") or {}, promotion, gate)    
 
     return {
         "ok": True,
