@@ -1,0 +1,3 @@
+Patch 018: signal calibration plan.
+
+Adds a concrete active signal calibration plan so repeated no-signal deployments show which entry gate to review next and what guardrail to keep in place.
