@@ -9895,6 +9895,59 @@ def _signal_check_calibration_hint(key: str) -> dict[str, Any]:
     }
 
 
+def _signal_check_shadow_experiment(key: str) -> dict[str, Any] | None:
+    key_l = str(key or '').lower()
+    if key_l.startswith('me1|breakout'):
+        return {
+            "name": "shadow_me1_breakout_buffer",
+            "env_var": "ME1_BREAKOUT_BUFFER_PCT",
+            "current_value": float(ME1_BREAKOUT_BUFFER_PCT),
+            "shadow_test_value": max(0.0, min(float(ME1_BREAKOUT_BUFFER_PCT), float(ME1_REAL_BREAKOUT_BUFFER_PCT))),
+            "success_metric": "active_passed increases without spread/edge admission failures",
+        }
+    if key_l.startswith('me1|volume_expansion'):
+        return {
+            "name": "shadow_me1_volume_mult",
+            "env_var": "ME1_MIN_VOLUME_MULT",
+            "current_value": float(ME1_MIN_VOLUME_MULT),
+            "shadow_test_value": max(float(ME1_REAL_MIN_VOLUME_MULT), min(float(ME1_MIN_VOLUME_MULT), float(ME1_ADAPTIVE_MIN_VOLUME_MULT))),
+            "success_metric": "ME1 candidates pass volume without expected edge falling below threshold",
+        }
+    if key_l.startswith('me1|range_expansion'):
+        return {
+            "name": "shadow_me1_range_atr",
+            "env_var": "ME1_MIN_RANGE_ATR",
+            "current_value": float(ME1_MIN_RANGE_ATR),
+            "shadow_test_value": max(float(ME1_REAL_MIN_RANGE_ATR), min(float(ME1_MIN_RANGE_ATR), float(ME1_ADAPTIVE_MIN_RANGE_ATR))),
+            "success_metric": "ME1 range passes while realized spread and edge gates remain healthy",
+        }
+    if key_l.startswith('mr1|volume_confirm'):
+        return {
+            "name": "shadow_mr1_volume_mult",
+            "env_var": "MR1_MIN_VOLUME_MULT",
+            "current_value": float(MR1_MIN_VOLUME_MULT),
+            "shadow_test_value": max(float(MR1_REAL_MIN_VOLUME_MULT), min(float(MR1_MIN_VOLUME_MULT), float(MR1_ADAPTIVE_MIN_VOLUME_MULT))),
+            "success_metric": "MR1 reclaim candidates pass volume without increasing churn",
+        }
+    if key_l.startswith('mr1|ema_reclaim') or key_l.startswith('mr1|green_or_reclaim_bar'):
+        return {
+            "name": "shadow_mr1_reclaim_softening",
+            "env_var": "MR1_REQUIRE_VWAP_RECLAIM",
+            "current_value": bool(MR1_REQUIRE_VWAP_RECLAIM),
+            "shadow_test_value": False,
+            "success_metric": "MR1 reclaim candidates pass only when expected net edge remains positive",
+        }
+    if key_l.startswith('mr1|rejection_wick'):
+        return {
+            "name": "shadow_mr1_lower_wick_pct",
+            "env_var": "MR1_MIN_LOWER_WICK_PCT",
+            "current_value": float(MR1_MIN_LOWER_WICK_PCT),
+            "shadow_test_value": max(float(MR1_REAL_MIN_LOWER_WICK_PCT), min(float(MR1_MIN_LOWER_WICK_PCT), float(MR1_ADAPTIVE_MIN_LOWER_WICK_PCT))),
+            "success_metric": "MR1 rejection candidates pass without weakening stop/edge quality",
+        }
+    return None
+
+
 def _active_signal_calibration_plan(
     active_signal_funnel: dict[str, Any],
     active_no_signal_rules: dict[str, Any],
@@ -9923,6 +9976,7 @@ def _active_signal_calibration_plan(
 
     top_check = str(((top_checks or [{}])[0] or {}).get("key") or "")
     hint = _signal_check_calibration_hint(top_check)
+    experiments = [e for e in (_signal_check_shadow_experiment(str(row.get("key") or "")) for row in top_checks) if e is not None]
     signal_starved = bool(status.get("signal_starved"))
     decision = "run_shadow_calibration" if signal_starved else str(status.get("next_step") or "monitor")
     return {
@@ -9935,6 +9989,7 @@ def _active_signal_calibration_plan(
         "recommended_review": hint.get("review"),
         "top_failed_checks": top_checks,
         "top_no_signal_symbols": top_symbols,
+        "shadow_experiments": experiments[:3],
         "guardrail": "Do not loosen live risk or multiple gates at once; test one threshold change in shadow/paper first.",
     }
 
@@ -9989,7 +10044,7 @@ def _performance_snapshot(days: float = 30.0, recent_limit: int = 25) -> dict[st
     active_signal_funnel = _active_signal_funnel(limit=500)
     active_no_signal_rules = _active_no_signal_rule_breakdown(limit=500)
     active_entry_status = _active_entry_status(positions, active_window, active_signal_funnel, active_no_signal_rules)
-    active_signal_calibration = _active_signal_calibration_plan(active_signal_funnel, active_no_signal_rules, active_entry_status)    
+    active_signal_calibration = _active_signal_calibration_plan(active_signal_funnel, active_no_signal_rules, active_entry_status)   
 
     return {
         "ok": True,
@@ -10250,6 +10305,8 @@ def dashboard_ui(recent_limit: int = 25, refresh_sec: int | None = None):
     calibration_decision_text = str(active_signal_calibration.get("decision") or next_step_text)
     calibration_focus_text = str(active_signal_calibration.get("primary_focus") or active_entry_status.get("top_failed_rule") or "none")
     calibration_review_text = str(active_signal_calibration.get("recommended_review") or active_entry_status.get("operator_action") or "review diagnostics")
+    shadow_experiments = list(active_signal_calibration.get("shadow_experiments") or [])
+    shadow_experiment_text = ", ".join([f"{e.get('env_var')}={e.get('shadow_test_value')}" for e in shadow_experiments[:3]]) or "none"
     scanner_status_text = "OPTIONAL" if not scanner_required_flag else ("OK" if bool((snap.get("compatibility") or {}).get("scanner_ok")) else "DOWN")
 
     rows = []
@@ -10328,6 +10385,7 @@ def dashboard_ui(recent_limit: int = 25, refresh_sec: int | None = None):
             <tr><th>decision</th><td>{calibration_decision_text}</td><th>no_signal_rejections</th><td>{int(active_entry_status.get("no_signal_rejections") or 0)} / {int(active_entry_status.get("no_signal_escalation_count") or 0)}</td></tr>
             <tr><th>calibration_focus</th><td>{calibration_focus_text}</td><th>primary_failed_check</th><td>{active_signal_calibration.get("primary_failed_check") or "none"}</td></tr>
             <tr><th>review</th><td colspan="3">{calibration_review_text}</td></tr>
+            <tr><th>shadow_test</th><td colspan="3">{shadow_experiment_text}</td></tr>
             <tr><th>guardrail</th><td colspan="3">{active_signal_calibration.get("guardrail") or "Keep live risk unchanged while calibrating."}</td></tr>
           </tbody></table>
         </div>
