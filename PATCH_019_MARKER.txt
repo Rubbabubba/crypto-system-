@@ -1,0 +1,3 @@
+Patch 019: worker health next action.
+
+Prioritizes worker/pretrade recovery over signal calibration when the dashboard is not ready due stale scan or exit workers.
