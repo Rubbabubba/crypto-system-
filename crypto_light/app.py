@@ -9731,6 +9731,14 @@ def _active_no_signal_rule_breakdown(limit: int = 250) -> dict[str, Any]:
     }
 
 
+def _active_no_signal_escalation_count() -> int:
+    try:
+        raw = int(os.getenv("ACTIVE_NO_SIGNAL_ESCALATE_COUNT", "10") or 10)
+    except Exception:
+        raw = 10
+    return max(1, min(raw, 1000))
+
+
 def _active_entry_status(
     positions: list[dict[str, Any]],
     active_window: dict[str, Any],
@@ -9745,31 +9753,44 @@ def _active_entry_status(
     no_signal_count += int((active_signal_funnel.get("by_reason") or {}).get("no_signal") or 0)
     top_symbol = ((active_signal_funnel.get("no_signal_by_symbol") or [{}])[0] or {}).get("key") or None
     top_rule = ((active_no_signal_rules.get("top_strategy_failed_checks") or [{}])[0] or {}).get("key") or None
+    escalation_count = _active_no_signal_escalation_count()
+    signal_starved = bool(no_signal_count >= escalation_count and accepted == 0 and closed_trades == 0 and open_positions == 0)
+    next_step = "monitor"
 
     if open_positions > 0:
         state = "IN_POSITION"
         blocker = "none"
         action = "Monitor open position management and execution reconciliation."
+        next_step = "monitor_position"
     elif closed_trades > 0:
         state = "TRADING"
         blocker = "none"
         action = "Trading has completed active-window round trips; monitor expectancy and edge decay."
+        next_step = "monitor_expectancy"
     elif accepted > 0:
         state = "SIGNALS_PASSED_NO_CLOSED_TRADES"
         blocker = "fills_or_position_lifecycle"
         action = "Inspect open plans/orders and execution telemetry for accepted signals that have not closed."
+        next_step = "inspect_execution_lifecycle"
     elif rejected > 0 and no_signal_count >= rejected:
-        state = "NO_ENTRY_SIGNALS"
+        state = "SIGNAL_STARVATION" if signal_starved else "NO_ENTRY_SIGNALS"
         blocker = "no_signal"
-        action = "Wait for either ME1 momentum breakout/volume expansion or MR1 reclaim/rejection-wick confirmation; current market bars do not satisfy entry rules."
+        next_step = "calibrate_entry_rules" if signal_starved else "wait_for_valid_setup"
+        action = (
+            "No signals have passed after repeated active scans; review ME1/MR1 thresholds against recent bars before loosening live risk."
+            if signal_starved
+            else "Wait for either ME1 momentum breakout/volume expansion or MR1 reclaim/rejection-wick confirmation; current market bars do not satisfy entry rules."
+        )
     elif rejected > 0:
         state = "REJECTING_ENTRIES"
         blocker = ", ".join((active_signal_funnel.get("by_reason") or {}).keys()) or "entry_rejections"
         action = "Review rejection totals and the active rule-failure table for the highest-count gate."
+        next_step = "review_entry_rejections"
     else:
         state = "WAITING_FOR_SCANS"
         blocker = "none_observed"
         action = "No active admission events are present yet; confirm the scan loop is producing candidates."
+        next_step = "verify_scan_candidates"
 
     return {
         "ok": True,
@@ -9780,6 +9801,9 @@ def _active_entry_status(
         "active_passed": accepted,
         "active_rejected": rejected,
         "no_signal_rejections": no_signal_count,
+        "no_signal_escalation_count": escalation_count,
+        "signal_starved": signal_starved,
+        "next_step": next_step,
         "primary_blocker": blocker,
         "top_no_signal_symbol": top_symbol,
         "top_failed_rule": top_rule,
@@ -9810,6 +9834,8 @@ def _dashboard_entry_status(
     system_blockers = [str(b) for b in ((promotion or {}).get("promotion_blockers") or []) if str(b)]
     pretrade_blockers = _pretrade_gate_blockers(gate)
     primary_system_blocker = (pretrade_blockers or system_blockers or ["none"])[0]
+    entry_state = str(status.get("state") or "UNKNOWN")
+    effective_state = entry_state if system_ready else "SYSTEM_NOT_READY"
     status.update({
         "system_ready": system_ready,
         "promotion_ready": promotion_ready,
@@ -9817,7 +9843,8 @@ def _dashboard_entry_status(
         "system_blockers": system_blockers,
         "pretrade_blockers": pretrade_blockers,
         "primary_system_blocker": primary_system_blocker,
-        "effective_state": (status.get("state") if system_ready else "SYSTEM_NOT_READY"),
+        "system_state": "READY" if system_ready else "NOT_READY",
+        "effective_state": effective_state,
         "effective_primary_blocker": (status.get("primary_blocker") if system_ready else primary_system_blocker),
     })
     return status
@@ -10120,7 +10147,8 @@ def dashboard_ui(recent_limit: int = 25, refresh_sec: int | None = None):
     blocker_text = ", ".join(sorted(set(blockers))) or "none"
     pretrade_blocker_text = ", ".join(active_entry_status.get("pretrade_blockers") or []) or "none"
     entry_blocker_text = str(active_entry_status.get("primary_blocker") or "unknown")
-    effective_entry_blocker_text = str(active_entry_status.get("effective_primary_blocker") or entry_blocker_text)
+    system_blocker_text = str(active_entry_status.get("primary_system_blocker") or "none")
+    next_step_text = str(active_entry_status.get("next_step") or "review_diagnostics")
     scanner_status_text = "OPTIONAL" if not scanner_required_flag else ("OK" if bool((snap.get("compatibility") or {}).get("scanner_ok")) else "DOWN")
 
     rows = []
@@ -10186,11 +10214,18 @@ def dashboard_ui(recent_limit: int = 25, refresh_sec: int | None = None):
       <div class="grid">
         <div class="card callout span-12"><h3>Entry Status — Where Are We?</h3>
           <table><tbody>
-            <tr><th>system_state</th><td>{active_entry_status.get("effective_state") or "unknown"}</td><th>has_trades</th><td>{str(bool(active_entry_status.get("has_trades"))).upper()}</td></tr>
-            <tr><th>entry_state</th><td>{active_entry_status.get("state") or "unknown"}</td><th>entry_blocker</th><td>{entry_blocker_text}</td></tr>
-            <tr><th>system_blocker</th><td>{effective_entry_blocker_text}</td><th>pretrade_blockers</th><td>{pretrade_blocker_text}</td></tr>
+            <tr><th>system_state</th><td>{active_entry_status.get("system_state") or ("READY" if snap.get("ready") else "NOT_READY")}</td><th>has_trades</th><td>{str(bool(active_entry_status.get("has_trades"))).upper()}</td></tr>
+            <tr><th>entry_state</th><td>{active_entry_status.get("effective_state") or active_entry_status.get("state") or "unknown"}</td><th>entry_blocker</th><td>{entry_blocker_text}</td></tr>
+            <tr><th>system_blocker</th><td>{system_blocker_text}</td><th>pretrade_blockers</th><td>{pretrade_blocker_text}</td></tr>
+            <tr><th>next_step</th><td>{next_step_text}</td><th>signal_starved</th><td>{str(bool(active_entry_status.get("signal_starved"))).upper()}</td></tr>
             <tr><th>top_no_signal_symbol</th><td>{active_entry_status.get("top_no_signal_symbol") or "none"}</td><th>top_failed_rule</th><td>{active_entry_status.get("top_failed_rule") or "none"}</td></tr>
             <tr><th>operator_action</th><td colspan="3">{active_entry_status.get("operator_action") or "review diagnostics"}</td></tr>
+          </tbody></table>
+        </div>
+        <div class="card span-12"><h3>Next Action</h3>
+          <table><tbody>
+            <tr><th>decision</th><td>{next_step_text}</td><th>no_signal_rejections</th><td>{int(active_entry_status.get("no_signal_rejections") or 0)} / {int(active_entry_status.get("no_signal_escalation_count") or 0)}</td></tr>
+            <tr><th>guidance</th><td colspan="3">If signal_starved is TRUE, keep live risk unchanged and run a calibration review of the highest failed checks before adjusting ME1/MR1 thresholds.</td></tr>
           </tbody></table>
         </div>
         <div class="card span-6"><h3>Operator Alerts</h3>
