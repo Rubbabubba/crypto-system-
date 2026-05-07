@@ -9749,8 +9749,11 @@ def _active_entry_status(
     closed_trades = int(active_window.get("closed_trades") or 0) if active_window.get("ok") else 0
     accepted = int(active_signal_funnel.get("passed") or 0)
     rejected = int(active_signal_funnel.get("rejected") or 0)
-    no_signal_count = int((active_signal_funnel.get("by_reason") or {}).get("rejected_no_signal") or 0)
-    no_signal_count += int((active_signal_funnel.get("by_reason") or {}).get("no_signal") or 0)
+    by_reason = dict((active_signal_funnel.get("by_reason") or {}))
+    no_signal_count = int(by_reason.get("rejected_no_signal") or 0)
+    no_signal_count += int(by_reason.get("no_signal") or 0)
+    scan_cap_count = int(by_reason.get("rejected_max_entries_per_scan") or 0)
+    other_rejection_reasons = sorted([str(k) for k in by_reason.keys() if k not in ("rejected_no_signal", "no_signal")])
     top_symbol = ((active_signal_funnel.get("no_signal_by_symbol") or [{}])[0] or {}).get("key") or None
     top_rule = ((active_no_signal_rules.get("top_strategy_failed_checks") or [{}])[0] or {}).get("key") or None
     escalation_count = _active_no_signal_escalation_count()
@@ -9772,20 +9775,23 @@ def _active_entry_status(
         blocker = "fills_or_position_lifecycle"
         action = "Inspect open plans/orders and execution telemetry for accepted signals that have not closed."
         next_step = "inspect_execution_lifecycle"
-    elif rejected > 0 and no_signal_count >= rejected:
-        state = "SIGNAL_STARVATION" if signal_starved else "NO_ENTRY_SIGNALS"
+    elif signal_starved:
+        state = "SIGNAL_STARVATION"
         blocker = "no_signal"
-        next_step = "calibrate_entry_rules" if signal_starved else "wait_for_valid_setup"
-        action = (
-            "No signals have passed after repeated active scans; review ME1/MR1 thresholds against recent bars before loosening live risk."
-            if signal_starved
-            else "Wait for either ME1 momentum breakout/volume expansion or MR1 reclaim/rejection-wick confirmation; current market bars do not satisfy entry rules."
-        )
+        if scan_cap_count > 0:
+            blocker = "no_signal, rejected_max_entries_per_scan"
+        next_step = "calibrate_entry_rules"
+        action = "No signals have passed after repeated active scans; review ME1/MR1 thresholds against recent bars before loosening live risk."
+    elif rejected > 0 and no_signal_count >= rejected:
+        state = "NO_ENTRY_SIGNALS"
+        blocker = "no_signal"
+        next_step = "wait_for_valid_setup"
+        action = "Wait for either ME1 momentum breakout/volume expansion or MR1 reclaim/rejection-wick confirmation; current market bars do not satisfy entry rules."
     elif rejected > 0:
-        state = "REJECTING_ENTRIES"
-        blocker = ", ".join((active_signal_funnel.get("by_reason") or {}).keys()) or "entry_rejections"
-        action = "Review rejection totals and the active rule-failure table for the highest-count gate."
-        next_step = "review_entry_rejections"
+        state = "SCAN_CAP_AND_ENTRY_REJECTIONS" if scan_cap_count > 0 else "REJECTING_ENTRIES"
+        blocker = ", ".join(by_reason.keys()) or "entry_rejections"
+        action = "Review rejection totals, scan-cap counts, and the active rule-failure table for the highest-count gate."
+        next_step = "review_scan_capacity" if scan_cap_count > 0 else "review_entry_rejections"
     else:
         state = "WAITING_FOR_SCANS"
         blocker = "none_observed"
@@ -9801,6 +9807,8 @@ def _active_entry_status(
         "active_passed": accepted,
         "active_rejected": rejected,
         "no_signal_rejections": no_signal_count,
+        "scan_cap_rejections": scan_cap_count,
+        "other_rejection_reasons": other_rejection_reasons,
         "no_signal_escalation_count": escalation_count,
         "signal_starved": signal_starved,
         "next_step": next_step,
@@ -9956,6 +9964,7 @@ def _active_signal_calibration_plan(
     top_checks = list((active_no_signal_rules or {}).get("top_strategy_failed_checks") or [])[:5]
     top_symbols = list((active_signal_funnel or {}).get("no_signal_by_symbol") or [])[:5]
     status = dict(active_entry_status or {})
+    scan_cap_count = int(status.get("scan_cap_rejections") or 0)
     if ("system_ready" in status) and not bool(status.get("system_ready")):
         pretrade_blockers = [str(b) for b in (status.get("pretrade_blockers") or []) if str(b)]
         system_blockers = [str(b) for b in (status.get("system_blockers") or []) if str(b)]
@@ -9971,6 +9980,9 @@ def _active_signal_calibration_plan(
             "recommended_review": f"Restore pretrade readiness first: {', '.join(blockers)}. Then reassess active signal failures after fresh scans.",
             "top_failed_checks": top_checks,
             "top_no_signal_symbols": top_symbols,
+            "scan_cap_rejections": scan_cap_count,
+            "scan_cap_guidance": "",
+            "shadow_experiments": [],
             "guardrail": "Do not calibrate strategy thresholds while the scan/exit worker health gate is closed; stale signal-debug rows may be misleading.",
         }
 
@@ -9990,6 +10002,8 @@ def _active_signal_calibration_plan(
         "top_failed_checks": top_checks,
         "top_no_signal_symbols": top_symbols,
         "shadow_experiments": experiments[:3],
+        "scan_cap_rejections": scan_cap_count,
+        "scan_cap_guidance": ("MAX_ENTRIES_PER_SCAN is also firing; do not raise live capacity until at least one candidate passes signal and edge gates in shadow." if scan_cap_count > 0 else ""),
         "guardrail": "Do not loosen live risk or multiple gates at once; test one threshold change in shadow/paper first.",
     }
 
@@ -10307,6 +10321,7 @@ def dashboard_ui(recent_limit: int = 25, refresh_sec: int | None = None):
     calibration_review_text = str(active_signal_calibration.get("recommended_review") or active_entry_status.get("operator_action") or "review diagnostics")
     shadow_experiments = list(active_signal_calibration.get("shadow_experiments") or [])
     shadow_experiment_text = ", ".join([f"{e.get('env_var')}={e.get('shadow_test_value')}" for e in shadow_experiments[:3]]) or "none"
+    scan_cap_guidance_text = str(active_signal_calibration.get("scan_cap_guidance") or "none")
     scanner_status_text = "OPTIONAL" if not scanner_required_flag else ("OK" if bool((snap.get("compatibility") or {}).get("scanner_ok")) else "DOWN")
 
     rows = []
@@ -10386,6 +10401,7 @@ def dashboard_ui(recent_limit: int = 25, refresh_sec: int | None = None):
             <tr><th>calibration_focus</th><td>{calibration_focus_text}</td><th>primary_failed_check</th><td>{active_signal_calibration.get("primary_failed_check") or "none"}</td></tr>
             <tr><th>review</th><td colspan="3">{calibration_review_text}</td></tr>
             <tr><th>shadow_test</th><td colspan="3">{shadow_experiment_text}</td></tr>
+            <tr><th>scan_cap_guidance</th><td colspan="3">{scan_cap_guidance_text}</td></tr>
             <tr><th>guardrail</th><td colspan="3">{active_signal_calibration.get("guardrail") or "Keep live risk unchanged while calibrating."}</td></tr>
           </tbody></table>
         </div>
