@@ -9902,10 +9902,29 @@ def _active_signal_calibration_plan(
 ) -> dict[str, Any]:
     top_checks = list((active_no_signal_rules or {}).get("top_strategy_failed_checks") or [])[:5]
     top_symbols = list((active_signal_funnel or {}).get("no_signal_by_symbol") or [])[:5]
+    status = dict(active_entry_status or {})
+    if ("system_ready" in status) and not bool(status.get("system_ready")):
+        pretrade_blockers = [str(b) for b in (status.get("pretrade_blockers") or []) if str(b)]
+        system_blockers = [str(b) for b in (status.get("system_blockers") or []) if str(b)]
+        blockers = pretrade_blockers or system_blockers or [str(status.get("primary_system_blocker") or "system_not_ready")]
+        worker_blocked = any("worker_stale" in b or "worker_health" in b for b in blockers)
+        return {
+            "ok": True,
+            "decision": "recover_worker_health" if worker_blocked else "recover_system_readiness",
+            "signal_starved": False,
+            "primary_failed_check": None,
+            "primary_focus": "Worker heartbeat / pretrade gate" if worker_blocked else "System readiness gate",
+            "primary_hypothesis": "scan or exit worker heartbeat is stale, so the system is not producing reliable active admission events" if worker_blocked else "the pretrade readiness gate is closed",
+            "recommended_review": f"Restore pretrade readiness first: {', '.join(blockers)}. Then reassess active signal failures after fresh scans.",
+            "top_failed_checks": top_checks,
+            "top_no_signal_symbols": top_symbols,
+            "guardrail": "Do not calibrate strategy thresholds while the scan/exit worker health gate is closed; stale signal-debug rows may be misleading.",
+        }
+
     top_check = str(((top_checks or [{}])[0] or {}).get("key") or "")
     hint = _signal_check_calibration_hint(top_check)
-    signal_starved = bool((active_entry_status or {}).get("signal_starved"))
-    decision = "run_shadow_calibration" if signal_starved else str((active_entry_status or {}).get("next_step") or "monitor")
+    signal_starved = bool(status.get("signal_starved"))
+    decision = "run_shadow_calibration" if signal_starved else str(status.get("next_step") or "monitor")
     return {
         "ok": True,
         "decision": decision,
@@ -10113,7 +10132,12 @@ def dashboard(recent_limit: int = 15):
     except Exception:
         open_plans = []
         
-    dashboard_entry_status = _dashboard_entry_status(perf.get("active_entry_status") or {}, promotion, gate)    
+    dashboard_entry_status = _dashboard_entry_status(perf.get("active_entry_status") or {}, promotion, gate)
+    dashboard_signal_calibration = _active_signal_calibration_plan(
+        perf.get("active_signal_funnel") or {},
+        perf.get("active_no_signal_rules") or {},
+        dashboard_entry_status,
+    )    
 
     return {
         "ok": True,
@@ -10128,6 +10152,7 @@ def dashboard(recent_limit: int = 15):
         "promotion_guardrails": promotion,
         "performance": perf,
         "active_entry_status": dashboard_entry_status,
+        "active_signal_calibration": dashboard_signal_calibration,
         "open_plans": [_annotate_open_plan_legacy_state(p) if ((p or {}).get("strategy") == "tc1") else p for p in open_plans],
         "snapshot_consistency": {
             "ok": True,
@@ -10162,7 +10187,7 @@ def dashboard_ui(recent_limit: int = 25, refresh_sec: int | None = None):
     active_admission_summary = perf.get("active_admission_summary") or {}
     active_signal_funnel = perf.get("active_signal_funnel") or {}
     active_no_signal_rules = perf.get("active_no_signal_rules") or {}
-    active_signal_calibration = perf.get("active_signal_calibration") or {}
+    active_signal_calibration = snap.get("active_signal_calibration") or perf.get("active_signal_calibration") or {}
     active_entry_status = snap.get("active_entry_status") or perf.get("active_entry_status") or {}
     edge_decay = perf.get("active_edge_decay") or ((active_window.get("edge_decay") or {}) or (telemetry.get("edge_decay") or {}))
     ops = telemetry.get("operations_health") or {}
@@ -10442,6 +10467,11 @@ def diagnostics_active_entry_status(recent_limit: int = 25):
         "utc": utc_now_iso(),
         "build": PATCH_BUILD,
         "active_entry_status": active_entry_status,
+        "active_signal_calibration": _active_signal_calibration_plan(
+            perf.get("active_signal_funnel") or {},
+            perf.get("active_no_signal_rules") or {},
+            active_entry_status,
+        ),
         "active_signal_funnel": perf.get("active_signal_funnel") or {},
         "active_no_signal_rules": perf.get("active_no_signal_rules") or {},
         "pretrade_health_gate": gate,
@@ -10451,15 +10481,31 @@ def diagnostics_active_entry_status(recent_limit: int = 25):
 
 @app.get("/diagnostics/active_signal_calibration")
 def diagnostics_active_signal_calibration(recent_limit: int = 25):
+    try:
+        gate = _pretrade_health_gate_summary(rerun_startup_check=False)
+    except Exception:
+        gate = {"ok": False}
+    try:
+        promotion = _live_promotion_guardrails_snapshot(gate=gate)
+    except Exception:
+        promotion = {"ok": False}
     perf = _performance_snapshot(recent_limit=recent_limit)
+    active_entry_status = _dashboard_entry_status(perf.get("active_entry_status") or {}, promotion, gate)
+    active_signal_calibration = _active_signal_calibration_plan(
+        perf.get("active_signal_funnel") or {},
+        perf.get("active_no_signal_rules") or {},
+        active_entry_status,
+    )
     return {
         "ok": True,
         "utc": utc_now_iso(),
         "build": PATCH_BUILD,
-        "active_entry_status": perf.get("active_entry_status") or {},
-        "active_signal_calibration": perf.get("active_signal_calibration") or {},
+        "active_entry_status": active_entry_status,
+        "active_signal_calibration": active_signal_calibration,
         "active_signal_funnel": perf.get("active_signal_funnel") or {},
         "active_no_signal_rules": perf.get("active_no_signal_rules") or {},
+        "pretrade_health_gate": gate,
+        "promotion_guardrails": promotion,
     }
 
 
