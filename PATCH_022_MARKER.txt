@@ -1,0 +1,3 @@
+Patch 022: signal rule gap evidence.
+
+Adds active rule-gap evidence so signal-starvation calibration shows how close recent bars are to the failed ME1/MR1 thresholds.
