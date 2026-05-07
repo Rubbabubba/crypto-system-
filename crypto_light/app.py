@@ -9850,6 +9850,76 @@ def _dashboard_entry_status(
     return status
 
 
+def _signal_check_calibration_hint(key: str) -> dict[str, Any]:
+    key_l = str(key or '').lower()
+    if key_l.startswith('me1|breakout'):
+        return {
+            "focus": "ME1 breakout gate",
+            "hypothesis": "price is not clearing the recent range high with the configured breakout buffer",
+            "review": "Compare current bars with ME1_BREAKOUT_BUFFER_PCT and ME1_LOOKBACK_BARS before changing live thresholds.",
+        }
+    if key_l.startswith('me1|volume_expansion'):
+        return {
+            "focus": "ME1 volume expansion",
+            "hypothesis": "momentum candidates lack the required relative volume",
+            "review": "Review ME1_MIN_VOLUME_MULT and recent volume distribution in shadow mode.",
+        }
+    if key_l.startswith('me1|range_expansion'):
+        return {
+            "focus": "ME1 range expansion",
+            "hypothesis": "bars are not expanding enough versus ATR",
+            "review": "Review ME1_MIN_RANGE_ATR against recent realized ranges.",
+        }
+    if key_l.startswith('mr1|ema_reclaim') or key_l.startswith('mr1|green_or_reclaim_bar'):
+        return {
+            "focus": "MR1 reclaim confirmation",
+            "hypothesis": "mean-reversion candidates are not reclaiming EMA/VWAP or printing reclaim bars",
+            "review": "Review MR1_RECLAIM_EMA_PERIOD, MR1_REQUIRE_VWAP_RECLAIM, and soft-reclaim settings in paper first.",
+        }
+    if key_l.startswith('mr1|volume_confirm'):
+        return {
+            "focus": "MR1 volume confirmation",
+            "hypothesis": "reversal candidates lack confirmation volume",
+            "review": "Review MR1_MIN_VOLUME_MULT and prior-volume participation settings.",
+        }
+    if key_l.startswith('mr1|rejection_wick'):
+        return {
+            "focus": "MR1 rejection wick",
+            "hypothesis": "selloff bars are not showing enough lower-wick rejection",
+            "review": "Review MR1_MIN_LOWER_WICK_PCT against recent reversal bars.",
+        }
+    return {
+        "focus": key or "unknown",
+        "hypothesis": "the highest-count entry check is preventing signal admission",
+        "review": "Inspect signal_debug payloads and compare configured thresholds to recent bars.",
+    }
+
+
+def _active_signal_calibration_plan(
+    active_signal_funnel: dict[str, Any],
+    active_no_signal_rules: dict[str, Any],
+    active_entry_status: dict[str, Any],
+) -> dict[str, Any]:
+    top_checks = list((active_no_signal_rules or {}).get("top_strategy_failed_checks") or [])[:5]
+    top_symbols = list((active_signal_funnel or {}).get("no_signal_by_symbol") or [])[:5]
+    top_check = str(((top_checks or [{}])[0] or {}).get("key") or "")
+    hint = _signal_check_calibration_hint(top_check)
+    signal_starved = bool((active_entry_status or {}).get("signal_starved"))
+    decision = "run_shadow_calibration" if signal_starved else str((active_entry_status or {}).get("next_step") or "monitor")
+    return {
+        "ok": True,
+        "decision": decision,
+        "signal_starved": signal_starved,
+        "primary_failed_check": top_check or None,
+        "primary_focus": hint.get("focus"),
+        "primary_hypothesis": hint.get("hypothesis"),
+        "recommended_review": hint.get("review"),
+        "top_failed_checks": top_checks,
+        "top_no_signal_symbols": top_symbols,
+        "guardrail": "Do not loosen live risk or multiple gates at once; test one threshold change in shadow/paper first.",
+    }
+
+
 def _performance_snapshot(days: float = 30.0, recent_limit: int = 25) -> dict[str, Any]:
     positions = get_positions()
     open_notional = sum(_safe_float(p.get("notional_usd")) for p in positions)
@@ -9899,7 +9969,8 @@ def _performance_snapshot(days: float = 30.0, recent_limit: int = 25) -> dict[st
         active_admission_summary = {"ok": False, "error": f"{type(e).__name__}: {e}", "since_ts": active_since_ts}
     active_signal_funnel = _active_signal_funnel(limit=500)
     active_no_signal_rules = _active_no_signal_rule_breakdown(limit=500)
-    active_entry_status = _active_entry_status(positions, active_window, active_signal_funnel, active_no_signal_rules)    
+    active_entry_status = _active_entry_status(positions, active_window, active_signal_funnel, active_no_signal_rules)
+    active_signal_calibration = _active_signal_calibration_plan(active_signal_funnel, active_no_signal_rules, active_entry_status)    
 
     return {
         "ok": True,
@@ -9940,6 +10011,7 @@ def _performance_snapshot(days: float = 30.0, recent_limit: int = 25) -> dict[st
         "active_signal_funnel": active_signal_funnel,
         "active_no_signal_rules": active_no_signal_rules,
         "active_entry_status": active_entry_status,
+        "active_signal_calibration": active_signal_calibration,
     }
 
 
@@ -10055,7 +10127,7 @@ def dashboard(recent_limit: int = 15):
         "pretrade_health_gate": gate,
         "promotion_guardrails": promotion,
         "performance": perf,
-        "active_entry_status": (perf.get("active_entry_status") or {}),
+        "active_entry_status": dashboard_entry_status,
         "open_plans": [_annotate_open_plan_legacy_state(p) if ((p or {}).get("strategy") == "tc1") else p for p in open_plans],
         "snapshot_consistency": {
             "ok": True,
@@ -10090,6 +10162,7 @@ def dashboard_ui(recent_limit: int = 25, refresh_sec: int | None = None):
     active_admission_summary = perf.get("active_admission_summary") or {}
     active_signal_funnel = perf.get("active_signal_funnel") or {}
     active_no_signal_rules = perf.get("active_no_signal_rules") or {}
+    active_signal_calibration = perf.get("active_signal_calibration") or {}
     active_entry_status = snap.get("active_entry_status") or perf.get("active_entry_status") or {}
     edge_decay = perf.get("active_edge_decay") or ((active_window.get("edge_decay") or {}) or (telemetry.get("edge_decay") or {}))
     ops = telemetry.get("operations_health") or {}
@@ -10149,6 +10222,9 @@ def dashboard_ui(recent_limit: int = 25, refresh_sec: int | None = None):
     entry_blocker_text = str(active_entry_status.get("primary_blocker") or "unknown")
     system_blocker_text = str(active_entry_status.get("primary_system_blocker") or "none")
     next_step_text = str(active_entry_status.get("next_step") or "review_diagnostics")
+    calibration_decision_text = str(active_signal_calibration.get("decision") or next_step_text)
+    calibration_focus_text = str(active_signal_calibration.get("primary_focus") or active_entry_status.get("top_failed_rule") or "none")
+    calibration_review_text = str(active_signal_calibration.get("recommended_review") or active_entry_status.get("operator_action") or "review diagnostics")
     scanner_status_text = "OPTIONAL" if not scanner_required_flag else ("OK" if bool((snap.get("compatibility") or {}).get("scanner_ok")) else "DOWN")
 
     rows = []
@@ -10224,8 +10300,10 @@ def dashboard_ui(recent_limit: int = 25, refresh_sec: int | None = None):
         </div>
         <div class="card span-12"><h3>Next Action</h3>
           <table><tbody>
-            <tr><th>decision</th><td>{next_step_text}</td><th>no_signal_rejections</th><td>{int(active_entry_status.get("no_signal_rejections") or 0)} / {int(active_entry_status.get("no_signal_escalation_count") or 0)}</td></tr>
-            <tr><th>guidance</th><td colspan="3">If signal_starved is TRUE, keep live risk unchanged and run a calibration review of the highest failed checks before adjusting ME1/MR1 thresholds.</td></tr>
+            <tr><th>decision</th><td>{calibration_decision_text}</td><th>no_signal_rejections</th><td>{int(active_entry_status.get("no_signal_rejections") or 0)} / {int(active_entry_status.get("no_signal_escalation_count") or 0)}</td></tr>
+            <tr><th>calibration_focus</th><td>{calibration_focus_text}</td><th>primary_failed_check</th><td>{active_signal_calibration.get("primary_failed_check") or "none"}</td></tr>
+            <tr><th>review</th><td colspan="3">{calibration_review_text}</td></tr>
+            <tr><th>guardrail</th><td colspan="3">{active_signal_calibration.get("guardrail") or "Keep live risk unchanged while calibrating."}</td></tr>
           </tbody></table>
         </div>
         <div class="card span-6"><h3>Operator Alerts</h3>
@@ -10368,6 +10446,20 @@ def diagnostics_active_entry_status(recent_limit: int = 25):
         "active_no_signal_rules": perf.get("active_no_signal_rules") or {},
         "pretrade_health_gate": gate,
         "promotion_guardrails": promotion,
+    }
+
+
+@app.get("/diagnostics/active_signal_calibration")
+def diagnostics_active_signal_calibration(recent_limit: int = 25):
+    perf = _performance_snapshot(recent_limit=recent_limit)
+    return {
+        "ok": True,
+        "utc": utc_now_iso(),
+        "build": PATCH_BUILD,
+        "active_entry_status": perf.get("active_entry_status") or {},
+        "active_signal_calibration": perf.get("active_signal_calibration") or {},
+        "active_signal_funnel": perf.get("active_signal_funnel") or {},
+        "active_no_signal_rules": perf.get("active_no_signal_rules") or {},
     }
 
 
