@@ -1,0 +1,3 @@
+Patch 016: dashboard auto refresh.
+
+Adds a configurable meta-refresh interval to the operator dashboard so active telemetry updates without manual reloads.
