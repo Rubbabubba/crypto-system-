@@ -10038,8 +10038,23 @@ def dashboard(recent_limit: int = 15):
     }
 
 
+def _dashboard_refresh_seconds(refresh_sec: int | None = None) -> int:
+    if refresh_sec is not None:
+        raw = refresh_sec
+    else:
+        raw = os.getenv("DASHBOARD_AUTO_REFRESH_SEC", "15")
+    try:
+        sec = int(raw or 0)
+    except Exception:
+        sec = 15
+    return max(0, min(sec, 300))
+
+
 @app.get("/dashboard/ui", response_class=HTMLResponse)
-def dashboard_ui(recent_limit: int = 25):
+def dashboard_ui(recent_limit: int = 25, refresh_sec: int | None = None):
+    auto_refresh_sec = _dashboard_refresh_seconds(refresh_sec)
+    refresh_meta = f'<meta http-equiv="refresh" content="{auto_refresh_sec}">' if auto_refresh_sec > 0 else ''
+    refresh_chip = f'Auto refresh {auto_refresh_sec}s' if auto_refresh_sec > 0 else 'Auto refresh off'
     snap = dashboard(recent_limit=recent_limit)
     perf = snap.get("performance") or {}
     pnl = perf.get("pnl") or {}
@@ -10146,7 +10161,7 @@ def dashboard_ui(recent_limit: int = 25):
     service = snap.get("service") or {}
     account_truth = ((snap.get("promotion_guardrails") or {}).get("account_truth") or {})
     html = f"""
-    <html><head><title>Crypto Intraday Dashboard</title>
+    <html><head><title>Crypto Intraday Dashboard</title>{refresh_meta}
     <style>
       body {{ font-family: Inter, Arial, sans-serif; background:#050a18; color:#e9f2ff; margin:0; }}
       .wrap {{ max-width:1400px; margin:0 auto; padding:20px; }}
@@ -10166,7 +10181,7 @@ def dashboard_ui(recent_limit: int = 25):
       <div class="top">
         <div><div class="k">Operator Console</div><h2>Crypto Intraday Dashboard</h2>
         <div class="muted">Patch: {build.get("patch_version","")} | Env: {service.get("env_name","")} | Stage: LIVE | Snapshot: {snap.get("snapshot_utc","")}</div></div>
-        <div class="chips"><span>{readiness}</span><span>Read-only</span><span>Fast path</span></div>
+        <div class="chips"><span>{readiness}</span><span>{refresh_chip}</span><span>Read-only</span><span>Fast path</span></div>
       </div>
       <div class="grid">
         <div class="card callout span-12"><h3>Entry Status — Where Are We?</h3>
