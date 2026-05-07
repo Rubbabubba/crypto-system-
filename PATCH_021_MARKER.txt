@@ -1,0 +1,3 @@
+Patch 021: scan cap and signal starvation.
+
+Keeps signal starvation primary when no-signal dominates, while surfacing max-entries-per-scan rejections as scan-cap guidance rather than a misleading generic rejection state.
