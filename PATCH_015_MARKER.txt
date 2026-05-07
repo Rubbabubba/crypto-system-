@@ -1,0 +1,3 @@
+Patch 015: system and entry blockers.
+
+Separates system readiness blockers from strategy no-signal blockers so operators can see why the live path is not ready and why no trades are firing.
