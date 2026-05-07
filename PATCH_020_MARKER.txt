@@ -1,0 +1,3 @@
+Patch 020: shadow calibration experiments.
+
+Adds concrete shadow-only threshold experiment suggestions for repeated signal starvation without changing live entry gates.
