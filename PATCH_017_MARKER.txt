@@ -1,0 +1,3 @@
+Patch 017: signal starvation next action.
+
+Escalates repeated no-signal rejections into an operator next-step so live-ready but trade-less deployments know when to calibrate entry rules.
