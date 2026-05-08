@@ -1,0 +1,3 @@
+Patch 026: universe expansion guidance.
+
+Adds explicit dashboard guidance for whether to expand the live coin universe. Signal-starvation from entry-rule failures recommends shadow threshold/edge validation first, with any broader universe test kept paper-only until candidates clear signal and expected-edge gates.
