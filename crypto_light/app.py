@@ -10120,6 +10120,9 @@ def _active_signal_calibration_plan(
             "additional_patch_needed": "NO_SYSTEM_RECOVERY_FIRST",
             "production_patch_required": False,
             "patch_rationale": "Do not create an entry-calibration patch while system/pretrade readiness is closed.",
+            "universe_expansion_recommended": False,
+            "universe_action": "NO_SYSTEM_RECOVERY_FIRST",
+            "universe_rationale": "Do not expand the tradable universe while readiness/pretrade health is unresolved; stale scan evidence can mislead universe decisions.",
             "signal_starved": False,
             "primary_failed_check": None,
             "primary_focus": "Worker heartbeat / pretrade gate" if worker_blocked else "System readiness gate",
@@ -10141,6 +10144,9 @@ def _active_signal_calibration_plan(
             "additional_patch_needed": "NO",
             "production_patch_required": False,
             "patch_rationale": "Patch 024 is doing its job: the active rejection sample is still below the review minimum.",
+            "universe_expansion_recommended": False,
+            "universe_action": "NO_LOW_SAMPLE",
+            "universe_rationale": "Do not expand the coin universe from a low-sample window; wait for the active rejection minimum or one passed signal.",
             "signal_starved": False,
             "primary_failed_check": None,
             "primary_focus": "Insufficient active rejection sample",
@@ -10172,6 +10178,9 @@ def _active_signal_calibration_plan(
             "additional_patch_needed": "NO",
             "production_patch_required": False,
             "patch_rationale": f"No production patch is indicated: signal_starved is FALSE and no_signal rejections are {no_signal_count}/{escalation_count}.",
+            "universe_expansion_recommended": False,
+            "universe_action": "NO_SIGNAL_NOT_ESCALATED",
+            "universe_rationale": "Do not expand the live coin universe before no-signal evidence reaches escalation and before at least one setup clears signal and edge gates in shadow.",
             "signal_starved": False,
             "primary_failed_check": top_check or None,
             "primary_focus": "No production patch indicated",
@@ -10192,12 +10201,28 @@ def _active_signal_calibration_plan(
         active_signal_rule_gaps,
     )
     feasible_experiments = [e for e in experiments if bool(e.get('likely_clears_closest_gap'))]
+    universe_symbols = _patch001c_fixed_universe_symbols()
+    universe_symbol_text = ", ".join(universe_symbols) or "current fixed universe"
+    universe_action = "NO_LIVE_EXPANSION_SHADOW_THRESHOLDS_FIRST"
+    universe_rationale = (
+        f"The active universe ({universe_symbol_text}) is producing repeated candidates, but they are being blocked by entry-rule gates, "
+        "not by lack of scan coverage. Run the suggested threshold experiment in paper/shadow first; only test a broader coin universe in paper after a candidate can clear signal and expected-edge gates."
+    )
+    if feasible_experiments:
+        universe_action = "PAPER_EXPANSION_OPTIONAL_AFTER_EDGE_PASS"
+        universe_rationale = (
+            f"At least one threshold shadow test may clear the closest observed gap in the current universe ({universe_symbol_text}). "
+            "Validate that path first; if it still produces no edge-qualified candidates, then try a paper-only universe expansion before any live allowlist change."
+        )
     return {
         "ok": True,
         "decision": "run_shadow_calibration",
         "additional_patch_needed": "PENDING_SHADOW_EVIDENCE",
         "production_patch_required": False,
         "patch_rationale": "Run one paper/shadow threshold experiment first; only promote a production patch after shadow evidence clears signal and edge gates.",
+        "universe_expansion_recommended": False,
+        "universe_action": universe_action,
+        "universe_rationale": universe_rationale,
         "signal_starved": True,
         "primary_failed_check": top_check or None,
         "primary_focus": hint.get("focus"),
@@ -10415,7 +10440,7 @@ def dashboard(recent_limit: int = 15):
         perf.get("active_no_signal_rules") or {},
         dashboard_entry_status,
         perf.get("active_signal_rule_gaps") or {},
-    )    
+    )  
 
     return {
         "ok": True,
@@ -10536,6 +10561,9 @@ def dashboard_ui(recent_limit: int = 25, refresh_sec: int | None = None):
     patch_needed_text = str(active_signal_calibration.get("additional_patch_needed") or "UNKNOWN")
     production_patch_text = "YES" if bool(active_signal_calibration.get("production_patch_required")) else "NO"
     patch_rationale_text = str(active_signal_calibration.get("patch_rationale") or "No patch assessment available.")
+    universe_expand_text = "YES" if bool(active_signal_calibration.get("universe_expansion_recommended")) else "NO"
+    universe_action_text = str(active_signal_calibration.get("universe_action") or "UNKNOWN")
+    universe_rationale_text = str(active_signal_calibration.get("universe_rationale") or "No universe assessment available.")
     rule_gap_rows = list(active_signal_rule_gaps.get("top_rule_gaps") or [])
     rule_gap_text = ", ".join([f"{r.get('key')} closest={_fmt(r.get('closest_gap'), 2)}" for r in rule_gap_rows[:3]]) or "none"
     scanner_status_text = "OPTIONAL" if not scanner_required_flag else ("OK" if bool((snap.get("compatibility") or {}).get("scanner_ok")) else "DOWN")
@@ -10616,6 +10644,8 @@ def dashboard_ui(recent_limit: int = 25, refresh_sec: int | None = None):
             <tr><th>decision</th><td>{calibration_decision_text}</td><th>active/no_signal</th><td>{int(active_entry_status.get("active_rejected") or 0)} / {int(active_entry_status.get("no_signal_rejections") or 0)} / {int(active_entry_status.get("no_signal_escalation_count") or 0)}</td></tr>
             <tr><th>additional_patch_needed</th><td>{patch_needed_text}</td><th>production_patch_required</th><td>{production_patch_text}</td></tr>
             <tr><th>patch_rationale</th><td colspan="3">{patch_rationale_text}</td></tr>
+            <tr><th>expand_coin_universe</th><td>{universe_expand_text}</td><th>universe_action</th><td>{universe_action_text}</td></tr>
+            <tr><th>universe_rationale</th><td colspan="3">{universe_rationale_text}</td></tr>
             <tr><th>calibration_focus</th><td>{calibration_focus_text}</td><th>primary_failed_check</th><td>{active_signal_calibration.get("primary_failed_check") or "none"}</td></tr>
             <tr><th>review</th><td colspan="3">{calibration_review_text}</td></tr>
             <tr><th>shadow_test</th><td colspan="3">{shadow_experiment_text}</td></tr>
@@ -10695,8 +10725,8 @@ def dashboard_ui(recent_limit: int = 25, refresh_sec: int | None = None):
     </div></body></html>
     """
     return HTMLResponse(content=html)
-    
-    
+
+
 @app.get("/performance")
 def performance(days: float = 30.0, recent_limit: int = 25):
     return _performance_snapshot(days=days, recent_limit=recent_limit)
