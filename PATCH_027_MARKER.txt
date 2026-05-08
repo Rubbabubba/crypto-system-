@@ -1,0 +1,3 @@
+Patch 027: shadow scan-cap probe guidance.
+
+When no trades persist with signal starvation plus MAX_ENTRIES_PER_SCAN rejections, the dashboard now recommends a paper-only scan-cap replay/probe before any live capacity, universe, or threshold change.
