@@ -10214,28 +10214,54 @@ def _active_signal_calibration_plan(
             f"At least one threshold shadow test may clear the closest observed gap in the current universe ({universe_symbol_text}). "
             "Validate that path first; if it still produces no edge-qualified candidates, then try a paper-only universe expansion before any live allowlist change."
         )
+    shadow_scan_cap_probe = bool(scan_cap_count > 0)
+    threshold_gap_clears = bool(feasible_experiments)
+    decision = "run_shadow_calibration"
+    recommended_review = str(hint.get("review") or "Review active signal diagnostics before changing live thresholds.")
+    scan_cap_guidance = ""
+    shadow_feasibility_guidance = (
+        "At least one shadow test likely clears the closest observed gap."
+        if feasible_experiments
+        else "Suggested shadow tests do not clear the closest observed gap yet; run a wider paper-only threshold sweep before any live change."
+    )
+    shadow_probe_plan = "Run the listed paper-only threshold test against recent active bars and require signal plus expected-edge pass before changing live config."
+    if shadow_scan_cap_probe:
+        decision = "run_shadow_scan_cap_probe" if not feasible_experiments else "run_shadow_threshold_and_scan_cap_probe"
+        recommended_review = (
+            f"{recommended_review} Also replay the active window in paper with MAX_ENTRIES_PER_SCAN=3 so capped candidates can be evaluated for signal and expected-edge pass/fail without increasing live capacity."
+        )
+        scan_cap_guidance = (
+            f"MAX_ENTRIES_PER_SCAN rejected {scan_cap_count} candidate(s). Do not raise live capacity yet; run a paper-only cap probe at MAX_ENTRIES_PER_SCAN=3 and promote only if a capped candidate clears signal, spread, and expected-edge gates."
+        )
+        shadow_probe_plan = (
+            "Paper-only two-axis probe: (1) replay with MAX_ENTRIES_PER_SCAN=3, (2) apply one threshold sweep at a time, "
+            "and record which candidate would clear signal, spread, and expected-edge gates."
+        )
     return {
         "ok": True,
-        "decision": "run_shadow_calibration",
+        "decision": decision,
         "additional_patch_needed": "PENDING_SHADOW_EVIDENCE",
         "production_patch_required": False,
-        "patch_rationale": "Run one paper/shadow threshold experiment first; only promote a production patch after shadow evidence clears signal and edge gates.",
+        "patch_rationale": "No live patch from this dashboard alone; require paper/shadow evidence that a candidate clears signal, spread, and expected-edge gates.",
         "universe_expansion_recommended": False,
         "universe_action": universe_action,
         "universe_rationale": universe_rationale,
+        "shadow_scan_cap_probe": shadow_scan_cap_probe,
+        "threshold_gap_clears": threshold_gap_clears,
+        "shadow_probe_plan": shadow_probe_plan,
         "signal_starved": True,
         "primary_failed_check": top_check or None,
         "primary_focus": hint.get("focus"),
         "primary_hypothesis": hint.get("hypothesis"),
-        "recommended_review": hint.get("review"),
+        "recommended_review": recommended_review,
         "top_failed_checks": top_checks,
         "top_no_signal_symbols": top_symbols,
         "shadow_experiments": experiments[:3],
         "shadow_feasible_count": len(feasible_experiments),
-        "shadow_feasibility_guidance": ("At least one shadow test likely clears the closest observed gap." if feasible_experiments else "Suggested shadow tests do not clear the closest observed gap yet; wait for closer setups or test a wider paper-only sweep."),
+        "shadow_feasibility_guidance": shadow_feasibility_guidance,
         "scan_cap_rejections": scan_cap_count,
-        "scan_cap_guidance": ("MAX_ENTRIES_PER_SCAN is also firing; do not raise live capacity until at least one candidate passes signal and edge gates in shadow." if scan_cap_count > 0 else ""),
-        "guardrail": "Do not loosen live risk or multiple gates at once; test one threshold change in shadow/paper first.",
+        "scan_cap_guidance": scan_cap_guidance,
+        "guardrail": "Do not loosen live risk, live capacity, universe, or multiple gates at once; prove the exact candidate path in paper/shadow first.",
     }
 
 
@@ -10440,7 +10466,7 @@ def dashboard(recent_limit: int = 15):
         perf.get("active_no_signal_rules") or {},
         dashboard_entry_status,
         perf.get("active_signal_rule_gaps") or {},
-    )  
+    )
 
     return {
         "ok": True,
@@ -10564,6 +10590,9 @@ def dashboard_ui(recent_limit: int = 25, refresh_sec: int | None = None):
     universe_expand_text = "YES" if bool(active_signal_calibration.get("universe_expansion_recommended")) else "NO"
     universe_action_text = str(active_signal_calibration.get("universe_action") or "UNKNOWN")
     universe_rationale_text = str(active_signal_calibration.get("universe_rationale") or "No universe assessment available.")
+    cap_probe_text = "YES" if bool(active_signal_calibration.get("shadow_scan_cap_probe")) else "NO"
+    threshold_gap_text = "YES" if bool(active_signal_calibration.get("threshold_gap_clears")) else "NO"
+    shadow_probe_plan_text = str(active_signal_calibration.get("shadow_probe_plan") or "No shadow probe plan available.")
     rule_gap_rows = list(active_signal_rule_gaps.get("top_rule_gaps") or [])
     rule_gap_text = ", ".join([f"{r.get('key')} closest={_fmt(r.get('closest_gap'), 2)}" for r in rule_gap_rows[:3]]) or "none"
     scanner_status_text = "OPTIONAL" if not scanner_required_flag else ("OK" if bool((snap.get("compatibility") or {}).get("scanner_ok")) else "DOWN")
@@ -10646,6 +10675,8 @@ def dashboard_ui(recent_limit: int = 25, refresh_sec: int | None = None):
             <tr><th>patch_rationale</th><td colspan="3">{patch_rationale_text}</td></tr>
             <tr><th>expand_coin_universe</th><td>{universe_expand_text}</td><th>universe_action</th><td>{universe_action_text}</td></tr>
             <tr><th>universe_rationale</th><td colspan="3">{universe_rationale_text}</td></tr>
+            <tr><th>paper_scan_cap_probe</th><td>{cap_probe_text}</td><th>threshold_gap_clears</th><td>{threshold_gap_text}</td></tr>
+            <tr><th>shadow_probe_plan</th><td colspan="3">{shadow_probe_plan_text}</td></tr>
             <tr><th>calibration_focus</th><td>{calibration_focus_text}</td><th>primary_failed_check</th><td>{active_signal_calibration.get("primary_failed_check") or "none"}</td></tr>
             <tr><th>review</th><td colspan="3">{calibration_review_text}</td></tr>
             <tr><th>shadow_test</th><td colspan="3">{shadow_experiment_text}</td></tr>
