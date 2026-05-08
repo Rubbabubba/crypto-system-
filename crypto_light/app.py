@@ -10036,10 +10036,57 @@ def _signal_check_shadow_experiment(key: str) -> dict[str, Any] | None:
     return None
 
 
+def _attach_shadow_gap_feasibility(experiments: list[dict[str, Any]], active_signal_rule_gaps: dict[str, Any] | None = None) -> list[dict[str, Any]]:
+    gap_rows = {str(r.get('key') or ''): dict(r) for r in ((active_signal_rule_gaps or {}).get('top_rule_gaps') or [])}
+    out: list[dict[str, Any]] = []
+    for exp_raw in experiments:
+        exp = dict(exp_raw or {})
+        env_var = str(exp.get('env_var') or '')
+        gap_key = ''
+        expected_reduction = None
+        if env_var == 'ME1_BREAKOUT_BUFFER_PCT':
+            gap_key = 'me1|breakout_gap_bps'
+            expected_reduction = max(0.0, (_safe_float(exp.get('current_value')) - _safe_float(exp.get('shadow_test_value'))) * 10000.0)
+        elif env_var == 'ME1_MIN_VOLUME_MULT':
+            gap_key = 'me1|volume_mult_gap'
+            expected_reduction = max(0.0, _safe_float(exp.get('current_value')) - _safe_float(exp.get('shadow_test_value')))
+        elif env_var == 'ME1_MIN_RANGE_ATR':
+            gap_key = 'me1|range_atr_gap'
+            expected_reduction = max(0.0, _safe_float(exp.get('current_value')) - _safe_float(exp.get('shadow_test_value')))
+        elif env_var == 'MR1_MIN_VOLUME_MULT':
+            gap_key = 'mr1|volume_mult_gap'
+            expected_reduction = max(0.0, _safe_float(exp.get('current_value')) - _safe_float(exp.get('shadow_test_value')))
+        elif env_var == 'MR1_MIN_LOWER_WICK_PCT':
+            gap_key = 'mr1|lower_wick_gap'
+            expected_reduction = max(0.0, _safe_float(exp.get('current_value')) - _safe_float(exp.get('shadow_test_value')))
+
+        row = gap_rows.get(gap_key) if gap_key else None
+        if row and expected_reduction is not None:
+            closest_gap = max(0.0, _safe_float(row.get('closest_gap')))
+            likely_clears = bool(expected_reduction >= closest_gap)
+            exp.update({
+                'gap_key': gap_key,
+                'closest_gap': closest_gap,
+                'expected_gap_reduction': expected_reduction,
+                'likely_clears_closest_gap': likely_clears,
+                'feasibility': 'likely_clears_closest_gap' if likely_clears else 'insufficient_for_closest_gap',
+            })
+        elif gap_key:
+            exp.update({
+                'gap_key': gap_key,
+                'feasibility': 'no_gap_sample',
+            })
+        else:
+            exp.update({'feasibility': 'manual_review_required'})
+        out.append(exp)
+    return out
+
+
 def _active_signal_calibration_plan(
     active_signal_funnel: dict[str, Any],
     active_no_signal_rules: dict[str, Any],
     active_entry_status: dict[str, Any],
+    active_signal_rule_gaps: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     top_checks = list((active_no_signal_rules or {}).get("top_strategy_failed_checks") or [])[:5]
     top_symbols = list((active_signal_funnel or {}).get("no_signal_by_symbol") or [])[:5]
@@ -10068,7 +10115,11 @@ def _active_signal_calibration_plan(
 
     top_check = str(((top_checks or [{}])[0] or {}).get("key") or "")
     hint = _signal_check_calibration_hint(top_check)
-    experiments = [e for e in (_signal_check_shadow_experiment(str(row.get("key") or "")) for row in top_checks) if e is not None]
+    experiments = _attach_shadow_gap_feasibility(
+        [e for e in (_signal_check_shadow_experiment(str(row.get("key") or "")) for row in top_checks) if e is not None],
+        active_signal_rule_gaps,
+    )
+    feasible_experiments = [e for e in experiments if bool(e.get('likely_clears_closest_gap'))]
     signal_starved = bool(status.get("signal_starved"))
     decision = "run_shadow_calibration" if signal_starved else str(status.get("next_step") or "monitor")
     return {
@@ -10082,6 +10133,8 @@ def _active_signal_calibration_plan(
         "top_failed_checks": top_checks,
         "top_no_signal_symbols": top_symbols,
         "shadow_experiments": experiments[:3],
+        "shadow_feasible_count": len(feasible_experiments),
+        "shadow_feasibility_guidance": ("At least one shadow test likely clears the closest observed gap." if feasible_experiments else "Suggested shadow tests do not clear the closest observed gap yet; wait for closer setups or test a wider paper-only sweep."),
         "scan_cap_rejections": scan_cap_count,
         "scan_cap_guidance": ("MAX_ENTRIES_PER_SCAN is also firing; do not raise live capacity until at least one candidate passes signal and edge gates in shadow." if scan_cap_count > 0 else ""),
         "guardrail": "Do not loosen live risk or multiple gates at once; test one threshold change in shadow/paper first.",
@@ -10139,7 +10192,7 @@ def _performance_snapshot(days: float = 30.0, recent_limit: int = 25) -> dict[st
     active_no_signal_rules = _active_no_signal_rule_breakdown(limit=500)
     active_signal_rule_gaps = _active_signal_rule_gap_summary(limit=500)
     active_entry_status = _active_entry_status(positions, active_window, active_signal_funnel, active_no_signal_rules)
-    active_signal_calibration = _active_signal_calibration_plan(active_signal_funnel, active_no_signal_rules, active_entry_status)   
+    active_signal_calibration = _active_signal_calibration_plan(active_signal_funnel, active_no_signal_rules, active_entry_status, active_signal_rule_gaps)
 
     return {
         "ok": True,
@@ -10288,6 +10341,7 @@ def dashboard(recent_limit: int = 15):
         perf.get("active_signal_funnel") or {},
         perf.get("active_no_signal_rules") or {},
         dashboard_entry_status,
+        perf.get("active_signal_rule_gaps") or {},
     )    
 
     return {
@@ -10404,6 +10458,7 @@ def dashboard_ui(recent_limit: int = 25, refresh_sec: int | None = None):
     calibration_review_text = str(active_signal_calibration.get("recommended_review") or active_entry_status.get("operator_action") or "review diagnostics")
     shadow_experiments = list(active_signal_calibration.get("shadow_experiments") or [])
     shadow_experiment_text = ", ".join([f"{e.get('env_var')}={e.get('shadow_test_value')}" for e in shadow_experiments[:3]]) or "none"
+    shadow_feasibility_text = ", ".join([f"{e.get('env_var')}:{e.get('feasibility')}" for e in shadow_experiments[:3]]) or "none"
     scan_cap_guidance_text = str(active_signal_calibration.get("scan_cap_guidance") or "none")
     rule_gap_rows = list(active_signal_rule_gaps.get("top_rule_gaps") or [])
     rule_gap_text = ", ".join([f"{r.get('key')} closest={_fmt(r.get('closest_gap'), 2)}" for r in rule_gap_rows[:3]]) or "none"
@@ -10486,6 +10541,7 @@ def dashboard_ui(recent_limit: int = 25, refresh_sec: int | None = None):
             <tr><th>calibration_focus</th><td>{calibration_focus_text}</td><th>primary_failed_check</th><td>{active_signal_calibration.get("primary_failed_check") or "none"}</td></tr>
             <tr><th>review</th><td colspan="3">{calibration_review_text}</td></tr>
             <tr><th>shadow_test</th><td colspan="3">{shadow_experiment_text}</td></tr>
+            <tr><th>shadow_feasibility</th><td colspan="3">{shadow_feasibility_text}; {active_signal_calibration.get("shadow_feasibility_guidance") or ""}</td></tr>
             <tr><th>scan_cap_guidance</th><td colspan="3">{scan_cap_guidance_text}</td></tr>
             <tr><th>closest_rule_gaps</th><td colspan="3">{rule_gap_text}</td></tr>
             <tr><th>guardrail</th><td colspan="3">{active_signal_calibration.get("guardrail") or "Keep live risk unchanged while calibrating."}</td></tr>
@@ -10631,6 +10687,7 @@ def diagnostics_active_entry_status(recent_limit: int = 25):
             perf.get("active_signal_funnel") or {},
             perf.get("active_no_signal_rules") or {},
             active_entry_status,
+            perf.get("active_signal_rule_gaps") or {},
         ),
         "active_signal_funnel": perf.get("active_signal_funnel") or {},
         "active_no_signal_rules": perf.get("active_no_signal_rules") or {},
@@ -10666,6 +10723,7 @@ def diagnostics_active_signal_calibration(recent_limit: int = 25):
         perf.get("active_signal_funnel") or {},
         perf.get("active_no_signal_rules") or {},
         active_entry_status,
+        perf.get("active_signal_rule_gaps") or {},
     )
     return {
         "ok": True,
