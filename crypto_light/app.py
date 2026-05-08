@@ -9739,6 +9739,14 @@ def _active_no_signal_escalation_count() -> int:
     return max(1, min(raw, 1000))
 
 
+def _active_entry_review_min_rejections() -> int:
+    try:
+        raw = int(os.getenv("ACTIVE_ENTRY_REVIEW_MIN_REJECTIONS", "5") or 5)
+    except Exception:
+        raw = 5
+    return max(1, min(raw, 1000))
+
+
 def _active_signal_rule_gap_summary(limit: int = 500) -> dict[str, Any]:
     since_ts = _active_telemetry_since_ts()
     try:
@@ -9837,7 +9845,9 @@ def _active_entry_status(
     top_symbol = ((active_signal_funnel.get("no_signal_by_symbol") or [{}])[0] or {}).get("key") or None
     top_rule = ((active_no_signal_rules.get("top_strategy_failed_checks") or [{}])[0] or {}).get("key") or None
     escalation_count = _active_no_signal_escalation_count()
+    review_min_rejections = _active_entry_review_min_rejections()
     signal_starved = bool(no_signal_count >= escalation_count and accepted == 0 and closed_trades == 0 and open_positions == 0)
+    low_sample_rejections = bool(0 < rejected < review_min_rejections and accepted == 0 and closed_trades == 0 and open_positions == 0)
     next_step = "monitor"
 
     if open_positions > 0:
@@ -9855,6 +9865,11 @@ def _active_entry_status(
         blocker = "fills_or_position_lifecycle"
         action = "Inspect open plans/orders and execution telemetry for accepted signals that have not closed."
         next_step = "inspect_execution_lifecycle"
+    elif low_sample_rejections:
+        state = "LOW_SAMPLE_WAITING_FOR_SETUP"
+        blocker = ", ".join(by_reason.keys()) or "none_observed"
+        next_step = "collect_more_active_samples"
+        action = f"Only {rejected} active rejection(s) observed; keep monitoring until at least {review_min_rejections} active rejections or one passed signal before changing calibration."
     elif signal_starved:
         state = "SIGNAL_STARVATION"
         blocker = "no_signal"
@@ -9890,6 +9905,8 @@ def _active_entry_status(
         "scan_cap_rejections": scan_cap_count,
         "other_rejection_reasons": other_rejection_reasons,
         "no_signal_escalation_count": escalation_count,
+        "active_rejection_review_min": review_min_rejections,
+        "low_sample_rejections": low_sample_rejections,
         "signal_starved": signal_starved,
         "next_step": next_step,
         "primary_blocker": blocker,
@@ -10111,6 +10128,25 @@ def _active_signal_calibration_plan(
             "scan_cap_guidance": "",
             "shadow_experiments": [],
             "guardrail": "Do not calibrate strategy thresholds while the scan/exit worker health gate is closed; stale signal-debug rows may be misleading.",
+        }
+
+    if str(status.get("next_step") or "") == "collect_more_active_samples":
+        return {
+            "ok": True,
+            "decision": "collect_more_active_samples",
+            "signal_starved": False,
+            "primary_failed_check": None,
+            "primary_focus": "Insufficient active rejection sample",
+            "primary_hypothesis": "the active window has too few rejections to justify scan-cap or threshold changes",
+            "recommended_review": f"Keep monitoring until active_rejected reaches {int(status.get('active_rejection_review_min') or 0)} or a signal passes; do not change MAX_ENTRIES_PER_SCAN or strategy thresholds from this sample.",
+            "top_failed_checks": top_checks,
+            "top_no_signal_symbols": top_symbols,
+            "shadow_experiments": [],
+            "shadow_feasible_count": 0,
+            "shadow_feasibility_guidance": "Not enough active evidence for a shadow threshold experiment yet.",
+            "scan_cap_rejections": scan_cap_count,
+            "scan_cap_guidance": "MAX_ENTRIES_PER_SCAN fired in a low-sample window; wait for more active scans before changing capacity.",
+            "guardrail": "Low active sample size: observe more scans before changing live or shadow calibration.",
         }
 
     top_check = str(((top_checks or [{}])[0] or {}).get("key") or "")
@@ -10537,7 +10573,7 @@ def dashboard_ui(recent_limit: int = 25, refresh_sec: int | None = None):
         </div>
         <div class="card span-12"><h3>Next Action</h3>
           <table><tbody>
-            <tr><th>decision</th><td>{calibration_decision_text}</td><th>no_signal_rejections</th><td>{int(active_entry_status.get("no_signal_rejections") or 0)} / {int(active_entry_status.get("no_signal_escalation_count") or 0)}</td></tr>
+            <tr><th>decision</th><td>{calibration_decision_text}</td><th>active/no_signal</th><td>{int(active_entry_status.get("active_rejected") or 0)} / {int(active_entry_status.get("no_signal_rejections") or 0)} / {int(active_entry_status.get("no_signal_escalation_count") or 0)}</td></tr>
             <tr><th>calibration_focus</th><td>{calibration_focus_text}</td><th>primary_failed_check</th><td>{active_signal_calibration.get("primary_failed_check") or "none"}</td></tr>
             <tr><th>review</th><td colspan="3">{calibration_review_text}</td></tr>
             <tr><th>shadow_test</th><td colspan="3">{shadow_experiment_text}</td></tr>
