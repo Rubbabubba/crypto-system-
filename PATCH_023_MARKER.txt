@@ -1,0 +1,3 @@
+Patch 023: shadow gap feasibility.
+
+Compares suggested shadow calibration changes against observed rule gaps so operators know whether a proposed paper-only threshold test is likely to clear the closest setup.
