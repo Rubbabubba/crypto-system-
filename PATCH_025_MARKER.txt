@@ -1,0 +1,3 @@
+Patch 025: explicit patch assessment.
+
+Makes the operator dashboard answer whether a new production patch is indicated, and suppresses shadow calibration recommendations until the active window actually reaches signal-starvation evidence.
