@@ -1,0 +1,3 @@
+Patch 024: low-sample entry status.
+
+Avoids overreacting to one-off no-signal or scan-cap rejections by requiring a minimum active rejection sample before recommending calibration or capacity changes.
