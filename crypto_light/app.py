@@ -10117,6 +10117,9 @@ def _active_signal_calibration_plan(
         return {
             "ok": True,
             "decision": "recover_worker_health" if worker_blocked else "recover_system_readiness",
+            "additional_patch_needed": "NO_SYSTEM_RECOVERY_FIRST",
+            "production_patch_required": False,
+            "patch_rationale": "Do not create an entry-calibration patch while system/pretrade readiness is closed.",
             "signal_starved": False,
             "primary_failed_check": None,
             "primary_focus": "Worker heartbeat / pretrade gate" if worker_blocked else "System readiness gate",
@@ -10127,6 +10130,7 @@ def _active_signal_calibration_plan(
             "scan_cap_rejections": scan_cap_count,
             "scan_cap_guidance": "",
             "shadow_experiments": [],
+            "shadow_feasible_count": 0,
             "guardrail": "Do not calibrate strategy thresholds while the scan/exit worker health gate is closed; stale signal-debug rows may be misleading.",
         }
 
@@ -10134,6 +10138,9 @@ def _active_signal_calibration_plan(
         return {
             "ok": True,
             "decision": "collect_more_active_samples",
+            "additional_patch_needed": "NO",
+            "production_patch_required": False,
+            "patch_rationale": "Patch 024 is doing its job: the active rejection sample is still below the review minimum.",
             "signal_starved": False,
             "primary_failed_check": None,
             "primary_focus": "Insufficient active rejection sample",
@@ -10151,17 +10158,47 @@ def _active_signal_calibration_plan(
 
     top_check = str(((top_checks or [{}])[0] or {}).get("key") or "")
     hint = _signal_check_calibration_hint(top_check)
+    signal_starved = bool(status.get("signal_starved"))
+    if not signal_starved:
+        no_signal_count = int(status.get("no_signal_rejections") or 0)
+        escalation_count = int(status.get("no_signal_escalation_count") or 0)
+        next_step = str(status.get("next_step") or "monitor")
+        scan_cap_note = ""
+        if scan_cap_count > 0:
+            scan_cap_note = " MAX_ENTRIES_PER_SCAN is present, but do not raise live capacity until a candidate passes signal and edge gates in shadow."
+        return {
+            "ok": True,
+            "decision": f"{next_step}_no_live_patch",
+            "additional_patch_needed": "NO",
+            "production_patch_required": False,
+            "patch_rationale": f"No production patch is indicated: signal_starved is FALSE and no_signal rejections are {no_signal_count}/{escalation_count}.",
+            "signal_starved": False,
+            "primary_failed_check": top_check or None,
+            "primary_focus": "No production patch indicated",
+            "primary_hypothesis": "active scans have not yet met the no-signal escalation threshold and no signal has passed",
+            "recommended_review": f"Continue collecting active scans; review diagnostics only. Do not loosen live thresholds from this window yet.{scan_cap_note}",
+            "top_failed_checks": top_checks,
+            "top_no_signal_symbols": top_symbols,
+            "shadow_experiments": [],
+            "shadow_feasible_count": 0,
+            "shadow_feasibility_guidance": "Shadow calibration is held until signal_starved becomes TRUE or a candidate passes signal and edge gates.",
+            "scan_cap_rejections": scan_cap_count,
+            "scan_cap_guidance": ("MAX_ENTRIES_PER_SCAN fired, but this is not a live-capacity patch request; first prove at least one candidate can pass signal and edge gates in shadow." if scan_cap_count > 0 else ""),
+            "guardrail": "No additional live patch from this dashboard state; observe more active scans before changing thresholds or capacity.",
+        }
+
     experiments = _attach_shadow_gap_feasibility(
         [e for e in (_signal_check_shadow_experiment(str(row.get("key") or "")) for row in top_checks) if e is not None],
         active_signal_rule_gaps,
     )
     feasible_experiments = [e for e in experiments if bool(e.get('likely_clears_closest_gap'))]
-    signal_starved = bool(status.get("signal_starved"))
-    decision = "run_shadow_calibration" if signal_starved else str(status.get("next_step") or "monitor")
     return {
         "ok": True,
-        "decision": decision,
-        "signal_starved": signal_starved,
+        "decision": "run_shadow_calibration",
+        "additional_patch_needed": "PENDING_SHADOW_EVIDENCE",
+        "production_patch_required": False,
+        "patch_rationale": "Run one paper/shadow threshold experiment first; only promote a production patch after shadow evidence clears signal and edge gates.",
+        "signal_starved": True,
         "primary_failed_check": top_check or None,
         "primary_focus": hint.get("focus"),
         "primary_hypothesis": hint.get("hypothesis"),
@@ -10496,6 +10533,9 @@ def dashboard_ui(recent_limit: int = 25, refresh_sec: int | None = None):
     shadow_experiment_text = ", ".join([f"{e.get('env_var')}={e.get('shadow_test_value')}" for e in shadow_experiments[:3]]) or "none"
     shadow_feasibility_text = ", ".join([f"{e.get('env_var')}:{e.get('feasibility')}" for e in shadow_experiments[:3]]) or "none"
     scan_cap_guidance_text = str(active_signal_calibration.get("scan_cap_guidance") or "none")
+    patch_needed_text = str(active_signal_calibration.get("additional_patch_needed") or "UNKNOWN")
+    production_patch_text = "YES" if bool(active_signal_calibration.get("production_patch_required")) else "NO"
+    patch_rationale_text = str(active_signal_calibration.get("patch_rationale") or "No patch assessment available.")
     rule_gap_rows = list(active_signal_rule_gaps.get("top_rule_gaps") or [])
     rule_gap_text = ", ".join([f"{r.get('key')} closest={_fmt(r.get('closest_gap'), 2)}" for r in rule_gap_rows[:3]]) or "none"
     scanner_status_text = "OPTIONAL" if not scanner_required_flag else ("OK" if bool((snap.get("compatibility") or {}).get("scanner_ok")) else "DOWN")
@@ -10574,6 +10614,8 @@ def dashboard_ui(recent_limit: int = 25, refresh_sec: int | None = None):
         <div class="card span-12"><h3>Next Action</h3>
           <table><tbody>
             <tr><th>decision</th><td>{calibration_decision_text}</td><th>active/no_signal</th><td>{int(active_entry_status.get("active_rejected") or 0)} / {int(active_entry_status.get("no_signal_rejections") or 0)} / {int(active_entry_status.get("no_signal_escalation_count") or 0)}</td></tr>
+            <tr><th>additional_patch_needed</th><td>{patch_needed_text}</td><th>production_patch_required</th><td>{production_patch_text}</td></tr>
+            <tr><th>patch_rationale</th><td colspan="3">{patch_rationale_text}</td></tr>
             <tr><th>calibration_focus</th><td>{calibration_focus_text}</td><th>primary_failed_check</th><td>{active_signal_calibration.get("primary_failed_check") or "none"}</td></tr>
             <tr><th>review</th><td colspan="3">{calibration_review_text}</td></tr>
             <tr><th>shadow_test</th><td colspan="3">{shadow_experiment_text}</td></tr>
