@@ -9896,7 +9896,9 @@ def _active_entry_status(
     return {
         "ok": True,
         "state": state,
-        "has_trades": bool(open_positions > 0 or closed_trades > 0),
+        "has_trades": bool(closed_trades > 0),
+        "has_closed_trades": bool(closed_trades > 0),
+        "has_open_exposure": bool(open_positions > 0),
         "open_positions": open_positions,
         "closed_trades": closed_trades,
         "active_passed": accepted,
@@ -9931,6 +9933,7 @@ def _dashboard_entry_status(
     active_entry_status: dict[str, Any],
     promotion: dict[str, Any],
     gate: dict[str, Any],
+    open_plans_count: int = 0,
 ) -> dict[str, Any]:
     status = dict(active_entry_status or {})
     system_ready = bool(((promotion or {}).get("checks") or {}).get("readiness_green"))
@@ -9940,7 +9943,24 @@ def _dashboard_entry_status(
     pretrade_blockers = _pretrade_gate_blockers(gate)
     primary_system_blocker = (pretrade_blockers or system_blockers or ["none"])[0]
     entry_state = str(status.get("state") or "UNKNOWN")
+    open_positions = int(status.get("open_positions") or 0)
+    closed_trades = int(status.get("closed_trades") or 0)
+    open_exposure_present = bool(open_positions > 0 or "positions_present" in system_blockers)
+    open_plans_present = bool(open_plans_count > 0)
     effective_state = entry_state if system_ready else "SYSTEM_NOT_READY"
+    effective_primary_blocker = status.get("primary_blocker") if system_ready else primary_system_blocker
+    if open_exposure_present:
+        effective_state = "OPEN_EXPOSURE_NO_CLOSED_TRADE" if closed_trades <= 0 else "OPEN_EXPOSURE"
+        effective_primary_blocker = "positions_present"
+        status["next_step"] = "reconcile_open_exposure"
+        status["operator_action"] = "Broker/internal exposure is present but no closed trade is recorded yet; reconcile the open position/plan lifecycle before changing entry thresholds, universe, or scan capacity."
+        status["signal_starved"] = False
+    elif open_plans_present and closed_trades <= 0:
+        effective_state = "OPEN_PLAN_NO_CLOSED_TRADE"
+        effective_primary_blocker = "open_plan_present"
+        status["next_step"] = "reconcile_open_plan"
+        status["operator_action"] = "An internal entry plan exists but no closed trade is recorded; inspect order fill, plan, and exit lifecycle telemetry before changing signal calibration."
+        status["signal_starved"] = False
     status.update({
         "system_ready": system_ready,
         "promotion_ready": promotion_ready,
@@ -9950,7 +9970,11 @@ def _dashboard_entry_status(
         "primary_system_blocker": primary_system_blocker,
         "system_state": "READY" if system_ready else "NOT_READY",
         "effective_state": effective_state,
-        "effective_primary_blocker": (status.get("primary_blocker") if system_ready else primary_system_blocker),
+        "effective_primary_blocker": effective_primary_blocker,
+        "open_plans": int(open_plans_count),
+        "has_trades": bool(closed_trades > 0),
+        "has_closed_trades": bool(closed_trades > 0),
+        "has_open_exposure": bool(open_exposure_present),
     })
     return status
 
@@ -10135,6 +10159,37 @@ def _active_signal_calibration_plan(
             "shadow_experiments": [],
             "shadow_feasible_count": 0,
             "guardrail": "Do not calibrate strategy thresholds while the scan/exit worker health gate is closed; stale signal-debug rows may be misleading.",
+        }
+
+    if str(status.get("next_step") or "") in ("reconcile_open_exposure", "reconcile_open_plan", "monitor_position") or bool(status.get("has_open_exposure")):
+        open_positions = int(status.get("open_positions") or 0)
+        open_plans = int(status.get("open_plans") or 0)
+        closed_trades = int(status.get("closed_trades") or 0)
+        return {
+            "ok": True,
+            "decision": "reconcile_open_exposure" if open_positions > 0 or bool(status.get("has_open_exposure")) else "reconcile_open_plan",
+            "additional_patch_needed": "NO_RECONCILE_OPEN_LIFECYCLE_FIRST",
+            "production_patch_required": False,
+            "patch_rationale": "No entry-calibration patch is indicated while an open position or internal plan is present without a closed trade record.",
+            "universe_expansion_recommended": False,
+            "universe_action": "NO_RECONCILE_OPEN_LIFECYCLE_FIRST",
+            "universe_rationale": "Do not expand the live universe while an open exposure/plan lifecycle is unresolved; first verify fill, position, exit, and journal reconciliation.",
+            "shadow_scan_cap_probe": False,
+            "threshold_gap_clears": False,
+            "shadow_probe_plan": "No shadow signal probe yet; first reconcile the open position/plan and confirm whether it should close, be journaled, or be cleared as stale.",
+            "signal_starved": False,
+            "primary_failed_check": None,
+            "primary_focus": "Open lifecycle reconciliation",
+            "primary_hypothesis": f"there are {open_positions} broker position(s), {open_plans} internal plan(s), and {closed_trades} closed trade(s) in the active window",
+            "recommended_review": "Inspect /positions, open plans, broker open orders, exit worker status, and journal/reconcile output before changing entry thresholds, scan capacity, or universe.",
+            "top_failed_checks": top_checks,
+            "top_no_signal_symbols": top_symbols,
+            "shadow_experiments": [],
+            "shadow_feasible_count": 0,
+            "shadow_feasibility_guidance": "Held while open lifecycle reconciliation is pending.",
+            "scan_cap_rejections": scan_cap_count,
+            "scan_cap_guidance": "Ignore scan-cap tuning until the existing open exposure/plan lifecycle is reconciled.",
+            "guardrail": "Do not change live entry calibration while exposure or an internal plan is open; resolve lifecycle/journal state first.",
         }
 
     if str(status.get("next_step") or "") == "collect_more_active_samples":
@@ -10460,7 +10515,7 @@ def dashboard(recent_limit: int = 15):
     except Exception:
         open_plans = []
         
-    dashboard_entry_status = _dashboard_entry_status(perf.get("active_entry_status") or {}, promotion, gate)
+    dashboard_entry_status = _dashboard_entry_status(perf.get("active_entry_status") or {}, promotion, gate, open_plans_count=len(open_plans))
     dashboard_signal_calibration = _active_signal_calibration_plan(
         perf.get("active_signal_funnel") or {},
         perf.get("active_no_signal_rules") or {},
@@ -10574,7 +10629,7 @@ def dashboard_ui(recent_limit: int = 25, refresh_sec: int | None = None):
         blockers = [b for b in blockers if not b.startswith("scanner_")]
     blocker_text = ", ".join(sorted(set(blockers))) or "none"
     pretrade_blocker_text = ", ".join(active_entry_status.get("pretrade_blockers") or []) or "none"
-    entry_blocker_text = str(active_entry_status.get("primary_blocker") or "unknown")
+    entry_blocker_text = str(active_entry_status.get("effective_primary_blocker") or active_entry_status.get("primary_blocker") or "unknown")
     system_blocker_text = str(active_entry_status.get("primary_system_blocker") or "none")
     next_step_text = str(active_entry_status.get("next_step") or "review_diagnostics")
     calibration_decision_text = str(active_signal_calibration.get("decision") or next_step_text)
@@ -10660,7 +10715,7 @@ def dashboard_ui(recent_limit: int = 25, refresh_sec: int | None = None):
       <div class="grid">
         <div class="card callout span-12"><h3>Entry Status — Where Are We?</h3>
           <table><tbody>
-            <tr><th>system_state</th><td>{active_entry_status.get("system_state") or ("READY" if snap.get("ready") else "NOT_READY")}</td><th>has_trades</th><td>{str(bool(active_entry_status.get("has_trades"))).upper()}</td></tr>
+            <tr><th>system_state</th><td>{active_entry_status.get("system_state") or ("READY" if snap.get("ready") else "NOT_READY")}</td><th>closed_trades/open_exposure</th><td>{int(active_entry_status.get("closed_trades") or 0)} / {str(bool(active_entry_status.get("has_open_exposure"))).upper()}</td></tr>
             <tr><th>entry_state</th><td>{active_entry_status.get("effective_state") or active_entry_status.get("state") or "unknown"}</td><th>entry_blocker</th><td>{entry_blocker_text}</td></tr>
             <tr><th>system_blocker</th><td>{system_blocker_text}</td><th>pretrade_blockers</th><td>{pretrade_blocker_text}</td></tr>
             <tr><th>next_step</th><td>{next_step_text}</td><th>signal_starved</th><td>{str(bool(active_entry_status.get("signal_starved"))).upper()}</td></tr>
