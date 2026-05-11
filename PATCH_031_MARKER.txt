@@ -1,0 +1,3 @@
+Patch 031: P&L audit and analysis start date.
+
+Restricts dashboard trade analysis to fills from 2026-05-06 forward by default and audits telemetry P&L against entry/exit costs so impossible journal outliers do not inflate performance.
