@@ -1,0 +1,3 @@
+Patch 032: price/quantity P&L audit.
+
+Adds a second P&L audit that recomputes profit from entry price, exit price, and matched quantity when entry/exit costs are mismatched, preventing tiny SOL moves from appearing as large dollar wins.
