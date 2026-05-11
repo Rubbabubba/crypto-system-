@@ -376,22 +376,47 @@ def _audited_pnl_fields(row: Dict[str, Any], alerts: List[str]) -> Dict[str, Opt
     source_net = _to_float(row.get("net_pnl_usd"))
     source_fees = _to_float(row.get("fees_total"))
     fees_total = float(source_fees) if source_fees is not None else float(entry_fee) + float(exit_fee)
-    audited_gross = None
-    audited_net = None
+    cost_gross = None
+    cost_net = None
     if entry_cost is not None and exit_cost is not None and entry_cost > 0 and exit_cost > 0:
-        audited_gross = float(exit_cost) - float(entry_cost)
-        audited_net = float(audited_gross) - float(fees_total)
+        cost_gross = float(exit_cost) - float(entry_cost)
+        cost_net = float(cost_gross) - float(fees_total)
+
+    entry_price = _to_float(row.get("entry_price"))
+    exit_price = _to_float(row.get("exit_price"))
+    entry_qty = _to_float(row.get("entry_qty"))
+    exit_qty = _to_float(row.get("exit_qty"))
+    price_qty_gross = None
+    price_qty_net = None
+    if entry_price and exit_price and entry_price > 0 and exit_price > 0 and entry_qty and exit_qty and entry_qty > 0 and exit_qty > 0:
+        qty = min(float(entry_qty), float(exit_qty))
+        price_qty_gross = (float(exit_price) - float(entry_price)) * qty
+        price_qty_net = float(price_qty_gross) - float(fees_total)
+
+    audited_gross = cost_gross
+    audited_net = cost_net
+    if price_qty_net is not None:
+        notional = max(abs(float(entry_price) * min(float(entry_qty or 0.0), float(exit_qty or 0.0))), abs(float(entry_cost or 0.0)), 1.0)
+        tolerance = max(0.25, notional * 0.0025)
+        cost_mismatch = cost_net is None or abs(float(cost_net) - float(price_qty_net)) > tolerance
+        if cost_mismatch:
+            audited_gross = price_qty_gross
+            audited_net = price_qty_net
+            alerts.append("pnl_recomputed_from_price_qty")
+
     gross = source_gross
     net = source_net
     if audited_net is not None:
-        tolerance = max(1.0, abs(float(entry_cost or 0.0)) * 0.01)
+        notional = max(abs(float(entry_cost or 0.0)), abs(float(entry_price or 0.0) * float(entry_qty or 0.0)), 1.0)
+        tolerance = max(0.25, notional * 0.0025)
         source_absurd = False
-        if source_net is not None and entry_cost and entry_cost > 0:
-            source_absurd = abs(float(source_net)) > (abs(float(entry_cost)) * _env_float("TELEMETRY_MAX_PNL_TO_NOTIONAL_PCT", 0.25))
+        if source_net is not None and notional > 0:
+            source_absurd = abs(float(source_net)) > (notional * _env_float("TELEMETRY_MAX_PNL_TO_NOTIONAL_PCT", 0.10))
         if source_net is None or abs(float(source_net) - float(audited_net)) > tolerance or source_absurd:
             net = audited_net
             gross = audited_gross
-            alerts.append("pnl_recomputed_from_costs")
+            if "pnl_recomputed_from_price_qty" not in alerts:
+                alerts.append("pnl_recomputed_from_costs")
     return {
         "gross_pnl_usd": _to_float(gross),
         "net_pnl_usd": _to_float(net),
@@ -701,7 +726,7 @@ def summary(days: float = 30.0, since_ts: Optional[float] = None) -> Dict[str, A
             flags = json.loads(r.get('alert_flags_json') or '[]')
         except Exception:
             flags = []
-        if isinstance(flags, list) and 'pnl_recomputed_from_costs' in flags:
+        if isinstance(flags, list) and any(str(flag).startswith('pnl_recomputed_from_') for flag in flags):
             pnl_recomputed += 1
     maker_entry = sum(1 for r in rec if str(r.get('entry_liquidity_role') or '') == 'maker')
     taker_entry = sum(1 for r in rec if str(r.get('entry_liquidity_role') or '') == 'taker')
