@@ -10579,9 +10579,10 @@ def _dashboard_refresh_seconds(refresh_sec: int | None = None) -> int:
     return max(0, min(sec, 300))
 
 
-def _trade_analysis_guidance(telemetry: dict[str, Any], edge_decay: dict[str, Any]) -> dict[str, Any]:
+def _trade_analysis_guidance(telemetry: dict[str, Any], edge_decay: dict[str, Any], entry_status: dict[str, Any] | None = None) -> dict[str, Any]:
     telemetry = dict(telemetry or {})
     edge_decay = dict(edge_decay or {})
+    entry_status = dict(entry_status or {})
     analysis_since_utc = str(telemetry.get("analysis_since_utc") or os.getenv("TRADE_ANALYSIS_START_UTC", "2026-05-06T00:00:00Z") or "")
     closed = int(telemetry.get("closed_trades") or 0)
     clean = int(telemetry.get("clean_closed_trades") or 0)
@@ -10622,7 +10623,15 @@ def _trade_analysis_guidance(telemetry: dict[str, Any], edge_decay: dict[str, An
     edge_quality = "unknown"
     strategy_focus = "none"
     risk_action = "do_not_size_up"
-    if closed <= 0:
+    open_exposure = bool(entry_status.get("has_open_exposure"))
+    open_plans = int(entry_status.get("open_plans") or 0)
+    entry_next_step = str(entry_status.get("next_step") or "")
+    if open_exposure or open_plans > 0 or entry_next_step in ("reconcile_open_exposure", "reconcile_open_plan"):
+        decision = "reconcile_open_lifecycle_before_trade_analysis"
+        edge_quality = "analysis_blocked_by_open_lifecycle"
+        strategy_focus = "reconcile_open_exposure" if open_exposure else "reconcile_open_plan"
+        rationale = f"The May 6+ trade sample shows {closed}/{min_trades} closed trades, but an open exposure/plan is still blocking promotion; resolve lifecycle state before interpreting or tuning trade performance."
+    elif closed <= 0:
         decision = "sync_or_collect_closed_trades"
         edge_quality = "no_closed_trade_sample"
         rationale = f"No closed trades are visible since {analysis_since_utc}; reconcile Kraken/journal sync before changing strategy settings."
@@ -10650,7 +10659,9 @@ def _trade_analysis_guidance(telemetry: dict[str, Any], edge_decay: dict[str, An
         strategy_focus = f"shadow_reduce_or_tighten_{worst_strategy[0]}" if worst_strategy else "review_strategy_attribution"
 
     next_step = "Compare Kraken fills against Recent Trades count; if Kraken has more fills than this dashboard, run/schedule journal reconciliation before tuning entries."
-    if closed >= min_trades:
+    if decision == "reconcile_open_lifecycle_before_trade_analysis":
+        next_step = "First reconcile /positions, open plans, broker orders, exit-worker state, and journal rows; only then collect the remaining trade sample or run paper-only calibration."
+    elif closed >= min_trades:
         next_step = (
             f"Do not add risk yet. Start with {strategy_focus}; compare best={best_text} versus worst={worst_text}, "
             "then run one paper-only change and require improved average net edge plus no worse drawdown before live promotion."
@@ -10673,6 +10684,7 @@ def _trade_analysis_guidance(telemetry: dict[str, Any], edge_decay: dict[str, An
         "best_strategy": best_text,
         "worst_strategy": worst_text,
         "low_win_rate": low_win_rate,
+        "open_lifecycle_blocker": bool(open_exposure or open_plans > 0),
     }
 
 
@@ -10704,7 +10716,7 @@ def dashboard_ui(recent_limit: int = 25, refresh_sec: int | None = None):
     strategy_truth = (telemetry.get("strategy_truth") or {}) or (active_window.get("strategy_truth") or {})
     regime_truth = (telemetry.get("expectancy_by_regime") or {}) or (active_window.get("expectancy_by_regime") or {})
     recent = list(((perf.get("recent_trades") or {}).get("trades") or []))[:12]
-    trade_analysis = _trade_analysis_guidance(telemetry, edge_decay)
+    trade_analysis = _trade_analysis_guidance(telemetry, edge_decay, active_entry_status)
     if active_funnel_ok:
         blocked_summary = active_signal_funnel.get("by_reason") or {}
     elif active_admission_summary.get("total") is not None:
@@ -10905,7 +10917,8 @@ def dashboard_ui(recent_limit: int = 25, refresh_sec: int | None = None):
             <tr><th>decision</th><td>{trade_analysis.get("decision")}</td><th>closed/min_sample</th><td>{int(trade_analysis.get("closed_trades") or 0)} / {int(trade_analysis.get("min_review_trades") or 0)}</td></tr>
             <tr><th>edge_quality</th><td>{trade_analysis.get("edge_quality")}</td><th>risk_action</th><td>{trade_analysis.get("risk_action")}</td></tr>
             <tr><th>pnl_recomputed</th><td>{int(trade_analysis.get("pnl_recomputed_from_costs") or 0)}</td><th>analysis_since</th><td>{trade_analysis.get("analysis_since_utc")}</td></tr>
-            <tr><th>strategy_focus</th><td>{trade_analysis.get("strategy_focus")}</td><th>low_win_rate</th><td>{str(bool(trade_analysis.get("low_win_rate"))).upper()}</td></tr>
+            <tr><th>strategy_focus</th><td>{trade_analysis.get("strategy_focus")}</td><th>open_lifecycle_blocker</th><td>{str(bool(trade_analysis.get("open_lifecycle_blocker"))).upper()}</td></tr>
+            <tr><th>low_win_rate</th><td>{str(bool(trade_analysis.get("low_win_rate"))).upper()}</td><th>sample_ready</th><td>{str(int(trade_analysis.get("closed_trades") or 0) >= int(trade_analysis.get("min_review_trades") or 0)).upper()}</td></tr>
             <tr><th>best_strategy</th><td colspan="3">{trade_analysis.get("best_strategy")}</td></tr>
             <tr><th>worst_strategy</th><td colspan="3">{trade_analysis.get("worst_strategy")}</td></tr>
             <tr><th>rationale</th><td colspan="3">{trade_analysis.get("rationale")}</td></tr>
