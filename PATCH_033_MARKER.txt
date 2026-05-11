@@ -1,0 +1,3 @@
+Patch 033: open lifecycle trade-analysis gate.
+
+Makes the trade-analysis card defer calibration and sample interpretation while positions/open plans are unresolved, prioritizing lifecycle reconciliation before collecting or tuning additional trades.
