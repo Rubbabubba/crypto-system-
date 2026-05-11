@@ -1,0 +1,3 @@
+Patch 028: open lifecycle reconciliation state.
+
+Clarifies that an open broker exposure or internal plan is not a closed trade, and prioritizes position/plan/order/journal reconciliation before any entry-threshold, scan-capacity, or universe change.
