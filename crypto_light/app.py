@@ -10558,6 +10558,43 @@ def _dashboard_refresh_seconds(refresh_sec: int | None = None) -> int:
     return max(0, min(sec, 300))
 
 
+def _trade_analysis_guidance(telemetry: dict[str, Any], edge_decay: dict[str, Any]) -> dict[str, Any]:
+    telemetry = dict(telemetry or {})
+    edge_decay = dict(edge_decay or {})
+    closed = int(telemetry.get("closed_trades") or 0)
+    clean = int(telemetry.get("clean_closed_trades") or 0)
+    net_pnl = _safe_float(telemetry.get("net_pnl_usd"))
+    avg_edge = _safe_float(telemetry.get("avg_realized_edge_bps"))
+    edge_samples = int(edge_decay.get("projected_samples") or 0)
+    min_trades = max(1, int(float(os.getenv("TRADE_ANALYSIS_MIN_TRADES", "10") or 10)))
+    if closed <= 0:
+        decision = "sync_or_collect_closed_trades"
+        rationale = "No closed trades are visible in the 30-day telemetry window; reconcile Kraken/journal sync before changing strategy settings."
+    elif closed < min_trades:
+        decision = "collect_more_trade_sample"
+        rationale = f"Only {closed}/{min_trades} closed trades are available; use them for direction, but avoid live calibration until the sample is larger."
+    elif net_pnl > 0 and avg_edge > 0:
+        decision = "keep_collecting_positive_edge"
+        rationale = "The 30-day closed-trade sample is positive; continue collecting while checking edge decay and failure funnels before sizing up."
+    else:
+        decision = "review_negative_or_flat_edge"
+        rationale = "Closed-trade edge is flat/negative; review strategy attribution, fees, slippage, and exit reasons before adding risk."
+    next_step = "Compare Kraken fills against Recent Trades count; if Kraken has more fills than this dashboard, run/schedule journal reconciliation before tuning entries."
+    if closed >= min_trades:
+        next_step = "Use strategy attribution, regime expectancy, edge decay, and rejected-entry funnels to choose one paper-only calibration change at a time."
+    return {
+        "decision": decision,
+        "rationale": rationale,
+        "next_step": next_step,
+        "closed_trades": closed,
+        "clean_closed_trades": clean,
+        "min_review_trades": min_trades,
+        "net_pnl_usd": net_pnl,
+        "avg_realized_edge_bps": avg_edge,
+        "edge_decay_samples": edge_samples,
+    }
+
+
 @app.get("/dashboard/ui", response_class=HTMLResponse)
 def dashboard_ui(recent_limit: int = 25, refresh_sec: int | None = None):
     auto_refresh_sec = _dashboard_refresh_seconds(refresh_sec)
@@ -10574,16 +10611,19 @@ def dashboard_ui(recent_limit: int = 25, refresh_sec: int | None = None):
     active_signal_rule_gaps = perf.get("active_signal_rule_gaps") or {}
     active_signal_calibration = snap.get("active_signal_calibration") or perf.get("active_signal_calibration") or {}
     active_entry_status = snap.get("active_entry_status") or perf.get("active_entry_status") or {}
-    edge_decay = perf.get("active_edge_decay") or ((active_window.get("edge_decay") or {}) or (telemetry.get("edge_decay") or {}))
+    active_edge_decay = perf.get("active_edge_decay") or (active_window.get("edge_decay") or {})
+    edge_decay = telemetry.get("edge_decay") or active_edge_decay or {}
     ops = telemetry.get("operations_health") or {}
     exec_truth = telemetry.get("execution_truth") or {}
     maker_taker = telemetry.get("maker_vs_taker") or {}
     active_window_ok = bool(active_window.get("ok"))
     active_funnel_ok = bool(active_signal_funnel.get("ok"))
-    strategy_truth = (active_window.get("strategy_truth") if active_window_ok else (telemetry.get("strategy_truth") or {})) or {}
-    regime_truth = (active_window.get("expectancy_by_regime") if active_window_ok else (telemetry.get("expectancy_by_regime") or {})) or {}
-    active_recent = [_serialize_recent_trade(dict(r)) for r in (active_window.get("recent_trades") or [])]
-    recent = (active_recent if active_window_ok else ((perf.get("recent_trades") or {}).get("trades") or []))[:12]
+    # Trade analysis intentionally uses the 30-day telemetry/journal window, not the
+    # deploy-scoped active window, so patch deployments do not hide weekend trades.
+    strategy_truth = (telemetry.get("strategy_truth") or {}) or (active_window.get("strategy_truth") or {})
+    regime_truth = (telemetry.get("expectancy_by_regime") or {}) or (active_window.get("expectancy_by_regime") or {})
+    recent = list(((perf.get("recent_trades") or {}).get("trades") or []))[:12]
+    trade_analysis = _trade_analysis_guidance(telemetry, edge_decay)
     if active_funnel_ok:
         blocked_summary = active_signal_funnel.get("by_reason") or {}
     elif active_admission_summary.get("total") is not None:
@@ -10604,10 +10644,18 @@ def dashboard_ui(recent_limit: int = 25, refresh_sec: int | None = None):
         except Exception:
             return "0.00%"
 
-    net_pnl = _fmt(active_window.get("net_pnl_usd") if active_window.get("ok") else (pnl.get("journal_window") or {}).get("net_pnl_usd"))
-    trades = int((active_window.get("closed_trades") if active_window.get("ok") else (pnl.get("journal_window") or {}).get("closed_trades")) or 0)
-    wr = _pct((active_window.get("win_rate") if active_window.get("ok") else (pnl.get("win_rate") or 0.0)) or 0.0, 1)
-    avg_net_edge = _fmt(active_window.get("avg_realized_edge_bps") if active_window.get("ok") else telemetry.get("avg_realized_edge_bps"), 1)
+    net_pnl = _fmt(telemetry.get("net_pnl_usd") if telemetry.get("ok") else (pnl.get("journal_window") or {}).get("net_pnl_usd"))
+    trades = int((telemetry.get("closed_trades") if telemetry.get("ok") else (pnl.get("journal_window") or {}).get("closed_trades")) or 0)
+    wins = 0
+    losses = 0
+    try:
+        for row in (((strategy_truth or {}).get("by_strategy") or {}).values()):
+            wins += int(row.get("wins") or 0)
+            losses += int(row.get("losses") or 0)
+    except Exception:
+        wins = losses = 0
+    wr = _pct((wins / float(wins + losses)) if (wins + losses) > 0 else 0.0, 1)
+    avg_net_edge = _fmt(telemetry.get("avg_realized_edge_bps"), 1)
     entry_roles = (telemetry.get("execution_truth") or {}).get("entry_roles") or {}
     maker_cnt = float(entry_roles.get("maker") or 0.0)
     taker_cnt = float(entry_roles.get("taker") or 0.0)
@@ -10768,6 +10816,14 @@ def dashboard_ui(recent_limit: int = 25, refresh_sec: int | None = None):
             <tr><th>maker_share</th><td>{maker_share}</td><th>avg_slippage_bps</th><td>{_fmt(exec_truth.get("avg_slippage_bps"),1)}</td></tr>
             <tr><th>entry_reject_rate</th><td>{_pct(reject_rate,1)}</td><th>open_plans</th><td>{len(snap.get("open_plans") or [])}</td></tr>
             <tr><th>edge_decay_bps</th><td>{_fmt(edge_decay.get("avg_edge_decay_bps"),1)}</td><th>edge_decay_samples</th><td>{int(edge_decay.get("projected_samples") or 0)}</td></tr>
+            <tr><th>analysis_window</th><td>30d telemetry</td><th>active_trades</th><td>{int(active_window.get("closed_trades") or 0) if active_window_ok else 0}</td></tr>
+          </tbody></table>
+        </div>
+        <div class="card span-12"><h3>Trade Analysis — How Do We Improve?</h3>
+          <table><tbody>
+            <tr><th>decision</th><td>{trade_analysis.get("decision")}</td><th>closed/min_sample</th><td>{int(trade_analysis.get("closed_trades") or 0)} / {int(trade_analysis.get("min_review_trades") or 0)}</td></tr>
+            <tr><th>rationale</th><td colspan="3">{trade_analysis.get("rationale")}</td></tr>
+            <tr><th>next_step</th><td colspan="3">{trade_analysis.get("next_step")}</td></tr>
           </tbody></table>
         </div>
         <div class="card span-4"><h3>Guarded Live Path</h3>
@@ -10804,7 +10860,7 @@ def dashboard_ui(recent_limit: int = 25, refresh_sec: int | None = None):
         <div class="card span-6"><h3>Regime Expectancy</h3>
           <table><thead><tr><th>Regime</th><th>Trades</th><th>Wins</th><th>Losses</th><th>Win Rate</th><th>Net P&L</th><th>Avg Net Edge</th></tr></thead><tbody>{regime_rows}</tbody></table>
         </div>
-        <div class="card span-12"><h3>Recent Trades</h3>
+        <div class="card span-12"><h3>Recent Trades — 30d Analysis Window</h3>
           <table><thead><tr><th>UTC</th><th>Symbol</th><th>Side</th><th>Net PnL</th><th>Fees</th><th>Net Edge bps</th></tr></thead><tbody>{table_rows}</tbody></table>
         </div>
       </div>
