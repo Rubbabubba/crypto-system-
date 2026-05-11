@@ -367,6 +367,38 @@ def _ratio(num: Optional[float], den: Optional[float]) -> Optional[float]:
     return float(num) / float(den)
 
 
+def _audited_pnl_fields(row: Dict[str, Any], alerts: List[str]) -> Dict[str, Optional[float]]:
+    entry_cost = _to_float(row.get("entry_cost"))
+    exit_cost = _to_float(row.get("exit_cost"))
+    entry_fee = _to_float(row.get("entry_fee")) or 0.0
+    exit_fee = _to_float(row.get("exit_fee")) or 0.0
+    source_gross = _to_float(row.get("gross_pnl_usd"))
+    source_net = _to_float(row.get("net_pnl_usd"))
+    source_fees = _to_float(row.get("fees_total"))
+    fees_total = float(source_fees) if source_fees is not None else float(entry_fee) + float(exit_fee)
+    audited_gross = None
+    audited_net = None
+    if entry_cost is not None and exit_cost is not None and entry_cost > 0 and exit_cost > 0:
+        audited_gross = float(exit_cost) - float(entry_cost)
+        audited_net = float(audited_gross) - float(fees_total)
+    gross = source_gross
+    net = source_net
+    if audited_net is not None:
+        tolerance = max(1.0, abs(float(entry_cost or 0.0)) * 0.01)
+        source_absurd = False
+        if source_net is not None and entry_cost and entry_cost > 0:
+            source_absurd = abs(float(source_net)) > (abs(float(entry_cost)) * _env_float("TELEMETRY_MAX_PNL_TO_NOTIONAL_PCT", 0.25))
+        if source_net is None or abs(float(source_net) - float(audited_net)) > tolerance or source_absurd:
+            net = audited_net
+            gross = audited_gross
+            alerts.append("pnl_recomputed_from_costs")
+    return {
+        "gross_pnl_usd": _to_float(gross),
+        "net_pnl_usd": _to_float(net),
+        "fees_total": _to_float(fees_total),
+    }
+
+
 def _expectancy_bucket(net_edge_bps: Optional[float]) -> str:
     v = _to_float(net_edge_bps)
     if v is None:
@@ -479,6 +511,7 @@ def sync_from_trade_journal(limit: int = 500) -> Dict[str, Any]:
                 alerts.append("partial_close")
             if net_edge_bps is not None and net_edge_bps < 0:
                 alerts.append('negative_edge')
+            audited_pnl = _audited_pnl_fields(r, alerts)
             clean_trade = int(len(alerts) == 0 and bool(r.get("exit_txid")) and bool(r.get("entry_txid")))
             payload = {
                 "trade_key": _trade_key(r),
@@ -524,9 +557,9 @@ def sync_from_trade_journal(limit: int = 500) -> Dict[str, Any]:
                 "hold_bucket": _hold_bucket(_to_float(r.get('hold_sec'))),
                 "regime_state": regime_state,
                 "expectancy_bucket": _expectancy_bucket(net_edge_bps),
-                "fees_total": _to_float(r.get("fees_total")),
-                "gross_pnl_usd": _to_float(r.get("gross_pnl_usd")),
-                "net_pnl_usd": _to_float(r.get("net_pnl_usd")),
+                "fees_total": audited_pnl.get("fees_total"),
+                "gross_pnl_usd": audited_pnl.get("gross_pnl_usd"),
+                "net_pnl_usd": audited_pnl.get("net_pnl_usd"),
                 "exit_reason": r.get("exit_reason"),
                 "partial_close": 1 if partial_close else 0,
                 "clean_trade": clean_trade,
@@ -618,21 +651,36 @@ def sync_from_trade_journal(limit: int = 500) -> Dict[str, Any]:
     return {"ok": True, "db_path": _db_path(), "synced_rows": inserted, "journal_rows": len(rows)}
 
 
-def recent_trades(limit: int = 100) -> List[Dict[str, Any]]:
+def recent_trades(limit: int = 100, since_ts: Optional[float] = None) -> List[Dict[str, Any]]:
     init_db()
     sync_from_trade_journal(limit=max(limit, 200))
+    args: List[Any] = []
+    where = ""
+    if since_ts is not None:
+        try:
+            where = "WHERE closed_ts >= ?"
+            args.append(float(since_ts))
+        except Exception:
+            where = ""
+            args = []
+    args.append(max(1, int(limit)))
     with _connect() as conn:
         rows = conn.execute(
-            "SELECT * FROM trade_telemetry ORDER BY closed_ts DESC LIMIT ?",
-            (max(1, int(limit)),),
+            f"SELECT * FROM trade_telemetry {where} ORDER BY closed_ts DESC LIMIT ?",
+            args,
         ).fetchall()
     return [dict(r) for r in rows]
 
 
-def summary(days: float = 30.0) -> Dict[str, Any]:
+def summary(days: float = 30.0, since_ts: Optional[float] = None) -> Dict[str, Any]:
     init_db()
     sync_from_trade_journal(limit=5000)
     since = time.time() - max(0.0, float(days)) * 86400.0
+    if since_ts is not None:
+        try:
+            since = max(float(since), float(since_ts))
+        except Exception:
+            pass
     with _connect() as conn:
         rows = conn.execute(
             "SELECT * FROM trade_telemetry WHERE closed_ts >= ? ORDER BY closed_ts DESC",
@@ -647,6 +695,14 @@ def summary(days: float = 30.0) -> Dict[str, Any]:
     projected_edge_vals = [float(r['projected_move_bps']) - float(r['projected_cost_bps']) for r in rec if r.get('projected_move_bps') is not None and r.get('projected_cost_bps') is not None]
     realized_edge_vals = [float(r['net_edge_bps']) for r in rec if r.get('net_edge_bps') is not None]
     blocked = _blocked_trade_summary(days)
+    pnl_recomputed = 0
+    for r in rec:
+        try:
+            flags = json.loads(r.get('alert_flags_json') or '[]')
+        except Exception:
+            flags = []
+        if isinstance(flags, list) and 'pnl_recomputed_from_costs' in flags:
+            pnl_recomputed += 1
     maker_entry = sum(1 for r in rec if str(r.get('entry_liquidity_role') or '') == 'maker')
     taker_entry = sum(1 for r in rec if str(r.get('entry_liquidity_role') or '') == 'taker')
     maker_exit = sum(1 for r in rec if str(r.get('exit_liquidity_role') or '') == 'maker')
@@ -673,7 +729,11 @@ def summary(days: float = 30.0) -> Dict[str, Any]:
         "expectancy_by_hold_bucket": _group_stats(rec, 'hold_bucket'),
         "expectancy_by_regime": _group_stats(rec, 'regime_state'),
         "blocked_trade_summary": blocked,
-        "edge_decay": edge_decay_summary(days=float(days)),
+        "edge_decay": edge_decay_summary(days=float(days), since_ts=since),
+        "pnl_audit": {
+            "recomputed_from_costs": int(pnl_recomputed),
+            "method": "entry_exit_costs_minus_fees",
+        },
         "latest_closed_ts": rec[0].get("closed_ts") if rec else None,
         "open_trades": len(trade_journal.list_open_trades(limit=5000)),
     }

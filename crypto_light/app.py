@@ -9622,6 +9622,22 @@ def _active_telemetry_since_ts() -> float | None:
         return None
 
 
+def _trade_analysis_since_ts() -> float | None:
+    raw_ts = str(os.getenv("TRADE_ANALYSIS_START_TS", "") or "").strip()
+    if raw_ts:
+        try:
+            return float(raw_ts)
+        except Exception:
+            pass
+    raw_utc = str(os.getenv("TRADE_ANALYSIS_START_UTC", "2026-05-06T00:00:00Z") or "").strip()
+    if not raw_utc:
+        return None
+    try:
+        return datetime.fromisoformat(raw_utc.replace("Z", "+00:00")).timestamp()
+    except Exception:
+        return None
+
+
 def _active_signal_funnel(limit: int = 500) -> dict[str, Any]:
     since_ts = _active_telemetry_since_ts()
     try:
@@ -10326,8 +10342,9 @@ def _performance_snapshot(days: float = 30.0, recent_limit: int = 25) -> dict[st
     account_truth = _account_truth_snapshot()
     realized_today = _journal_sync_daily_realized_pnl()
 
+    trade_analysis_since_ts = _trade_analysis_since_ts()
     try:
-        recent_raw = telemetry_db.recent_trades(limit=max(1, int(recent_limit)))
+        recent_raw = telemetry_db.recent_trades(limit=max(1, int(recent_limit)), since_ts=trade_analysis_since_ts)
     except Exception:
         recent_raw = []
     recent = [_serialize_recent_trade(dict(r)) for r in (recent_raw or [])]
@@ -10345,9 +10362,11 @@ def _performance_snapshot(days: float = 30.0, recent_limit: int = 25) -> dict[st
     except Exception:
         journal_window = {"ok": False, "days": float(days)}
     try:
-        telemetry_window = telemetry_db.summary(days=float(days))
+        telemetry_window = telemetry_db.summary(days=float(days), since_ts=trade_analysis_since_ts)
+        telemetry_window["analysis_since_ts"] = trade_analysis_since_ts
+        telemetry_window["analysis_since_utc"] = (datetime.fromtimestamp(float(trade_analysis_since_ts), timezone.utc).isoformat().replace("+00:00", "Z") if trade_analysis_since_ts is not None else None)
     except Exception:
-        telemetry_window = {"ok": False, "days": float(days)}
+        telemetry_window = {"ok": False, "days": float(days), "analysis_since_ts": trade_analysis_since_ts}
     try:
         validation = telemetry_db.live_validation_summary()
     except Exception:
@@ -10403,6 +10422,8 @@ def _performance_snapshot(days: float = 30.0, recent_limit: int = 25) -> dict[st
         },
         "recent_trades": {
             "count": len(recent),
+            "analysis_since_ts": trade_analysis_since_ts,
+            "analysis_since_utc": (datetime.fromtimestamp(float(trade_analysis_since_ts), timezone.utc).isoformat().replace("+00:00", "Z") if trade_analysis_since_ts is not None else None),
             "trades": recent,
         },
         "live_validation": validation,
@@ -10561,27 +10582,79 @@ def _dashboard_refresh_seconds(refresh_sec: int | None = None) -> int:
 def _trade_analysis_guidance(telemetry: dict[str, Any], edge_decay: dict[str, Any]) -> dict[str, Any]:
     telemetry = dict(telemetry or {})
     edge_decay = dict(edge_decay or {})
+    analysis_since_utc = str(telemetry.get("analysis_since_utc") or os.getenv("TRADE_ANALYSIS_START_UTC", "2026-05-06T00:00:00Z") or "")
     closed = int(telemetry.get("closed_trades") or 0)
     clean = int(telemetry.get("clean_closed_trades") or 0)
     net_pnl = _safe_float(telemetry.get("net_pnl_usd"))
     avg_edge = _safe_float(telemetry.get("avg_realized_edge_bps"))
     edge_samples = int(edge_decay.get("projected_samples") or 0)
+    pnl_recomputed = int(((telemetry.get("pnl_audit") or {}).get("recomputed_from_costs") or 0))
     min_trades = max(1, int(float(os.getenv("TRADE_ANALYSIS_MIN_TRADES", "10") or 10)))
+    strategy_rows = dict(((telemetry.get("strategy_truth") or {}).get("by_strategy") or {}))
+    ranked_strategies: list[tuple[str, dict[str, Any]]] = []
+    for name, row in strategy_rows.items():
+        row_d = dict(row or {})
+        if int(row_d.get("trades") or 0) <= 0:
+            continue
+        ranked_strategies.append((str(name or "unknown"), row_d))
+
+    def _strategy_sort_key(item: tuple[str, dict[str, Any]]) -> tuple[float, float, str]:
+        name, row = item
+        return (_safe_float(row.get("avg_net_edge_bps")), _safe_float(row.get("win_rate")), name)
+
+    worst_strategy = sorted(ranked_strategies, key=_strategy_sort_key)[0] if ranked_strategies else None
+    best_strategy = sorted(ranked_strategies, key=_strategy_sort_key, reverse=True)[0] if ranked_strategies else None
+    worst_text = "none"
+    if worst_strategy:
+        worst_text = f"{worst_strategy[0]} edge={_safe_float(worst_strategy[1].get('avg_net_edge_bps')):.1f}bps win={_safe_float(worst_strategy[1].get('win_rate')) * 100:.1f}% n={int(worst_strategy[1].get('trades') or 0)}"
+    best_text = "none"
+    if best_strategy:
+        best_text = f"{best_strategy[0]} edge={_safe_float(best_strategy[1].get('avg_net_edge_bps')):.1f}bps win={_safe_float(best_strategy[1].get('win_rate')) * 100:.1f}% n={int(best_strategy[1].get('trades') or 0)}"
+
+    low_win_rate = False
+    try:
+        wins = sum(int((row or {}).get("wins") or 0) for row in strategy_rows.values())
+        losses = sum(int((row or {}).get("losses") or 0) for row in strategy_rows.values())
+        low_win_rate = bool((wins + losses) > 0 and (wins / float(wins + losses)) < 0.35)
+    except Exception:
+        low_win_rate = False
+
+    edge_quality = "unknown"
+    strategy_focus = "none"
+    risk_action = "do_not_size_up"
     if closed <= 0:
         decision = "sync_or_collect_closed_trades"
-        rationale = "No closed trades are visible in the 30-day telemetry window; reconcile Kraken/journal sync before changing strategy settings."
+        edge_quality = "no_closed_trade_sample"
+        rationale = f"No closed trades are visible since {analysis_since_utc}; reconcile Kraken/journal sync before changing strategy settings."
+        strategy_focus = "journal_sync"
     elif closed < min_trades:
         decision = "collect_more_trade_sample"
+        edge_quality = "sample_too_small"
         rationale = f"Only {closed}/{min_trades} closed trades are available; use them for direction, but avoid live calibration until the sample is larger."
-    elif net_pnl > 0 and avg_edge > 0:
+        strategy_focus = worst_strategy[0] if worst_strategy else "collect_more_trades"
+    elif net_pnl > 0 and avg_edge < 0:
+        decision = "positive_pnl_negative_edge_review_quality"
+        edge_quality = "outlier_or_asymmetric_positive_pnl_negative_average_edge"
+        rationale = "Net P&L is positive but average net edge is negative; this is likely outlier/asymmetric winner driven, so do not size up until repeatable per-trade edge improves."
+        strategy_focus = f"shadow_reduce_or_tighten_{worst_strategy[0]}" if worst_strategy else "review_worst_strategy"
+    elif net_pnl > 0 and avg_edge > 0 and not low_win_rate:
         decision = "keep_collecting_positive_edge"
+        edge_quality = "positive_pnl_positive_average_edge"
         rationale = "The 30-day closed-trade sample is positive; continue collecting while checking edge decay and failure funnels before sizing up."
+        strategy_focus = f"preserve_{best_strategy[0]}_and_monitor_{worst_strategy[0]}" if best_strategy and worst_strategy else "monitor_strategy_mix"
+        risk_action = "hold_size_until_edge_decay_coverage_improves" if edge_samples < min_trades else "consider_paper_size_up_only"
     else:
         decision = "review_negative_or_flat_edge"
+        edge_quality = "negative_or_low_quality_average_edge"
         rationale = "Closed-trade edge is flat/negative; review strategy attribution, fees, slippage, and exit reasons before adding risk."
+        strategy_focus = f"shadow_reduce_or_tighten_{worst_strategy[0]}" if worst_strategy else "review_strategy_attribution"
+
     next_step = "Compare Kraken fills against Recent Trades count; if Kraken has more fills than this dashboard, run/schedule journal reconciliation before tuning entries."
     if closed >= min_trades:
-        next_step = "Use strategy attribution, regime expectancy, edge decay, and rejected-entry funnels to choose one paper-only calibration change at a time."
+        next_step = (
+            f"Do not add risk yet. Start with {strategy_focus}; compare best={best_text} versus worst={worst_text}, "
+            "then run one paper-only change and require improved average net edge plus no worse drawdown before live promotion."
+        )
     return {
         "decision": decision,
         "rationale": rationale,
@@ -10592,6 +10665,14 @@ def _trade_analysis_guidance(telemetry: dict[str, Any], edge_decay: dict[str, An
         "net_pnl_usd": net_pnl,
         "avg_realized_edge_bps": avg_edge,
         "edge_decay_samples": edge_samples,
+        "pnl_recomputed_from_costs": pnl_recomputed,
+        "analysis_since_utc": analysis_since_utc,
+        "edge_quality": edge_quality,
+        "strategy_focus": strategy_focus,
+        "risk_action": risk_action,
+        "best_strategy": best_text,
+        "worst_strategy": worst_text,
+        "low_win_rate": low_win_rate,
     }
 
 
@@ -10816,12 +10897,17 @@ def dashboard_ui(recent_limit: int = 25, refresh_sec: int | None = None):
             <tr><th>maker_share</th><td>{maker_share}</td><th>avg_slippage_bps</th><td>{_fmt(exec_truth.get("avg_slippage_bps"),1)}</td></tr>
             <tr><th>entry_reject_rate</th><td>{_pct(reject_rate,1)}</td><th>open_plans</th><td>{len(snap.get("open_plans") or [])}</td></tr>
             <tr><th>edge_decay_bps</th><td>{_fmt(edge_decay.get("avg_edge_decay_bps"),1)}</td><th>edge_decay_samples</th><td>{int(edge_decay.get("projected_samples") or 0)}</td></tr>
-            <tr><th>analysis_window</th><td>30d telemetry</td><th>active_trades</th><td>{int(active_window.get("closed_trades") or 0) if active_window_ok else 0}</td></tr>
+            <tr><th>analysis_window</th><td>since {telemetry.get("analysis_since_utc") or "2026-05-06T00:00:00Z"}</td><th>active_trades</th><td>{int(active_window.get("closed_trades") or 0) if active_window_ok else 0}</td></tr>
           </tbody></table>
         </div>
         <div class="card span-12"><h3>Trade Analysis — How Do We Improve?</h3>
           <table><tbody>
             <tr><th>decision</th><td>{trade_analysis.get("decision")}</td><th>closed/min_sample</th><td>{int(trade_analysis.get("closed_trades") or 0)} / {int(trade_analysis.get("min_review_trades") or 0)}</td></tr>
+            <tr><th>edge_quality</th><td>{trade_analysis.get("edge_quality")}</td><th>risk_action</th><td>{trade_analysis.get("risk_action")}</td></tr>
+            <tr><th>pnl_recomputed</th><td>{int(trade_analysis.get("pnl_recomputed_from_costs") or 0)}</td><th>analysis_since</th><td>{trade_analysis.get("analysis_since_utc")}</td></tr>
+            <tr><th>strategy_focus</th><td>{trade_analysis.get("strategy_focus")}</td><th>low_win_rate</th><td>{str(bool(trade_analysis.get("low_win_rate"))).upper()}</td></tr>
+            <tr><th>best_strategy</th><td colspan="3">{trade_analysis.get("best_strategy")}</td></tr>
+            <tr><th>worst_strategy</th><td colspan="3">{trade_analysis.get("worst_strategy")}</td></tr>
             <tr><th>rationale</th><td colspan="3">{trade_analysis.get("rationale")}</td></tr>
             <tr><th>next_step</th><td colspan="3">{trade_analysis.get("next_step")}</td></tr>
           </tbody></table>
@@ -10860,7 +10946,7 @@ def dashboard_ui(recent_limit: int = 25, refresh_sec: int | None = None):
         <div class="card span-6"><h3>Regime Expectancy</h3>
           <table><thead><tr><th>Regime</th><th>Trades</th><th>Wins</th><th>Losses</th><th>Win Rate</th><th>Net P&L</th><th>Avg Net Edge</th></tr></thead><tbody>{regime_rows}</tbody></table>
         </div>
-        <div class="card span-12"><h3>Recent Trades — 30d Analysis Window</h3>
+        <div class="card span-12"><h3>Recent Trades — Since 2026-05-06 Analysis Window</h3>
           <table><thead><tr><th>UTC</th><th>Symbol</th><th>Side</th><th>Net PnL</th><th>Fees</th><th>Net Edge bps</th></tr></thead><tbody>{table_rows}</tbody></table>
         </div>
       </div>
