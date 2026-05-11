@@ -1,0 +1,3 @@
+Patch 029: trade analysis window.
+
+Keeps active-window admission diagnostics deploy-scoped while making dashboard trade P&L, attribution, regime expectancy, and recent trades use the 30-day telemetry/journal analysis window so weekend trades remain visible after patch deploys.
