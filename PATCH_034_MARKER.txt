@@ -1,0 +1,3 @@
+Patch 034: near-sample signal probe guidance.
+
+When trade analysis is one trade short of the review minimum but active entries are already signal-starved, the dashboard now recommends a paper-only ME1/MR1 threshold plus scan-cap probe while collecting the final sample.
