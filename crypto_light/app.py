@@ -10623,14 +10623,24 @@ def _trade_analysis_guidance(telemetry: dict[str, Any], edge_decay: dict[str, An
     edge_quality = "unknown"
     strategy_focus = "none"
     risk_action = "do_not_size_up"
+    sample_status = "ready" if closed >= min_trades else ("near_ready" if closed >= max(1, min_trades - 1) else "too_small")
     open_exposure = bool(entry_status.get("has_open_exposure"))
     open_plans = int(entry_status.get("open_plans") or 0)
+    signal_starved = bool(entry_status.get("signal_starved"))
+    no_signal_count = int(entry_status.get("no_signal_rejections") or 0)
+    escalation_count = int(entry_status.get("no_signal_escalation_count") or 0)
+    scan_cap_count = int(entry_status.get("scan_cap_rejections") or 0)
     entry_next_step = str(entry_status.get("next_step") or "")
     if open_exposure or open_plans > 0 or entry_next_step in ("reconcile_open_exposure", "reconcile_open_plan"):
         decision = "reconcile_open_lifecycle_before_trade_analysis"
         edge_quality = "analysis_blocked_by_open_lifecycle"
         strategy_focus = "reconcile_open_exposure" if open_exposure else "reconcile_open_plan"
         rationale = f"The May 6+ trade sample shows {closed}/{min_trades} closed trades, but an open exposure/plan is still blocking promotion; resolve lifecycle state before interpreting or tuning trade performance."
+    elif signal_starved and sample_status in ("near_ready", "ready"):
+        decision = "run_paper_signal_probe_while_collecting_final_sample" if sample_status == "near_ready" else "run_paper_signal_probe"
+        edge_quality = "trade_sample_near_ready_but_entry_starved"
+        strategy_focus = "paper_me1_mr1_threshold_and_scan_cap_probe"
+        rationale = f"The May 6+ trade sample is {closed}/{min_trades}, but active entry is signal-starved ({no_signal_count}/{escalation_count}) with {scan_cap_count} scan-cap rejection(s); run the paper-only probe now while collecting the remaining sample, not a live change."
     elif closed <= 0:
         decision = "sync_or_collect_closed_trades"
         edge_quality = "no_closed_trade_sample"
@@ -10661,6 +10671,8 @@ def _trade_analysis_guidance(telemetry: dict[str, Any], edge_decay: dict[str, An
     next_step = "Compare Kraken fills against Recent Trades count; if Kraken has more fills than this dashboard, run/schedule journal reconciliation before tuning entries."
     if decision == "reconcile_open_lifecycle_before_trade_analysis":
         next_step = "First reconcile /positions, open plans, broker orders, exit-worker state, and journal rows; only then collect the remaining trade sample or run paper-only calibration."
+    elif decision in ("run_paper_signal_probe_while_collecting_final_sample", "run_paper_signal_probe"):
+        next_step = "Run the dashboard's paper-only ME1/MR1 threshold plus MAX_ENTRIES_PER_SCAN=3 probe; collect the final trade sample in parallel, but do not change live risk/capacity/universe until paper candidates clear signal, spread, and expected-edge gates."
     elif closed >= min_trades:
         next_step = (
             f"Do not add risk yet. Start with {strategy_focus}; compare best={best_text} versus worst={worst_text}, "
@@ -10685,6 +10697,8 @@ def _trade_analysis_guidance(telemetry: dict[str, Any], edge_decay: dict[str, An
         "worst_strategy": worst_text,
         "low_win_rate": low_win_rate,
         "open_lifecycle_blocker": bool(open_exposure or open_plans > 0),
+        "sample_status": sample_status,
+        "signal_starved": signal_starved,
     }
 
 
@@ -10918,7 +10932,8 @@ def dashboard_ui(recent_limit: int = 25, refresh_sec: int | None = None):
             <tr><th>edge_quality</th><td>{trade_analysis.get("edge_quality")}</td><th>risk_action</th><td>{trade_analysis.get("risk_action")}</td></tr>
             <tr><th>pnl_recomputed</th><td>{int(trade_analysis.get("pnl_recomputed_from_costs") or 0)}</td><th>analysis_since</th><td>{trade_analysis.get("analysis_since_utc")}</td></tr>
             <tr><th>strategy_focus</th><td>{trade_analysis.get("strategy_focus")}</td><th>open_lifecycle_blocker</th><td>{str(bool(trade_analysis.get("open_lifecycle_blocker"))).upper()}</td></tr>
-            <tr><th>low_win_rate</th><td>{str(bool(trade_analysis.get("low_win_rate"))).upper()}</td><th>sample_ready</th><td>{str(int(trade_analysis.get("closed_trades") or 0) >= int(trade_analysis.get("min_review_trades") or 0)).upper()}</td></tr>
+            <tr><th>low_win_rate</th><td>{str(bool(trade_analysis.get("low_win_rate"))).upper()}</td><th>sample_status</th><td>{trade_analysis.get("sample_status")}</td></tr>
+            <tr><th>signal_starved</th><td>{str(bool(trade_analysis.get("signal_starved"))).upper()}</td><th>sample_ready</th><td>{str(int(trade_analysis.get("closed_trades") or 0) >= int(trade_analysis.get("min_review_trades") or 0)).upper()}</td></tr>
             <tr><th>best_strategy</th><td colspan="3">{trade_analysis.get("best_strategy")}</td></tr>
             <tr><th>worst_strategy</th><td colspan="3">{trade_analysis.get("worst_strategy")}</td></tr>
             <tr><th>rationale</th><td colspan="3">{trade_analysis.get("rationale")}</td></tr>
