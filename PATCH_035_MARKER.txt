@@ -1,0 +1,3 @@
+Patch 035: dashboard patch-state clarity.
+
+Clarifies that a signal-starved dashboard with pending shadow evidence does not currently require a production code patch; operators must collect paper/shadow evidence before another live change.
