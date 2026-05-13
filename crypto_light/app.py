@@ -10159,7 +10159,10 @@ def _active_signal_calibration_plan(
             "decision": "recover_worker_health" if worker_blocked else "recover_system_readiness",
             "additional_patch_needed": "NO_SYSTEM_RECOVERY_FIRST",
             "production_patch_required": False,
-            "patch_rationale": "Do not create an entry-calibration patch while system/pretrade readiness is closed.",
+            "current_live_patch_required": False,
+            "current_code_change_status": "NO_CURRENT_PRODUCTION_CHANGE",
+            "evidence_required_before_next_patch": "RESTORE_SYSTEM_READINESS_FIRST",
+            "patch_rationale": "No code patch is indicated while system/pretrade readiness is closed; recover readiness first, then reassess fresh scans.",
             "universe_expansion_recommended": False,
             "universe_action": "NO_SYSTEM_RECOVERY_FIRST",
             "universe_rationale": "Do not expand the tradable universe while readiness/pretrade health is unresolved; stale scan evidence can mislead universe decisions.",
@@ -10186,7 +10189,10 @@ def _active_signal_calibration_plan(
             "decision": "reconcile_open_exposure" if open_positions > 0 or bool(status.get("has_open_exposure")) else "reconcile_open_plan",
             "additional_patch_needed": "NO_RECONCILE_OPEN_LIFECYCLE_FIRST",
             "production_patch_required": False,
-            "patch_rationale": "No entry-calibration patch is indicated while an open position or internal plan is present without a closed trade record.",
+            "current_live_patch_required": False,
+            "current_code_change_status": "NO_CURRENT_PRODUCTION_CHANGE",
+            "evidence_required_before_next_patch": "RECONCILE_OPEN_LIFECYCLE_FIRST",
+            "patch_rationale": "No code patch is indicated while an open position or internal plan is present without a closed trade record.",
             "universe_expansion_recommended": False,
             "universe_action": "NO_RECONCILE_OPEN_LIFECYCLE_FIRST",
             "universe_rationale": "Do not expand the live universe while an open exposure/plan lifecycle is unresolved; first verify fill, position, exit, and journal reconciliation.",
@@ -10214,7 +10220,10 @@ def _active_signal_calibration_plan(
             "decision": "collect_more_active_samples",
             "additional_patch_needed": "NO",
             "production_patch_required": False,
-            "patch_rationale": "Patch 024 is doing its job: the active rejection sample is still below the review minimum.",
+            "current_live_patch_required": False,
+            "current_code_change_status": "NO_CURRENT_PRODUCTION_CHANGE",
+            "evidence_required_before_next_patch": "MORE_ACTIVE_SCANS_OR_ONE_PASSED_SIGNAL",
+            "patch_rationale": "No code patch is indicated: the active rejection sample is still below the review minimum.",
             "universe_expansion_recommended": False,
             "universe_action": "NO_LOW_SAMPLE",
             "universe_rationale": "Do not expand the coin universe from a low-sample window; wait for the active rejection minimum or one passed signal.",
@@ -10248,7 +10257,10 @@ def _active_signal_calibration_plan(
             "decision": f"{next_step}_no_live_patch",
             "additional_patch_needed": "NO",
             "production_patch_required": False,
-            "patch_rationale": f"No production patch is indicated: signal_starved is FALSE and no_signal rejections are {no_signal_count}/{escalation_count}.",
+            "current_live_patch_required": False,
+            "current_code_change_status": "NO_CURRENT_PRODUCTION_CHANGE",
+            "evidence_required_before_next_patch": "NO_SIGNAL_ESCALATION_OR_EDGE_QUALIFIED_SHADOW_CANDIDATE",
+            "patch_rationale": f"No code patch is indicated: signal_starved is FALSE and no_signal rejections are {no_signal_count}/{escalation_count}.",
             "universe_expansion_recommended": False,
             "universe_action": "NO_SIGNAL_NOT_ESCALATED",
             "universe_rationale": "Do not expand the live coin universe before no-signal evidence reaches escalation and before at least one setup clears signal and edge gates in shadow.",
@@ -10313,7 +10325,10 @@ def _active_signal_calibration_plan(
         "decision": decision,
         "additional_patch_needed": "PENDING_SHADOW_EVIDENCE",
         "production_patch_required": False,
-        "patch_rationale": "No live patch from this dashboard alone; require paper/shadow evidence that a candidate clears signal, spread, and expected-edge gates.",
+        "current_live_patch_required": False,
+        "current_code_change_status": "NO_CURRENT_PRODUCTION_CHANGE",
+        "evidence_required_before_next_patch": "PAPER_OR_SHADOW_CANDIDATE_MUST_CLEAR_SIGNAL_SPREAD_AND_EXPECTED_EDGE",
+        "patch_rationale": "No code patch is indicated from this dashboard alone; require paper/shadow evidence that a candidate clears signal, spread, and expected-edge gates before preparing another production change.",
         "universe_expansion_recommended": False,
         "universe_action": universe_action,
         "universe_rationale": universe_rationale,
@@ -10796,6 +10811,9 @@ def dashboard_ui(recent_limit: int = 25, refresh_sec: int | None = None):
     scan_cap_guidance_text = str(active_signal_calibration.get("scan_cap_guidance") or "none")
     patch_needed_text = str(active_signal_calibration.get("additional_patch_needed") or "UNKNOWN")
     production_patch_text = "YES" if bool(active_signal_calibration.get("production_patch_required")) else "NO"
+    current_live_patch_text = "YES" if bool(active_signal_calibration.get("current_live_patch_required")) else "NO"
+    code_change_status_text = str(active_signal_calibration.get("current_code_change_status") or ("PRODUCTION_CHANGE_REQUIRED" if bool(active_signal_calibration.get("production_patch_required")) else "NO_CURRENT_PRODUCTION_CHANGE"))
+    evidence_required_text = str(active_signal_calibration.get("evidence_required_before_next_patch") or "none")
     patch_rationale_text = str(active_signal_calibration.get("patch_rationale") or "No patch assessment available.")
     universe_expand_text = "YES" if bool(active_signal_calibration.get("universe_expansion_recommended")) else "NO"
     universe_action_text = str(active_signal_calibration.get("universe_action") or "UNKNOWN")
@@ -10881,7 +10899,9 @@ def dashboard_ui(recent_limit: int = 25, refresh_sec: int | None = None):
         <div class="card span-12"><h3>Next Action</h3>
           <table><tbody>
             <tr><th>decision</th><td>{calibration_decision_text}</td><th>active/no_signal</th><td>{int(active_entry_status.get("active_rejected") or 0)} / {int(active_entry_status.get("no_signal_rejections") or 0)} / {int(active_entry_status.get("no_signal_escalation_count") or 0)}</td></tr>
+            <tr><th>current_live_patch_required</th><td>{current_live_patch_text}</td><th>code_change_status</th><td>{code_change_status_text}</td></tr>
             <tr><th>additional_patch_needed</th><td>{patch_needed_text}</td><th>production_patch_required</th><td>{production_patch_text}</td></tr>
+            <tr><th>evidence_required_before_next_patch</th><td colspan="3">{evidence_required_text}</td></tr>
             <tr><th>patch_rationale</th><td colspan="3">{patch_rationale_text}</td></tr>
             <tr><th>expand_coin_universe</th><td>{universe_expand_text}</td><th>universe_action</th><td>{universe_action_text}</td></tr>
             <tr><th>universe_rationale</th><td colspan="3">{universe_rationale_text}</td></tr>
