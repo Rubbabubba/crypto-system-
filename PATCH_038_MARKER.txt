@@ -1,0 +1,3 @@
+Patch 038: active admission sample cap clarity.
+
+Uses full patch-active admission totals for headline entry counts while keeping top symbol/rule diagnostics as recent samples, raises the default sample limit, and shows when top tables are capped.
