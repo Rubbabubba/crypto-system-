@@ -1,0 +1,3 @@
+Patch 037: paper-probe readiness clarity.
+
+When the dashboard has enough signal-starvation evidence and at least one shadow threshold or scan-cap probe is ready, it now says exactly what the operator should run now and what paper result is required before any live patch.
