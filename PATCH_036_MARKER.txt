@@ -1,0 +1,3 @@
+Patch 036: dashboard window-scope clarity.
+
+Adds explicit patch-active versus trade-analysis window context so operators can tell why entry rejection samples, strategy attribution, and recent trades may show different counts after a deploy.
