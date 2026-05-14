@@ -10766,6 +10766,25 @@ def dashboard_ui(recent_limit: int = 25, refresh_sec: int | None = None):
         except Exception:
             return "0.00%"
 
+    def _utc_from_ts(v: Any) -> str:
+        try:
+            return datetime.fromtimestamp(float(v), timezone.utc).isoformat().replace("+00:00", "Z")
+        except Exception:
+            return "unknown"
+
+    active_since_ts = active_signal_funnel.get("active_since_ts")
+    if active_since_ts is None:
+        active_since_ts = active_window.get("since_ts") or active_admission_summary.get("since_ts")
+    active_since_text = _utc_from_ts(active_since_ts) if active_since_ts is not None else "service start / all available active events"
+    analysis_since_text = str(telemetry.get("analysis_since_utc") or "2026-05-06T00:00:00Z")
+    active_review_min = int(active_entry_status.get("active_rejection_review_min") or 0)
+    no_signal_escalation = int(active_entry_status.get("no_signal_escalation_count") or 0)
+    active_sample_text = (
+        f"{int(active_entry_status.get('active_rejected') or 0)} rejected / "
+        f"{int(active_entry_status.get('no_signal_rejections') or 0)} no_signal / "
+        f"min {active_review_min} / escalate {no_signal_escalation}"
+    )
+
     net_pnl = _fmt(telemetry.get("net_pnl_usd") if telemetry.get("ok") else (pnl.get("journal_window") or {}).get("net_pnl_usd"))
     trades = int((telemetry.get("closed_trades") if telemetry.get("ok") else (pnl.get("journal_window") or {}).get("closed_trades")) or 0)
     wins = 0
@@ -10898,7 +10917,7 @@ def dashboard_ui(recent_limit: int = 25, refresh_sec: int | None = None):
         </div>
         <div class="card span-12"><h3>Next Action</h3>
           <table><tbody>
-            <tr><th>decision</th><td>{calibration_decision_text}</td><th>active/no_signal</th><td>{int(active_entry_status.get("active_rejected") or 0)} / {int(active_entry_status.get("no_signal_rejections") or 0)} / {int(active_entry_status.get("no_signal_escalation_count") or 0)}</td></tr>
+            <tr><th>decision</th><td>{calibration_decision_text}</td><th>active_sample</th><td>{active_sample_text}</td></tr>
             <tr><th>current_live_patch_required</th><td>{current_live_patch_text}</td><th>code_change_status</th><td>{code_change_status_text}</td></tr>
             <tr><th>additional_patch_needed</th><td>{patch_needed_text}</td><th>production_patch_required</th><td>{production_patch_text}</td></tr>
             <tr><th>evidence_required_before_next_patch</th><td colspan="3">{evidence_required_text}</td></tr>
@@ -10914,6 +10933,13 @@ def dashboard_ui(recent_limit: int = 25, refresh_sec: int | None = None):
             <tr><th>scan_cap_guidance</th><td colspan="3">{scan_cap_guidance_text}</td></tr>
             <tr><th>closest_rule_gaps</th><td colspan="3">{rule_gap_text}</td></tr>
             <tr><th>guardrail</th><td colspan="3">{active_signal_calibration.get("guardrail") or "Keep live risk unchanged while calibrating."}</td></tr>
+          </tbody></table>
+        </div>
+        <div class="card span-12"><h3>Window Context — Why Counts Can Differ</h3>
+          <table><tbody>
+            <tr><th>patch_active_window</th><td>since {active_since_text}</td><th>trade_analysis_window</th><td>since {analysis_since_text}</td></tr>
+            <tr><th>active_sample_rule</th><td colspan="3">Entry calibration waits for at least {active_review_min} active rejections or one passed signal; signal-starvation escalation starts at {no_signal_escalation} no-signal rejections.</td></tr>
+            <tr><th>count_scope</th><td colspan="3">Entry Status, Next Action, Readiness Evidence, Rejection Totals, Active No-Signal Symbols, and Active Rule Failures use the patch-active admission window. Performance Analytics, Trade Analysis, Strategy Attribution, Regime Expectancy, and Recent Trades use the broader trade-analysis window.</td></tr>
           </tbody></table>
         </div>
         <div class="card span-6"><h3>Operator Alerts</h3>
@@ -10943,7 +10969,8 @@ def dashboard_ui(recent_limit: int = 25, refresh_sec: int | None = None):
             <tr><th>maker_share</th><td>{maker_share}</td><th>avg_slippage_bps</th><td>{_fmt(exec_truth.get("avg_slippage_bps"),1)}</td></tr>
             <tr><th>entry_reject_rate</th><td>{_pct(reject_rate,1)}</td><th>open_plans</th><td>{len(snap.get("open_plans") or [])}</td></tr>
             <tr><th>edge_decay_bps</th><td>{_fmt(edge_decay.get("avg_edge_decay_bps"),1)}</td><th>edge_decay_samples</th><td>{int(edge_decay.get("projected_samples") or 0)}</td></tr>
-            <tr><th>analysis_window</th><td>since {telemetry.get("analysis_since_utc") or "2026-05-06T00:00:00Z"}</td><th>active_trades</th><td>{int(active_window.get("closed_trades") or 0) if active_window_ok else 0}</td></tr>
+            <tr><th>analysis_window</th><td>since {analysis_since_text}</td><th>active_trades</th><td>{int(active_window.get("closed_trades") or 0) if active_window_ok else 0}</td></tr>
+            <tr><th>patch_active_window</th><td>since {active_since_text}</td><th>active_events_sampled</th><td>{int(active_signal_funnel.get("events_sampled") or 0)}</td></tr>
           </tbody></table>
         </div>
         <div class="card span-12"><h3>Trade Analysis — How Do We Improve?</h3>
@@ -10979,22 +11006,22 @@ def dashboard_ui(recent_limit: int = 25, refresh_sec: int | None = None):
             <tr><th>no_signal_rejections</th><td>{int(active_entry_status.get("no_signal_rejections") or 0)}</td></tr>
           </tbody></table>
         </div>
-        <div class="card span-6"><h3>Rejection Totals</h3>
+        <div class="card span-6"><h3>Patch-Active Rejection Totals</h3>
           <table><thead><tr><th>Reason</th><th>Count</th></tr></thead><tbody>{reject_rows}</tbody></table>
         </div>
-        <div class="card span-6"><h3>Active No-Signal Symbols</h3>
+        <div class="card span-6"><h3>Patch-Active No-Signal Symbols</h3>
           <table><thead><tr><th>Symbol</th><th>Count</th></tr></thead><tbody>{funnel_rows}</tbody></table>
         </div>
-        <div class="card span-6"><h3>Active Rule Failures</h3>
+        <div class="card span-6"><h3>Patch-Active Rule Failures</h3>
           <table><thead><tr><th>Strategy / Check</th><th>Count</th></tr></thead><tbody>{rule_rows}</tbody></table>
         </div>
-        <div class="card span-6"><h3>Strategy Attribution</h3>
+        <div class="card span-6"><h3>Analysis-Window Strategy Attribution</h3>
           <table><thead><tr><th>Strategy</th><th>Closed</th><th>Wins</th><th>Losses</th><th>Win Rate</th><th>Net P&L</th><th>Avg Net Edge</th></tr></thead><tbody>{strategy_rows}</tbody></table>
         </div>
-        <div class="card span-6"><h3>Regime Expectancy</h3>
+        <div class="card span-6"><h3>Analysis-Window Regime Expectancy</h3>
           <table><thead><tr><th>Regime</th><th>Trades</th><th>Wins</th><th>Losses</th><th>Win Rate</th><th>Net P&L</th><th>Avg Net Edge</th></tr></thead><tbody>{regime_rows}</tbody></table>
         </div>
-        <div class="card span-12"><h3>Recent Trades — Since 2026-05-06 Analysis Window</h3>
+        <div class="card span-12"><h3>Recent Trades — Analysis Window Since {analysis_since_text}</h3>
           <table><thead><tr><th>UTC</th><th>Symbol</th><th>Side</th><th>Net PnL</th><th>Fees</th><th>Net Edge bps</th></tr></thead><tbody>{table_rows}</tbody></table>
         </div>
       </div>
