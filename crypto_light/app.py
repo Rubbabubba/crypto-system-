@@ -9640,10 +9640,15 @@ def _trade_analysis_since_ts() -> float | None:
 
 def _active_signal_funnel(limit: int = 500) -> dict[str, Any]:
     since_ts = _active_telemetry_since_ts()
+    sample_limit = max(1, int(limit))
     try:
-        events = lifecycle_db.list_recent_admission_events(since_ts=since_ts, limit=max(1, int(limit)))
+        events = lifecycle_db.list_recent_admission_events(since_ts=since_ts, limit=sample_limit)
     except Exception as e:
-        return {"ok": False, "error": f"{type(e).__name__}: {e}", "active_since_ts": since_ts}
+        return {"ok": False, "error": f"{type(e).__name__}: {e}", "active_since_ts": since_ts, "sample_limit": sample_limit}
+    try:
+        active_totals = lifecycle_db.summarize_admission_events(since_ts=since_ts)
+    except Exception:
+        active_totals = {}
 
     by_result: dict[str, int] = {}
     by_reason: dict[str, int] = {}
@@ -9672,15 +9677,35 @@ def _active_signal_funnel(limit: int = 500) -> dict[str, Any]:
     def _top(d: dict[str, int], n: int = 8) -> list[dict[str, Any]]:
         return [{"key": k, "count": v} for k, v in sorted(d.items(), key=lambda kv: (-kv[1], kv[0]))[:n]]
 
+    sample_by_result = dict(by_result)
+    sample_by_reason = dict(by_reason)
+    total_events = int(active_totals.get("total") or len(events) or 0)
+    total_by_result = dict(active_totals.get("by_result") or {})
+    total_by_reason = dict(active_totals.get("by_reason") or {})
+    if total_by_result:
+        by_result = {str(k): int(v or 0) for k, v in total_by_result.items()}
+        passed = int(by_result.get("passed") or 0)
+        rejected = int(by_result.get("rejected") or 0)
+    if total_by_reason:
+        by_reason = {str(k): int(v or 0) for k, v in total_by_reason.items()}
+    sample_capped = bool(total_events > len(events) or len(events) >= sample_limit)
+
     return {
         "ok": True,
         "active_since_ts": since_ts,
         "events_sampled": len(events),
+        "total_events": total_events,
+        "sample_limit": sample_limit,
+        "sample_capped": sample_capped,
+        "counts_scope": "full_active_window" if total_by_result or total_by_reason else "sampled_recent_events",
+        "top_tables_scope": "recent_sample",
         "passed": passed,
         "rejected": rejected,
         "pass_rate": (float(passed) / float(passed + rejected)) if (passed + rejected) > 0 else None,
         "by_result": by_result,
         "by_reason": by_reason,
+        "sample_by_result": sample_by_result,
+        "sample_by_reason": sample_by_reason,
         "top_symbol_reasons": _top(by_symbol_reason),
         "top_strategy_reasons": _top(by_strategy_reason),
         "no_signal_by_symbol": _top(no_signal_by_symbol),
@@ -9736,9 +9761,14 @@ def _active_no_signal_rule_breakdown(limit: int = 250) -> dict[str, Any]:
     def _top(d: dict[str, int], n: int = 10) -> list[dict[str, Any]]:
         return [{"key": k, "count": v} for k, v in sorted(d.items(), key=lambda kv: (-kv[1], kv[0]))[:n]]
 
+    sample_limit = max(1, int(limit))
     return {
         "ok": True,
         "active_since_ts": since_ts,
+        "events_sampled": len(events),
+        "sample_limit": sample_limit,
+        "sample_capped": bool(len(events) >= sample_limit),
+        "top_tables_scope": "recent_sample",
         "events_inspected": inspected,
         "active_strategies": sorted(active_strategy_set),
         "top_symbol_strategy_reasons": _top(by_symbol_strategy_reason),
@@ -9761,6 +9791,14 @@ def _active_entry_review_min_rejections() -> int:
     except Exception:
         raw = 5
     return max(1, min(raw, 1000))
+
+
+def _active_signal_sample_limit() -> int:
+    try:
+        raw = int(os.getenv("ACTIVE_SIGNAL_SAMPLE_LIMIT", "5000") or 5000)
+    except Exception:
+        raw = 5000
+    return max(100, min(raw, 25000))
 
 
 def _active_signal_rule_gap_summary(limit: int = 500) -> dict[str, Any]:
@@ -9836,9 +9874,14 @@ def _active_signal_rule_gap_summary(limit: int = 500) -> dict[str, Any]:
             'worst_gap': vals_sorted[-1],
         })
     rows = sorted(rows, key=lambda r: (-int(r.get('samples') or 0), float(r.get('closest_gap') or 0.0), str(r.get('key') or '')))
+    sample_limit = max(1, int(limit))
     return {
         'ok': True,
         'active_since_ts': since_ts,
+        'events_sampled': len(events),
+        'sample_limit': sample_limit,
+        'sample_capped': bool(len(events) >= sample_limit),
+        'top_tables_scope': 'recent_sample',
         'top_rule_gaps': rows[:8],
     }
 
@@ -10428,9 +10471,10 @@ def _performance_snapshot(days: float = 30.0, recent_limit: int = 25) -> dict[st
         active_admission_summary = lifecycle_db.summarize_admission_events(since_ts=active_since_ts)
     except Exception as e:
         active_admission_summary = {"ok": False, "error": f"{type(e).__name__}: {e}", "since_ts": active_since_ts}
-    active_signal_funnel = _active_signal_funnel(limit=500)
-    active_no_signal_rules = _active_no_signal_rule_breakdown(limit=500)
-    active_signal_rule_gaps = _active_signal_rule_gap_summary(limit=500)
+    active_sample_limit = _active_signal_sample_limit()
+    active_signal_funnel = _active_signal_funnel(limit=active_sample_limit)
+    active_no_signal_rules = _active_no_signal_rule_breakdown(limit=active_sample_limit)
+    active_signal_rule_gaps = _active_signal_rule_gap_summary(limit=active_sample_limit)
     active_entry_status = _active_entry_status(positions, active_window, active_signal_funnel, active_no_signal_rules)
     active_signal_calibration = _active_signal_calibration_plan(active_signal_funnel, active_no_signal_rules, active_entry_status, active_signal_rule_gaps)
 
@@ -10811,6 +10855,14 @@ def dashboard_ui(recent_limit: int = 25, refresh_sec: int | None = None):
         f"{int(active_entry_status.get('no_signal_rejections') or 0)} no_signal / "
         f"min {active_review_min} / escalate {no_signal_escalation}"
     )
+    active_events_total = int(active_signal_funnel.get("total_events") or active_signal_funnel.get("events_sampled") or 0)
+    active_events_sampled = int(active_signal_funnel.get("events_sampled") or 0)
+    active_sample_limit = int(active_signal_funnel.get("sample_limit") or _active_signal_sample_limit())
+    active_sample_capped = bool(active_signal_funnel.get("sample_capped"))
+    active_sample_scope_text = "FULL ACTIVE COUNTS; RECENT SAMPLE FOR TOP TABLES"
+    if active_sample_capped:
+        active_sample_scope_text = "FULL ACTIVE COUNTS; TOP SYMBOL/RULE TABLES ARE CAPPED RECENT SAMPLES"
+    active_events_text = f"{active_events_total} total / {active_events_sampled} sampled / limit {active_sample_limit}"
 
     net_pnl = _fmt(telemetry.get("net_pnl_usd") if telemetry.get("ok") else (pnl.get("journal_window") or {}).get("net_pnl_usd"))
     trades = int((telemetry.get("closed_trades") if telemetry.get("ok") else (pnl.get("journal_window") or {}).get("closed_trades")) or 0)
@@ -10973,7 +11025,8 @@ def dashboard_ui(recent_limit: int = 25, refresh_sec: int | None = None):
           <table><tbody>
             <tr><th>patch_active_window</th><td>since {active_since_text}</td><th>trade_analysis_window</th><td>since {analysis_since_text}</td></tr>
             <tr><th>active_sample_rule</th><td colspan="3">Entry calibration waits for at least {active_review_min} active rejections or one passed signal; signal-starvation escalation starts at {no_signal_escalation} no-signal rejections.</td></tr>
-            <tr><th>count_scope</th><td colspan="3">Entry Status, Next Action, Readiness Evidence, Rejection Totals, Active No-Signal Symbols, and Active Rule Failures use the patch-active admission window. Performance Analytics, Trade Analysis, Strategy Attribution, Regime Expectancy, and Recent Trades use the broader trade-analysis window.</td></tr>
+            <tr><th>count_scope</th><td colspan="3">Entry Status, Next Action, Readiness Evidence, and Rejection Totals use full patch-active admission totals. Active No-Signal Symbols, Active Rule Failures, and closest gaps use the most recent active sample. Performance Analytics, Trade Analysis, Strategy Attribution, Regime Expectancy, and Recent Trades use the broader trade-analysis window.</td></tr>
+            <tr><th>active_sample_scope</th><td colspan="3">{active_sample_scope_text}; {active_events_text}</td></tr>
           </tbody></table>
         </div>
         <div class="card span-6"><h3>Operator Alerts</h3>
@@ -11004,7 +11057,7 @@ def dashboard_ui(recent_limit: int = 25, refresh_sec: int | None = None):
             <tr><th>entry_reject_rate</th><td>{_pct(reject_rate,1)}</td><th>open_plans</th><td>{len(snap.get("open_plans") or [])}</td></tr>
             <tr><th>edge_decay_bps</th><td>{_fmt(edge_decay.get("avg_edge_decay_bps"),1)}</td><th>edge_decay_samples</th><td>{int(edge_decay.get("projected_samples") or 0)}</td></tr>
             <tr><th>analysis_window</th><td>since {analysis_since_text}</td><th>active_trades</th><td>{int(active_window.get("closed_trades") or 0) if active_window_ok else 0}</td></tr>
-            <tr><th>patch_active_window</th><td>since {active_since_text}</td><th>active_events_sampled</th><td>{int(active_signal_funnel.get("events_sampled") or 0)}</td></tr>
+            <tr><th>patch_active_window</th><td>since {active_since_text}</td><th>active_events</th><td>{active_events_text}</td></tr>
           </tbody></table>
         </div>
         <div class="card span-12"><h3>Trade Analysis — How Do We Improve?</h3>
@@ -11038,6 +11091,7 @@ def dashboard_ui(recent_limit: int = 25, refresh_sec: int | None = None):
             <tr><th>active_passed</th><td>{int(active_signal_funnel.get("passed") or 0)}</td></tr>
             <tr><th>active_rejected</th><td>{int(active_signal_funnel.get("rejected") or 0)}</td></tr>
             <tr><th>no_signal_rejections</th><td>{int(active_entry_status.get("no_signal_rejections") or 0)}</td></tr>
+            <tr><th>active_events</th><td>{active_events_text}</td></tr>
           </tbody></table>
         </div>
         <div class="card span-6"><h3>Patch-Active Rejection Totals</h3>
@@ -11185,13 +11239,13 @@ def diagnostics_active_signal_calibration(recent_limit: int = 25):
 
 
 @app.get("/diagnostics/active_signal_funnel")
-def diagnostics_active_signal_funnel(limit: int = 500):
+def diagnostics_active_signal_funnel(limit: int | None = None):
     return {
         "ok": True,
         "utc": utc_now_iso(),
         "build": PATCH_BUILD,
         "active_strategies": list(ENTRY_ENGINE_STRATEGIES_LIST),
-        "funnel": _active_signal_funnel(limit=limit),
+        "funnel": _active_signal_funnel(limit=limit or _active_signal_sample_limit()),
     }
 
 
