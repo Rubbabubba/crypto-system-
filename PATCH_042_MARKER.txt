@@ -1,0 +1,3 @@
+Patch 042: trade permission banner clarity.
+
+The dashboard top chips now distinguish system readiness from effective trade permission, showing TRADE BLOCKED while lifecycle or promotion blockers remain even when system readiness is green.
