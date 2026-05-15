@@ -1,0 +1,3 @@
+Patch 043: dashboard header chip wrapping.
+
+The operator dashboard header now wraps system/trade-permission chips cleanly and includes a viewport meta tag so narrow screenshots do not overlap or clip status chips.
