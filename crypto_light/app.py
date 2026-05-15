@@ -11007,12 +11007,14 @@ def dashboard_ui(recent_limit: int = 25, refresh_sec: int | None = None):
     build = snap.get("build") or {}
     service = snap.get("service") or {}
     html = f"""
-    <html><head><title>Crypto Intraday Dashboard</title>{refresh_meta}
+    <html><head><title>Crypto Intraday Dashboard</title><meta name="viewport" content="width=device-width, initial-scale=1">{refresh_meta}
     <style>
       body {{ font-family: Inter, Arial, sans-serif; background:#050a18; color:#e9f2ff; margin:0; }}
       .wrap {{ max-width:1400px; margin:0 auto; padding:20px; }}
-      .top {{ display:flex; justify-content:space-between; align-items:center; margin-bottom:14px; }}
-      .chips span {{ border:1px solid #22406a; border-radius:999px; padding:6px 10px; margin-left:8px; font-size:12px; background:#0d1730; color:{label_color}; }}
+      .top {{ display:flex; justify-content:space-between; align-items:flex-start; gap:12px; flex-wrap:wrap; margin-bottom:14px; }}
+      .top-title {{ min-width:280px; flex:1 1 520px; }}
+      .chips {{ display:flex; flex:1 1 320px; flex-wrap:wrap; justify-content:flex-end; align-items:center; gap:8px; max-width:100%; }}
+      .chips span {{ border:1px solid #22406a; border-radius:999px; padding:6px 10px; font-size:12px; background:#0d1730; color:{label_color}; white-space:nowrap; }}
       .grid {{ display:grid; grid-template-columns: repeat(12, 1fr); gap:12px; }}
       .card {{ background:linear-gradient(180deg, #101933 0%, #0b1329 100%); border:1px solid #203764; border-radius:14px; padding:14px; }}
       .callout {{ border-color:#345f9f; background:linear-gradient(180deg, #142346 0%, #0d1833 100%); }}
@@ -11023,9 +11025,10 @@ def dashboard_ui(recent_limit: int = 25, refresh_sec: int | None = None):
       table {{ width:100%; border-collapse:collapse; font-size:12px; }} td,th {{ border-bottom:1px solid #1c2b4d; padding:8px; text-align:left; }} th {{ color:{label_color}; }}
       .status-ok {{ color:#76f7b0; font-weight:700; }} .status-bad {{ color:#ff8f9e; font-weight:700; }}
       pre {{ white-space:pre-wrap; font-size:11px; color:#d0e5ff; background:#071126; border:1px solid #1b2f54; border-radius:8px; padding:10px; }}
+      @media (max-width: 760px) {{ .chips {{ justify-content:flex-start; }} .span-3,.span-4,.span-6,.span-8,.span-12 {{ grid-column: span 12; }} }}
     </style></head><body><div class="wrap">
       <div class="top">
-        <div><div class="k">Operator Console</div><h2>Crypto Intraday Dashboard</h2>
+        <div class="top-title"><div class="k">Operator Console</div><h2>Crypto Intraday Dashboard</h2>
         <div class="muted">Patch: {build.get("patch_version","")} | Env: {service.get("env_name","")} | Stage: LIVE | Snapshot: {snap.get("snapshot_utc","")}</div></div>
         <div class="chips"><span>{readiness}</span><span>{trade_permission_chip}</span><span>{refresh_chip}</span><span>Read-only</span><span>Fast path</span></div>
       </div>
