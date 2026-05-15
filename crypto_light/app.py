@@ -10989,12 +10989,17 @@ def dashboard_ui(recent_limit: int = 25, refresh_sec: int | None = None):
         or next_step_text in ("reconcile_open_exposure", "reconcile_open_plan", "monitor_position")
     )
     lifecycle_status_text = "RECONCILE_OPEN_LIFECYCLE" if lifecycle_blocked else "CLEAR"
+    lifecycle_gate_ok = not lifecycle_blocked
+    pretrade_gate_open = bool((snap.get('pretrade_health_gate') or {}).get('gate_open'))
+    effective_trade_allowed = bool(pretrade_gate_open and lifecycle_gate_ok and bool(snap.get('promotion_ready')))
     reconcile_tile_text = "CHECK" if bool(lifecycle_blocked or open_order_count > 0) else "HEALTHY"
     lifecycle_action_text = (
         "Resolve /positions, open plans, broker orders, exit-worker state, and journal rows before trade analysis or calibration."
         if lifecycle_blocked
         else "No open lifecycle blocker detected."
     )
+    lifecycle_gate_text = "TRUE" if lifecycle_gate_ok else "FALSE"
+    effective_trade_allowed_text = "TRUE" if effective_trade_allowed else "FALSE"
 
     label_color = "#a9d6ff"
     build = snap.get("build") or {}
@@ -11042,6 +11047,7 @@ def dashboard_ui(recent_limit: int = 25, refresh_sec: int | None = None):
             <tr><th>entry_diagnostics_scope</th><td colspan="3">{entry_diagnostics_scope_text}</td></tr>
             <tr><th>active_sample_interpretation</th><td colspan="3">{active_sample_interpretation_text}</td></tr>
             <tr><th>paper_probe_ready</th><td>{paper_probe_ready_text}</td><th>live_change_allowed</th><td>{live_change_allowed_text}</td></tr>
+            <tr><th>lifecycle_gate_ok</th><td>{lifecycle_gate_text}</td><th>effective_trade_allowed</th><td>{effective_trade_allowed_text}</td></tr>
             <tr><th>operator_now</th><td colspan="3">{operator_now_text}</td></tr>
             <tr><th>next_live_change_condition</th><td colspan="3">{next_live_change_condition_text}</td></tr>
             <tr><th>patch_rationale</th><td colspan="3">{patch_rationale_text}</td></tr>
@@ -11072,6 +11078,8 @@ def dashboard_ui(recent_limit: int = 25, refresh_sec: int | None = None):
             <tr><th>Pretrade blockers</th><td>{pretrade_blocker_text}</td></tr>
             <tr><th>Entry blocker</th><td>{entry_blocker_text}</td></tr>
             <tr><th>Lifecycle status</th><td>{lifecycle_status_text}</td></tr>
+            <tr><th>Lifecycle gate ok</th><td>{lifecycle_gate_text}</td></tr>
+            <tr><th>Effective trade allowed</th><td>{effective_trade_allowed_text}</td></tr>
             <tr><th>Lifecycle action</th><td>{lifecycle_action_text}</td></tr>
             <tr><th>Internal scanner</th><td>{'RUNNING' if bool(((snap.get('promotion_guardrails') or {}).get('checks') or {}).get('workers_healthy')) else 'ISSUES'}</td></tr>
             <tr><th>Worker status</th><td>{'HEALTHY' if bool(((snap.get('promotion_guardrails') or {}).get('checks') or {}).get('workers_healthy')) else 'ISSUES'}</td></tr>
@@ -11080,7 +11088,9 @@ def dashboard_ui(recent_limit: int = 25, refresh_sec: int | None = None):
         <div class="card span-6"><h3>Exception Center</h3>
           <table><tbody>
             <tr><th>promotion_ready</th><td>{str(bool(snap.get('promotion_ready'))).upper()}</td></tr>
-            <tr><th>trade_gate_ok</th><td>{str(bool((snap.get('pretrade_health_gate') or {}).get('gate_open'))).upper()}</td></tr>
+            <tr><th>pretrade_gate_ok</th><td>{str(pretrade_gate_open).upper()}</td></tr>
+            <tr><th>lifecycle_gate_ok</th><td>{lifecycle_gate_text}</td></tr>
+            <tr><th>effective_trade_allowed</th><td>{effective_trade_allowed_text}</td></tr>
             <tr><th>balance_ok</th><td>{str(bool(account_truth.get('balance_ok'))).upper()}</td></tr>
             <tr><th>positions_count</th><td>{positions_count}</td></tr>
             <tr><th>open_plans_count</th><td>{open_plans_count}</td></tr>
@@ -11120,7 +11130,9 @@ def dashboard_ui(recent_limit: int = 25, refresh_sec: int | None = None):
           <table><tbody>
             <tr><th>ready</th><td class="{'status-ok' if snap.get('ready') else 'status-bad'}">{str(bool(snap.get('ready'))).upper()}</td></tr>
             <tr><th>promotion_ready</th><td>{str(bool(snap.get('promotion_ready'))).upper()}</td></tr>
-            <tr><th>trade_gate_ok</th><td>{str(bool((snap.get('pretrade_health_gate') or {}).get('gate_open'))).upper()}</td></tr>
+            <tr><th>pretrade_gate_ok</th><td>{str(pretrade_gate_open).upper()}</td></tr>
+            <tr><th>lifecycle_gate_ok</th><td>{lifecycle_gate_text}</td></tr>
+            <tr><th>effective_trade_allowed</th><td>{effective_trade_allowed_text}</td></tr>
             <tr><th>current_blockers</th><td>{blocker_text}</td></tr>
           </tbody></table>
         </div>
