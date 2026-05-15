@@ -10243,6 +10243,9 @@ def _active_signal_calibration_plan(
             "operator_now": "RECONCILE_OPEN_LIFECYCLE",
             "next_live_change_condition": "Reassess only after open exposure/plans are reconciled and closed-trade evidence is current.",
             "live_change_allowed": False,
+            "suppress_entry_calibration_details": True,
+            "entry_diagnostics_scope": "HELD_OPEN_LIFECYCLE_RECONCILIATION",
+            "active_sample_interpretation": "Active no-signal and rule-gap diagnostics are informational only while exposure or an internal plan is open; do not use them for threshold, universe, or scan-cap changes until lifecycle state is reconciled.",
             "patch_rationale": "No code patch is indicated while an open position or internal plan is present without a closed trade record.",
             "universe_expansion_recommended": False,
             "universe_action": "NO_RECONCILE_OPEN_LIFECYCLE_FIRST",
@@ -10850,11 +10853,17 @@ def dashboard_ui(recent_limit: int = 25, refresh_sec: int | None = None):
     analysis_since_text = str(telemetry.get("analysis_since_utc") or "2026-05-06T00:00:00Z")
     active_review_min = int(active_entry_status.get("active_rejection_review_min") or 0)
     no_signal_escalation = int(active_entry_status.get("no_signal_escalation_count") or 0)
+    lifecycle_calibration_blocked = bool(active_signal_calibration.get("suppress_entry_calibration_details"))
     active_sample_text = (
         f"{int(active_entry_status.get('active_rejected') or 0)} rejected / "
         f"{int(active_entry_status.get('no_signal_rejections') or 0)} no_signal / "
         f"min {active_review_min} / escalate {no_signal_escalation}"
     )
+    if lifecycle_calibration_blocked:
+        active_sample_text = (
+            f"HELD_OPEN_LIFECYCLE: {int(active_entry_status.get('active_rejected') or 0)} rejected / "
+            f"{int(active_entry_status.get('no_signal_rejections') or 0)} no_signal; reconcile exposure before calibration"
+        )
     active_events_total = int(active_signal_funnel.get("total_events") or active_signal_funnel.get("events_sampled") or 0)
     active_events_sampled = int(active_signal_funnel.get("events_sampled") or 0)
     active_sample_limit = int(active_signal_funnel.get("sample_limit") or _active_signal_sample_limit())
@@ -10925,6 +10934,15 @@ def dashboard_ui(recent_limit: int = 25, refresh_sec: int | None = None):
     shadow_probe_plan_text = str(active_signal_calibration.get("shadow_probe_plan") or "No shadow probe plan available.")
     rule_gap_rows = list(active_signal_rule_gaps.get("top_rule_gaps") or [])
     rule_gap_text = ", ".join([f"{r.get('key')} closest={_fmt(r.get('closest_gap'), 2)}" for r in rule_gap_rows[:3]]) or "none"
+    entry_diagnostics_scope_text = str(active_signal_calibration.get("entry_diagnostics_scope") or "ACTIVE_ENTRY_CALIBRATION")
+    active_sample_interpretation_text = str(active_signal_calibration.get("active_sample_interpretation") or "Active sample can be used for entry-calibration review when no lifecycle blocker is present.")
+    if lifecycle_calibration_blocked:
+        shadow_experiment_text = "held_until_open_lifecycle_reconciled"
+        shadow_feasibility_text = "held_open_lifecycle_reconciliation"
+        scan_cap_guidance_text = "Held while exposure/plan lifecycle is unresolved; reconcile positions, plans, exits, and journal rows before scan-cap tuning."
+        rule_gap_text = "held_until_open_lifecycle_reconciled"
+        cap_probe_text = "NO"
+        threshold_gap_text = "NO"
     scanner_status_text = "OPTIONAL" if not scanner_required_flag else ("OK" if bool((snap.get("compatibility") or {}).get("scanner_ok")) else "DOWN")
 
     rows = []
@@ -11004,6 +11022,8 @@ def dashboard_ui(recent_limit: int = 25, refresh_sec: int | None = None):
             <tr><th>current_live_patch_required</th><td>{current_live_patch_text}</td><th>code_change_status</th><td>{code_change_status_text}</td></tr>
             <tr><th>additional_patch_needed</th><td>{patch_needed_text}</td><th>production_patch_required</th><td>{production_patch_text}</td></tr>
             <tr><th>evidence_required_before_next_patch</th><td colspan="3">{evidence_required_text}</td></tr>
+            <tr><th>entry_diagnostics_scope</th><td colspan="3">{entry_diagnostics_scope_text}</td></tr>
+            <tr><th>active_sample_interpretation</th><td colspan="3">{active_sample_interpretation_text}</td></tr>
             <tr><th>paper_probe_ready</th><td>{paper_probe_ready_text}</td><th>live_change_allowed</th><td>{live_change_allowed_text}</td></tr>
             <tr><th>operator_now</th><td colspan="3">{operator_now_text}</td></tr>
             <tr><th>next_live_change_condition</th><td colspan="3">{next_live_change_condition_text}</td></tr>
