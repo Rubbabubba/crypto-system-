@@ -1,0 +1,3 @@
+Patch 041: effective trade gate clarity.
+
+Separates pretrade health from lifecycle readiness by showing lifecycle_gate_ok and effective_trade_allowed, so a green pretrade gate cannot be mistaken for permission to trade while positions/plans are unresolved.
