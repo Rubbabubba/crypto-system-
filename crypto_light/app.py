@@ -10899,7 +10899,7 @@ def dashboard_ui(recent_limit: int = 25, refresh_sec: int | None = None):
         accepted = float(admission_result.get("accepted") or 0.0)
         rejected = float(admission_result.get("rejected") or 0.0)
     reject_rate = (rejected / (accepted + rejected)) if (accepted + rejected) > 0 else 0.0
-    readiness = "READY" if snap.get("ready") else "NOT READY"
+    readiness = "SYSTEM READY" if snap.get("ready") else "SYSTEM NOT READY"
     scanner_required_flag = bool((((snap.get("promotion_guardrails") or {}).get("checks") or {}).get("scanner_required")))
     blockers = [str(b) for b in raw_blockers if str(b)]
     if not scanner_required_flag:
@@ -11000,6 +11000,8 @@ def dashboard_ui(recent_limit: int = 25, refresh_sec: int | None = None):
     )
     lifecycle_gate_text = "TRUE" if lifecycle_gate_ok else "FALSE"
     effective_trade_allowed_text = "TRUE" if effective_trade_allowed else "FALSE"
+    trade_permission_chip = "TRADE ALLOWED" if effective_trade_allowed else "TRADE BLOCKED"
+    trade_permission_reason = "none" if effective_trade_allowed else (lifecycle_status_text if lifecycle_blocked else (blocker_text or "promotion_not_ready"))
 
     label_color = "#a9d6ff"
     build = snap.get("build") or {}
@@ -11025,7 +11027,7 @@ def dashboard_ui(recent_limit: int = 25, refresh_sec: int | None = None):
       <div class="top">
         <div><div class="k">Operator Console</div><h2>Crypto Intraday Dashboard</h2>
         <div class="muted">Patch: {build.get("patch_version","")} | Env: {service.get("env_name","")} | Stage: LIVE | Snapshot: {snap.get("snapshot_utc","")}</div></div>
-        <div class="chips"><span>{readiness}</span><span>{refresh_chip}</span><span>Read-only</span><span>Fast path</span></div>
+        <div class="chips"><span>{readiness}</span><span>{trade_permission_chip}</span><span>{refresh_chip}</span><span>Read-only</span><span>Fast path</span></div>
       </div>
       <div class="grid">
         <div class="card callout span-12"><h3>Entry Status — Where Are We?</h3>
@@ -11048,6 +11050,7 @@ def dashboard_ui(recent_limit: int = 25, refresh_sec: int | None = None):
             <tr><th>active_sample_interpretation</th><td colspan="3">{active_sample_interpretation_text}</td></tr>
             <tr><th>paper_probe_ready</th><td>{paper_probe_ready_text}</td><th>live_change_allowed</th><td>{live_change_allowed_text}</td></tr>
             <tr><th>lifecycle_gate_ok</th><td>{lifecycle_gate_text}</td><th>effective_trade_allowed</th><td>{effective_trade_allowed_text}</td></tr>
+            <tr><th>trade_permission_reason</th><td colspan="3">{trade_permission_reason}</td></tr>
             <tr><th>operator_now</th><td colspan="3">{operator_now_text}</td></tr>
             <tr><th>next_live_change_condition</th><td colspan="3">{next_live_change_condition_text}</td></tr>
             <tr><th>patch_rationale</th><td colspan="3">{patch_rationale_text}</td></tr>
@@ -11080,6 +11083,7 @@ def dashboard_ui(recent_limit: int = 25, refresh_sec: int | None = None):
             <tr><th>Lifecycle status</th><td>{lifecycle_status_text}</td></tr>
             <tr><th>Lifecycle gate ok</th><td>{lifecycle_gate_text}</td></tr>
             <tr><th>Effective trade allowed</th><td>{effective_trade_allowed_text}</td></tr>
+            <tr><th>Trade permission reason</th><td>{trade_permission_reason}</td></tr>
             <tr><th>Lifecycle action</th><td>{lifecycle_action_text}</td></tr>
             <tr><th>Internal scanner</th><td>{'RUNNING' if bool(((snap.get('promotion_guardrails') or {}).get('checks') or {}).get('workers_healthy')) else 'ISSUES'}</td></tr>
             <tr><th>Worker status</th><td>{'HEALTHY' if bool(((snap.get('promotion_guardrails') or {}).get('checks') or {}).get('workers_healthy')) else 'ISSUES'}</td></tr>
@@ -11091,6 +11095,7 @@ def dashboard_ui(recent_limit: int = 25, refresh_sec: int | None = None):
             <tr><th>pretrade_gate_ok</th><td>{str(pretrade_gate_open).upper()}</td></tr>
             <tr><th>lifecycle_gate_ok</th><td>{lifecycle_gate_text}</td></tr>
             <tr><th>effective_trade_allowed</th><td>{effective_trade_allowed_text}</td></tr>
+            <tr><th>trade_permission_reason</th><td>{trade_permission_reason}</td></tr>
             <tr><th>balance_ok</th><td>{str(bool(account_truth.get('balance_ok'))).upper()}</td></tr>
             <tr><th>positions_count</th><td>{positions_count}</td></tr>
             <tr><th>open_plans_count</th><td>{open_plans_count}</td></tr>
@@ -11128,11 +11133,12 @@ def dashboard_ui(recent_limit: int = 25, refresh_sec: int | None = None):
         </div>
         <div class="card span-4"><h3>Guarded Live Path</h3>
           <table><tbody>
-            <tr><th>ready</th><td class="{'status-ok' if snap.get('ready') else 'status-bad'}">{str(bool(snap.get('ready'))).upper()}</td></tr>
+            <tr><th>system_ready</th><td class="{'status-ok' if snap.get('ready') else 'status-bad'}">{str(bool(snap.get('ready'))).upper()}</td></tr>
             <tr><th>promotion_ready</th><td>{str(bool(snap.get('promotion_ready'))).upper()}</td></tr>
             <tr><th>pretrade_gate_ok</th><td>{str(pretrade_gate_open).upper()}</td></tr>
             <tr><th>lifecycle_gate_ok</th><td>{lifecycle_gate_text}</td></tr>
             <tr><th>effective_trade_allowed</th><td>{effective_trade_allowed_text}</td></tr>
+            <tr><th>trade_permission_reason</th><td>{trade_permission_reason}</td></tr>
             <tr><th>current_blockers</th><td>{blocker_text}</td></tr>
           </tbody></table>
         </div>
