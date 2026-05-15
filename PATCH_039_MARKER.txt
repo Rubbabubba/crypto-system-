@@ -1,0 +1,3 @@
+Patch 039: lifecycle-blocked calibration clarity.
+
+When an open position or internal plan is present, the dashboard now marks entry calibration diagnostics as held, suppresses stale shadow/gap actions, and keeps reconciliation as the only actionable next step.
