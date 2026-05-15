@@ -1,0 +1,3 @@
+Patch 040: lifecycle reconcile status clarity.
+
+The dashboard reconcile tile now reflects open positions/plans as lifecycle blockers instead of showing healthy solely because broker open orders are zero.
