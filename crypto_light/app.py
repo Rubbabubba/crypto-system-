@@ -10978,10 +10978,27 @@ def dashboard_ui(recent_limit: int = 25, refresh_sec: int | None = None):
     if not regime_rows:
         regime_rows = "<tr><td colspan='7'>No regime expectancy.</td></tr>"
 
+    account_truth = ((snap.get("promotion_guardrails") or {}).get("account_truth") or {})
+    open_plans_count = len(snap.get("open_plans") or [])
+    positions_count = int(account_truth.get("positions_count") or active_entry_status.get("open_positions") or 0)
+    open_order_count = int(account_truth.get("open_order_count") or 0)
+    lifecycle_blocked = bool(
+        positions_count > 0
+        or open_plans_count > 0
+        or bool(active_entry_status.get("has_open_exposure"))
+        or next_step_text in ("reconcile_open_exposure", "reconcile_open_plan", "monitor_position")
+    )
+    lifecycle_status_text = "RECONCILE_OPEN_LIFECYCLE" if lifecycle_blocked else "CLEAR"
+    reconcile_tile_text = "CHECK" if bool(lifecycle_blocked or open_order_count > 0) else "HEALTHY"
+    lifecycle_action_text = (
+        "Resolve /positions, open plans, broker orders, exit-worker state, and journal rows before trade analysis or calibration."
+        if lifecycle_blocked
+        else "No open lifecycle blocker detected."
+    )
+
     label_color = "#a9d6ff"
     build = snap.get("build") or {}
     service = snap.get("service") or {}
-    account_truth = ((snap.get("promotion_guardrails") or {}).get("account_truth") or {})
     html = f"""
     <html><head><title>Crypto Intraday Dashboard</title>{refresh_meta}
     <style>
@@ -11054,6 +11071,8 @@ def dashboard_ui(recent_limit: int = 25, refresh_sec: int | None = None):
             <tr><th>Current blockers</th><td>{blocker_text}</td></tr>
             <tr><th>Pretrade blockers</th><td>{pretrade_blocker_text}</td></tr>
             <tr><th>Entry blocker</th><td>{entry_blocker_text}</td></tr>
+            <tr><th>Lifecycle status</th><td>{lifecycle_status_text}</td></tr>
+            <tr><th>Lifecycle action</th><td>{lifecycle_action_text}</td></tr>
             <tr><th>Internal scanner</th><td>{'RUNNING' if bool(((snap.get('promotion_guardrails') or {}).get('checks') or {}).get('workers_healthy')) else 'ISSUES'}</td></tr>
             <tr><th>Worker status</th><td>{'HEALTHY' if bool(((snap.get('promotion_guardrails') or {}).get('checks') or {}).get('workers_healthy')) else 'ISSUES'}</td></tr>
           </tbody></table>
@@ -11063,12 +11082,15 @@ def dashboard_ui(recent_limit: int = 25, refresh_sec: int | None = None):
             <tr><th>promotion_ready</th><td>{str(bool(snap.get('promotion_ready'))).upper()}</td></tr>
             <tr><th>trade_gate_ok</th><td>{str(bool((snap.get('pretrade_health_gate') or {}).get('gate_open'))).upper()}</td></tr>
             <tr><th>balance_ok</th><td>{str(bool(account_truth.get('balance_ok'))).upper()}</td></tr>
-            <tr><th>open_order_count</th><td>{int(account_truth.get('open_order_count') or 0)}</td></tr>
+            <tr><th>positions_count</th><td>{positions_count}</td></tr>
+            <tr><th>open_plans_count</th><td>{open_plans_count}</td></tr>
+            <tr><th>open_order_count</th><td>{open_order_count}</td></tr>
+            <tr><th>lifecycle_status</th><td>{lifecycle_status_text}</td></tr>
           </tbody></table>
         </div>
         <div class="card span-4"><h3>Release Stage</h3><div class="v">LIVE</div></div>
         <div class="card span-4"><h3>Workers</h3><div class="v">{'OK' if bool(((snap.get('promotion_guardrails') or {}).get('checks') or {}).get('workers_healthy')) else 'ISSUE'}</div></div>
-        <div class="card span-4"><h3>Reconcile</h3><div class="v">{'HEALTHY' if int(account_truth.get('open_order_count') or 0)==0 else 'CHECK'}</div></div>
+        <div class="card span-4"><h3>Lifecycle Reconcile</h3><div class="v">{reconcile_tile_text}</div><div class="muted">{lifecycle_status_text}</div></div>
         <div class="card span-8"><h3>Performance Analytics</h3>
           <table><tbody>
             <tr><th>net_pnl</th><td>{net_pnl}</td><th>trades</th><td>{trades}</td></tr>
@@ -11107,7 +11129,9 @@ def dashboard_ui(recent_limit: int = 25, refresh_sec: int | None = None):
             <tr><th>entry_engine_enabled</th><td>{str(bool(ENTRY_ENGINE_ENABLED)).upper()}</td></tr>
             <tr><th>scan_loop_healthy</th><td>{str(bool(((snap.get('promotion_guardrails') or {}).get('checks') or {}).get('workers_healthy'))).upper()}</td></tr>
             <tr><th>balance_ok</th><td>{str(bool(((snap.get('promotion_guardrails') or {}).get('account_truth') or {}).get('balance_ok'))).upper()}</td></tr>
-            <tr><th>open_order_count</th><td>{int((((snap.get('promotion_guardrails') or {}).get('account_truth') or {}).get('open_order_count') or 0))}</td></tr>
+            <tr><th>positions_count</th><td>{positions_count}</td></tr>
+            <tr><th>open_plans_count</th><td>{open_plans_count}</td></tr>
+            <tr><th>open_order_count</th><td>{open_order_count}</td></tr>
             <tr><th>active_passed</th><td>{int(active_signal_funnel.get("passed") or 0)}</td></tr>
             <tr><th>active_rejected</th><td>{int(active_signal_funnel.get("rejected") or 0)}</td></tr>
             <tr><th>no_signal_rejections</th><td>{int(active_entry_status.get("no_signal_rejections") or 0)}</td></tr>
