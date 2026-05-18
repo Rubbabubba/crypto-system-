@@ -10989,6 +10989,15 @@ def dashboard_ui(recent_limit: int = 25, refresh_sec: int | None = None):
         or next_step_text in ("reconcile_open_exposure", "reconcile_open_plan", "monitor_position")
     )
     lifecycle_status_text = "RECONCILE_OPEN_LIFECYCLE" if lifecycle_blocked else "CLEAR"
+    active_closed_trades_count = int(active_entry_status.get("closed_trades") or active_window.get("closed_trades") or 0)
+    lifecycle_position_status = f"OPEN({positions_count})" if positions_count > 0 else "CLEAR(0)"
+    lifecycle_plan_status = f"OPEN({open_plans_count})" if open_plans_count > 0 else "CLEAR(0)"
+    lifecycle_order_status = f"OPEN({open_order_count})" if open_order_count > 0 else "CLEAR(0)"
+    lifecycle_journal_status = f"RECORDED({active_closed_trades_count})" if active_closed_trades_count > 0 else "MISSING(0)"
+    lifecycle_reconcile_checklist_text = (
+        f"positions={lifecycle_position_status}; plans={lifecycle_plan_status}; "
+        f"orders={lifecycle_order_status}; active_closed_trade={lifecycle_journal_status}"
+    )
     lifecycle_gate_ok = not lifecycle_blocked
     pretrade_gate_open = bool((snap.get('pretrade_health_gate') or {}).get('gate_open'))
     effective_trade_allowed = bool(pretrade_gate_open and lifecycle_gate_ok and bool(snap.get('promotion_ready')))
@@ -11054,6 +11063,7 @@ def dashboard_ui(recent_limit: int = 25, refresh_sec: int | None = None):
             <tr><th>paper_probe_ready</th><td>{paper_probe_ready_text}</td><th>live_change_allowed</th><td>{live_change_allowed_text}</td></tr>
             <tr><th>lifecycle_gate_ok</th><td>{lifecycle_gate_text}</td><th>effective_trade_allowed</th><td>{effective_trade_allowed_text}</td></tr>
             <tr><th>trade_permission_reason</th><td colspan="3">{trade_permission_reason}</td></tr>
+            <tr><th>lifecycle_reconcile_checklist</th><td colspan="3">{lifecycle_reconcile_checklist_text}</td></tr>
             <tr><th>operator_now</th><td colspan="3">{operator_now_text}</td></tr>
             <tr><th>next_live_change_condition</th><td colspan="3">{next_live_change_condition_text}</td></tr>
             <tr><th>patch_rationale</th><td colspan="3">{patch_rationale_text}</td></tr>
@@ -11087,6 +11097,7 @@ def dashboard_ui(recent_limit: int = 25, refresh_sec: int | None = None):
             <tr><th>Lifecycle gate ok</th><td>{lifecycle_gate_text}</td></tr>
             <tr><th>Effective trade allowed</th><td>{effective_trade_allowed_text}</td></tr>
             <tr><th>Trade permission reason</th><td>{trade_permission_reason}</td></tr>
+            <tr><th>Lifecycle checklist</th><td>{lifecycle_reconcile_checklist_text}</td></tr>
             <tr><th>Lifecycle action</th><td>{lifecycle_action_text}</td></tr>
             <tr><th>Internal scanner</th><td>{'RUNNING' if bool(((snap.get('promotion_guardrails') or {}).get('checks') or {}).get('workers_healthy')) else 'ISSUES'}</td></tr>
             <tr><th>Worker status</th><td>{'HEALTHY' if bool(((snap.get('promotion_guardrails') or {}).get('checks') or {}).get('workers_healthy')) else 'ISSUES'}</td></tr>
@@ -11104,11 +11115,13 @@ def dashboard_ui(recent_limit: int = 25, refresh_sec: int | None = None):
             <tr><th>open_plans_count</th><td>{open_plans_count}</td></tr>
             <tr><th>open_order_count</th><td>{open_order_count}</td></tr>
             <tr><th>lifecycle_status</th><td>{lifecycle_status_text}</td></tr>
+            <tr><th>active_closed_trades</th><td>{active_closed_trades_count}</td></tr>
+            <tr><th>lifecycle_checklist</th><td>{lifecycle_reconcile_checklist_text}</td></tr>
           </tbody></table>
         </div>
         <div class="card span-4"><h3>Release Stage</h3><div class="v">LIVE</div></div>
         <div class="card span-4"><h3>Workers</h3><div class="v">{'OK' if bool(((snap.get('promotion_guardrails') or {}).get('checks') or {}).get('workers_healthy')) else 'ISSUE'}</div></div>
-        <div class="card span-4"><h3>Lifecycle Reconcile</h3><div class="v">{reconcile_tile_text}</div><div class="muted">{lifecycle_status_text}</div></div>
+        <div class="card span-4"><h3>Lifecycle Reconcile</h3><div class="v">{reconcile_tile_text}</div><div class="muted">{lifecycle_status_text}</div><div class="muted">{lifecycle_reconcile_checklist_text}</div></div>
         <div class="card span-8"><h3>Performance Analytics</h3>
           <table><tbody>
             <tr><th>net_pnl</th><td>{net_pnl}</td><th>trades</th><td>{trades}</td></tr>
@@ -11142,6 +11155,7 @@ def dashboard_ui(recent_limit: int = 25, refresh_sec: int | None = None):
             <tr><th>lifecycle_gate_ok</th><td>{lifecycle_gate_text}</td></tr>
             <tr><th>effective_trade_allowed</th><td>{effective_trade_allowed_text}</td></tr>
             <tr><th>trade_permission_reason</th><td>{trade_permission_reason}</td></tr>
+            <tr><th>lifecycle_checklist</th><td>{lifecycle_reconcile_checklist_text}</td></tr>
             <tr><th>current_blockers</th><td>{blocker_text}</td></tr>
           </tbody></table>
         </div>
@@ -11153,6 +11167,7 @@ def dashboard_ui(recent_limit: int = 25, refresh_sec: int | None = None):
             <tr><th>positions_count</th><td>{positions_count}</td></tr>
             <tr><th>open_plans_count</th><td>{open_plans_count}</td></tr>
             <tr><th>open_order_count</th><td>{open_order_count}</td></tr>
+            <tr><th>active_closed_trades</th><td>{active_closed_trades_count}</td></tr>
             <tr><th>active_passed</th><td>{int(active_signal_funnel.get("passed") or 0)}</td></tr>
             <tr><th>active_rejected</th><td>{int(active_signal_funnel.get("rejected") or 0)}</td></tr>
             <tr><th>no_signal_rejections</th><td>{int(active_entry_status.get("no_signal_rejections") or 0)}</td></tr>
