@@ -1,0 +1,3 @@
+Patch 044: lifecycle reconcile checklist.
+
+Adds an explicit positions/plans/orders/active-closed-trade checklist wherever lifecycle reconciliation blocks trading, so operators can see exactly which lifecycle item still needs resolution.
