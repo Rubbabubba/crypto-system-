@@ -10993,7 +10993,13 @@ def dashboard_ui(recent_limit: int = 25, refresh_sec: int | None = None):
     lifecycle_position_status = f"OPEN({positions_count})" if positions_count > 0 else "CLEAR(0)"
     lifecycle_plan_status = f"OPEN({open_plans_count})" if open_plans_count > 0 else "CLEAR(0)"
     lifecycle_order_status = f"OPEN({open_order_count})" if open_order_count > 0 else "CLEAR(0)"
-    lifecycle_journal_status = f"RECORDED({active_closed_trades_count})" if active_closed_trades_count > 0 else "MISSING(0)"
+    lifecycle_journal_required = bool(lifecycle_blocked or positions_count > 0 or open_plans_count > 0 or open_order_count > 0)
+    if active_closed_trades_count > 0:
+        lifecycle_journal_status = f"RECORDED({active_closed_trades_count})"
+    elif lifecycle_journal_required:
+        lifecycle_journal_status = "MISSING(0)"
+    else:
+        lifecycle_journal_status = "NOT_REQUIRED(0)"
     lifecycle_reconcile_checklist_text = (
         f"positions={lifecycle_position_status}; plans={lifecycle_plan_status}; "
         f"orders={lifecycle_order_status}; active_closed_trade={lifecycle_journal_status}"
