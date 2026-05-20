@@ -1,0 +1,3 @@
+Patch 045: lifecycle checklist journal requirement clarity.
+
+Active closed-trade evidence is now marked NOT_REQUIRED when there is no open lifecycle blocker, avoiding a misleading MISSING status after positions/plans/orders are clear.
